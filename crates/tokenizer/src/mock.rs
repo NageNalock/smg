@@ -45,6 +45,7 @@ pub struct MockTokenizer {
     /// generation-prompt flag as JSON, so a test can assert exactly what
     /// reached the template.
     json_chat_template: bool,
+    response_template: Option<serde_json::Value>,
 }
 
 impl Default for MockTokenizer {
@@ -108,6 +109,7 @@ impl MockTokenizer {
             renderer_capabilities: RendererCapabilities::default(),
             content_format: ChatTemplateContentFormat::default(),
             json_chat_template: false,
+            response_template: None,
         }
     }
 
@@ -190,6 +192,12 @@ impl MockTokenizer {
     /// and tool list the template received.
     pub fn with_json_chat_template(mut self) -> Self {
         self.json_chat_template = true;
+        self
+    }
+
+    /// Report `template` from `response_template()`.
+    pub fn with_response_template(mut self, template: serde_json::Value) -> Self {
+        self.response_template = Some(template);
         self
     }
 }
@@ -355,5 +363,9 @@ impl TokenizerTrait for MockTokenizer {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn response_template(&self) -> Option<&serde_json::Value> {
+        self.response_template.as_ref()
     }
 }

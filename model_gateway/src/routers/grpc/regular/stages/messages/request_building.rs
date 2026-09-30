@@ -169,6 +169,21 @@ impl BuildStage for MessageRequestBuildingStage {
             error::internal_error("invalid_tool_constraint", format!("Invalid tool constraint: {e}"))
         })?;
 
+        // The response-template parsers start from the end of the prompt.
+        let mut spec = MessagesResponseSpec::from(messages_request.as_ref());
+        spec.response_parser = ctx
+            .components
+            .parser_resolver
+            .response_template(&messages_request.model)
+            .map(|template| {
+                utils::ResponseParserSpec::new(
+                    template,
+                    &processed_messages.text,
+                    &spec.chat_tools,
+                    false,
+                )
+            });
+
         // The ids are the prompt; the text rides along only when the request
         // carries media (see `helpers::wire_prompt_text`).
         let carries_media = multimodal_data.is_some() || ctx.state.multimodal_refs.is_some();
@@ -244,7 +259,6 @@ impl BuildStage for MessageRequestBuildingStage {
             tool_parser.as_deref(),
             &proto_request,
         );
-        let mut spec = MessagesResponseSpec::from(messages_request.as_ref());
         spec.reasoning_in_prefill = reasoning_in_prefill;
         Ok(BuildOutput {
             plan: ExecutionPlan::generate(self.plan_kind, proto_request),

@@ -44,7 +44,7 @@ use super::{
         responses, stages::decisions::supports_worker as supports_decisions_worker,
         streaming::StreamingProcessor,
     },
-    utils::{message_utils, missing_tokenizer_response, ParserResolver},
+    utils::{message_utils, missing_tokenizer_response, ParserResolver, ResponseTemplateParsers},
 };
 use crate::{
     app_context::AppContext,
@@ -124,6 +124,12 @@ impl GrpcRouter {
             .map_err(|e| format!("multimodal components: {e:#}"))?,
         ));
 
+        let response_templates = Some(Arc::new(ResponseTemplateParsers::new(
+            tokenizer_registry.clone(),
+            reasoning_parser_factory.clone(),
+            tool_parser_factory.clone(),
+        )));
+
         // Create shared components for pipeline
         let shared_components = Arc::new(SharedComponents {
             tokenizer_registry: tokenizer_registry.clone(),
@@ -134,6 +140,7 @@ impl GrpcRouter {
                 worker_registry.clone(),
                 ctx.configured_tool_parser.clone(),
                 ctx.configured_reasoning_parser.clone(),
+                response_templates.clone(),
             ),
             multimodal,
             tokenizer_autoload: !ctx.router_config.disable_tokenizer_autoload,
@@ -152,6 +159,7 @@ impl GrpcRouter {
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
             ctx.configured_reasoning_parser.clone(),
+            response_templates,
             ctx.rate_limit_manager.clone(),
             queue_timeout,
         );
