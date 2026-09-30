@@ -6,6 +6,7 @@ pub(crate) mod message_utils;
 mod metrics;
 mod parsers;
 mod pd_bootstrap;
+mod response_template;
 pub(crate) mod stream_failure;
 pub(crate) mod tonic_ext;
 
@@ -29,10 +30,14 @@ pub(crate) use parsers::{
     check_reasoning_parser_availability, check_tool_parser_availability, continues_final_assistant,
     create_reasoning_parser, create_tool_parser, get_tool_parser,
     messages_reasoning_starts_in_prefill, reasoning_parser_requires_special_tokens,
-    reasoning_starts_in_prefill, rendered_prompt_reasoning_in_prefill,
-    should_mark_reasoning_started, tool_constraints_for_worker, ParserResolver,
+    reasoning_starts_in_prefill, reject_json_constraint_for_template,
+    rendered_prompt_reasoning_in_prefill, should_mark_reasoning_started,
+    tool_constraints_for_worker, ParserResolver,
 };
 pub(crate) use pd_bootstrap::account_pd_leg_failure;
+pub(crate) use response_template::{
+    log_template_error, ResponseParserSpec, ResponseTemplateParsers,
+};
 pub(crate) use stream_failure::{send_stream_failure, StreamFailure, StreamSource};
 
 /// One WARN per choice whose stream recovered from a rewritten decode prefix

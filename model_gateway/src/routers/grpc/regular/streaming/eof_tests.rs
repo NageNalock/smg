@@ -266,6 +266,7 @@ pub(super) fn processor(with_tools: bool) -> StreamingProcessor {
             Arc::new(WorkerRegistry::new()),
             with_tools.then(|| "json".to_string()),
             Some("qwen3".to_string()),
+            None,
         ),
         "vllm",
     )
@@ -566,6 +567,7 @@ async fn byte_fallback_messages_eof_emits_exact_text_before_block_stop() {
         history_tool_calls_count: 0,
         chat_tools: Vec::new(),
         stop_sequences: None,
+        response_parser: None,
     };
     let result = processor(false)
         .process_messages_streaming_chunks(
@@ -663,6 +665,7 @@ fn byte_fallback_messages_spec(thinking: bool) -> MessagesResponseSpec {
         history_tool_calls_count: 0,
         chat_tools: Vec::new(),
         stop_sequences: None,
+        response_parser: None,
     }
 }
 
@@ -992,7 +995,12 @@ async fn byte_fallback_unary_valid_reasoning_counts_original_tokens() {
     let processor = ResponseProcessor::new(
         ToolParserFactory::new(),
         ReasoningParserFactory::new(),
-        utils::ParserResolver::new(Arc::new(WorkerRegistry::new()), None, Some("qwen3".into())),
+        utils::ParserResolver::new(
+            Arc::new(WorkerRegistry::new()),
+            None,
+            Some("qwen3".into()),
+            None,
+        ),
     );
     for ids in [
         b"<think>ab</think>de"
@@ -1412,6 +1420,7 @@ async fn kimi_k3_cut_inside_the_closing_structure_keeps_the_markers_out_of_conte
                 Arc::new(WorkerRegistry::new()),
                 Some("kimi_k3".to_string()),
                 Some("kimi_k3".to_string()),
+                None,
             )
         };
         // Streamed, a chunk per token.
@@ -1693,6 +1702,7 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
             history_tool_calls_count: 0,
             chat_tools: Vec::new(),
             stop_sequences: None,
+            response_parser: None,
         };
         let result = processor(false)
             .process_messages_streaming_chunks(
@@ -1750,6 +1760,7 @@ async fn qwen_xml_messages(text: &str, finish: &str, stream: bool) -> (Vec<Strin
         utils::ParserResolver::new(
             Arc::new(WorkerRegistry::new()),
             Some("qwen_xml".to_string()),
+            None,
             None,
         )
     };
@@ -2007,6 +2018,7 @@ async fn chat_eof_starts_a_call_a_parser_reports_at_the_end() {
         Arc::new(WorkerRegistry::new()),
         Some("call-at-end".to_string()),
         None,
+        None,
     );
     let processor = StreamingProcessor::new(tools, ReasoningParserFactory::new(), resolver, "vllm");
     let mut spec = chat_spec(true);
@@ -2130,6 +2142,7 @@ fn stub_processor(in_reasoning: bool) -> StreamingProcessor {
         Arc::new(WorkerRegistry::new()),
         Some("call-first".to_string()),
         Some("reasoning-but-text".to_string()),
+        None,
     );
     StreamingProcessor::new(tools, reasoning, resolver, "vllm")
 }
@@ -2166,6 +2179,7 @@ async fn messages_blocks_and_inputs(
         history_tool_calls_count: 0,
         chat_tools: chat_spec(true).tools.unwrap(),
         stop_sequences: None,
+        response_parser: None,
     };
     let mut frames: Vec<_> = texts.iter().map(|text| chunk(0, text)).collect();
     frames.push(complete(0, "stop"));
@@ -2284,6 +2298,7 @@ fn named_processor(tool: &str, reasoning: &str) -> StreamingProcessor {
             Arc::new(WorkerRegistry::new()),
             Some(tool.to_string()),
             Some(reasoning.to_string()),
+            None,
         ),
         "vllm",
     )
@@ -2456,6 +2471,7 @@ async fn gemma4_rendered_prompt_state_controls_chat_responses() {
                     Arc::new(WorkerRegistry::new()),
                     Some("gemma4".to_string()),
                     configured.map(str::to_string),
+                    None,
                 );
                 let mut spec = ChatResponseSpec::from(&request);
                 spec.reasoning_in_prefill = utils::rendered_prompt_reasoning_in_prefill(
@@ -2585,6 +2601,7 @@ async fn gemma4_rendered_prompt_state_controls_messages_responses() {
                     Arc::new(WorkerRegistry::new()),
                     Some("gemma4".to_string()),
                     configured.map(str::to_string),
+                    None,
                 );
                 let mut spec = MessagesResponseSpec::from(&request);
                 spec.reasoning_in_prefill = utils::rendered_prompt_reasoning_in_prefill(
@@ -2822,6 +2839,7 @@ plan<|tool_call>call:lookup{q:<|"|>Paris<|"|>}<tool_call|>"#;
                 Arc::new(WorkerRegistry::new()),
                 Some("gemma4".to_string()),
                 Some("gemma4".to_string()),
+                None,
             ),
         );
         let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());

@@ -68,6 +68,7 @@ fn response_processor() -> ResponseProcessor {
             Arc::new(WorkerRegistry::new()),
             None,
             Some("qwen3".to_string()),
+            None,
         ),
     )
 }
