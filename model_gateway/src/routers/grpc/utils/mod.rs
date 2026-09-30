@@ -37,7 +37,7 @@ pub(crate) use parsers::{
 };
 pub(crate) use pd_bootstrap::account_pd_leg_failure;
 pub(crate) use response_template::{
-    log_template_error, ResponseParserSpec, ResponseTemplateParsers,
+    log_template_error, response_prompt_tail, ResponseParserSpec, ResponseTemplateParsers,
 };
 pub(crate) use stream_failure::{send_stream_failure, StreamFailure, StreamSource};
 
