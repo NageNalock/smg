@@ -16,13 +16,16 @@
 //!   decoded: `"exact phrase"` keeps its quotes, indentation and a trailing newline stay, and
 //!   `&amp;` is five characters. A parameter is declared `string` when its schema admits that
 //!   type at all: `"type": "string"`, a list of types or an `anyOf` that includes it, or, when the
-//!   schema has no `type`, an `enum` of strings, with or without `null` among them. A `type`
-//!   decides alone when it is there, as it does for the engine's parser: BFCL declares
-//!   `{"type": "array", "enum": [...]}` for a list whose members come from the enum, and that is
-//!   an array. When the schema admits `null` as well as `string`, the text `null`, and the `None`
-//!   a template writes for a null argument, are null; any other text is the string. A string
-//!   declared alone keeps `null` as its text, as the engine's readers do; bellwether #56 refuses a case
-//!   whose reference holds a null there, since no output carries it.
+//!   schema has no `type`, an `enum` of strings, with or without `null` among them, or a `const`
+//!   string, which is an enum of one. An `allOf` admits what all of its members that name a type
+//!   admit, so `{"allOf": [{"type": "string"}, {"maxLength": 8}]}` is a string. OpenAPI's
+//!   `"nullable": true` admits `null` beside the schema's types. A `type` decides alone when it
+//!   is there, as it does for the engine's parser: BFCL declares `{"type": "array", "enum":
+//!   [...]}` for a list whose members come from the enum, and that is an array. When the schema
+//!   admits `null` as well as `string`, the text `null`, and the `None` a template writes for a
+//!   null argument, are null; any other text is the string. A string declared alone keeps `null`
+//!   as its text, as the engine's readers do; bellwether #56 refuses a case whose reference holds
+//!   a null there, since no output carries it.
 //! - A parameter declared `integer` is that integer when its text is a sign and digits, with the
 //!   whitespace around it ignored. It may be spelled `+5` or `007`; it is written in JSON's
 //!   spelling, with the digits the model wrote.
@@ -91,22 +94,18 @@ impl Kind {
     /// nullable when it admits `null` too; one that admits an integer, an array or an object alone
     /// declares that; any other schema declares nothing here.
     fn of(root: &Value, schema: &Value) -> Option<Self> {
-        let mut admitted = Vec::new();
-        admitted_types(root, schema, &mut admitted);
-        // A type named twice (`"type": "integer"` beside a reference to an integer) is one type.
-        admitted.sort_unstable();
-        admitted.dedup();
-        if admitted.contains(&"string") {
-            Some(if admitted.contains(&"null") {
+        let admitted = Types::admitted(root, schema);
+        if admitted.has(Types::STRING) {
+            Some(if admitted.has(Types::NULL) {
                 Self::NullableString
             } else {
                 Self::String
             })
-        } else if admitted == ["integer"] {
+        } else if admitted == Types::INTEGER {
             Some(Self::Integer)
-        } else if admitted == ["array"] {
+        } else if admitted == Types::ARRAY {
             Some(Self::Array)
-        } else if admitted == ["object"] {
+        } else if admitted == Types::OBJECT {
             Some(Self::Object)
         } else {
             None
@@ -114,56 +113,158 @@ impl Kind {
     }
 }
 
-/// The type names `schema` admits: its `type`, as one name or a list; the types of its `anyOf` or
-/// `oneOf` members; and, when it has no `type`, `string` for an `enum` of strings, and `null` too
-/// when `null` is among them (what Pydantic writes for `Literal["a", "b", None]`). A `$ref` into
-/// `root` admits what its target admits.
-fn admitted_types<'a>(root: &'a Value, schema: &'a Value, into: &mut Vec<&'a str>) {
-    admitted_types_within(root, schema, into, &mut HashSet::new());
+/// A set of type names: a bit for each of JSON Schema's seven types, and one that every other
+/// name shares. No rule reads a name JSON Schema does not have; its bit keeps a schema that admits
+/// one from reading as admitting a single type. A set holds a type once however often the schema
+/// names it (`"type": "integer"` beside a reference to an integer), and costs one step to join or
+/// meet, so what a node admits is cheap to keep and to hand to every place that refers to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Types(u8);
+
+impl Types {
+    const NONE: Self = Self(0);
+    const STRING: Self = Self(1);
+    const NULL: Self = Self(1 << 1);
+    const INTEGER: Self = Self(1 << 2);
+    const ARRAY: Self = Self(1 << 3);
+    const OBJECT: Self = Self(1 << 4);
+    const NUMBER: Self = Self(1 << 5);
+    const BOOLEAN: Self = Self(1 << 6);
+    const OTHER: Self = Self(1 << 7);
+
+    fn named(name: &str) -> Self {
+        match name {
+            "string" => Self::STRING,
+            "null" => Self::NULL,
+            "integer" => Self::INTEGER,
+            "array" => Self::ARRAY,
+            "object" => Self::OBJECT,
+            "number" => Self::NUMBER,
+            "boolean" => Self::BOOLEAN,
+            _ => Self::OTHER,
+        }
+    }
+
+    fn has(self, types: Self) -> bool {
+        self.0 & types.0 != 0
+    }
+
+    fn join(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    fn meet(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    /// The types `schema` admits: its `type`, as one name or a list; `null` when it is OpenAPI's
+    /// `"nullable": true`; the types of its `anyOf` or `oneOf` members; the types every member of
+    /// an `allOf` that admits any admits; and, when it has no `type`, `string` for an `enum` of
+    /// strings, and `null` too when `null` is among them (what Pydantic writes for
+    /// `Literal["a", "b", None]`), with a `const` read as an enum of one. A `$ref` into `root`
+    /// admits what its target admits.
+    fn admitted(root: &Value, schema: &Value) -> Self {
+        Lookup {
+            root,
+            read: HashMap::new(),
+        }
+        .admitted(schema)
+    }
 }
 
-/// `seen` holds the nodes this lookup has read, so a definition that refers to itself, however
-/// many times over, is read once: without it the walk would branch at every reference and cost
-/// the power of the fan-out.
-fn admitted_types_within<'a>(
+/// One lookup of what a schema admits. It reads each node once and keeps what the node admits, so
+/// a node that many places refer to costs one reading, and each of those places gets all of what
+/// it admits: an `allOf` meets its members' types, so a member that refers to a node another
+/// member already read must still bring that node's types. Without the record a definition that
+/// refers to itself, however many times over, would branch at every reference and cost the power
+/// of the fan-out. A node met again while it is still being read (a definition that reaches itself
+/// through `anyOf`, `oneOf`, `allOf` or `$ref` alone, which says nothing about a value) admits
+/// nothing at that point.
+struct Lookup<'a> {
     root: &'a Value,
-    schema: &'a Value,
-    into: &mut Vec<&'a str>,
-    seen: &mut HashSet<*const Value>,
-) {
-    let Some(schema) = resolve(root, schema) else {
-        return;
-    };
-    if !seen.insert(std::ptr::from_ref(schema)) {
-        return;
-    }
-    let typed = match schema.get("type") {
-        Some(Value::String(name)) => {
-            into.push(name);
-            true
+    /// What each node read admits, by address; `None` while the node is being read.
+    read: HashMap<*const Value, Option<Types>>,
+}
+
+impl<'a> Lookup<'a> {
+    fn admitted(&mut self, schema: &'a Value) -> Types {
+        let Some(schema) = resolve(self.root, schema) else {
+            return Types::NONE;
+        };
+        let node = std::ptr::from_ref(schema);
+        match self.read.get(&node) {
+            Some(Some(types)) => return *types,
+            Some(None) => return Types::NONE,
+            None => {}
         }
-        Some(Value::Array(names)) => {
-            into.extend(names.iter().filter_map(Value::as_str));
-            true
+        self.read.insert(node, None);
+        let types = self.read_node(schema);
+        self.read.insert(node, Some(types));
+        types
+    }
+
+    /// What `schema`, with its `$ref` followed, admits, as [`Types::admitted`] lists it.
+    fn read_node(&mut self, schema: &'a Value) -> Types {
+        let (mut types, typed) = match schema.get("type") {
+            Some(Value::String(name)) => (Types::named(name), true),
+            Some(Value::Array(names)) => (
+                names
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(Types::named)
+                    .fold(Types::NONE, Types::join),
+                true,
+            ),
+            _ => (Types::NONE, false),
+        };
+        if schema.get("nullable") == Some(&Value::Bool(true)) {
+            types = types.join(Types::NULL);
         }
-        _ => false,
-    };
-    for member in members(schema) {
-        admitted_types_within(root, member, into, seen);
-    }
-    if typed {
-        return;
-    }
-    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
-        let strings_or_null = values
-            .iter()
-            .all(|value| value.is_string() || value.is_null());
-        if strings_or_null && values.iter().any(Value::is_string) {
-            into.push("string");
-            if values.iter().any(Value::is_null) {
-                into.push("null");
+        for member in members(schema) {
+            types = types.join(self.admitted(member));
+        }
+        types = types.join(self.admitted_by_all(schema));
+        if typed {
+            return types;
+        }
+        let constant = schema.get("const").map(std::slice::from_ref);
+        if let Some(values) = schema
+            .get("enum")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .or(constant)
+        {
+            let strings_or_null = values
+                .iter()
+                .all(|value| value.is_string() || value.is_null());
+            if strings_or_null && values.iter().any(Value::is_string) {
+                types = types.join(Types::STRING);
+                if values.iter().any(Value::is_null) {
+                    types = types.join(Types::NULL);
+                }
             }
         }
+        types
+    }
+
+    /// The types an `allOf` of several members admits: those that every member naming a type
+    /// admits. A member that admits no type (`{"maxLength": 8}`, a description) narrows nothing,
+    /// so only the members that admit a type are met; an `allOf` none of whose members admits one
+    /// admits nothing. A one-member `allOf` is a wrapper, read with the `anyOf` members
+    /// ([`members`]).
+    fn admitted_by_all(&mut self, schema: &'a Value) -> Types {
+        let Some(all) = schema
+            .get("allOf")
+            .and_then(Value::as_array)
+            .filter(|all| all.len() > 1)
+        else {
+            return Types::NONE;
+        };
+        all.iter()
+            .map(|member| self.admitted(member))
+            .filter(|types| *types != Types::NONE)
+            .reduce(Types::meet)
+            .unwrap_or(Types::NONE)
     }
 }
 
@@ -238,9 +339,8 @@ fn resolve<'a>(root: &'a Value, schema: &'a Value) -> Option<&'a Value> {
 /// `$defs`) is looked into for the member that has the items or the properties, since the wrapper
 /// itself has neither; a `$ref` is followed into `root` wherever it stands.
 fn below<'a>(root: &'a Value, schema: &'a Value, segment: &str) -> Option<&'a Value> {
-    let mut admitted = Vec::new();
-    admitted_types(root, schema, &mut admitted);
-    let (array, object) = (admitted.contains(&"array"), admitted.contains(&"object"));
+    let admitted = Types::admitted(root, schema);
+    let (array, object) = (admitted.has(Types::ARRAY), admitted.has(Types::OBJECT));
     if array && object {
         // A schema that admits an array and an object alike says nothing about what is below:
         // the segment could be a list's `item` or a property, so the value is inferred.
@@ -1410,8 +1510,169 @@ mod tests {
         }]);
         assert_eq!(declared.kind("f", "meta"), Some(Kind::Object));
         assert_eq!(declared.kind_at("f", &["meta", "id"]), Some(Kind::Integer));
-        // An `allOf` with more than one member is a conjunction the crate does not read.
-        assert_eq!(declared.kind("f", "both"), None);
+        // An `allOf` with more than one member admits what its typed members all admit.
+        assert_eq!(declared.kind("f", "both"), Some(Kind::String));
+    }
+
+    #[test]
+    fn an_all_of_admits_what_every_member_that_names_a_type_admits() {
+        let declared = Declared::of(&[tool_with(value!({
+            "type": "object",
+            "properties": {
+                "bounded": {"allOf": [{"type": "string"}, {"maxLength": 8}]},
+                "referred": {"allOf": [{"$ref": "#/$defs/Name"}, {"description": "a name"}]},
+                "narrowed": {"allOf": [{"type": ["string", "null"]}, {"type": "string"}]},
+                "optional": {"allOf": [{"type": ["string", "null"]}, {"minLength": 1}]},
+                "counted": {"allOf": [{"type": "integer"}, {"minimum": 0}]},
+                "merged": {"allOf": [{"$ref": "#/$defs/Base"}, {"properties": {"x": {}}}]},
+                "contradicted": {"allOf": [{"type": "string"}, {"type": "integer"}]},
+                "untyped": {"allOf": [{"minLength": 1}, {"description": "anything"}]},
+            },
+            "$defs": {
+                "Name": {"type": "string"},
+                "Base": {"type": "object", "properties": {"id": {"type": "integer"}}},
+            },
+        }))]);
+        for (parameter, kind) in [
+            ("bounded", Some(Kind::String)),
+            ("referred", Some(Kind::String)),
+            ("narrowed", Some(Kind::String)),
+            ("optional", Some(Kind::NullableString)),
+            ("counted", Some(Kind::Integer)),
+            ("merged", Some(Kind::Object)),
+            ("contradicted", None),
+            ("untyped", None),
+        ] {
+            assert_eq!(declared.kind("f", parameter), kind, "{parameter}");
+        }
+        // A digit for a string bounded in a second member stays the string.
+        assert_eq!(json("3", declared.kind("f", "bounded")), r#""3""#);
+    }
+
+    #[test]
+    fn each_member_of_an_all_of_brings_all_it_admits_whatever_another_member_read() {
+        let declared = Declared::of(&[tool_with(value!({
+            "type": "object",
+            "properties": {
+                // A string or an integer, and a string or null: a string, through references as
+                // when the same schema is written inline.
+                "referred": {"allOf": [
+                    {"anyOf": [{"$ref": "#/$defs/S"}, {"$ref": "#/$defs/I"}]},
+                    {"anyOf": [{"$ref": "#/$defs/S"}, {"type": "null"}]}
+                ]},
+                "inline": {"allOf": [
+                    {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+                    {"anyOf": [{"type": "string"}, {"type": "null"}]}
+                ]},
+                // A string or null, and a string: a string, whichever member reads it first.
+                "narrowed": {"allOf": [
+                    {"anyOf": [{"$ref": "#/$defs/S"}, {"type": "null"}]},
+                    {"$ref": "#/$defs/S"}
+                ]},
+                // What a node admits inside an `allOf` reaches the union around it too.
+                "beside": {"anyOf": [
+                    {"allOf": [{"$ref": "#/$defs/S"}, {"type": "integer"}]},
+                    {"$ref": "#/$defs/S"}
+                ]},
+                // A definition met again while it is read admits nothing there.
+                "looped": {"$ref": "#/$defs/L"},
+            },
+            "$defs": {
+                "S": {"type": "string"},
+                "I": {"type": "integer"},
+                "L": {"allOf": [{"$ref": "#/$defs/L"}, {"type": "string"}]},
+            },
+        }))]);
+        for parameter in ["referred", "inline", "narrowed", "beside", "looped"] {
+            assert_eq!(
+                declared.kind("f", parameter),
+                Some(Kind::String),
+                "{parameter}"
+            );
+        }
+        assert_eq!(json("3", declared.kind("f", "referred")), r#""3""#);
+        assert_eq!(json("null", declared.kind("f", "narrowed")), r#""null""#);
+    }
+
+    #[test]
+    fn a_definition_every_member_of_an_all_of_refers_to_is_read_once_per_lookup() {
+        // Twenty-four levels, each an `allOf` of two references to the next: read once per node,
+        // this is a few dozen steps; read again for every member, it would be two to the power of
+        // twenty-four.
+        let depth = 24;
+        let mut definitions = serde_json::Map::new();
+        for level in 0..depth {
+            let next = format!("#/$defs/D{}", level + 1);
+            definitions.insert(
+                format!("D{level}"),
+                value!({"allOf": [{"$ref": next}, {"$ref": next}]}),
+            );
+        }
+        definitions.insert(format!("D{depth}"), value!({"type": "string"}));
+        let started = std::time::Instant::now();
+        let declared = Declared::of(&[tool_with(value!({
+            "type": "object",
+            "properties": {"x": {"$ref": "#/$defs/D0"}},
+            "$defs": definitions,
+        }))]);
+        assert_eq!(declared.kind("f", "x"), Some(Kind::String));
+        assert!(
+            started.elapsed().as_secs() < 2,
+            "{:?} for an `allOf` of shared references",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_const_is_an_enum_of_one_and_a_type_beside_it_decides() {
+        let declared = Declared::of(&[tool(
+            "f",
+            value!({
+                "word": {"const": "7"},
+                "number": {"const": 7},
+                "nothing": {"const": null},
+                "typed": {"const": "7", "type": "integer"},
+                "listed": {"enum": ["a", "b"], "const": 1},
+            }),
+        )]);
+        assert_eq!(declared.kind("f", "word"), Some(Kind::String));
+        assert_eq!(json("7", declared.kind("f", "word")), r#""7""#);
+        assert_eq!(declared.kind("f", "number"), None);
+        assert_eq!(json("7", declared.kind("f", "number")), "7");
+        assert_eq!(declared.kind("f", "nothing"), None);
+        assert_eq!(declared.kind("f", "typed"), Some(Kind::Integer));
+        // The enum, when there is one, is what the value is read from.
+        assert_eq!(declared.kind("f", "listed"), Some(Kind::String));
+    }
+
+    #[test]
+    fn openapis_nullable_admits_null_beside_the_schemas_types() {
+        let declared = Declared::of(&[tool(
+            "f",
+            value!({
+                "note": {"type": "string", "nullable": true},
+                "named": {"enum": ["a", "b"], "nullable": true},
+                "count": {"type": "integer", "nullable": true},
+                "style": {"type": "object", "nullable": true},
+                "points": {"type": "array", "nullable": true},
+                "plain": {"type": "string", "nullable": false},
+            }),
+        )]);
+        assert_eq!(declared.kind("f", "note"), Some(Kind::NullableString));
+        assert_eq!(json("null", declared.kind("f", "note")), "null");
+        assert_eq!(json("None", declared.kind("f", "note")), "null");
+        assert_eq!(json("Paris", declared.kind("f", "note")), r#""Paris""#);
+        assert_eq!(declared.kind("f", "named"), Some(Kind::NullableString));
+        // An integer that may be null admits two types, as `["integer", "null"]` does: inferred.
+        assert_eq!(declared.kind("f", "count"), None);
+        assert_eq!(json("5", declared.kind("f", "count")), "5");
+        assert_eq!(json("null", declared.kind("f", "count")), "null");
+        // So is an object or an array that may be null: an XML element with no child is not `{}`
+        // or `[]` under it.
+        assert_eq!(declared.kind("f", "style"), None);
+        assert_eq!(declared.kind("f", "points"), None);
+        assert_eq!(declared.kind("f", "plain"), Some(Kind::String));
+        assert_eq!(json("null", declared.kind("f", "plain")), r#""null""#);
     }
 
     #[test]
