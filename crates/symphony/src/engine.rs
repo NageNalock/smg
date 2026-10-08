@@ -29,6 +29,12 @@
 //!   comes before a complete call gives what is left as `Malformed` with a reason that says so,
 //!   since `UnterminatedRegion` means the stream ended inside the region; with the tagged syntax
 //!   the call is closed for the client first, as [`tagged::Assembler::close`] says.
+//! - A table can say that the stream's stop closes the call in a state
+//!   ([`Format::closes_at_stop`]), for a family whose last call ends with a stop token the stop
+//!   decoder hides: a stream that stops there ends the call as its closing terminal would, with
+//!   no bytes. One cut for length, aborted, or ended with any finish but `Stop` is cut as before;
+//!   a driver hands a stop sequence of the request's that matched inside the call over as such a
+//!   finish, so that it never completes the call (the stop row in [`crate::format`]).
 //! - With the tagged syntax, a value's type comes from the request's tools ([`Declared`]): a
 //!   declared string streams, every other value is written at its close. A call to a function the
 //!   request did not declare has every value inferred.
@@ -76,7 +82,7 @@ pub(crate) const TEXT_AFTER_THE_OBJECT: &str =
 const TEXT_BETWEEN_CALLS: &str = "text between a block's calls";
 
 /// Why a call region closed: its closing terminal (or the next opener) arrived, or the stream
-/// ended.
+/// stopped where the table says a stop closes it; or the stream ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Closed {
     ByMarker,
@@ -551,7 +557,15 @@ impl Engine {
         match self.emits() {
             Emits::Reasoning => out.push(Event::ReasoningEnd),
             Emits::Arguments => {
-                self.close_call(Closed::ByEnd, "", out);
+                // The stop token that closes the call is hidden, so the call's end has no bytes.
+                let closed = if matches!(finish, EngineFinish::Stop)
+                    && self.format.stop_closes(self.state)
+                {
+                    Closed::ByMarker
+                } else {
+                    Closed::ByEnd
+                };
+                self.close_call(closed, "", out);
             }
             Emits::Content | Emits::Wrapper => {}
         }
@@ -608,5 +622,248 @@ impl Parser for Engine {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use openai_protocol::common::{Function, Tool};
+    use serde_json::json as value;
+
+    use super::*;
+    use crate::tagged::{addressed::Spelling, keyed::Tags};
+
+    fn declared() -> Declared {
+        Declared::of(&[Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "get_weather".to_string(),
+                description: None,
+                parameters: value!({"type": "object", "properties": {
+                    "city": {"type": "string"},
+                    "days": {"type": "integer"},
+                }}),
+                strict: None,
+                extra: Default::default(),
+            },
+        }])
+    }
+
+    /// A synthetic table: each call is a message addressed to the tool, `<|end|>` between two
+    /// calls and `<|call|>`, a stop token, after the last.
+    fn addressed() -> Format {
+        Format::new("addressed")
+            .terminal("start", "<|start|>assistant")
+            .terminal("recipient", " to=")
+            .terminal("end", "<|end|>")
+            .terminal("call", "<|call|>")
+            .state("header", Emits::Wrapper)
+            .state("between", Emits::Wrapper)
+            .state("calls", Emits::Arguments)
+            .transition("header", "recipient", "calls")
+            .transition("calls", "end", "between")
+            .transition("calls", "call", "between")
+            .transition("between", "start", "header")
+            .calls(CallSyntax::Addressed(Spelling {
+                header_close: "<|channel|>commentary<|message|>",
+                key_open: "<parameter name=\"",
+                key_close: "\">",
+                value_close: "</parameter>",
+                next_key_closes: false,
+            }))
+    }
+
+    /// Keyed calls after a marker, the last one ended by the stop token.
+    fn keyed() -> Format {
+        Format::new("keyed")
+            .terminal("open", "<call>")
+            .terminal("close", "</call>")
+            .state("content", Emits::Content)
+            .state("call", Emits::Arguments)
+            .transition("content", "open", "call")
+            .transition("call", "close", "content")
+            .calls(CallSyntax::Keyed(Tags::PLAIN))
+    }
+
+    const LAST_CALL: &str = concat!(
+        " to=get_weather<|channel|>commentary<|message|><parameter name=\"city\">\nParis\n",
+        "</parameter>\n<parameter name=\"days\">\n3\n</parameter>"
+    );
+
+    fn run(format: Format, output: &str, finish: EngineFinish) -> Vec<Event> {
+        let mut engine = Engine::new(format, declared());
+        let mut out = Events::new();
+        for input in [
+            Input::Delta {
+                token_ids: &[],
+                text: output,
+                spans: &[],
+            },
+            Input::End { finish },
+        ] {
+            engine.feed(input, &mut out).expect("in order");
+        }
+        out.drain()
+    }
+
+    /// Each call's arguments as the client joins them, and the bytes of each call's end.
+    fn calls(events: &[Event]) -> Vec<(String, Option<String>)> {
+        let mut calls: Vec<(String, Option<String>)> = Vec::new();
+        for event in events {
+            match event {
+                Event::ToolCallStart { .. } => calls.push((String::new(), None)),
+                Event::ToolCallArguments { json, .. } => {
+                    if let Some((arguments, _)) = calls.last_mut() {
+                        arguments.push_str(json);
+                    }
+                }
+                Event::ToolCallEnd { source, .. } => {
+                    if let Some((_, end)) = calls.last_mut() {
+                        *end = Some(source.text.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        calls
+    }
+
+    fn bytes(events: &[Event]) -> String {
+        let mut list = Events::new();
+        for event in events {
+            list.push(event.clone());
+        }
+        list.text()
+    }
+
+    #[test]
+    fn a_stop_closes_the_call_where_the_table_says_and_a_cut_stays_cut() {
+        let closed = calls(&run(
+            addressed().closes_at_stop("calls"),
+            LAST_CALL,
+            EngineFinish::Stop,
+        ));
+        assert_eq!(
+            closed,
+            [(
+                r#"{"city": "Paris", "days": 3}"#.to_string(),
+                Some(String::new())
+            )]
+        );
+        for finish in [EngineFinish::Length, EngineFinish::Abort] {
+            let events = run(addressed().closes_at_stop("calls"), LAST_CALL, finish);
+            assert_eq!(
+                calls(&events),
+                [(
+                    r#"{"city": "Paris", "days": 3"#.to_string(),
+                    Some(String::new())
+                )]
+            );
+            assert_eq!(bytes(&events), LAST_CALL);
+        }
+    }
+
+    #[test]
+    fn without_the_row_a_stop_leaves_the_call_cut() {
+        let events = run(addressed(), LAST_CALL, EngineFinish::Stop);
+        assert_eq!(
+            calls(&events),
+            [(
+                r#"{"city": "Paris", "days": 3"#.to_string(),
+                Some(String::new())
+            )]
+        );
+    }
+
+    #[test]
+    fn a_closing_marker_the_model_wrote_ends_the_call_with_or_without_the_row() {
+        let output = format!(
+            "{LAST_CALL}<|end|><|start|>assistant to=get_weather<|channel|>commentary\
+             <|message|><|call|>"
+        );
+        let with_row = run(
+            addressed().closes_at_stop("calls"),
+            &output,
+            EngineFinish::Stop,
+        );
+        assert_eq!(with_row, run(addressed(), &output, EngineFinish::Stop));
+        assert_eq!(
+            calls(&with_row),
+            [
+                (
+                    r#"{"city": "Paris", "days": 3}"#.to_string(),
+                    Some("<|end|>".to_string())
+                ),
+                ("{}".to_string(), Some("<|call|>".to_string())),
+            ]
+        );
+        assert_eq!(bytes(&with_row), output);
+    }
+
+    #[test]
+    fn a_stop_inside_a_value_closes_the_value_and_the_object() {
+        // The hidden stop token ends the call inside a string, whose held `<` may only start the
+        // closing tag, and inside an integer: each value is closed as its tag would close it.
+        for (output, arguments) in [
+            (
+                " to=get_weather<|channel|>commentary<|message|><parameter name=\"city\">\nPar <",
+                r#"{"city": "Par "}"#,
+            ),
+            (
+                " to=get_weather<|channel|>commentary<|message|><parameter name=\"city\">\nParis\n\
+                 </parameter>\n<parameter name=\"days\">\n2",
+                r#"{"city": "Paris", "days": 2}"#,
+            ),
+        ] {
+            let events = run(
+                addressed().closes_at_stop("calls"),
+                output,
+                EngineFinish::Stop,
+            );
+            assert_eq!(
+                calls(&events),
+                [(arguments.to_string(), Some(String::new()))]
+            );
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, Event::Malformed { .. })));
+            assert_eq!(bytes(&events), output);
+        }
+    }
+
+    #[test]
+    fn under_the_row_any_finish_but_stop_leaves_the_call_cut() {
+        // A driver hands a stop sequence that matched inside the call over as `Other`: the row
+        // does not take it for the stop token, and the call keeps what arrived, open.
+        for finish in [
+            EngineFinish::Other("stop".to_string()),
+            EngineFinish::Length,
+            EngineFinish::Abort,
+        ] {
+            let events = run(addressed().closes_at_stop("calls"), LAST_CALL, finish);
+            assert_eq!(
+                calls(&events),
+                [(
+                    r#"{"city": "Paris", "days": 3"#.to_string(),
+                    Some(String::new())
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn the_row_closes_a_call_of_another_syntax_the_same_way() {
+        let output = "<call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>";
+        let closed = run(keyed().closes_at_stop("call"), output, EngineFinish::Stop);
+        assert_eq!(
+            calls(&closed),
+            [(r#"{"city": "Paris"}"#.to_string(), Some(String::new()))]
+        );
+        assert_eq!(bytes(&closed), output);
+        let cut = run(keyed(), output, EngineFinish::Stop);
+        assert_eq!(
+            calls(&cut),
+            [(r#"{"city": "Paris""#.to_string(), Some(String::new()))]
+        );
     }
 }

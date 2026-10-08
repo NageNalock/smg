@@ -21,6 +21,16 @@
 //! - An **ignored terminal** is a spelling the engine drops wherever it stands, a call's arguments
 //!   included, without moving: the separator token MiniMax M3's template writes before every tag.
 //!   No transition can name it.
+//! - A **stop row** names an arguments state whose call the stream's stop closes. A family whose
+//!   last call ends with a stop token writes no other marker after it, and the stop decoder hides
+//!   that token, so without the row the call would read as cut short. With it, a stream that
+//!   stops in that state ends the call as its closing marker would, with no bytes; a stream cut
+//!   for length, or aborted, is still cut, and so is one that ended with any finish but `Stop`.
+//!   `EngineFinish::Stop` also covers a stop sequence of the request's, which the row would take
+//!   for the stop token and close the call on, with whatever arguments had arrived; a driver that
+//!   knows a stop sequence ended the stream hands the end over as another finish
+//!   (`EngineFinish::Other`), and the call stays cut, since a stop sequence never completes a
+//!   call.
 //!
 //! The first state in the table is where an output starts, unless the prompt moved the engine
 //! before the output began: the engine replays the prompt's terminals over the same table, from
@@ -130,6 +140,8 @@ pub struct Format {
     calls: Option<CallSyntax>,
     turn_opener: Option<String>,
     structural_tokens: Vec<String>,
+    /// The arguments states whose call the stream's stop closes.
+    stop_closes: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -174,6 +186,7 @@ impl Format {
             calls: None,
             turn_opener: None,
             structural_tokens: Vec::new(),
+            stop_closes: Vec::new(),
         }
     }
 
@@ -240,6 +253,18 @@ impl Format {
     #[must_use]
     pub fn calls(mut self, syntax: CallSyntax) -> Self {
         self.calls = Some(syntax);
+        self
+    }
+
+    /// The arguments state `state` closes its call when the stream stops in it: the family ends
+    /// its last call with a stop token, which the stop decoder hides. A stream cut for length,
+    /// aborted, or ended with any finish but `Stop` is still cut; a driver hands a stop sequence of
+    /// the request's over as such a finish (see the stop row in [`crate::format`]). The state must
+    /// already be in the table.
+    #[must_use]
+    pub fn closes_at_stop(mut self, state: &str) -> Self {
+        let state = self.state_named(state);
+        self.stop_closes.push(state);
         self
     }
 
@@ -335,12 +360,17 @@ impl Format {
         self.calls.as_ref()
     }
 
+    /// Whether the stream's stop closes the call in state `index`.
+    pub(crate) fn stop_closes(&self, index: usize) -> bool {
+        self.stop_closes.contains(&index)
+    }
+
     /// What every table must hold before an engine runs it: a state to start in, which does not
     /// emit reasoning (a thought the output starts inside is entered by the prompt's replay, which
     /// pushes `ReasoningStart`; an arguments state at the start has its call opened by the
-    /// engine), a call syntax when a state emits arguments, a text for every terminal and a turn
-    /// opener that is not empty. The builder keeps a row from naming what the table lacks; this
-    /// checks the rest.
+    /// engine), a call syntax when a state emits arguments, a text for every terminal, a turn
+    /// opener that is not empty, and a stop row only for an arguments state. The builder keeps a
+    /// row from naming what the table lacks; this checks the rest.
     pub fn validate(&self) -> Result<(), String> {
         let Some(first) = self.states.first() else {
             return Err(format!("format {}: a table with no state", self.name));
@@ -375,6 +405,17 @@ impl Format {
         }
         if self.turn_opener.as_deref() == Some("") {
             return Err(format!("format {}: an empty turn opener", self.name));
+        }
+        if let Some(state) = self
+            .stop_closes
+            .iter()
+            .map(|&index| &self.states[index])
+            .find(|state| state.emits != Emits::Arguments)
+        {
+            return Err(format!(
+                "format {}: a stop closes state {:?}, which holds no call",
+                self.name, state.name
+            ));
         }
         Ok(())
     }
@@ -442,6 +483,30 @@ mod tests {
                     .to_string()
             )
         );
+    }
+
+    #[test]
+    fn a_stop_row_names_an_arguments_state() {
+        let format = Format::new("stop")
+            .terminal("open", "<call>")
+            .state("content", Emits::Content)
+            .state("call", Emits::Arguments)
+            .transition("content", "open", "call")
+            .calls(CallSyntax::Json)
+            .closes_at_stop("call");
+        assert!(format.stop_closes(1));
+        assert!(!format.stop_closes(0));
+        assert!(format.validate().is_ok());
+        assert_eq!(
+            format.closes_at_stop("content").validate(),
+            Err("format stop: a stop closes state \"content\", which holds no call".to_string())
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "format t: no state named \"call\"")]
+    fn a_stop_row_for_a_state_the_table_lacks_is_a_programming_error() {
+        let _ = two_states().closes_at_stop("call");
     }
 
     #[test]

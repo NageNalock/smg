@@ -56,17 +56,17 @@
 //!   call ends inside it: an arguments object holds each key once, so the arguments every API
 //!   returns stay one JSON object with no key twice. A reader that collects the parameters into a
 //!   dictionary keeps the last value instead.
-//! - **Two endings.** [`Assembler::close`] is the marker that ends the message: after the last
-//!   value it closes the object and pushes `ToolCallEnd` with the marker's bytes; inside a value
-//!   it closes the value as its closing tag would, a string with its quote and any other value
-//!   written whole, then the object. [`Assembler::finish`] is a stream that was cut: nothing is
-//!   closed, and a value the cut stopped keeps what arrived, a string's fragment open and any
-//!   other value written as its text reads so far, with the object left open. Either way the
-//!   arguments keep every value that arrived, whatever its type, and no tag reaches the content:
-//!   a tag the end cut short (a key with no value yet, the start of a closing tag) is the
-//!   template's and goes with the bytes around it, into the object's close, or, at a cut,
-//!   `Dropped { Wrapper }`. Bytes the end left held inside a value that cannot be its closing tag
-//!   are the value's text.
+//! - **Two endings.** [`Assembler::close`] is the marker that ends the message, or the stream's
+//!   stop where the table says the stop closes the call: after the last value it closes the
+//!   object and pushes `ToolCallEnd` with the marker's bytes; inside a value it closes the value
+//!   as its closing tag would, a string with its quote and any other value written whole, then
+//!   the object. [`Assembler::finish`] is a stream that was cut: nothing is closed, and a value
+//!   the cut stopped keeps what arrived, a string's fragment open and any other value written as
+//!   its text reads so far, with the object left open. Either way the arguments keep every value
+//!   that arrived, whatever its type, and no tag reaches the content: a tag the end cut short (a
+//!   key with no value yet, the start of a closing tag) is the template's and goes with the bytes
+//!   around it, into the object's close, or, at a cut, `Dropped { Wrapper }`. Bytes the end left
+//!   held inside a value that cannot be its closing tag are the value's text.
 //! - **Every byte of the call lands in exactly one event**, with the Qwen assembler's accounting:
 //!   the name's and the header's bytes in `ToolCallStart`, each tag's and value's bytes in the
 //!   fragments they produce. Text where the syntax has tags, and a tag out of its place, are
@@ -227,10 +227,11 @@ impl Assembler {
     }
 
     /// The call's end: `terminal` is the marker that ended the message, whose bytes go into
-    /// `ToolCallEnd`. After the last value the object is closed; inside a value the value is
-    /// closed as its closing tag would close it, then the object; a key or a tag the end cut short
-    /// is the template's and goes into the object's close; a message whose header never closed,
-    /// or that named no call, has its bytes reported, the marker's with them, and no call.
+    /// `ToolCallEnd`, or nothing when the stream's stop ended it. After the last value the object
+    /// is closed; inside a value the value is closed as its closing tag would close it, then the
+    /// object; a key or a tag the end cut short is the template's and goes into the object's
+    /// close; a message whose header never closed, or that named no call, has its bytes reported,
+    /// the marker's with them, and no call.
     pub fn close(mut self, terminal: &str, out: &mut Events) {
         let held = self.scanner.held().to_string();
         if !self.started() {

@@ -231,6 +231,15 @@ fn addressed_next_key_closes() -> Box<dyn Parser> {
     ))
 }
 
+/// The same table where the stream's stop closes the last call, as when `<|call|>` is a stop
+/// token the stop decoder hides.
+fn addressed_closed_at_stop() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        addressed_table().closes_at_stop("calls"),
+        keyed_tools(),
+    ))
+}
+
 const FORMATS: &[Subject] = &[
     Subject {
         name: "qwen3",
@@ -317,13 +326,18 @@ const FORMATS: &[Subject] = &[
         new: addressed_next_key_closes,
         outputs: ADDRESSED_OUTPUTS,
     },
+    Subject {
+        name: "addressed, closed at stop",
+        new: addressed_closed_at_stop,
+        outputs: ADDRESSED_OUTPUTS,
+    },
 ];
 
 /// Calls addressed to a tool, in the synthetic table: the shapes the syntax writes (one call,
 /// calls ended by `<|end|>` and `<|call|>`, no parameters, values typed by the tools and inferred,
-/// a value with tags in it), cut streams, a header that does not close, text where a name or a
-/// tag should be (spaced words between two parameters and after a call, a name with spaces around
-/// it), and the channels with no call.
+/// a value with tags in it), streams that stop or are cut before the last call's marker, a header
+/// that does not close, text where a name or a tag should be (spaced words between two parameters
+/// and after a call, a name with spaces around it), and the channels with no call.
 const ADDRESSED_OUTPUTS: &[&str] = &[
     "<|channel|>analysis<|message|>Plan.<|end|><|start|>assistant to=get_weather\
      <|channel|>commentary<|message|><parameter name=\"city\">\nParis\n</parameter>\n\
@@ -335,6 +349,9 @@ const ADDRESSED_OUTPUTS: &[&str] = &[
     "<|channel|>analysis<|message|>Two.<|end|><|start|>assistant to=get_weather\
      <|channel|>commentary<|message|><parameter name=\"city\">\n<p a=\"b\">x</p> to=y\n\
      </parameter><|end|>",
+    "<|channel|>analysis<|message|>Plan.<|end|><|start|>assistant to=get_weather\
+     <|channel|>commentary<|message|><parameter name=\"city\">\nParis\n</parameter>\n\
+     <parameter name=\"days\">\n3\n</parameter>",
     "<|channel|>analysis<|message|>Cut.<|end|><|start|>assistant to=get_weather\
      <|channel|>commentary<|message|><parameter name=\"city\">\nPar",
     "<|channel|>analysis<|message|>Cut.<|end|><|start|>assistant to=get_weather\
