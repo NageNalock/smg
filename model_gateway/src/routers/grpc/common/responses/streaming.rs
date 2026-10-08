@@ -12,8 +12,7 @@ use openai_protocol::{
         ResponseEvent,
     },
     responses::{
-        IncludeField, IncompleteDetails, IncompleteReason, ResponseOutputItem, ResponseStatus,
-        ResponsesRequest, ResponsesResponse, ResponsesUsage,
+        IncludeField, ResponseOutputItem, ResponsesRequest, ResponsesResponse, ResponsesUsage,
     },
 };
 use serde_json::json;
@@ -356,6 +355,11 @@ impl ResponseStreamEventEmitter {
         })
     }
 
+    /// Whether an output item is a function call whose arguments were cut short.
+    fn is_cut_call(item: &serde_json::Value) -> bool {
+        item["type"] == "function_call" && item["status"] == "incomplete"
+    }
+
     // INVARIANT: this method is terminal — it drains internal state via `take()`
     // and must only be called once per emitter lifetime.
     pub fn emit_completed(&mut self, usage: Option<&serde_json::Value>) -> serde_json::Value {
@@ -390,8 +394,11 @@ impl ResponseStreamEventEmitter {
         // A `length` finish means max_output_tokens truncated the response;
         // the Responses contract reports that as status=incomplete with
         // incomplete_details and terminates the stream with
-        // response.incomplete, mirroring the non-streaming conversion.
-        let truncated = self.finish_reason.as_deref() == Some("length");
+        // response.incomplete, mirroring the non-streaming conversion. A
+        // function call cut short by any other end makes it incomplete too,
+        // without details.
+        let length = self.finish_reason.as_deref() == Some("length");
+        let truncated = length || output.iter().any(Self::is_cut_call);
         let failed = matches!(self.finish_reason.as_deref(), Some("failed" | "error"));
 
         // Build base response object
@@ -407,7 +414,7 @@ impl ResponseStreamEventEmitter {
         if let Some(error) = generation_failure_error(self.finish_reason.as_deref()) {
             response_obj["error"] = error;
         }
-        if truncated {
+        if length {
             response_obj["incomplete_details"] = json!({ "reason": "max_output_tokens" });
         }
 
@@ -867,17 +874,13 @@ impl ResponseStreamEventEmitter {
         });
 
         // Match the streamed terminal event: a `length` finish reports
-        // status=incomplete with the truncation reason.
-        let (status, incomplete_details) = match self.finish_reason.as_deref() {
-            Some("failed" | "error") => (ResponseStatus::Failed, None),
-            Some("length") => (
-                ResponseStatus::Incomplete,
-                Some(IncompleteDetails {
-                    reason: IncompleteReason::MaxOutputTokens,
-                }),
-            ),
-            _ => (ResponseStatus::Completed, None),
-        };
+        // status=incomplete with the truncation reason, and a function call
+        // cut short by any other end status=incomplete.
+        let cut_call = output.iter().any(|item| {
+            matches!(item, ResponseOutputItem::FunctionToolCall { status, .. } if status == "incomplete")
+        });
+        let (status, incomplete_details) =
+            super::utils::response_status(self.finish_reason.as_deref(), cut_call);
 
         // Build response using builder
         let mut builder = ResponsesResponse::builder(&self.response_id, &self.model)
@@ -1933,6 +1936,26 @@ mod process_chunk_tests {
         assert_eq!(output[1]["status"], "incomplete");
         assert_eq!(events[5]["item"], output[0]);
         assert_eq!(events[7]["item"], output[1]);
+    }
+
+    #[tokio::test]
+    async fn a_call_an_abort_cut_is_incomplete_and_so_is_the_response() {
+        let (_, terminal) = stream_with_terminal(
+            json!({"model": "test-model", "input": "hi"}),
+            &[
+                chunk(
+                    json!({"tool_calls": [{"index": 0, "id": "call_a", "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"city\": \"Par"}}]}),
+                    None,
+                ),
+                chunk(json!({}), Some("abort")),
+            ],
+        )
+        .await;
+        assert_eq!(terminal["type"], "response.incomplete");
+        assert_eq!(terminal["response"]["status"], "incomplete");
+        assert!(terminal["response"]["incomplete_details"].is_null());
+        assert_eq!(terminal["response"]["output"][0]["status"], "incomplete");
     }
 
     #[tokio::test]

@@ -21,9 +21,8 @@ use openai_protocol::{
     },
     common::{FunctionCallResponse, ToolCall, ToolCallDelta, Usage, UsageInfo},
     responses::{
-        IncompleteDetails, IncompleteReason, ResponseContentPart, ResponseOutputItem,
-        ResponseReasoningContent, ResponseStatus, ResponsesRequest, ResponsesResponse,
-        ResponsesUsage,
+        ResponseContentPart, ResponseOutputItem, ResponseReasoningContent, ResponsesRequest,
+        ResponsesResponse, ResponsesUsage,
     },
 };
 use serde_json::{json, Value};
@@ -61,6 +60,7 @@ use crate::{
                 },
                 utils::{
                     function_call_status, generation_failure_error, resolve_function_identity,
+                    response_status,
                 },
                 BackgroundStream, ResponsesContext,
             },
@@ -493,20 +493,13 @@ impl StreamingResponseAccumulator {
 
         // Determine final status. A `length` finish is a max_output_tokens
         // truncation, reported as status=incomplete with incomplete_details,
+        // and a function call cut short by any other end is incomplete too,
         // matching the non-streaming conversion and the streamed terminal
         // event.
-        let (status, incomplete_details) = match self.finish_reason.as_deref() {
-            Some("stop") => (ResponseStatus::Completed, None),
-            Some("length") => (
-                ResponseStatus::Incomplete,
-                Some(IncompleteDetails {
-                    reason: IncompleteReason::MaxOutputTokens,
-                }),
-            ),
-            Some("tool_calls") => (ResponseStatus::Completed, None),
-            Some("failed") | Some("error") => (ResponseStatus::Failed, None),
-            _ => (ResponseStatus::Completed, None),
-        };
+        let cut_call = output.iter().any(|item| {
+            matches!(item, ResponseOutputItem::FunctionToolCall { status, .. } if status == "incomplete")
+        });
+        let (status, incomplete_details) = response_status(self.finish_reason.as_deref(), cut_call);
 
         // Convert usage
         let usage = self.usage.as_ref().map(|u| {

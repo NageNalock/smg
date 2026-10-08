@@ -63,7 +63,7 @@ use crate::{
                 ChatResponseSpec, CompletionResponseSpec, GenerateResponseSpec,
                 MessagesResponseSpec,
             },
-            utils,
+            symphony, utils,
             utils::message_utils,
         },
     },
@@ -436,6 +436,8 @@ impl StreamingProcessor {
         let mut has_tool_calls: HashMap<u32, bool> = HashMap::new();
         // One response-parser state per choice, shared by its two parsers.
         let mut states: HashMap<u32, ResponseParserState> = HashMap::new();
+        // Per-index symphony choices, when a symphony table reads the output.
+        let mut symphony_choices: HashMap<u32, symphony::Choice> = HashMap::new();
 
         // Per-index stop decoders (each index needs its own state for n>1 support)
         let mut stop_decoders: HashMap<u32, StopSequenceDecoder> = HashMap::new();
@@ -469,8 +471,11 @@ impl StreamingProcessor {
                 model,
             );
 
+        // A symphony table's reasoning is not split off by the reasoning parser: its tokens
+        // are the engine's count alone.
+        let reasoning_parsed = reasoning_parser_available && original_request.symphony.is_none();
         if let Some(usage) = &mut continuous_usage {
-            usage.reasoning_parsed = reasoning_parser_available;
+            usage.reasoning_parsed = reasoning_parsed;
         }
 
         // If the template supports a thinking toggle and the user enabled it,
@@ -724,6 +729,7 @@ impl StreamingProcessor {
                         let mut indices: Vec<_> = stop_decoders
                             .keys()
                             .chain(reasoning_parsers.keys())
+                            .chain(symphony_choices.keys())
                             .copied()
                             .collect();
                         indices.sort_unstable();
@@ -801,6 +807,48 @@ impl StreamingProcessor {
                     .or_insert_with(|| spec.new_state())
                     .clone()
             });
+
+            // A symphony table reads the choice: the adapter renders its events, and the finish
+            // chunk stays Phase 4's.
+            if let Some(spec) = &original_request.symphony {
+                let choice = symphony_choices
+                    .entry(index)
+                    .or_insert_with(|| symphony::Choice::new(spec, model));
+                let events = if final_chunk {
+                    let matched_stop = matched_stops.get(&index).and_then(Option::as_ref);
+                    choice.end(
+                        finish_reasons
+                            .get(&index)
+                            .map(|finish| spec.finish_of(finish, matched_stop)),
+                    )
+                } else {
+                    choice.delta(&delta)
+                };
+                // The calls made so far: none once a returned call ends cut short, which the end
+                // of the stream can still bring, and a backend's own `tool_calls` finish makes no
+                // tool turn of such a turn either.
+                has_tool_calls.insert(index, choice.calls() > 0);
+                if choice.cut()
+                    && finish_reasons
+                        .get(&index)
+                        .is_some_and(|finish| finish == "tool_calls")
+                {
+                    finish_reasons.insert(index, "stop".to_string());
+                }
+                for stream_choice in symphony::chat_deltas(index, &events, choice_logprobs) {
+                    Self::push_chunk(
+                        tx,
+                        &mut sse_buffer,
+                        &chunk_frame,
+                        &stream_choice,
+                        usage.as_ref(),
+                        emit_usage_null,
+                    )
+                    .await
+                    .map_err(|()| "Failed to send symphony chunk".to_string())?;
+                }
+                continue;
+            }
 
             // Reasoning content handling
             let in_reasoning = if separate_reasoning && reasoning_parser_available {
@@ -998,7 +1046,7 @@ impl StreamingProcessor {
             };
             chat_usage(
                 counts.usage(),
-                reasoning_parser_available.then(|| parsed_reasoning_tokens.values().sum()),
+                reasoning_parsed.then(|| parsed_reasoning_tokens.values().sum()),
                 original_request.unbilled_prompt_tokens,
             )
         });
@@ -4082,6 +4130,9 @@ mod failure_tests;
 mod sse_bytes_tests;
 #[cfg(test)]
 mod usage_tests;
+
+#[cfg(test)]
+mod symphony_tests;
 
 #[cfg(test)]
 mod tests {

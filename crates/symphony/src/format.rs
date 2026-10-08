@@ -399,6 +399,27 @@ impl Format {
         &self.name
     }
 
+    /// The markers a call has of its own: the terminals of the rows into an arguments state,
+    /// which open a call, and those of the rows out of one, which end it, each list in the order
+    /// of the rows and each text once. A row from an arguments state into one (a new call that
+    /// ends the open one) is in both. The markers of a block the calls sit in, or of the regions
+    /// around it, are in neither: a driver that returns the calls apart from the text the model
+    /// wrote takes each call's own markers out with it and leaves every other one in the text.
+    pub fn call_terminals(&self) -> (Vec<&str>, Vec<&str>) {
+        let mut opens: Vec<&str> = Vec::new();
+        let mut ends: Vec<&str> = Vec::new();
+        for transition in &self.transitions {
+            let text = self.terminals[transition.on].text.as_str();
+            if self.states[transition.to].emits == Emits::Arguments && !opens.contains(&text) {
+                opens.push(text);
+            }
+            if self.states[transition.from].emits == Emits::Arguments && !ends.contains(&text) {
+                ends.push(text);
+            }
+        }
+        (opens, ends)
+    }
+
     fn state_named(&self, name: &str) -> usize {
         self.states
             .iter()
@@ -707,5 +728,36 @@ mod tests {
     #[should_panic(expected = "format t: no state named \"nowhere\"")]
     fn a_transition_to_a_state_the_table_lacks_is_a_programming_error() {
         let _ = two_states().transition("content", "open", "nowhere");
+    }
+
+    #[test]
+    fn a_calls_own_markers_are_the_rows_into_and_out_of_its_state() {
+        // A block of calls, a call inside it, and a new call that ends the open one: the call's
+        // own markers are the call's rows, never the block's or the thought's.
+        let table = Format::new("calls")
+            .terminal("think_open", "<think>")
+            .terminal("think_close", "</think>")
+            .terminal("calls_open", "<calls>")
+            .terminal("calls_close", "</calls>")
+            .terminal("call_open", "<call>")
+            .terminal("call_close", "</call>")
+            .state("content", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("calls", Emits::Wrapper)
+            .state("call", Emits::Arguments)
+            .transition("content", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "content")
+            .transition("content", "calls_open", "calls")
+            .transition("calls", "call_open", "call")
+            .transition("call", "call_open", "call")
+            .transition("call", "call_close", "calls")
+            .transition("call", "calls_close", "content")
+            .transition("calls", "calls_close", "content")
+            .calls(CallSyntax::Json);
+        assert_eq!(
+            table.call_terminals(),
+            (vec!["<call>"], vec!["<call>", "</call>", "</calls>"])
+        );
+        assert_eq!(two_states().call_terminals(), (vec![], vec![]));
     }
 }

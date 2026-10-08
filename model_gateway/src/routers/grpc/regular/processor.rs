@@ -29,7 +29,7 @@ use crate::routers::{
         context::{DispatchMetadata, ExecutionResult},
         proto_wrapper::ProtoGenerateComplete,
         spec::{ChatResponseSpec, CompletionResponseSpec, MessagesResponseSpec},
-        utils,
+        symphony, utils,
     },
 };
 
@@ -133,6 +133,33 @@ impl ResponseProcessor {
             }
         }
         stopped |= stop_decoder.is_stopped();
+
+        // A symphony table reads the choice; the finish, matched stop and logprobs are the
+        // gateway's, as below. A stop sequence ends the output without closing a call.
+        if let Some(spec) = &original_request.symphony {
+            let finish = if stopped {
+                "stop"
+            } else {
+                complete.finish_reason()
+            };
+            let matched_stop = stop_decoder
+                .matched_stop()
+                .map(|s| serde_json::Value::String(s.to_string()))
+                .or_else(|| complete.matched_stop_json());
+            let finish = spec.finish_of(finish, matched_stop.as_ref());
+            let events = symphony::Choice::whole(spec, model, &final_text, finish);
+            let mut choice = symphony::chat_message(index as u32, &events);
+            choice.matched_stop = matched_stop;
+            choice.logprobs = complete.output_logprobs().map(|ref proto_logprobs| {
+                utils::convert_proto_to_openai_logprobs(
+                    proto_logprobs,
+                    tokenizer,
+                    original_request.top_logprobs,
+                )
+            });
+            // No reasoning parser ran: the usage keeps the engine's reasoning count alone.
+            return Ok((choice, 0));
+        }
 
         // Step 1: Handle reasoning content parsing
         let mut reasoning_text: Option<String> = None;
@@ -377,7 +404,8 @@ impl ResponseProcessor {
         // detail counter present as the OpenAI API sends it.
         let usage = response_formatting::chat_usage(
             response_formatting::build_usage(&all_responses),
-            reasoning_parser_available.then_some(parsed_reasoning_tokens),
+            (reasoning_parser_available && chat_request.symphony.is_none())
+                .then_some(parsed_reasoning_tokens),
             chat_request.unbilled_prompt_tokens,
         );
 

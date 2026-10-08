@@ -14,11 +14,10 @@ use openai_protocol::{
         ToolChoice, ToolChoiceValue, UsageInfo,
     },
     responses::{
-        CustomToolCallOutputContent, CustomToolInputContentPart, IncludeField, IncompleteDetails,
-        IncompleteReason, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
-        ResponseOutputItem, ResponseReasoningContent::ReasoningText, ResponseStatus,
-        ResponsesRequest, ResponsesResponse, ResponsesUsage, StringOrContentParts, TextConfig,
-        TextFormat,
+        CustomToolCallOutputContent, CustomToolInputContentPart, IncludeField, ResponseContentPart,
+        ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
+        ResponseReasoningContent::ReasoningText, ResponsesRequest, ResponsesResponse,
+        ResponsesUsage, StringOrContentParts, TextConfig, TextFormat,
     },
     UNKNOWN_MODEL_ID,
 };
@@ -27,7 +26,7 @@ use tracing::warn;
 use crate::routers::grpc::common::responses::utils::{
     custom_tool_input, custom_tool_names, decode_reasoning_content, encode_reasoning_content,
     extract_tools_from_response_tools, function_call_status, generation_failure_error,
-    resolve_function_identity,
+    resolve_function_identity, response_status,
 };
 
 /// Convert a ResponsesRequest to ChatCompletionRequest for processing through the chat pipeline
@@ -628,19 +627,12 @@ pub(crate) fn chat_to_responses(
 
     // Determine response status based on finish_reason. "length" is a
     // max_output_tokens truncation, which the Responses contract reports as
-    // status=incomplete with incomplete_details.
-    let (status, incomplete_details) = match choice.finish_reason.as_deref() {
-        Some("stop") => (ResponseStatus::Completed, None),
-        Some("length") => (
-            ResponseStatus::Incomplete,
-            Some(IncompleteDetails {
-                reason: IncompleteReason::MaxOutputTokens,
-            }),
-        ),
-        Some("tool_calls") => (ResponseStatus::Completed, None),
-        Some("failed") | Some("error") => (ResponseStatus::Failed, None),
-        _ => (ResponseStatus::Completed, None), // Default to completed
-    };
+    // status=incomplete with incomplete_details; a function call cut short
+    // by any other end makes the response incomplete too.
+    let cut_call = output.iter().any(|item| {
+        matches!(item, ResponseOutputItem::FunctionToolCall { status, .. } if status == "incomplete")
+    });
+    let (status, incomplete_details) = response_status(choice.finish_reason.as_deref(), cut_call);
 
     // Convert usage from Usage to UsageInfo, then wrap in ResponsesUsage
     let usage = chat_resp.usage.as_ref().map(|u| {
@@ -1200,5 +1192,43 @@ mod tests {
         assert_eq!(wire["status"], "incomplete");
         assert_eq!(wire["output"][0]["status"], "completed");
         assert_eq!(wire["output"][0]["arguments"], "{}");
+    }
+
+    #[test]
+    fn a_call_cut_short_by_any_end_is_incomplete_and_so_is_the_response() {
+        // A parser that keeps what arrived returns a call an abort, a stop token or a stop
+        // sequence cut: its arguments are no complete JSON, so neither it nor the response is
+        // completed. Only `length` has a reason in the contract.
+        for finish_reason in ["abort", "stop"] {
+            let chat: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+                "id":"chat_test","object":"chat.completion","created":0,"model":"test-model",
+                "choices":[{"index":0,"message":{"role":"assistant","tool_calls":[
+                    {"id":"call_weather","type":"function","function":{"name":"weather","arguments":"{\"city\": \"Par"}}
+                ]},"finish_reason":finish_reason}]
+            }))
+            .unwrap();
+            let wire = serde_json::to_value(
+                chat_to_responses(&chat, &ResponsesRequest::default(), None).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(wire["status"], "incomplete", "{finish_reason}");
+            assert!(wire["incomplete_details"].is_null(), "{finish_reason}");
+            assert_eq!(wire["output"][0]["status"], "incomplete", "{finish_reason}");
+            assert_eq!(wire["output"][0]["arguments"], "{\"city\": \"Par");
+        }
+        // A complete call under an abort stays completed.
+        let chat: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id":"chat_test","object":"chat.completion","created":0,"model":"test-model",
+            "choices":[{"index":0,"message":{"role":"assistant","tool_calls":[
+                {"id":"call_weather","type":"function","function":{"name":"weather","arguments":"{}"}}
+            ]},"finish_reason":"abort"}]
+        }))
+        .unwrap();
+        let wire = serde_json::to_value(
+            chat_to_responses(&chat, &ResponsesRequest::default(), None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wire["status"], "completed");
+        assert_eq!(wire["output"][0]["status"], "completed");
     }
 }

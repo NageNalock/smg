@@ -22,7 +22,9 @@ use openai_protocol::{
 };
 use serde_json::Value;
 
-use crate::routers::grpc::{regular::stages::decisions::scoring::DecisionScoring, utils};
+use crate::routers::grpc::{
+    regular::stages::decisions::scoring::DecisionScoring, symphony::SymphonySpec, utils,
+};
 
 /// Response-phase contract for one request, produced by request building.
 #[derive(Clone)]
@@ -104,6 +106,9 @@ pub(crate) struct ChatResponseSpec {
     pub reasoning_in_prefill: Option<bool>,
     /// Set by request building when a response template selects the parsers.
     pub response_parser: Option<utils::ResponseParserSpec>,
+    /// The symphony table that reads the output, when the model selects one; set by request
+    /// building.
+    pub symphony: Option<Arc<SymphonySpec>>,
 }
 
 impl From<&ChatCompletionRequest> for ChatResponseSpec {
@@ -140,6 +145,7 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             unbilled_prompt_tokens: 0,
             reasoning_in_prefill: None,
             response_parser: None,
+            symphony: None,
         }
     }
 }

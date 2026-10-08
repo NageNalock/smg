@@ -18,6 +18,7 @@ use crate::routers::{
             reserve_multimodal_inflight,
         },
         spec::{ChatResponseSpec, ResponseSpec},
+        symphony::SymphonySpec,
         utils,
     },
 };
@@ -269,6 +270,24 @@ impl BuildStage for ChatRequestBuildingStage {
             ));
         };
 
+        let mut spec = ChatResponseSpec::from(chat_request.as_ref());
+        // A selected symphony table replays the prompt, so it takes the text before the
+        // request does.
+        spec.symphony = ctx
+            .components
+            .parser_resolver
+            .symphony(&chat_request.model)
+            .and_then(|table| {
+                SymphonySpec::for_chat(
+                    table,
+                    &spec,
+                    chat_request.parallel_tool_calls,
+                    &processed_messages.text,
+                    tool_constraints.as_ref(),
+                    ctx.tokenizer_arc().as_deref(),
+                )
+            });
+
         let unbilled_prompt_tokens = processed_messages.unbilled_prompt_tokens;
         // The response-template parsers start from the end of the prompt.
         let response_parser = match ctx
@@ -305,7 +324,6 @@ impl BuildStage for ChatRequestBuildingStage {
 
         // Only the client-facing usage drops them; settlement keeps the engine's count.
         ctx.state.response.unbilled_prompt_tokens = unbilled_prompt_tokens;
-        let mut spec = ChatResponseSpec::from(chat_request.as_ref());
         spec.unbilled_prompt_tokens = unbilled_prompt_tokens;
         spec.reasoning_in_prefill = reasoning_in_prefill;
         spec.response_parser = response_parser;

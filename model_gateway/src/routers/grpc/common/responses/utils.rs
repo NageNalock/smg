@@ -6,7 +6,10 @@ use axum::response::Response;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use openai_protocol::{
     common::Tool,
-    responses::{CustomTool, NamespaceTool, ResponseTool, ResponsesRequest, ResponsesResponse},
+    responses::{
+        CustomTool, IncompleteDetails, IncompleteReason, NamespaceTool, ResponseStatus,
+        ResponseTool, ResponsesRequest, ResponsesResponse,
+    },
 };
 use serde_json::to_value;
 use smg_data_connector::{
@@ -40,14 +43,46 @@ pub(crate) fn generation_failure_error(finish_reason: Option<&str>) -> Option<se
 }
 
 /// Map a Chat finish reason to a generated function-call item's status.
-/// On token-limit truncation, preserve complete arguments and mark partial JSON incomplete.
+/// A turn that ended on its calls (`tool_calls`) has them as the model wrote
+/// them, completed. A turn that ended otherwise (the token limit, an abort,
+/// a stop token or stop sequence inside the call, which a parser that keeps
+/// what arrived reports as it arrived) preserves complete arguments as
+/// completed and marks arguments that are not a complete JSON value
+/// incomplete, so that no client runs a call cut short.
+///
+/// The rule is the Responses API's for every parser, not only for a symphony
+/// table: a legacy parser's call that an abort or a stop cut short, which was
+/// `completed` with its partial arguments, is `incomplete` too, and so is the
+/// response ([`response_status`]). A call under `length` was incomplete
+/// already, and a turn that ended on its calls keeps them completed.
 pub(crate) fn function_call_status(finish_reason: Option<&str>, arguments: &str) -> &'static str {
     match finish_reason {
         Some("failed" | "error") => "in_progress",
-        Some("length") if serde_json::from_str::<serde_json::Value>(arguments).is_err() => {
-            "incomplete"
-        }
+        Some("tool_calls") => "completed",
+        _ if serde_json::from_str::<serde_json::Value>(arguments).is_err() => "incomplete",
         _ => "completed",
+    }
+}
+
+/// The status and incomplete details of a response from its Chat finish
+/// reason and whether one of its function calls is incomplete
+/// ([`function_call_status`]). A `length` finish is a max_output_tokens
+/// truncation; a call cut short by any other end makes the response
+/// incomplete too, with no detail the contract has a reason for.
+pub(crate) fn response_status(
+    finish_reason: Option<&str>,
+    cut_call: bool,
+) -> (ResponseStatus, Option<IncompleteDetails>) {
+    match finish_reason {
+        Some("failed" | "error") => (ResponseStatus::Failed, None),
+        Some("length") => (
+            ResponseStatus::Incomplete,
+            Some(IncompleteDetails {
+                reason: IncompleteReason::MaxOutputTokens,
+            }),
+        ),
+        _ if cut_call => (ResponseStatus::Incomplete, None),
+        _ => (ResponseStatus::Completed, None),
     }
 }
 
@@ -430,6 +465,44 @@ mod tests {
         assert_eq!(
             resolve_function_identity(request.tools.as_deref(), "weather.lookup"),
             ("weather.lookup".into(), None)
+        );
+    }
+
+    #[test]
+    fn a_call_whose_arguments_are_not_complete_json_is_incomplete_unless_the_turn_ended_on_it() {
+        for finish in [Some("length"), Some("abort"), Some("stop"), None] {
+            assert_eq!(function_call_status(finish, "{\"a\": \"b"), "incomplete");
+            assert_eq!(function_call_status(finish, ""), "incomplete");
+            assert_eq!(function_call_status(finish, "{\"a\": 1}"), "completed");
+        }
+        // A turn that ended on its calls has them as written, JSON or not.
+        for arguments in ["{\"a\": 1}", "", "weather in Paris"] {
+            assert_eq!(
+                function_call_status(Some("tool_calls"), arguments),
+                "completed"
+            );
+        }
+        assert_eq!(function_call_status(Some("failed"), "{"), "in_progress");
+        assert_eq!(
+            response_status(Some("abort"), true),
+            (ResponseStatus::Incomplete, None)
+        );
+        assert_eq!(
+            response_status(Some("abort"), false),
+            (ResponseStatus::Completed, None)
+        );
+        assert_eq!(
+            response_status(Some("length"), false),
+            (
+                ResponseStatus::Incomplete,
+                Some(IncompleteDetails {
+                    reason: IncompleteReason::MaxOutputTokens
+                })
+            )
+        );
+        assert_eq!(
+            response_status(Some("error"), true),
+            (ResponseStatus::Failed, None)
         );
     }
 }

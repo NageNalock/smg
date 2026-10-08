@@ -7636,6 +7636,7 @@ dependencies = [
  "smg-mm-rdma",
  "smg-response-template",
  "smg-rl",
+ "smg-symphony",
  "smg-wasm",
  "str0m",
  "tempfile",
