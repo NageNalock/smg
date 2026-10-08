@@ -2383,6 +2383,10 @@ impl StreamingProcessor {
 
         // Parser state (simple variables — Messages is always n=1)
         let mut reasoning_parser: Option<Box<dyn ReasoningParser>> = None;
+        // A symphony table reads the output instead, when the model selects one.
+        let symphony_spec = original_request.symphony.as_deref();
+        let mut symphony_stream =
+            symphony_spec.map(|spec| symphony::MessagesStream::new(spec, model));
 
         // Stop decoder
         let mut stop_decoder = {
@@ -2648,7 +2652,9 @@ impl StreamingProcessor {
                         _ => continue,
                     }
                 }
-                None if reasoning_parser.is_some() => Some(String::new()),
+                None if reasoning_parser.is_some() || symphony_stream.is_some() => {
+                    Some(String::new())
+                }
                 None => break,
             };
 
@@ -2656,6 +2662,26 @@ impl StreamingProcessor {
                 continue;
             };
             let chunk_text_len = chunk_text.len();
+
+            // A symphony table reads the output: the adapter's block machine renders its
+            // events, and the stop reason stays Phase 4's.
+            if let Some(stream) = symphony_stream.as_mut() {
+                let blocks = if final_chunk {
+                    stream.end(
+                        symphony_spec
+                            .filter(|_| !finish_reason_str.is_empty())
+                            .map(|spec| spec.finish_of(&finish_reason_str, matched_stop.as_ref())),
+                    )
+                } else {
+                    stream.delta(&chunk_text)
+                };
+                // The calls made so far: none once a returned call ends cut short.
+                has_tool_calls = stream.calls() > 0;
+                for block in &blocks {
+                    Self::send_messages_event(tx, &mut sse_buffer, block).await?;
+                }
+                continue;
+            }
 
             // Apply reasoning parser
             let (normal_text, reasoning_chunk_text, in_reasoning) = if reasoning_parser_available {
@@ -3110,9 +3136,14 @@ impl StreamingProcessor {
         // Phase 4: Emit message_delta with stop_reason and usage. A truncation
         // stays max_tokens after a tool call started, as Chat keeps `length`:
         // the call may be cut short.
+        // A table's stream that returned a call cut short makes no tool turn, whatever the
+        // backend named its finish.
+        let symphony_cut = symphony_stream
+            .as_ref()
+            .is_some_and(symphony::MessagesStream::cut);
         let stop_reason = if finish_reason_str == "length" {
             Some(messages::StopReason::MaxTokens)
-        } else if has_tool_calls || finish_reason_str == "tool_calls" {
+        } else if (has_tool_calls || finish_reason_str == "tool_calls") && !symphony_cut {
             Some(messages::StopReason::ToolUse)
         } else if matched_stop.is_some() {
             Some(messages::StopReason::StopSequence)

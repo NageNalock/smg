@@ -201,6 +201,9 @@ pub(crate) struct MessagesResponseSpec {
     pub stop_sequences: Option<Vec<String>>,
     /// Set by request building when a response template selects the parsers.
     pub response_parser: Option<utils::ResponseParserSpec>,
+    /// The symphony table that reads the output, when the model selects one; set by request
+    /// building.
+    pub symphony: Option<Arc<SymphonySpec>>,
 }
 
 impl From<&CreateMessageRequest> for MessagesResponseSpec {
@@ -220,6 +223,7 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
                 .unwrap_or_default(),
             stop_sequences: request.stop_sequences.clone(),
             response_parser: None,
+            symphony: None,
         }
     }
 }

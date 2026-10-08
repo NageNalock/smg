@@ -771,6 +771,71 @@ impl ResponseProcessor {
         }
         stopped |= stop_decoder.is_stopped();
 
+        // A symphony table reads the output; the stop sequence and usage are the gateway's, as
+        // below. A stop sequence ends the output without closing a call.
+        if let Some(spec) = &messages_request.symphony {
+            let finish = if stopped {
+                "stop"
+            } else {
+                complete.finish_reason()
+            };
+            let matched_stop = stop_decoder
+                .matched_stop()
+                .map(|s| serde_json::Value::String(s.to_string()))
+                .or_else(|| complete.matched_stop_json());
+            let output = symphony::messages_output(&symphony::Choice::whole(
+                spec,
+                model,
+                &final_text,
+                spec.finish_of(finish, matched_stop.as_ref()),
+            ));
+            let stop_sequence = matched_stop.and_then(|v| v.as_str().map(String::from));
+            // The adapter's reason, refined as the stream refines it: an engine that stopped for
+            // a call is a tool_use turn when no call parsed (a call cut short keeps the turn
+            // from being one), then a stop sequence is one.
+            let returned_a_call = output
+                .content
+                .iter()
+                .any(|block| matches!(block, messages::ContentBlock::ToolUse { .. }));
+            let stop_reason = match output.stop_reason {
+                Some(messages::StopReason::EndTurn)
+                    if finish == "tool_calls" && !returned_a_call =>
+                {
+                    Some(messages::StopReason::ToolUse)
+                }
+                Some(messages::StopReason::EndTurn) if stop_sequence.is_some() => {
+                    Some(messages::StopReason::StopSequence)
+                }
+                stop_reason => stop_reason,
+            };
+            // A turn that ran with thinking reports the engine's thinking count: no reasoning
+            // parser split the output.
+            let thinking_requested = matches!(
+                &messages_request.thinking,
+                Some(
+                    messages::ThinkingConfig::Enabled { .. }
+                        | messages::ThinkingConfig::Adaptive { .. }
+                )
+            );
+            return Ok(Message {
+                id: dispatch.request_id,
+                message_type: "message".to_string(),
+                role: "assistant".to_string(),
+                content: output.content,
+                model: dispatch.model,
+                stop_sequence: stop_sequence
+                    .filter(|_| matches!(stop_reason, Some(messages::StopReason::StopSequence))),
+                stop_reason,
+                stop_details: None,
+                usage: messages_usage_from_counts(
+                    complete.prompt_tokens(),
+                    complete.completion_tokens(),
+                    thinking_requested.then_some(complete.reasoning_tokens()),
+                ),
+                container: None,
+            });
+        }
+
         // Step 1: Parse reasoning content
         let mut reasoning_text: Option<String> = None;
         let mut thinking_tokens = 0;

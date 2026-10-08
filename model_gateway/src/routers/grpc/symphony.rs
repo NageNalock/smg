@@ -12,8 +12,8 @@
 //! parser is looked up by name: preparation (tool constraints, `skip_special_tokens`, the stop
 //! decoder) stays what it is for the family, and only the reading of the output changes.
 //!
-//! Request building arms a [`SymphonySpec`] on the response spec. The Chat response paths,
-//! streamed and whole, branch where they parse: each choice gets a [`Choice`], which feeds
+//! Request building arms a [`SymphonySpec`] on the response spec. The Chat and Messages response
+//! paths, streamed and whole, branch where they parse: each choice gets a [`Choice`], which feeds
 //! the prompt, the decoded deltas and the end of the stream to an [`Engine`] and applies the
 //! request's [`Policy`] to the events, and the adapters render the events. The envelope around the
 //! parse (role and finish chunks, usage, stop decoding, prefill/decode, metrics) is unchanged. The
@@ -29,6 +29,7 @@ use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::{
     chat::{ChatChoice, ChatStreamChoice},
     common::{ChatLogProbs, Tool, ToolChoice, ToolChoiceValue},
+    messages::{self, MessageStreamEvent},
 };
 use serde_json::Value;
 use symphony::{
@@ -37,7 +38,10 @@ use symphony::{
 };
 use tracing::warn;
 
-use super::{spec::ChatResponseSpec, utils};
+use super::{
+    spec::{ChatResponseSpec, MessagesResponseSpec},
+    utils,
+};
 
 /// The parser-name prefix that selects a symphony table.
 pub(crate) const PREFIX: &str = "symphony:";
@@ -216,6 +220,42 @@ impl SymphonySpec {
         let tools = spec.tools.as_deref().unwrap_or_default();
         Some(Arc::new(
             Self::new(table, tools, prompt, policy).with_call_stops(tokenizer),
+        ))
+    }
+
+    /// The spec for a Messages request, or `None` when its tool constraint keeps it on the
+    /// legacy parsers. Reasoning is always a thinking block. `tokenizer` is the model's, which
+    /// names the stop tokens that end a call.
+    pub(crate) fn for_messages(
+        table: &'static Table,
+        spec: &MessagesResponseSpec,
+        prompt: &str,
+        tool_constraint: Option<&(String, String)>,
+        tokenizer: Option<&dyn Tokenizer>,
+    ) -> Option<Arc<Self>> {
+        if forces_json(tool_constraint) {
+            return None;
+        }
+        let policy = Policy {
+            calls: spec.has_tools && !matches!(spec.tool_choice, Some(messages::ToolChoice::None)),
+            separate_reasoning: true,
+            first_call_only: matches!(
+                spec.tool_choice,
+                Some(
+                    messages::ToolChoice::Auto {
+                        disable_parallel_tool_use: Some(true)
+                    } | messages::ToolChoice::Any {
+                        disable_parallel_tool_use: Some(true)
+                    } | messages::ToolChoice::Tool {
+                        disable_parallel_tool_use: Some(true),
+                        ..
+                    }
+                )
+            ),
+            history_tool_calls_count: spec.history_tool_calls_count,
+        };
+        Some(Arc::new(
+            Self::new(table, &spec.chat_tools, prompt, policy).with_call_stops(tokenizer),
         ))
     }
 }
@@ -619,9 +659,114 @@ pub(crate) fn chat_message(index: u32, events: &[Event]) -> ChatChoice {
     adapt::chat::message(index, events)
 }
 
+/// The content blocks and stop reason of a whole output's events, for the Messages API.
+///
+/// The whole message and the stream ([`MessagesStream`]) render the same events, each by the
+/// adapter's rules (`symphony::adapt::messages`), and agree for the shapes models write most: one
+/// thought, then text, then calls. Elsewhere they differ by that adapter's policy, which this
+/// driver keeps as it is: the whole message gathers each kind into one block in the API's order
+/// (thinking, text, tool_use), where the stream keeps the order the model wrote, gives each
+/// reasoning region a thinking block of its own and lets go of whitespace between blocks; and a
+/// call whose arguments are not a whole JSON value (one the end of the stream cut) has `{}` as its
+/// whole `input`, where the stream has already sent the fragments that arrived as `partial_json`.
+/// Either way such a call is not a call made, so the turn is not `tool_use`, and neither is a turn
+/// that holds one beside whole calls ([`Choice::calls`]). The stream also lets text another kind
+/// of block closed a call's `tool_use` block with take the call's later fragments, so a call the
+/// model interrupted with text out of place streams as an input that is not whole JSON, while
+/// the whole message gives every fragment to its call; the stream then makes no call either
+/// ([`MessagesStream::calls`]), and the whole message keeps the call, whose input is whole.
+pub(crate) fn messages_output(events: &[Event]) -> adapt::messages::Output {
+    adapt::messages::output(events)
+}
+
+/// A Messages stream's choice: its events as `content_block_*` events, one block open at a time;
+/// see [`messages_output`] for where the stream and the whole message differ.
+pub(crate) struct MessagesStream {
+    choice: Choice,
+    blocks: adapt::messages::Stream,
+    /// The input each `tool_use` block has streamed, by block index.
+    inputs: HashMap<u32, String>,
+}
+
+impl MessagesStream {
+    /// A stream that has read the prompt.
+    pub(crate) fn new(spec: &SymphonySpec, model: &str) -> Self {
+        Self {
+            choice: Choice::new(spec, model),
+            blocks: adapt::messages::Stream::new(),
+            inputs: HashMap::new(),
+        }
+    }
+
+    /// The block events one decoded delta completes.
+    pub(crate) fn delta(&mut self, text: &str) -> Vec<MessageStreamEvent> {
+        let events = self.choice.delta(text);
+        self.render(&events)
+    }
+
+    /// The block events the end of the stream releases; the open block is stopped. `finish` is
+    /// as for [`Choice::end`].
+    pub(crate) fn end(&mut self, finish: Option<&str>) -> Vec<MessageStreamEvent> {
+        let events = self.choice.end(finish);
+        self.render(&events)
+    }
+
+    /// The calls this stream has made so far, as [`Choice::calls`] counts them, or none while a
+    /// `tool_use` block it streamed holds an input that is not a whole JSON object, as a block
+    /// another block closed before its call's last fragment does: the client's input is what the
+    /// stream sent.
+    pub(crate) fn calls(&self) -> u32 {
+        if self.cut() {
+            0
+        } else {
+            self.choice.calls()
+        }
+    }
+
+    /// Whether a call this stream returned is not whole: cut short, or streamed as an input that
+    /// is not a whole JSON object.
+    pub(crate) fn cut(&self) -> bool {
+        self.choice.cut()
+            || self
+                .inputs
+                .values()
+                .any(|input| serde_json::from_str::<serde_json::Map<String, Value>>(input).is_err())
+    }
+
+    fn render(&mut self, events: &[Event]) -> Vec<MessageStreamEvent> {
+        let mut out = Vec::new();
+        for event in events {
+            // The stop reason is the stream's own, decided with the stop sequence it knows.
+            let _ = self.blocks.feed(event, &mut out);
+        }
+        for event in &out {
+            match event {
+                MessageStreamEvent::ContentBlockStart {
+                    index,
+                    content_block: messages::ContentBlock::ToolUse { .. },
+                } => {
+                    self.inputs.insert(*index, String::new());
+                }
+                MessageStreamEvent::ContentBlockDelta {
+                    index,
+                    delta: messages::ContentBlockDelta::InputJsonDelta { partial_json },
+                } => {
+                    if let Some(input) = self.inputs.get_mut(index) {
+                        input.push_str(partial_json);
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use openai_protocol::{chat::ChatCompletionRequest, model_card::ModelCard};
+    use openai_protocol::{
+        chat::ChatCompletionRequest, messages::CreateMessageRequest, model_card::ModelCard,
+    };
     use reasoning_parser::ParserFactory as ReasoningParserFactory;
     use serde_json::{json, Value};
     use tool_parser::ParserFactory as ToolParserFactory;
@@ -938,6 +1083,41 @@ mod tests {
     }
 
     #[test]
+    fn a_messages_request_sets_the_policy() {
+        let armed = |tool_choice: Value| {
+            let mut request = json!({
+                "model": "m", "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}]
+            });
+            if !tool_choice.is_null() {
+                request["tool_choice"] = tool_choice;
+            }
+            let request: CreateMessageRequest = serde_json::from_value(request).expect("request");
+            SymphonySpec::for_messages(
+                qwen3(),
+                &MessagesResponseSpec::from(&request),
+                PROMPT,
+                None,
+                None,
+            )
+            .expect("armed")
+            .policy
+        };
+        let auto = armed(Value::Null);
+        assert!(auto.calls && auto.separate_reasoning && !auto.first_call_only);
+        assert!(!armed(json!({"type": "none"})).calls);
+        for choice in [
+            json!({"type": "auto", "disable_parallel_tool_use": true}),
+            json!({"type": "any", "disable_parallel_tool_use": true}),
+            json!({"type": "tool", "name": "get_weather", "disable_parallel_tool_use": true}),
+        ] {
+            assert!(armed(choice.clone()).first_call_only, "{choice}");
+        }
+        assert!(!armed(json!({"type": "any", "disable_parallel_tool_use": false})).first_call_only);
+    }
+
+    #[test]
     fn a_whole_output_renders_reasoning_content_and_calls() {
         let output = format!("<think>\nCheck the weather.\n</think>\n\nLet me look.\n{CALL}");
         assert_eq!(
@@ -1157,6 +1337,37 @@ mod tests {
         // Both whole: two calls made.
         let reply = message(&spec(policy()), &format!("{CALL}\n{CALL}"), "stop");
         assert_eq!(reply["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn a_messages_stream_whose_call_text_interrupted_makes_no_call() {
+        // Text out of place between a call's arguments closes its tool_use block in the stream,
+        // and the later fragments become text: the streamed input is not whole JSON, so the
+        // stream makes no call, where the whole message gives every fragment to the call.
+        let hy4 = SymphonySpec::new(
+            table("symphony:hy4").expect("row"),
+            &[typed_tool()],
+            PROMPT,
+            policy(),
+        );
+        let output = format!(
+            "{HY4_CALL}<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Paris\
+             </arg_value:opensource>stray words<arg_key:opensource>days</arg_key:opensource>\
+             <arg_value:opensource>3</arg_value:opensource></tool_call:opensource>\
+             </tool_calls:opensource>"
+        );
+        let whole = messages_output(&Choice::whole(&hy4, KIMI, &output, "stop"));
+        assert_eq!(whole.stop_reason, Some(messages::StopReason::ToolUse));
+        let mut stream = MessagesStream::new(&hy4, KIMI);
+        let mut events = stream.delta(&output);
+        events.extend(stream.end(Some("stop")));
+        assert!(stream.cut());
+        assert_eq!(stream.calls(), 0);
+        let blocks = fold_blocks(&events);
+        assert!(
+            blocks.iter().any(|block| block["type"] == "tool_use"),
+            "{blocks:?}"
+        );
     }
 
     #[test]
@@ -1401,6 +1612,11 @@ mod tests {
         };
         let reply = message(&spec(no_calls), BARE_CALL, "stop");
         assert_eq!(reply["message"]["content"], "\n{\"name\": \"get_weather\"}");
+        let output = messages_output(&Choice::whole(&spec(policy()), KIMI, BARE_CALL, "stop"));
+        assert_eq!(
+            serde_json::to_value(&output.content).expect("blocks")[0]["input"],
+            json!({})
+        );
     }
 
     /// A tool with a string and an integer parameter: a tagged call streams the string and
@@ -1729,5 +1945,97 @@ mod tests {
             })
             .collect();
         assert_eq!(with, [(true, true)]);
+    }
+
+    /// A Messages stream folded into the blocks it describes.
+    fn fold_blocks(events: &[MessageStreamEvent]) -> Vec<Value> {
+        let mut blocks: Vec<Value> = Vec::new();
+        let mut arguments: Vec<String> = Vec::new();
+        for event in events {
+            match event {
+                MessageStreamEvent::ContentBlockStart { content_block, .. } => {
+                    blocks.push(serde_json::to_value(content_block).expect("block"));
+                    arguments.push(String::new());
+                }
+                MessageStreamEvent::ContentBlockDelta { delta, .. } => {
+                    let block = blocks.last_mut().expect("an open block");
+                    match delta {
+                        messages::ContentBlockDelta::TextDelta { text } => {
+                            let joined =
+                                format!("{}{text}", block["text"].as_str().unwrap_or_default());
+                            block["text"] = Value::String(joined);
+                        }
+                        messages::ContentBlockDelta::ThinkingDelta { thinking } => {
+                            let joined = format!(
+                                "{}{thinking}",
+                                block["thinking"].as_str().unwrap_or_default()
+                            );
+                            block["thinking"] = Value::String(joined);
+                        }
+                        messages::ContentBlockDelta::InputJsonDelta { partial_json } => {
+                            arguments
+                                .last_mut()
+                                .expect("arguments")
+                                .push_str(partial_json);
+                        }
+                        other => panic!("unexpected delta {other:?}"),
+                    }
+                }
+                MessageStreamEvent::ContentBlockStop { .. } => {
+                    let block = blocks.last_mut().expect("an open block");
+                    if block["type"] == "tool_use" {
+                        block["input"] = serde_json::from_str(arguments.last().expect("arguments"))
+                            .unwrap_or_else(|_| json!({}));
+                    }
+                }
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        blocks
+    }
+
+    #[test]
+    fn a_messages_stream_builds_the_whole_message_s_blocks_at_every_chunking() {
+        // One reasoning region, then text, then nothing but calls: the stream's blocks are the
+        // fold's (the adapter's contract; text between calls is where the two differ).
+        for (output, finish) in [
+            (
+                format!("<think>\nplan\n</think>\n\nLet me look.\n{CALL}"),
+                "stop",
+            ),
+            (format!("Sure.\n{CALL}{CALL}"), "stop"),
+            ("answer".to_string(), "length"),
+            (format!("{BARE_CALL}{CALL}"), "stop"),
+        ] {
+            let spec = spec(policy());
+            let whole = messages_output(&Choice::whole(&spec, KIMI, &output, finish));
+            let whole: Vec<Value> = whole
+                .content
+                .iter()
+                .map(|block| serde_json::to_value(block).expect("block"))
+                .collect();
+            for pieces in cuts(&output) {
+                let mut stream = MessagesStream::new(&spec, KIMI);
+                let mut events = Vec::new();
+                for piece in &pieces {
+                    events.extend(stream.delta(piece));
+                }
+                events.extend(stream.end(Some(finish)));
+                assert_eq!(fold_blocks(&events), whole, "{pieces:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_messages_stream_counts_its_calls_and_closes_its_last_block() {
+        let mut stream = MessagesStream::new(&spec(policy()), KIMI);
+        let mut events = stream.delta(&format!("Sure.\n{CALL}"));
+        assert_eq!(stream.calls(), 1);
+        events.extend(stream.end(None));
+        assert!(matches!(
+            events.last(),
+            Some(MessageStreamEvent::ContentBlockStop { index: 1 })
+        ));
+        assert!(stream.end(Some("stop")).is_empty());
     }
 }

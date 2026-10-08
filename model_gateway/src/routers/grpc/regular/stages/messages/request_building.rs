@@ -18,6 +18,7 @@ use crate::routers::{
             reserve_multimodal_inflight,
         },
         spec::{MessagesResponseSpec, ResponseSpec},
+        symphony::SymphonySpec,
         utils,
     },
 };
@@ -187,6 +188,21 @@ impl BuildStage for MessageRequestBuildingStage {
                 false,
             ));
         }
+        // A selected symphony table replays the prompt, so it takes the text before the
+        // request does.
+        spec.symphony = ctx
+            .components
+            .parser_resolver
+            .symphony(&messages_request.model)
+            .and_then(|table| {
+                SymphonySpec::for_messages(
+                    table,
+                    &spec,
+                    &processed_messages.text,
+                    tool_constraints.as_ref(),
+                    ctx.tokenizer_arc().as_deref(),
+                )
+            });
 
         // The ids are the prompt; the text rides along only when the request
         // carries media (see `helpers::wire_prompt_text`).
