@@ -32,9 +32,9 @@ use serde_json::json as value;
 use symphony::{
     formats,
     json::PartialJson,
-    tagged::{Placement, Spelling},
-    CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, FinishReason, Input,
-    MalformedReason, ParseError, Parser, TokenSpan,
+    tagged::{addressed, Placement, Spelling},
+    CallSyntax, Declared, DropReason, Emits, Engine, EngineFinish, Event, Events, FinishReason,
+    Format, Input, MalformedReason, ParseError, Parser, TokenSpan,
 };
 
 /// A subject under test: how to make its parser, and the outputs it is checked over.
@@ -173,6 +173,64 @@ fn plain() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::plain(), Declared::default()))
 }
 
+/// The synthetic table's spelling: the commentary channel closes the header, and the arguments
+/// are named parameter tags.
+const ADDRESSED_SPELLING: addressed::Spelling = addressed::Spelling {
+    header_close: "<|channel|>commentary<|message|>",
+    key_open: "<parameter name=\"",
+    key_close: "\">",
+    value_close: "</parameter>",
+    next_key_closes: false,
+};
+
+/// A synthetic table that holds the addressed call syntax to the contract: Harmony's channels for
+/// the thought and the answer, and calls written as messages addressed to the tool, whose header
+/// the commentary channel closes and whose arguments are named parameter tags.
+fn addressed_table() -> Format {
+    addressed_table_spelled(ADDRESSED_SPELLING)
+}
+
+/// [`addressed_table`] with the calls in `spelling`.
+fn addressed_table_spelled(spelling: addressed::Spelling) -> Format {
+    Format::new("addressed")
+        .terminal("start", "<|start|>assistant")
+        .terminal("analysis", "<|channel|>analysis<|message|>")
+        .terminal("final", "<|channel|>final<|message|>")
+        .terminal("recipient", " to=")
+        .terminal("end", "<|end|>")
+        .terminal("call", "<|call|>")
+        .state("header", Emits::Wrapper)
+        .state("reasoning", Emits::Reasoning)
+        .state("content", Emits::Content)
+        .state("between", Emits::Wrapper)
+        .state("calls", Emits::Arguments)
+        .transition("header", "analysis", "reasoning")
+        .transition("header", "final", "content")
+        .transition("header", "recipient", "calls")
+        .transition("reasoning", "end", "between")
+        .transition("content", "end", "between")
+        .transition("calls", "end", "between")
+        .transition("calls", "call", "between")
+        .transition("between", "start", "header")
+        .calls(CallSyntax::Addressed(spelling))
+        .opens_turn("<|start|>assistant")
+}
+
+fn addressed() -> Box<dyn Parser> {
+    Box::new(Engine::new(addressed_table(), keyed_tools()))
+}
+
+/// The same table in a spelling where the next key closes a value the model left unclosed.
+fn addressed_next_key_closes() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        addressed_table_spelled(addressed::Spelling {
+            next_key_closes: true,
+            ..ADDRESSED_SPELLING
+        }),
+        keyed_tools(),
+    ))
+}
+
 const FORMATS: &[Subject] = &[
     Subject {
         name: "qwen3",
@@ -249,6 +307,61 @@ const FORMATS: &[Subject] = &[
         new: plain,
         outputs: PLAIN_OUTPUTS,
     },
+    Subject {
+        name: "addressed",
+        new: addressed,
+        outputs: ADDRESSED_OUTPUTS,
+    },
+    Subject {
+        name: "addressed, the next key closes a value",
+        new: addressed_next_key_closes,
+        outputs: ADDRESSED_OUTPUTS,
+    },
+];
+
+/// Calls addressed to a tool, in the synthetic table: the shapes the syntax writes (one call,
+/// calls ended by `<|end|>` and `<|call|>`, no parameters, values typed by the tools and inferred,
+/// a value with tags in it), cut streams, a header that does not close, text where a name or a
+/// tag should be (spaced words between two parameters and after a call, a name with spaces around
+/// it), and the channels with no call.
+const ADDRESSED_OUTPUTS: &[&str] = &[
+    "<|channel|>analysis<|message|>Plan.<|end|><|start|>assistant to=get_weather\
+     <|channel|>commentary<|message|><parameter name=\"city\">\nParis\n</parameter>\n\
+     <parameter name=\"days\">\n3\n</parameter><|call|>",
+    "<|channel|>analysis<|message|><|end|><|start|>assistant to=get_weather\
+     <|channel|>commentary<|message|><parameter name=\"note\">\nnull\n</parameter>\n\
+     <parameter name=\"extra\">\n{\"a\": [1, 2]}\n</parameter><|end|><|start|>assistant to=ping\
+     <|channel|>commentary<|message|><|call|>",
+    "<|channel|>analysis<|message|>Two.<|end|><|start|>assistant to=get_weather\
+     <|channel|>commentary<|message|><parameter name=\"city\">\n<p a=\"b\">x</p> to=y\n\
+     </parameter><|end|>",
+    "<|channel|>analysis<|message|>Cut.<|end|><|start|>assistant to=get_weather\
+     <|channel|>commentary<|message|><parameter name=\"city\">\nPar",
+    "<|channel|>analysis<|message|>Cut.<|end|><|start|>assistant to=get_weather\
+     <|channel|>commentary<|message|><parameter name=\"days\">\n1",
+    "<|channel|>analysis<|message|><|end|><|start|>assistant to=get_weather<|channel|>comm",
+    "<|channel|>analysis<|message|><|end|><|start|>assistant to=get_weather\
+     <|channel|>analysis<|message|><parameter name=\"city\">\nParis\n</parameter><|call|>",
+    "<|channel|>analysis<|message|><|end|><|start|>assistant to=get weather\
+     <|channel|>commentary<|message|><parameter name=\"city\">\nParis\n</parameter><|call|>",
+    "<|channel|>analysis<|message|><|end|><|start|>assistant to=get_weather\
+     <|channel|>commentary<|message|> junk <parameter name=\"\">\nx\n</parameter>\
+     <parameter name=\"ci<parameter name=\"city\">\n計画 🌍\n</parameter>\"><|call|>",
+    "<|channel|>analysis<|message|>Think.<|end|><|start|>assistant<|channel|>final<|message|>\
+     Hello <b>world</b> to=x",
+    "<|channel|>analysis<|message|><|end|><|start|>assistant to=get_weather\
+     <|channel|>commentary<|message|><parameter name=\"city\">\nParis\n</parameter>\n\
+     some stray words\n<parameter name=\"days\">\n2\n</parameter><|end|>stray words \
+     <|start|>assistant<|channel|>final<|message|>Hi there.",
+    "<|channel|>analysis<|message|><|end|><|start|>assistant to= get_weather \
+     <|channel|>commentary<|message|><parameter name=\"city\">\nNew York\n</parameter><|call|>",
+    "<|channel|>analysis<|message|><|end|><|start|>assistant to=get_weather\
+     <|channel|>commentary<|message|><parameter name=\"city\">\nParis\n</parameter>\n\
+     <parameter name=\"city\">\nRome\n</parameter>\n<parameter name=\"days\">\n2\n<parameter \
+     name=\"city\">\nOslo\n<parameter name=\"note\">\nNone\n</parameter><|call|>",
+    "<|channel|>analysis<|message|>Only a thought.",
+    "Prose where a channel should be.",
+    "",
 ];
 
 /// MiniMax M3's syntax: the recorded shape with its separators, the tree's shapes, cut streams,

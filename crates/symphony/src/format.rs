@@ -36,7 +36,7 @@
 
 use crate::{
     pythonic,
-    tagged::{self, keyed},
+    tagged::{self, addressed, keyed},
 };
 
 /// How the model writes a call between the call markers.
@@ -98,6 +98,13 @@ pub enum CallSyntax {
     /// terminals that enter and leave the state are the call's own markers, and the call's end
     /// carries the closing one.
     Gemma,
+    /// A call written as a message addressed to the tool, as Harmony addresses one, with tagged
+    /// parameters where Harmony writes JSON: the tool's name, the fixed spelling that closes the
+    /// message's header, then a tag pair around each argument's text, typed by the request's
+    /// tools, in the family's spelling of the header's close and the three tags. The terminal that
+    /// enters the state is the recipient marker before the name, and the one that leaves it ends
+    /// the message, which the call's end carries.
+    Addressed(addressed::Spelling),
 }
 
 /// What the text inside a state is.

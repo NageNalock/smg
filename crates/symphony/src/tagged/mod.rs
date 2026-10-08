@@ -14,8 +14,12 @@
 //! Ling, IQuest), typed by the request's tools again; [`attributed`] for one MiniMax M2 invoke,
 //! whose parameter tags name their key in an attribute, typed by the request's tools; [`xml`] for
 //! one MiniMax M3 invoke, whose arguments are an XML tree, typed by the request's tools at every
-//! depth; and [`xtml`] for one Kimi K3 call, whose argument tags name each value's type.
+//! depth; [`xtml`] for one Kimi K3 call, whose argument tags name each value's type; and
+//! [`addressed`] for one call written as a message addressed to the tool, its name in the
+//! message's header as Harmony writes it and its arguments as tagged parameters where Harmony
+//! writes JSON, typed by the request's tools.
 
+pub mod addressed;
 pub mod assembler;
 pub mod attributed;
 pub mod dsml;

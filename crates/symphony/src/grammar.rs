@@ -48,8 +48,8 @@
 //! its way to the calls, whichever that was.
 //!
 //! A table without calls gives `None`, as do Inkling's named JSON (a forced call's tag would start
-//! inside the first message, before any opener) and Gemma 4's syntax until their tags are derived;
-//! the gateway takes the JSON-schema path for them.
+//! inside the first message, before any opener), Gemma 4's syntax and calls addressed to a tool
+//! until their tags are derived; the gateway takes the JSON-schema path for them.
 
 use openai_protocol::common::Tool;
 use serde_json::{json, Value};
@@ -318,7 +318,7 @@ impl Format {
             CallSyntax::Xml => {
                 return xml::calls(markers?, self.separator(), &named, at_least_one);
             }
-            CallSyntax::NamedJson(_) | CallSyntax::Gemma => return None,
+            CallSyntax::NamedJson(_) | CallSyntax::Gemma | CallSyntax::Addressed(_) => return None,
         };
         if !reasoning_open {
             return Some(calls);
@@ -672,7 +672,7 @@ mod tests {
     use serde_json::json as value;
 
     use super::*;
-    use crate::formats;
+    use crate::{formats, tagged::addressed};
 
     fn tool(name: &str, strict: Option<bool>, parameters: Value) -> Tool {
         Tool {
@@ -1235,7 +1235,38 @@ mod tests {
         assert!(formats::glm()
             .grammar(&[tool("", None, value!({}))], true, false)
             .is_none());
-        assert!(formats::plain().grammar(&tools, true, false).is_none());
+        // Calls addressed to a tool have no derivation yet either: a table of Harmony's channels
+        // whose calls are messages addressed to the tool, with tagged parameters.
+        let addressed = Format::new("addressed")
+            .terminal("start", "<|start|>assistant")
+            .terminal("analysis", "<|channel|>analysis<|message|>")
+            .terminal("recipient", " to=")
+            .terminal("end", "<|end|>")
+            .terminal("call", "<|call|>")
+            .state("header", Emits::Wrapper)
+            .state("reasoning", Emits::Reasoning)
+            .state("between", Emits::Wrapper)
+            .state("calls", Emits::Arguments)
+            .transition("header", "analysis", "reasoning")
+            .transition("header", "recipient", "calls")
+            .transition("reasoning", "end", "between")
+            .transition("calls", "end", "between")
+            .transition("calls", "call", "between")
+            .transition("between", "start", "header")
+            .calls(CallSyntax::Addressed(addressed::Spelling {
+                header_close: "<|channel|>commentary<|message|>",
+                key_open: "<parameter name=\"",
+                key_close: "\">",
+                value_close: "</parameter>",
+                next_key_closes: false,
+            }));
+        for format in [formats::plain(), addressed] {
+            assert!(
+                format.grammar(&tools, true, false).is_none(),
+                "{}",
+                format.name()
+            );
+        }
     }
 
     #[test]

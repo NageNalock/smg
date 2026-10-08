@@ -113,6 +113,7 @@ enum Call {
     Attributed(tagged::attributed::Assembler),
     NamedJson(json::named::Assembler),
     Gemma(gemma::Assembler),
+    Addressed(tagged::addressed::Assembler),
 }
 
 impl Call {
@@ -140,6 +141,9 @@ impl Call {
                 Self::NamedJson(json::named::Assembler::new(index, id, marker))
             }
             Some(CallSyntax::Gemma) => Self::Gemma(gemma::Assembler::new(index, id)),
+            Some(CallSyntax::Addressed(spelling)) => {
+                Self::Addressed(tagged::addressed::Assembler::new(index, id, spelling))
+            }
         }
     }
 
@@ -180,6 +184,10 @@ impl Call {
                 assembler.feed(text, out);
                 text.len()
             }
+            Self::Addressed(assembler) => {
+                assembler.feed(text, declared, out);
+                text.len()
+            }
         }
     }
 
@@ -200,8 +208,8 @@ impl Call {
     /// taken as the call's end. The JSON assembler has one ending, and the engine names a block its
     /// terminal closed (`close_call`); the Qwen tagged one closes the call for the client when the
     /// block ended, and leaves it open when the stream was cut; the DSML one takes the invoke's
-    /// closing tag, and only that terminal, as `ToolCallEnd`'s bytes; the keyed one takes the
-    /// call's closing marker.
+    /// closing tag, and only that terminal, as `ToolCallEnd`'s bytes; the keyed and the addressed
+    /// ones take the call's closing marker.
     fn end(self, closed: Closed, terminal: &str, out: &mut Events) -> bool {
         match (self, closed) {
             (Self::Json(assembler), _) => assembler.finish(out),
@@ -268,6 +276,12 @@ impl Call {
                 return true;
             }
             (Self::Gemma(assembler), Closed::ByEnd) => assembler.finish(out),
+            // The marker that ends the message is the call's end, as for the keyed syntax.
+            (Self::Addressed(assembler), Closed::ByMarker) => {
+                assembler.close(terminal, out);
+                return true;
+            }
+            (Self::Addressed(assembler), Closed::ByEnd) => assembler.finish(out),
         }
         false
     }
