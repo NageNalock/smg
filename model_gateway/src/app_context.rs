@@ -28,7 +28,7 @@ use crate::{
             openai_bridge::FormatRegistry, overload, pd_admission, realtime::RealtimeRegistry,
         },
         gateway::Gateway,
-        grpc::multimodal::MultimodalConfigRegistry,
+        grpc::{multimodal::MultimodalConfigRegistry, symphony},
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
     worker::{
@@ -411,7 +411,7 @@ impl AppContextBuilder {
         if let (Some(name), Some(factory)) =
             (&configured_reasoning_parser, &self.reasoning_parser_factory)
         {
-            if !factory.registry().has_parser(name) {
+            if !factory.registry().has_parser(name) && !symphony::known(name) {
                 tracing::error!(
                     parser = %name,
                     available = %factory.list_parsers().join(", "),
@@ -423,7 +423,7 @@ impl AppContextBuilder {
             }
         }
         if let (Some(name), Some(factory)) = (&configured_tool_parser, &self.tool_parser_factory) {
-            if !factory.has_parser(name) {
+            if !factory.has_parser(name) && !symphony::known(name) {
                 tracing::error!(
                     parser = %name,
                     available = %factory.list_parsers().join(", "),

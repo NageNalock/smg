@@ -21,7 +21,10 @@ use tracing::warn;
 
 use super::ResponseTemplateParsers;
 use crate::{
-    routers::{error, grpc::context::WorkerSelection},
+    routers::{
+        error,
+        grpc::{context::WorkerSelection, symphony},
+    },
     worker::WorkerRegistry,
 };
 
@@ -34,7 +37,12 @@ use crate::{
 /// `response_template` in the model's tokenizer, for both sides and only
 /// when neither side has an override or a configured name → `None`, which
 /// lets the factory helpers fall back to their name-based auto-detection,
-/// unchanged.
+/// unchanged. A name `symphony:<table>` on either side selects a symphony
+/// table, and both names then resolve to the parsers of the table's family.
+/// The card decides the table as a whole: a card that names either parser
+/// selects from its own names only, and the configured names select a table
+/// only for a model whose card names neither. A table name that selects
+/// nothing for the model resolves to its family's parser of that kind.
 ///
 /// Lookups borrow straight from worker metadata (no card clones); only the
 /// resolved name is cloned.
@@ -74,15 +82,47 @@ impl ParserResolver {
         }
     }
 
-    /// Effective tool-parser name for `model`, if any.
+    /// Effective tool-parser name for `model`, if any. A model that selects a
+    /// symphony table gets the tool parser of the table's family.
     pub(crate) fn tool_parser(&self, model: &str) -> Option<String> {
+        let table = self.symphony(model);
+        family_or_named(table, self.named_tool_parser(model), |t| t.tool_parser)
+    }
+
+    /// Effective reasoning-parser name for `model`, if any. A model that
+    /// selects a symphony table gets the reasoning parser of the table's family.
+    pub(crate) fn reasoning_parser(&self, model: &str) -> Option<String> {
+        let table = self.symphony(model);
+        family_or_named(table, self.named_reasoning_parser(model), |t| {
+            t.reasoning_parser
+        })
+    }
+
+    /// The symphony table `model`'s parser names select (`symphony:<table>`),
+    /// the tool parser's name first: the card's names when it names either
+    /// parser, the configured names otherwise.
+    pub(crate) fn symphony(&self, model: &str) -> Option<&'static symphony::Table> {
+        let card_tool = self.card_parser(model, |card| card.tool_parser.as_ref());
+        let card_reasoning = self.card_parser(model, |card| card.reasoning_parser.as_ref());
+        let (tool, reasoning) = if card_tool.is_some() || card_reasoning.is_some() {
+            (card_tool.as_deref(), card_reasoning.as_deref())
+        } else {
+            (
+                self.configured_tool_parser.as_deref(),
+                self.configured_reasoning_parser.as_deref(),
+            )
+        };
+        tool.and_then(symphony::table)
+            .or_else(|| reasoning.and_then(symphony::table))
+    }
+
+    fn named_tool_parser(&self, model: &str) -> Option<String> {
         self.card_parser(model, |card| card.tool_parser.as_ref())
             .or_else(|| self.configured_tool_parser.clone())
             .or_else(|| Some(self.template_parsers(model)?.0))
     }
 
-    /// Effective reasoning-parser name for `model`, if any.
-    pub(crate) fn reasoning_parser(&self, model: &str) -> Option<String> {
+    fn named_reasoning_parser(&self, model: &str) -> Option<String> {
         self.card_parser(model, |card| card.reasoning_parser.as_ref())
             .or_else(|| self.configured_reasoning_parser.clone())
             .or_else(|| Some(self.template_parsers(model)?.0))
@@ -146,6 +186,20 @@ impl ParserResolver {
             );
         }
         chosen
+    }
+}
+
+/// The parser name of one kind for a model: the family's when the model
+/// selects `table`, else the name as resolved, a table name standing for its
+/// family's parser (a card's names kept the configured one from selecting).
+fn family_or_named(
+    table: Option<&'static symphony::Table>,
+    named: Option<String>,
+    family: impl Fn(&symphony::Table) -> Option<&'static str>,
+) -> Option<String> {
+    match table.or_else(|| named.as_deref().and_then(symphony::table)) {
+        Some(table) => family(table).map(str::to_string),
+        None => named,
     }
 }
 

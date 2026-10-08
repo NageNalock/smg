@@ -13,7 +13,9 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use super::discover_dp::DpInfo;
 use crate::{
-    routers::grpc::{multimodal::SUPPORTS_VISION_LABEL, zmq_client::zmq_handshake_address},
+    routers::grpc::{
+        multimodal::SUPPORTS_VISION_LABEL, symphony, zmq_client::zmq_handshake_address,
+    },
     worker::{
         bootstrap_probe, circuit_breaker::CircuitBreakerConfig, overload::OverloadThresholds,
         resilience::resolve_resilience, worker::RuntimeType, BasicWorkerBuilder, ConnectionMode,
@@ -410,7 +412,7 @@ fn validate_parser_overrides(
     reasoning_parser_factory: Option<&reasoning_parser::ParserFactory>,
 ) -> Result<(), String> {
     if let (Some(name), Some(factory)) = (card.tool_parser.as_deref(), tool_parser_factory) {
-        if !factory.registry().has_parser(name) {
+        if !factory.registry().has_parser(name) && !symphony::known(name) {
             return Err(format!(
                 "worker {} declares unknown tool_parser '{}' for model '{}'",
                 worker_url, name, card.id
@@ -420,7 +422,7 @@ fn validate_parser_overrides(
     if let (Some(name), Some(factory)) =
         (card.reasoning_parser.as_deref(), reasoning_parser_factory)
     {
-        if !factory.registry().has_parser(name) {
+        if !factory.registry().has_parser(name) && !symphony::known(name) {
             return Err(format!(
                 "worker {} declares unknown reasoning_parser '{}' for model '{}'",
                 worker_url, name, card.id
@@ -1531,5 +1533,36 @@ mod tests {
         // Absent factories skip validation (parsers unused in that config).
         let card = ModelCard::new("m").with_tool_parser("definitely-not-a-parser");
         assert!(validate_parser_overrides(&card, "http://w:1", None, None).is_ok());
+    }
+
+    #[test]
+    fn a_symphony_table_label_passes_validation_only_for_a_known_table() {
+        let tool_factory = tool_parser::ParserFactory::default();
+        let reasoning_factory = reasoning_parser::ParserFactory::default();
+        let validate = |labels: [(&str, &str); 1]| {
+            let labels: HashMap<String, String> = labels
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            let card = build_model_card(
+                "m",
+                &WorkerSpec::new("http://worker:8080"),
+                &labels,
+                &HashMap::new(),
+            );
+            validate_parser_overrides(
+                &card,
+                "http://w:1",
+                Some(&tool_factory),
+                Some(&reasoning_factory),
+            )
+        };
+
+        assert!(validate([("tool_parser", "symphony:qwen3")]).is_ok());
+        assert!(validate([("reasoning_parser", "symphony:qwen3")]).is_ok());
+        let err = validate([("tool_parser", "symphony:nope")])
+            .expect_err("a table the gateway does not have must fail registration");
+        assert!(err.contains("symphony:nope"), "{err}");
+        assert!(validate([("reasoning_parser", "symphony:nope")]).is_err());
     }
 }
