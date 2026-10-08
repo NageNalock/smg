@@ -119,7 +119,7 @@ impl Kind {
 /// names it (`"type": "integer"` beside a reference to an integer), and costs one step to join or
 /// meet, so what a node admits is cheap to keep and to hand to every place that refers to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Types(u8);
+pub(crate) struct Types(u8);
 
 impl Types {
     const NONE: Self = Self(0);
@@ -131,6 +131,18 @@ impl Types {
     const NUMBER: Self = Self(1 << 5);
     const BOOLEAN: Self = Self(1 << 6);
     const OTHER: Self = Self(1 << 7);
+    /// The types [`typed_first`] casts a text to.
+    const CASTS: Self =
+        Self(Self::INTEGER.0 | Self::NUMBER.0 | Self::BOOLEAN.0 | Self::ARRAY.0 | Self::OBJECT.0);
+    /// The cast types one by one, in the order a schema that names them all at once (a multi-member
+    /// `allOf`) leaves them.
+    const CAST_ORDER: [Self; 5] = [
+        Self::INTEGER,
+        Self::NUMBER,
+        Self::BOOLEAN,
+        Self::ARRAY,
+        Self::OBJECT,
+    ];
 
     fn named(name: &str) -> Self {
         match name {
@@ -311,6 +323,102 @@ impl Declared {
         }
         Kind::of(root, schema)
     }
+
+    /// The types a value's text is cast to for `function`'s `parameter`, in the order its schema
+    /// declares them, when the casts decide how the text reads: the schema admits a string beside
+    /// at least one type a text can be cast to (integer, number, boolean, array, object), as
+    /// `{"anyOf": [{"type": "string"}, {"type": "integer"}]}` or `{"type": ["string", "boolean",
+    /// "integer"]}` does, admits two or more of those, as `{"type": ["boolean", "integer"]}` does,
+    /// or admits a boolean and no other of them, as `{"type": "boolean"}` and `{"type":
+    /// ["boolean", "null"]}` do, whose cast reads `1`, `0` and `TRUE` as booleans where [`json`]
+    /// infers 1, 0 and the string. Nothing otherwise, the parameter's [`Kind`] alone then saying
+    /// how its text reads. For [`typed_first`].
+    ///
+    /// The order is transformers' `_schema_types`: the schema's `type`, one name or a list in
+    /// its order, then each `anyOf` member and each `oneOf` member in turn, depth first. A `$ref`
+    /// is followed where it stands, and a one-member `allOf` is read as its member, as
+    /// [`Kind`] reads them; the types a several-member `allOf` admits come last, in the order
+    /// integer, number, boolean, array, object, since its members agree on a set and not an order.
+    pub(crate) fn casts(&self, function: &str, parameter: &str) -> Option<Casts> {
+        let root = self.schemas.get(function)?;
+        let schema = root.get("properties")?.get(parameter)?;
+        let admitted = Types::admitted(root, schema);
+        let castable = admitted.meet(Types::CASTS);
+        let several = castable.0.count_ones() > 1;
+        let boolean = castable == Types::BOOLEAN;
+        if !(admitted.has(Types::STRING) && castable != Types::NONE || several || boolean) {
+            return None;
+        }
+        let mut casts = Casts::default();
+        declared_order(root, schema, &mut casts, &mut HashSet::new());
+        casts.keep(castable);
+        for cast in Types::CAST_ORDER {
+            if castable.has(cast) {
+                casts.push(cast);
+            }
+        }
+        Some(casts)
+    }
+}
+
+/// The types a value's text is cast to, each once, in the order its schema declares them
+/// ([`Declared::casts`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Casts {
+    order: [Option<Types>; 5],
+}
+
+impl Casts {
+    /// Appends `cast`, a cast type, unless it is already there.
+    fn push(&mut self, cast: Types) {
+        if Types::CASTS.has(cast) && !self.iter().any(|known| known == cast) {
+            if let Some(slot) = self.order.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(cast);
+            }
+        }
+    }
+
+    /// Keeps only the types `admitted` holds, in their order.
+    fn keep(&mut self, admitted: Types) {
+        let kept: Vec<Types> = self.iter().filter(|cast| admitted.has(*cast)).collect();
+        *self = Self::default();
+        for cast in kept {
+            self.push(cast);
+        }
+    }
+
+    /// The types in their order.
+    fn iter(&self) -> impl Iterator<Item = Types> + '_ {
+        self.order.iter().map_while(|slot| *slot)
+    }
+}
+
+/// The cast types `schema` names, appended to `into` in the order transformers' `_schema_types`
+/// reads them ([`Declared::casts`]), each node read once.
+fn declared_order<'a>(
+    root: &'a Value,
+    schema: &'a Value,
+    into: &mut Casts,
+    seen: &mut HashSet<*const Value>,
+) {
+    let Some(schema) = resolve(root, schema) else {
+        return;
+    };
+    if !seen.insert(std::ptr::from_ref(schema)) {
+        return;
+    }
+    match schema.get("type") {
+        Some(Value::String(name)) => into.push(Types::named(name)),
+        Some(Value::Array(names)) => {
+            for name in names.iter().filter_map(Value::as_str) {
+                into.push(Types::named(name));
+            }
+        }
+        _ => {}
+    }
+    for member in members(schema) {
+        declared_order(root, member, into, seen);
+    }
 }
 
 /// How many `$ref`s in a row [`resolve`] follows before it gives up: a reference to a reference
@@ -433,6 +541,54 @@ pub fn json(text: &str, kind: Option<Kind>) -> String {
             .unwrap_or_else(|| inferred(text)),
         Some(Kind::Array | Kind::Object) | None => inferred(text),
     }
+}
+
+/// The JSON for the text of a value whose schema declares the types `casts` lists
+/// ([`Declared::casts`]), typed as a template that writes a string bare and every other value as
+/// JSON reads it back: the text is cast to the first of those types it fits, in the order the
+/// schema declares them, and is a string only when it fits none. That is how transformers'
+/// `_coerce` reads a response template's arguments: it tries a parameter's types in their order
+/// and has no cast for `string`, so `string` never wins over a type the text fits, wherever it
+/// stands; a template of this kind writes `5` and `"5"` alike for a parameter that admits both,
+/// and its reader gives `5`, for `{"type": ["string", "boolean", "integer"]}` it reads `1` as
+/// `true`, and for a parameter declared `boolean` it reads `1` and `TRUE` as `true` where
+/// inference reads 1 and the string. A number keeps the model's digits when they are JSON's
+/// spelling, a boolean is `true` or
+/// `false` for `true`, `false`, `1` or `0` in any case, and an array or an object keeps the model's
+/// bytes; whitespace around the text is ignored for these casts. A text no cast takes is read by
+/// [`json`] under `kind`, so `null` is null for a schema that admits null too.
+pub(crate) fn typed_first(text: &str, kind: Option<Kind>, casts: Casts) -> String {
+    let trimmed = text.trim();
+    casts
+        .iter()
+        .find_map(|cast| cast_to(trimmed, cast))
+        .unwrap_or_else(|| json(text, kind))
+}
+
+/// `trimmed` cast to `cast`, one of the cast types, if it fits: an integer as a sign and digits, a
+/// number in JSON's spelling, a boolean as `true`, `false`, `1` or `0` in any case, an array or an
+/// object as JSON of that shape; each as an argument reads it back.
+fn cast_to(trimmed: &str, cast: Types) -> Option<String> {
+    if cast == Types::INTEGER {
+        return integer(trimmed).filter(|integer| reads_back_as_an_argument(integer));
+    }
+    if cast == Types::BOOLEAN {
+        return match trimmed.to_ascii_lowercase().as_str() {
+            "true" | "1" => Some("true".to_string()),
+            "false" | "0" => Some("false".to_string()),
+            _ => None,
+        };
+    }
+    if !reads_back_as_an_argument(trimmed) {
+        return None;
+    }
+    let fits = match serde_json::from_str::<Value>(trimmed) {
+        Ok(Value::Number(_)) => cast == Types::NUMBER,
+        Ok(Value::Array(_)) => cast == Types::ARRAY,
+        Ok(Value::Object(_)) => cast == Types::OBJECT,
+        _ => false,
+    };
+    fits.then(|| trimmed.to_string())
 }
 
 /// `text` as a JSON integer when it is an optional sign and then digits: no sign for `+`, no
@@ -1729,6 +1885,151 @@ mod tests {
                 strict: None,
                 extra: Default::default(),
             },
+        }
+    }
+
+    /// The cast types in `order`, as [`Declared::casts`] lists them.
+    fn casts_of(order: &[Types]) -> Casts {
+        let mut casts = Casts::default();
+        for cast in order {
+            casts.push(*cast);
+        }
+        casts
+    }
+
+    #[test]
+    fn a_union_names_the_types_its_text_is_cast_to_in_the_schemas_order() {
+        let declared = Declared::of(&[tool_with(value!({
+            "type": "object",
+            "properties": {
+                "plain": {"type": "string"},
+                "nullable": {"type": ["string", "null"]},
+                "single": {"type": "integer"},
+                "maybe": {"type": ["integer", "null"]},
+                "either": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+                "listed": {"type": ["integer", "string", "null"]},
+                "numbers": {"type": ["number", "integer"]},
+                "flag_first": {"type": ["string", "boolean", "integer"]},
+                "int_first": {"type": ["string", "integer", "boolean"]},
+                "bare": {"type": ["boolean", "integer"]},
+                "nested": {"anyOf": [
+                    {"type": "string"},
+                    {"oneOf": [{"type": "boolean"}, {"$ref": "#/$defs/N"}]},
+                ]},
+                "met": {"allOf": [
+                    {"type": ["object", "integer", "boolean", "string"]},
+                    {"type": ["boolean", "integer"]},
+                ]},
+                "described": {"anyOf": [{"type": "string"}, {"description": "x"}]},
+                "flag": {"type": "boolean"},
+                "flag_or_null": {"type": ["boolean", "null"]},
+                "flag_by_ref": {"$ref": "#/$defs/B"},
+            },
+            "$defs": {"N": {"type": "integer"}, "B": {"type": "boolean"}},
+        }))]);
+        let casts = |parameter| declared.casts("f", parameter);
+        for parameter in [
+            "plain",
+            "nullable",
+            "single",
+            "maybe",
+            "described",
+            "missing",
+        ] {
+            assert_eq!(casts(parameter), None, "{parameter}");
+        }
+        assert_eq!(declared.casts("g", "either"), None);
+        for (parameter, order) in [
+            ("either", &[Types::INTEGER][..]),
+            ("listed", &[Types::INTEGER]),
+            ("numbers", &[Types::NUMBER, Types::INTEGER]),
+            ("flag_first", &[Types::BOOLEAN, Types::INTEGER]),
+            ("int_first", &[Types::INTEGER, Types::BOOLEAN]),
+            ("bare", &[Types::BOOLEAN, Types::INTEGER]),
+            ("nested", &[Types::BOOLEAN, Types::INTEGER]),
+            // A several-member allOf agrees on a set: its types come in the casts' own order.
+            ("met", &[Types::INTEGER, Types::BOOLEAN]),
+            // A boolean alone, beside null, or through a reference: its cast reads `1` and `TRUE`.
+            ("flag", &[Types::BOOLEAN]),
+            ("flag_or_null", &[Types::BOOLEAN]),
+            ("flag_by_ref", &[Types::BOOLEAN]),
+        ] {
+            assert_eq!(casts(parameter), Some(casts_of(order)), "{parameter}");
+        }
+    }
+
+    #[test]
+    fn a_union_text_is_cast_to_the_first_type_it_fits_in_the_schemas_order() {
+        let all = casts_of(&Types::CAST_ORDER);
+        for (text, kind, expected) in [
+            ("5", Some(Kind::String), "5"),
+            (" -12 ", Some(Kind::String), "-12"),
+            ("1.5e3", Some(Kind::String), "1.5e3"),
+            ("TRUE", Some(Kind::String), "true"),
+            ("0", Some(Kind::String), "0"),
+            ("[1, 2]", Some(Kind::String), "[1, 2]"),
+            ("{\"a\": null}", Some(Kind::String), "{\"a\": null}"),
+            ("null", Some(Kind::NullableString), "null"),
+            ("null", Some(Kind::String), "\"null\""),
+            ("Paris", Some(Kind::String), "\"Paris\""),
+            (" 5 x", Some(Kind::String), "\" 5 x\""),
+        ] {
+            assert_eq!(typed_first(text, kind, all), expected, "{text:?}");
+        }
+        // Only the types the union admits are tried.
+        let only = |cast| casts_of(&[cast]);
+        assert_eq!(
+            typed_first("true", Some(Kind::String), only(Types::INTEGER)),
+            "\"true\""
+        );
+        assert_eq!(
+            typed_first("1", Some(Kind::String), only(Types::BOOLEAN)),
+            "true"
+        );
+        assert_eq!(
+            typed_first("1.5", Some(Kind::String), only(Types::INTEGER)),
+            "\"1.5\""
+        );
+        // In the order the schema declares them, as transformers' `_coerce` tries them: `1` is
+        // `true` for `["string", "boolean", "integer"]` and 1 for `["string", "integer",
+        // "boolean"]`, and so without the string.
+        let flag_first = casts_of(&[Types::BOOLEAN, Types::INTEGER]);
+        let int_first = casts_of(&[Types::INTEGER, Types::BOOLEAN]);
+        for (text, kind, casts, expected) in [
+            ("1", Some(Kind::String), flag_first, "true"),
+            ("0", Some(Kind::String), flag_first, "false"),
+            ("5", Some(Kind::String), flag_first, "5"),
+            ("yes", Some(Kind::String), flag_first, "\"yes\""),
+            ("1", Some(Kind::String), int_first, "1"),
+            ("true", Some(Kind::String), int_first, "true"),
+            ("1", None, flag_first, "true"),
+            ("1", None, int_first, "1"),
+            ("maybe", None, flag_first, "\"maybe\""),
+        ] {
+            assert_eq!(
+                typed_first(text, kind, casts),
+                expected,
+                "{text:?} {casts:?}"
+            );
+        }
+        let numbers = casts_of(&[Types::NUMBER, Types::INTEGER]);
+        assert_eq!(typed_first("5", None, numbers), "5");
+        assert_eq!(typed_first("5.5", None, numbers), "5.5");
+        // A boolean alone, as `_coerce` reads one: `true`, `false`, `1` and `0` in any case, the
+        // whitespace around them ignored; any other text as `json` reads it with no kind, so
+        // Python's `False` is false, `None` is null and the rest is the string.
+        let flag = casts_of(&[Types::BOOLEAN]);
+        for (text, expected) in [
+            ("1", "true"),
+            ("0", "false"),
+            ("TRUE", "true"),
+            (" true ", "true"),
+            ("False", "false"),
+            ("None", "null"),
+            ("yes", "\"yes\""),
+            ("2", "2"),
+        ] {
+            assert_eq!(typed_first(text, None, flag), expected, "{text:?}");
         }
     }
 }

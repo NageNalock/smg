@@ -39,7 +39,14 @@
 //! - **A value's type comes from the request's tools**, as in the Qwen assembler: a declared
 //!   string is its text, streamed as it arrives; every other value is written whole at its closing
 //!   tag through [`json`], which reads the JSON a template writes for a number, a boolean, a list,
-//!   an object or null, and infers the rest.
+//!   an object or null, and infers the rest. A union that admits a string beside a type the text
+//!   can be cast to (`{"anyOf": [{"type": "string"}, {"type": "integer"}]}`), or two such types,
+//!   is written whole too, cast to the first of its types it fits in the order the schema declares
+//!   them and kept as the string only when it fits none, as the reader shipped with a template of
+//!   this syntax reads it (`typed_first` in the value module): the template writes `5` and `"5"`
+//!   alike for such a parameter, and `1` for `{"type": ["string", "boolean", "integer"]}` reads
+//!   as `true`. A boolean declared alone, with `null` beside it or not, is cast the same way, so
+//!   `1`, `0` and `TRUE` are booleans for it, as they are for that reader.
 //! - **The template writes one newline after the key's tag and one before the value's closing
 //!   tag**; neither is the value's, and the assembler takes exactly those two away, as the Qwen
 //!   assembler does. A newline at the end of a streamed piece is held back until the next piece
@@ -80,7 +87,7 @@ use crate::{
     markers::{Piece, Scanner},
     tagged::{
         assembler::{push_escaped, push_quoted},
-        value::{json, Declared, Kind, NULL_WORDS},
+        value::{json, typed_first, Casts, Declared, Kind, NULL_WORDS},
     },
 };
 
@@ -166,6 +173,8 @@ enum Stage {
 struct ValueState {
     key: String,
     kind: Option<Kind>,
+    /// The types its text is cast to, in the schema's order (`Declared::casts`).
+    casts: Option<Casts>,
     /// Whether the newline the template writes after the key's tag may still come: no value text
     /// yet.
     leading: bool,
@@ -422,6 +431,7 @@ impl Assembler {
         self.stage = Stage::Value(ValueState {
             key,
             kind: None,
+            casts: None,
             leading: true,
             mode: Mode::Whole {
                 start: self.carried.len(),
@@ -522,7 +532,12 @@ impl Assembler {
     fn open_value(&mut self, key: String, declared: &Declared, out: &mut Events) {
         let function = self.function.as_deref().unwrap_or_default();
         let kind = declared.kind(function, &key);
+        let casts = declared.casts(function, &key);
         let mode = match kind {
+            // A value cast to its schema's types is cast at its close, so it is written whole.
+            _ if casts.is_some() => Mode::Whole {
+                start: self.carried.len(),
+            },
             Some(Kind::String) => {
                 self.open_string_fragment(&key, out);
                 Mode::Streaming {
@@ -539,6 +554,7 @@ impl Assembler {
         self.stage = Stage::Value(ValueState {
             key,
             kind,
+            casts,
             leading: true,
             mode,
             repeated: false,
@@ -667,7 +683,11 @@ impl Assembler {
         let Stage::Value(value) = &self.stage else {
             return String::new();
         };
-        let written = json(self.whole_text(start), value.kind);
+        let text = self.whole_text(start);
+        let written = match value.casts {
+            Some(casts) => typed_first(text, value.kind, casts),
+            None => json(text, value.kind),
+        };
         let mut member = String::with_capacity(value.key.len() + written.len() + 8);
         member.push_str(self.separator());
         push_quoted(&mut member, &value.key);
@@ -766,20 +786,56 @@ mod tests {
 
     /// A tool `get_weather` with a string `city`, an integer `days` and a nullable string `note`.
     fn declared() -> Declared {
-        Declared::of(&[Tool {
+        let tool = |name: &str, parameters| Tool {
             tool_type: "function".to_string(),
             function: Function {
-                name: "get_weather".to_string(),
+                name: name.to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
+                parameters,
+                strict: None,
+                extra: Default::default(),
+            },
+        };
+        Declared::of(&[
+            tool(
+                "get_weather",
+                value!({"type": "object", "properties": {
                     "city": {"type": "string"},
                     "days": {"type": "integer"},
                     "note": {"type": ["string", "null"]},
                 }}),
-                strict: None,
-                extra: Default::default(),
-            },
-        }])
+            ),
+            // Unions of a string and the types a text can be cast to.
+            tool(
+                "set_x",
+                value!({"type": "object", "properties": {
+                    "x": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+                    "y": {"type": ["integer", "string"]},
+                    "z": {"type": ["string", "number", "null"]},
+                    "flag": {"type": ["string", "boolean"]},
+                    "o": {"anyOf": [{"type": "string"}, {"$ref": "#/$defs/O"}]},
+                    "list": {"oneOf": [{"type": "array"}, {"type": "string"}]},
+                }, "$defs": {"O": {"type": "object"}}}),
+            ),
+            // Unions whose order decides: the types are tried as the schema lists them.
+            tool(
+                "set_b",
+                value!({"type": "object", "properties": {
+                    "b": {"type": ["string", "boolean", "integer"]},
+                    "c": {"type": ["string", "integer", "boolean"]},
+                    "d": {"type": ["boolean", "integer"]},
+                }}),
+            ),
+            // A boolean alone and beside null, and an integer alone.
+            tool(
+                "set_one",
+                value!({"type": "object", "properties": {
+                    "flag": {"type": "boolean"},
+                    "maybe": {"type": ["boolean", "null"]},
+                    "count": {"type": "integer"},
+                }}),
+            ),
+        ])
     }
 
     const CALL: &str = concat!(
@@ -1519,6 +1575,120 @@ mod tests {
                 );
                 let (shown, _) = shown_and_hidden(&events);
                 assert_eq!(shown.concat(), format!("{call}{END}"), "{name:?}");
+                nothing_empty(&events);
+            }
+        }
+    }
+
+    #[test]
+    fn a_union_with_a_string_is_cast_to_its_other_types_first() {
+        for (key, text, expected) in [
+            // The template writes 5 and "5" alike; its reader gives 5.
+            ("x", "5", "5"),
+            ("y", "7", "7"),
+            ("x", "007", "7"),
+            ("x", "5.5", r#""5.5""#),
+            ("x", "Paris", r#""Paris""#),
+            ("x", "null", r#""null""#),
+            ("z", "5.5", "5.5"),
+            ("z", "null", "null"),
+            ("z", "None", "null"),
+            ("z", "five", r#""five""#),
+            ("flag", "true", "true"),
+            ("flag", "0", "false"),
+            ("flag", "yes", r#""yes""#),
+            ("o", "{\"a\": 1}", r#"{"a": 1}"#),
+            ("o", "[1]", r#""[1]""#),
+            ("list", " [1, \"b\"] ", r#"[1, "b"]"#),
+            ("list", "a, b", r#""a, b""#),
+        ] {
+            let call = format!(
+                "set_x<|channel|>commentary<|message|><parameter name=\"{key}\">\n{text}\n\
+                 </parameter>"
+            );
+            for events in every_split(&call, false) {
+                assert_eq!(
+                    arguments(&events),
+                    format!(r#"{{"{key}": {expected}}}"#),
+                    "{key} {text:?}"
+                );
+                assert_eq!(bytes(&events), format!("{call}{END}"));
+                nothing_empty(&events);
+            }
+        }
+        // Two unions in one call, as the probe writes them.
+        let call = concat!(
+            "set_x<|channel|>commentary<|message|><parameter name=\"x\">\n5\n</parameter>\n",
+            "<parameter name=\"y\">\n7\n</parameter>"
+        );
+        assert_eq!(arguments(&run(&[call], false)), r#"{"x": 5, "y": 7}"#);
+        // A plain string keeps text that reads as another type.
+        let call = "get_weather<|channel|>commentary<|message|><parameter name=\"city\">\n5\n\
+                    </parameter>";
+        assert_eq!(arguments(&run(&[call], false)), r#"{"city": "5"}"#);
+    }
+
+    #[test]
+    fn a_union_is_cast_in_the_order_its_schema_declares() {
+        // transformers' `_coerce`, the reader shipped with a template of this syntax, tries a
+        // parameter's types in the schema's order: `1` is `true` where the boolean comes first,
+        // with or without a string in the union, and 1 where the integer does.
+        for (key, text, expected) in [
+            ("b", "1", "true"),
+            ("b", "0", "false"),
+            ("b", "7", "7"),
+            ("b", "on", r#""on""#),
+            ("c", "1", "1"),
+            ("c", "true", "true"),
+            ("d", "1", "true"),
+            ("d", "2", "2"),
+        ] {
+            let call = format!(
+                "set_b<|channel|>commentary<|message|><parameter name=\"{key}\">\n{text}\n\
+                 </parameter>"
+            );
+            for events in every_split(&call, false) {
+                assert_eq!(
+                    arguments(&events),
+                    format!(r#"{{"{key}": {expected}}}"#),
+                    "{key} {text:?}"
+                );
+                assert_eq!(bytes(&events), format!("{call}{END}"));
+                nothing_empty(&events);
+            }
+        }
+    }
+
+    #[test]
+    fn a_boolean_declared_alone_is_cast_as_the_reader_casts_it() {
+        // transformers' `_coerce` casts a parameter's one type too: `1`, `0` and `TRUE` are
+        // booleans for a `boolean`, with null beside it or not, and `None` is null where null is
+        // admitted. Text that fits no cast reads as before: `yes` stays the string, `False` is
+        // false. An integer declared alone reads as before: `7.0` and `1e2` are the numbers the
+        // model wrote, where that reader keeps them as text.
+        for (key, text, expected) in [
+            ("flag", "1", "true"),
+            ("flag", "0", "false"),
+            ("flag", "TRUE", "true"),
+            ("flag", "False", "false"),
+            ("flag", "yes", r#""yes""#),
+            ("maybe", "1", "true"),
+            ("maybe", "None", "null"),
+            ("count", "7", "7"),
+            ("count", "7.0", "7.0"),
+            ("count", "1e2", "1e2"),
+        ] {
+            let call = format!(
+                "set_one<|channel|>commentary<|message|><parameter name=\"{key}\">\n{text}\n\
+                 </parameter>"
+            );
+            for events in every_split(&call, false) {
+                assert_eq!(
+                    arguments(&events),
+                    format!(r#"{{"{key}": {expected}}}"#),
+                    "{key} {text:?}"
+                );
+                assert_eq!(bytes(&events), format!("{call}{END}"));
                 nothing_empty(&events);
             }
         }
