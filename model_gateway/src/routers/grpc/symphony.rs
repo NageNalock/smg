@@ -100,6 +100,14 @@ pub(crate) fn known(name: &str) -> bool {
     table(name).is_some()
 }
 
+/// Every parser name that selects a table, for a launcher that lists the names it accepts.
+pub fn parser_names() -> Vec<String> {
+    TABLES
+        .iter()
+        .map(|table| format!("{PREFIX}{}", table.name))
+        .collect()
+}
+
 /// The request's say over the events, applied before the adapters render them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Policy {
@@ -828,6 +836,15 @@ mod tests {
             reasoning.map(str::to_string),
             None,
         )
+    }
+
+    #[test]
+    fn every_listed_parser_name_selects_its_table() {
+        let names = parser_names();
+        assert_eq!(names.len(), TABLES.len());
+        for (name, row) in names.iter().zip(TABLES) {
+            assert_eq!(table(name).map(|t| t.name), Some(row.name));
+        }
     }
 
     #[test]

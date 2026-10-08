@@ -1894,26 +1894,32 @@ fn print_banner(host: &str, port: u16, mode: &str) {
     version::print_banner(host, port, mode);
 }
 
-/// Get the list of available tool call parsers from the Rust factory.
+/// Get the list of available tool call parsers from the Rust factory, and the
+/// `symphony:<table>` names that select a symphony table.
 #[pyfunction]
 fn get_available_tool_call_parsers() -> Vec<String> {
     static PARSERS: OnceCell<Vec<String>> = OnceCell::new();
     PARSERS
         .get_or_init(|| {
             let factory = tool_parser::ParserFactory::new();
-            factory.list_parsers()
+            let mut parsers = factory.list_parsers();
+            parsers.extend(routers::grpc::symphony_parser_names());
+            parsers
         })
         .clone()
 }
 
-/// Get the list of available reasoning parsers from the Rust factory.
+/// Get the list of available reasoning parsers from the Rust factory, and the
+/// `symphony:<table>` names that select a symphony table.
 #[pyfunction]
 fn get_available_reasoning_parsers() -> Vec<String> {
     static PARSERS: OnceCell<Vec<String>> = OnceCell::new();
     PARSERS
         .get_or_init(|| {
             let factory = reasoning_parser::ParserFactory::new();
-            factory.list_parsers()
+            let mut parsers = factory.list_parsers();
+            parsers.extend(routers::grpc::symphony_parser_names());
+            parsers
         })
         .clone()
 }

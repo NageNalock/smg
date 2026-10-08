@@ -24,6 +24,7 @@ pub mod zmq_client; // ZMQ backend adapter behind the vLLM client surface
 // Re-export for convenience
 pub use multimodal::worker as worker_media;
 pub use proto_wrapper::{MultimodalData, TensorBytes};
+pub use symphony::parser_names as symphony_parser_names;
 
 fn validate_text_only_output(request: &ChatCompletionRequest) -> Result<(), Box<Response>> {
     if request.return_audio == Some(true) {

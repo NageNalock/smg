@@ -567,6 +567,17 @@ class TestParseRouterArgs:
         assert router_args.worker_urls == ["http://worker1:8000", "http://worker2:8000"]
         assert router_args.policy == "round_robin"
 
+    def test_parse_symphony_table_parser_names(self):
+        """A `symphony:<table>` parser name selects a symphony table; others stay refused."""
+        router_args = parse_router_args(
+            ["--tool-call-parser", "symphony:qwen3", "--reasoning-parser", "symphony:qwen3"]
+        )
+        assert router_args.tool_call_parser == "symphony:qwen3"
+        assert router_args.reasoning_parser == "symphony:qwen3"
+        for flag in ("--tool-call-parser", "--reasoning-parser"):
+            with pytest.raises(SystemExit):
+                parse_router_args([flag, "symphony:not-a-table"])
+
     def test_parse_mm_per_request_image_limit(self):
         """Deployment-wide image-count limit; unset keeps model spec limits."""
         router_args = parse_router_args(["--mm-per-request-image-limit", "128"])
