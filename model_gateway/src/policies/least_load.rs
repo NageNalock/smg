@@ -1,10 +1,11 @@
 use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock},
+    collections::{HashMap, VecDeque},
+    sync::{Arc, Mutex, RwLock},
+    time::Instant,
 };
 
 use openai_protocol::worker::WorkerLoadResponse;
-use rand::RngExt;
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 use tracing::debug;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
@@ -12,20 +13,71 @@ use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 pub use crate::worker::expected_wait::{
     DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
 };
-use crate::worker::{expected_wait::ExpectedWait, load_state::LoadSnapshot, Worker};
+use crate::{
+    observability::cache_trace,
+    worker::{expected_wait::ExpectedWait, load_state::LoadSnapshot, Worker},
+};
 
-/// Since-poll dispatch tally for one worker.
-#[derive(Clone, Copy, Debug, Default)]
+/// Dispatches kept per worker between reports. A worker that never reports
+/// (a dark fleet is scored by its live in-flight count instead) would
+/// otherwise accumulate them without end; past this the oldest are dropped.
+const SINCE_POLL_DISPATCHES_KEPT: usize = 8_192;
+
+/// Expected waits within this of the minimum are one tie and are drawn from
+/// uniformly. Idle workers with identical reports score exactly equal, but a
+/// report's throughput or a KV digit sets two otherwise identical workers a
+/// few nanoseconds apart, and an exact-equality tie then hands every request
+/// to the lower index: a cold fleet never spreads that way.
+const TIE_EPSILON_SECS: f64 = 1e-6;
+
+/// Since-poll dispatch tally for one worker: the token-work and request count
+/// of the dispatches no report has reflected yet, with each dispatch's
+/// instant, so a report that says when the engine was sampled releases
+/// exactly the dispatches it saw and keeps the later ones as credit.
+#[derive(Clone, Debug, Default)]
 struct SincePollDispatch {
     tokens: u64,
     requests: u64,
+    /// `(dispatched_at, tokens)` per dispatch, oldest first.
+    dispatches: VecDeque<(Instant, u64)>,
+}
+
+impl SincePollDispatch {
+    fn record(&mut self, at: Instant, tokens: u64) {
+        self.tokens += tokens;
+        self.requests += 1;
+        self.dispatches.push_back((at, tokens));
+        if self.dispatches.len() > SINCE_POLL_DISPATCHES_KEPT {
+            self.pop_oldest();
+        }
+    }
+
+    /// Release the dispatches a report sampled at `sampled_at` already
+    /// reflects: those made at or before it.
+    fn release_through(&mut self, sampled_at: Instant) {
+        while self
+            .dispatches
+            .front()
+            .is_some_and(|&(at, _)| at <= sampled_at)
+        {
+            self.pop_oldest();
+        }
+    }
+
+    fn pop_oldest(&mut self) {
+        if let Some((_, tokens)) = self.dispatches.pop_front() {
+            self.tokens -= tokens;
+            self.requests -= 1;
+        }
+    }
 }
 
 /// Least-(token-)work routing — route to the worker with the lowest estimated
 /// time-to-drain plus a convex KV-pressure barrier (argmin, lower is better):
 ///
 /// ```text
-///   score_i = (queued_tokens_i + inflight_tokens_i) / throughput_i
+///   score_i = (queued_tokens_i + running_estimated_tokens_i + unaccounted_i · p̄
+///              + inflight_tokens_i) / throughput_i
 ///             + kv_pressure_weight · k_i / (1 − k_i)
 /// ```
 ///
@@ -38,6 +90,13 @@ struct SincePollDispatch {
 ///   since its last load poll. Polls are stale between intervals; without this
 ///   correction, plain argmin sends a whole interval's arrivals to one worker
 ///   (incast). Crediting each dispatch water-fills load across workers instead.
+/// - `unaccounted` — requests this router holds on the worker that neither the
+///   report nor the since-poll credit accounts for: dispatches still on their
+///   way to an engine that has not seen them. A report releases the credit of
+///   the dispatches made before its sample; while those sit in transit the
+///   report reads emptier than the worker is, and the router would keep
+///   piling on (see [`Self::unaccounted_requests`]). Each is priced at `p̄`,
+///   like a dispatch whose size is unknown.
 /// - `/ throughput` — normalizes work to *time*, comparing heterogeneous
 ///   workers by drain time rather than raw token count.
 /// - `k / (1 − k)` — the M/M/1 expected-occupancy barrier on KV utilization
@@ -51,6 +110,9 @@ struct SincePollDispatch {
 ///   `waiting_reqs · p̄`, keeping the queue visible in time units rather than
 ///   scoring a backlogged worker as idle. Only a backend reporting neither
 ///   scores `queued_tokens = 0`;
+/// - running requests are estimated
+///   at `running_reqs · p̄`: a poll releases dispatch credit but does not mean
+///   the request finished. This is a fallback estimate, not remaining prefill;
 /// - zero/absent throughput (backend reports no generation rate): falls back to
 ///   the configured `default_throughput`, so the work term stays in seconds and
 ///   the KV barrier stays relevant;
@@ -81,7 +143,8 @@ struct SincePollDispatch {
 ///   in-flight correction absorbs staleness between polls.
 /// - `max_waiting_requests` (default `0` = disabled) — per-worker waiting-queue
 ///   cap: a worker whose reported waiting requests, plus requests dispatched to
-///   it since its last poll, have reached the cap is skipped. When every
+///   it since its last poll and the requests the router holds on it beyond
+///   its report, have reached the cap is skipped. When every
 ///   candidate is at the cap the selection returns none, so the request falls
 ///   to the router's admission queue instead of deepening a backlog. Set it
 ///   below the engine's max batch size.
@@ -89,9 +152,11 @@ struct SincePollDispatch {
 pub struct LeastLoadPolicy {
     /// Cached load reports from the worker monitor (keyed by worker URL).
     cached_loads: RwLock<HashMap<String, WorkerLoadResponse>>,
-    /// Per-worker dispatch tally since the last load poll (keyed by worker
-    /// URL); reset when a fresh report arrives. Token-work feeds the score's
-    /// in-flight term; the request count feeds the waiting-queue veto.
+    /// Per-worker dispatch tally since the last load report (keyed by worker
+    /// URL): a report that carries `sampled_at` releases the dispatches made
+    /// up to that instant, one without it resets the tally. Token-work feeds
+    /// the score's in-flight term; the request count feeds the waiting-queue
+    /// veto.
     inflight_tokens: RwLock<HashMap<String, SincePollDispatch>>,
     /// KV-pressure weight `λ_t` (seconds).
     kv_pressure_weight: f64,
@@ -103,6 +168,9 @@ pub struct LeastLoadPolicy {
     default_throughput: f64,
     /// Per-worker waiting-queue cap; `0` disables the veto.
     max_waiting_requests: u32,
+    /// Seeded source for the tie draw when set (tests reproduce a selection
+    /// sequence with it); the thread's generator otherwise.
+    tie_rng: Option<Mutex<StdRng>>,
 }
 
 /// Everything one expected-wait score reads besides the worker itself.
@@ -158,6 +226,24 @@ impl LeastLoadPolicy {
                 DEFAULT_THROUGHPUT
             },
             max_waiting_requests,
+            tie_rng: None,
+        }
+    }
+
+    /// Draw ties from a seeded generator instead of the thread's.
+    pub fn with_tie_break_seed(mut self, seed: u64) -> Self {
+        self.tie_rng = Some(Mutex::new(StdRng::seed_from_u64(seed)));
+        self
+    }
+
+    /// Uniform draw in `0..n`: the reservoir step of the argmin's tie-break.
+    fn tie_draw(&self, n: u32) -> u32 {
+        match &self.tie_rng {
+            Some(rng) => rng
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .random_range(0..n),
+            None => rand::rng().random_range(0..n),
         }
     }
 
@@ -182,14 +268,16 @@ impl LeastLoadPolicy {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .contains_key(url);
-        let dispatch = self
+        let inflight = self
             .inflight_tokens
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(url)
-            .copied()
-            .unwrap_or_default();
-        (has_load, dispatch.tokens, dispatch.requests)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dispatch = inflight.get(url);
+        (
+            has_load,
+            dispatch.map_or(0, |dispatch| dispatch.tokens),
+            dispatch.map_or(0, |dispatch| dispatch.requests),
+        )
     }
 
     /// Expected-wait score for a worker (lower is better).
@@ -212,18 +300,17 @@ impl LeastLoadPolicy {
         let url = worker.url();
         match Self::fresh_load(loads, complete_snapshot, url) {
             Some(load) => {
-                let inflight_tokens = inflight.get(url).copied().unwrap_or_default().tokens;
-                let queued_tokens = self.queued_tokens(load);
-                let live_throughput = load.total_gen_throughput();
-                let throughput = if live_throughput > 0.0 {
-                    live_throughput
-                } else {
-                    self.default_throughput
-                };
+                let dispatch = inflight.get(url);
+                let inflight_tokens = dispatch.map_or(0, |dispatch| dispatch.tokens);
+                let since_poll = dispatch.map_or(0, |dispatch| dispatch.requests);
+                let queued_tokens = self.queued_tokens(load)
+                    + self.running_estimated_tokens(load)
+                    + Self::unaccounted_requests(worker, load, since_poll) as f64
+                        * f64::from(self.mean_prefill_tokens);
                 ExpectedWait::new(
                     queued_tokens,
-                    throughput,
-                    load.effective_token_usage(),
+                    self.drain_rate(load),
+                    load.effective_kv_pressure(),
                     self.kv_pressure_weight,
                 )
                 .seconds(inflight_tokens)
@@ -258,6 +345,74 @@ impl LeastLoadPolicy {
         loads.and_then(|map| map.get(url))
     }
 
+    /// The drain rate a reporting worker's wait is priced at: its live
+    /// generation rate, else the configured default.
+    fn drain_rate(&self, load: &WorkerLoadResponse) -> f64 {
+        let live = load.total_gen_throughput();
+        if live > 0.0 {
+            live
+        } else {
+            self.default_throughput
+        }
+    }
+
+    /// The scoring inputs for one pass over `candidates`: the nominal drain
+    /// rate (mean of the positive reports) that stands in for a worker
+    /// missing a fresh snapshot; whether anyone reports at all, which
+    /// separates a partial gap (estimate the missing worker at the nominal
+    /// rate) from a dark fleet (join-shortest-queue on live in-flight); and
+    /// the best-known reporting peer's score, which a worker without a report
+    /// starts from: never better than a worker whose load is known, never
+    /// starved by one. The baseline is computed only when some candidate
+    /// lacks a report, so the common all-reporting case pays nothing for it.
+    fn score_inputs<'a>(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        candidates: &[usize],
+        loads: Option<&'a HashMap<String, WorkerLoadResponse>>,
+        complete_snapshot: Option<&'a LoadSnapshot>,
+        inflight: &'a HashMap<String, SincePollDispatch>,
+    ) -> ScoreInputs<'a> {
+        let (tp_sum, tp_count) = candidates
+            .iter()
+            .filter_map(|&i| Self::fresh_load(loads, complete_snapshot, workers[i].url()))
+            .map(|l| l.total_gen_throughput())
+            .filter(|t| *t > 0.0)
+            .fold((0.0, 0u32), |(s, n), t| (s + t, n + 1));
+        let nominal_throughput = if tp_count > 0 {
+            tp_sum / tp_count as f64
+        } else {
+            self.default_throughput
+        };
+        let reporting = candidates
+            .iter()
+            .filter(|&&i| Self::fresh_load(loads, complete_snapshot, workers[i].url()).is_some())
+            .count();
+        let mut inputs = ScoreInputs {
+            loads,
+            complete_snapshot,
+            inflight,
+            nominal_throughput,
+            fleet_has_loads: reporting > 0,
+            peer_baseline: 0.0,
+        };
+        if reporting < candidates.len() {
+            let best_known = candidates
+                .iter()
+                .filter(|&&i| {
+                    Self::fresh_load(loads, complete_snapshot, workers[i].url()).is_some()
+                })
+                .map(|&i| self.score(&workers[i], &inputs))
+                .fold(f64::INFINITY, f64::min);
+            // Nobody reports: the dark-fleet arm scores by live in-flight and
+            // never reads the baseline; keep it neutral rather than infinite.
+            if best_known.is_finite() {
+                inputs.peer_baseline = best_known;
+            }
+        }
+        inputs
+    }
+
     /// Waiting-queue token-work for a worker.
     ///
     /// Prefers the backend's own `num_waiting_uncached_tokens`. Backends that
@@ -273,6 +428,41 @@ impl LeastLoadPolicy {
             return reported as f64;
         }
         load.total_waiting_reqs().max(0) as f64 * self.mean_prefill_tokens as f64
+    }
+
+    /// Load snapshots do not report remaining running token-work. Keep running
+    /// requests visible after the poll resets dispatch credit, including during
+    /// a mixed-version rollout: optional KV fields must not change this cost.
+    fn running_estimated_tokens(&self, load: &WorkerLoadResponse) -> f64 {
+        load.loads
+            .iter()
+            .map(|rank| rank.num_running_reqs.max(0) as f64 * self.mean_prefill_tokens as f64)
+            .sum()
+    }
+
+    /// Requests the router holds on `worker` beyond what its report and the
+    /// since-poll credit account for: work in transit that the engine has not
+    /// seen yet.
+    ///
+    /// A report is sampled at the engine, and the credit for the dispatches
+    /// made before its sample is released on the assumption that the engine
+    /// had them by then. Under a backlog between the router and the engine's
+    /// queue (a saturated router, a slow servicer) that assumption fails: the
+    /// report keeps saying "nearly idle" while the router piles requests on
+    /// the worker, every fresh sample releases the credit for dispatches the
+    /// engine never saw, and the worker reads as the emptiest of the fleet
+    /// until it holds most of it (a fleet sent every new request to three of
+    /// its workers for over a minute this way while the rest sat idle). The
+    /// router's own in-flight count is the floor: a report cannot claim fewer
+    /// requests than the router has outstanding on the worker.
+    fn unaccounted_requests(
+        worker: &Arc<dyn Worker>,
+        load: &WorkerLoadResponse,
+        since_poll_requests: u64,
+    ) -> u64 {
+        let reported =
+            u64::try_from(load.total_running_reqs() + load.total_waiting_reqs()).unwrap_or(0);
+        (worker.load() as u64).saturating_sub(reported.saturating_add(since_poll_requests))
     }
 
     /// Token-work the request being routed adds to the chosen worker's
@@ -314,7 +504,8 @@ impl LeastLoadPolicy {
         let loads = loads_guard.as_deref();
 
         // Waiting-queue veto: drop candidates whose reported queue, plus
-        // requests dispatched since their last poll, has reached the cap.
+        // requests dispatched since their last poll and the requests the
+        // router holds on them beyond the report, has reached the cap.
         // Workers without a snapshot stay eligible — there is no queue
         // evidence to veto on, and a dark fleet must keep routing.
         let capped: Vec<usize>;
@@ -335,10 +526,20 @@ impl LeastLoadPolicy {
                         Some(load) => {
                             let since_poll = inflight_guard
                                 .get(url)
-                                .copied()
-                                .unwrap_or_default()
-                                .requests;
-                            (load.total_waiting_reqs().max(0) as u64) + since_poll < cap
+                                .map_or(0, |dispatch| dispatch.requests);
+                            let unaccounted =
+                                Self::unaccounted_requests(&workers[i], load, since_poll);
+                            let waiting = load.total_waiting_reqs().max(0) as u64;
+                            let eligible = waiting + since_poll + unaccounted < cap;
+                            if cache_trace::enabled() {
+                                cache_trace::gate(serde_json::json!({
+                                    "source": "waiting_queue_cap", "worker": url,
+                                    "waiting_requests": waiting, "since_poll_requests": since_poll,
+                                    "unaccounted_requests": unaccounted,
+                                    "cap": cap, "eligible": eligible,
+                                }));
+                            }
+                            eligible
                         }
                         None => true,
                     }
@@ -348,91 +549,56 @@ impl LeastLoadPolicy {
         };
         let (&first, rest) = candidates.split_first()?;
 
-        // Nominal throughput (mean of positive reports) stands in for a
-        // worker missing a fresh snapshot; `fleet_has_loads` distinguishes a
-        // partial gap (estimate that worker's drain time at the nominal rate)
-        // from a fully dark fleet (fall back to join-shortest-queue).
-        let (tp_sum, tp_count) = candidates
-            .iter()
-            .filter_map(|&i| Self::fresh_load(loads, complete_snapshot, workers[i].url()))
-            .map(|l| l.total_gen_throughput())
-            .filter(|t| *t > 0.0)
-            .fold((0.0, 0u32), |(s, n), t| (s + t, n + 1));
-        let nominal_throughput = if tp_count > 0 {
-            tp_sum / tp_count as f64
-        } else {
-            self.default_throughput
-        };
-        let fleet_has_loads = candidates
-            .iter()
-            .any(|&i| Self::fresh_load(loads, complete_snapshot, workers[i].url()).is_some());
-
         // Held across selection so the in-flight estimate stays consistent and
         // the chosen worker can be credited before the guard is released.
         let mut inflight = self
             .inflight_tokens
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let inputs = self.score_inputs(workers, candidates, loads, complete_snapshot, &inflight);
 
-        // Argmin with reservoir tie-breaking: equal-score workers (the common
-        // idle/homogeneous case scores exactly equal) are sampled uniformly
-        // instead of first-index-wins, which herded ties onto one worker.
-        // A worker without a fresh report scores as the best-known reporting
-        // peer plus its own in-flight: never better than a worker whose load
-        // is known, never starved by one. Computed only when some candidate
-        // lacks a report, so the common all-reporting case pays nothing.
-        let peer_baseline = if candidates
-            .iter()
-            .all(|&i| Self::fresh_load(loads, complete_snapshot, workers[i].url()).is_some())
-        {
-            0.0
-        } else {
-            let known = ScoreInputs {
-                loads,
-                complete_snapshot,
-                inflight: &inflight,
-                nominal_throughput,
-                fleet_has_loads,
-                peer_baseline: 0.0,
-            };
-            let best_known = candidates
-                .iter()
-                .filter(|&&i| {
-                    Self::fresh_load(loads, complete_snapshot, workers[i].url()).is_some()
-                })
-                .map(|&i| self.score(&workers[i], &known))
-                .fold(f64::INFINITY, f64::min);
-            // Nobody reports: the dark-fleet arm scores by live in-flight and
-            // never reads the baseline; keep it neutral rather than infinite.
-            if best_known.is_finite() {
-                best_known
-            } else {
-                0.0
+        // Argmin with reservoir tie-breaking: workers within
+        // `TIE_EPSILON_SECS` of the minimum (the common idle/homogeneous case
+        // scores equal to the digit) are sampled uniformly instead of
+        // first-index-wins, which herded ties onto one worker.
+        let observe_score = |idx: usize, score: f64| {
+            if cache_trace::enabled() {
+                let url = workers[idx].url();
+                let load = Self::fresh_load(loads, complete_snapshot, url);
+                cache_trace::score(serde_json::json!({
+                    "source": "expected_wait", "worker": url, "score": score,
+                    "score_unit": if inputs.fleet_has_loads { "seconds" } else { "requests" },
+                    "queued_tokens": load.map(|load| self.queued_tokens(load)),
+                    "running_estimated_tokens": load.map(|load| self.running_estimated_tokens(load)),
+                    "kv_pressure": load.map(WorkerLoadResponse::effective_kv_pressure),
+                    "resident_token_usage": load.map(WorkerLoadResponse::effective_token_usage),
+                    "drain_rate": load.map(|load| self.drain_rate(load)),
+                    "since_poll_tokens": inflight.get(url).map_or(0, |dispatch| dispatch.tokens),
+                    "unaccounted_requests": load.map(|load| {
+                        let since_poll = inflight.get(url).map_or(0, |dispatch| dispatch.requests);
+                        Self::unaccounted_requests(&workers[idx], load, since_poll)
+                    }),
+                    "fresh_load": load.is_some(),
+                }));
             }
         };
-        let mut rng = rand::rng();
         let mut best = first;
-        let inputs = ScoreInputs {
-            loads,
-            complete_snapshot,
-            inflight: &inflight,
-            nominal_throughput,
-            fleet_has_loads,
-            peer_baseline,
-        };
         let mut best_score = self.score(&workers[best], &inputs);
+        observe_score(best, best_score);
         let mut tied = 1u32;
         for &idx in rest {
             let s = self.score(&workers[idx], &inputs);
-            if s < best_score {
+            observe_score(idx, s);
+            if s < best_score - TIE_EPSILON_SECS {
                 best = idx;
                 best_score = s;
                 tied = 1;
-            } else if s == best_score {
+            } else if (s - best_score).abs() <= TIE_EPSILON_SECS {
                 // Keep each tying candidate with probability 1/k so the final
                 // pick is uniform over all ties without collecting them.
                 tied += 1;
-                if rng.random_range(0..tied) == 0 {
+                best_score = best_score.min(s);
+                if self.tie_draw(tied) == 0 {
                     best = idx;
                 }
             }
@@ -441,9 +607,10 @@ impl LeastLoadPolicy {
         // In-flight correction: credit the chosen worker with this request's
         // token-work until its next poll refreshes the snapshot.
         let req_tokens = self.request_tokens(info);
-        let tally = inflight.entry(workers[best].url().to_string()).or_default();
-        tally.tokens += req_tokens;
-        tally.requests += 1;
+        inflight
+            .entry(workers[best].url().to_string())
+            .or_default()
+            .record(Instant::now(), req_tokens);
         drop(inflight);
 
         debug!(
@@ -471,10 +638,23 @@ impl LeastLoadPolicy {
         };
         cached.extend(loads.iter().map(|(k, v)| (k.clone(), v.clone())));
         after_publish();
-        // A fresh snapshot already reflects work up to the poll, so reset the
-        // since-poll in-flight estimate for the workers it covers.
-        for url in loads.keys() {
-            inflight.insert(url.clone(), SincePollDispatch::default());
+        // A report reflects the work dispatched up to the instant the engine
+        // was sampled: release those dispatches and keep the later ones as
+        // credit, so a record republished unchanged (the monitor republishes
+        // the shared snapshot when a pushed record arrives) releases nothing
+        // twice and a dispatch made after the sample is not lost. A report
+        // with no sample instant resets the tally as before.
+        for (url, load) in loads {
+            match load.sampled_at {
+                Some(sampled_at) => {
+                    if let Some(dispatch) = inflight.get_mut(url) {
+                        dispatch.release_through(sampled_at);
+                    }
+                }
+                None => {
+                    inflight.insert(url.clone(), SincePollDispatch::default());
+                }
+            }
         }
     }
 }
@@ -599,6 +779,109 @@ mod tests {
                 .health_config(no_health_check())
                 .build(),
         )
+    }
+
+    #[test]
+    fn running_work_survives_the_poll_credit_reset() {
+        let policy = LeastLoadPolicy::new();
+        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let mut busy = make_load(0, 0.0, 0.0);
+        busy.loads[0].num_running_reqs = 1;
+        let loads = HashMap::from([
+            (workers[0].url().to_string(), busy),
+            (workers[1].url().to_string(), make_load(0, 0.1, 0.0)),
+        ]);
+        // Dispatch credit is gone once the scheduler reports the request.
+        policy.update_loads(&loads);
+        assert_eq!(policy.load_state_for_test(workers[0].url()), (true, 0, 0));
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn reclaimable_prefix_cache_does_not_make_an_idle_worker_busy() {
+        let policy = LeastLoadPolicy::new();
+        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let mut idle = make_load(0, 1.0, 0.0);
+        idle.loads[0].active_token_usage = Some(0.0);
+        let mut busy = make_load(0, 0.5, 0.0);
+        busy.loads[0].active_token_usage = Some(0.5);
+        busy.loads[0].num_running_reqs = 1;
+        policy.update_loads(&HashMap::from([
+            (workers[0].url().to_string(), idle),
+            (workers[1].url().to_string(), busy),
+        ]));
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn a_cold_fleet_of_128_spreads_a_thousand_misses() {
+        // No report anywhere: every worker scores its live in-flight count,
+        // zero for all, so the whole fleet ties on every request.
+        let policy = LeastLoadPolicy::new().with_tie_break_seed(7);
+        let workers: Vec<Arc<dyn Worker>> =
+            (0..128).map(|i| mk(&format!("http://w{i}:8000"))).collect();
+        let info = SelectWorkerInfo::default();
+        let mut hits = vec![0usize; workers.len()];
+        for _ in 0..1000 {
+            hits[policy.select_worker(&workers, &info).unwrap()] += 1;
+        }
+        let mean = 1000.0 / workers.len() as f64;
+        assert!(
+            hits.iter().all(|&h| h >= 1),
+            "a worker never chosen: {hits:?}"
+        );
+        let max = *hits.iter().max().unwrap();
+        assert!(
+            max as f64 <= 3.0 * mean,
+            "max {max} over a mean of {mean:.1}: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn a_strictly_cheaper_worker_wins_every_time() {
+        let policy = LeastLoadPolicy::new().with_tie_break_seed(7);
+        let workers: Vec<Arc<dyn Worker>> =
+            (0..128).map(|i| mk(&format!("http://w{i}:8000"))).collect();
+        for (i, worker) in workers.iter().enumerate() {
+            if i != 77 {
+                worker.increment_load();
+            }
+        }
+        let info = SelectWorkerInfo::default();
+        for _ in 0..1000 {
+            assert_eq!(policy.select_worker(&workers, &info), Some(77));
+        }
+    }
+
+    #[test]
+    fn scores_within_epsilon_of_the_minimum_tie() {
+        // Four idle workers whose reports differ by a KV digit far below the
+        // epsilon; an exact-equality tie handed everything to the first.
+        let policy = LeastLoadPolicy::new().with_tie_break_seed(7);
+        let workers: Vec<Arc<dyn Worker>> =
+            (0..4).map(|i| mk(&format!("http://w{i}:8000"))).collect();
+        let mut loads = HashMap::new();
+        for (i, worker) in workers.iter().enumerate() {
+            loads.insert(
+                worker.url().to_string(),
+                make_load(0, i as f64 * 1e-9, 100.0),
+            );
+        }
+        policy.update_loads(&loads);
+        let info = SelectWorkerInfo::default();
+        let mut hits = [0usize; 4];
+        for _ in 0..400 {
+            hits[policy.select_worker(&workers, &info).unwrap()] += 1;
+            // Release the winner's credit so every pick sees the same four scores.
+            policy.update_loads(&loads);
+        }
+        assert!(hits.iter().all(|&h| h >= 50), "{hits:?}");
     }
 
     #[test]
@@ -748,6 +1031,219 @@ mod tests {
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn unaccounted_requests_are_the_in_flight_beyond_the_report_and_the_credit() {
+        let w = mk("http://a:8000");
+        for _ in 0..12 {
+            w.increment_load();
+        }
+        let mut load = make_load(0, 0.0, 100.0);
+        load.loads[0].num_running_reqs = 5;
+        load.loads[0].num_waiting_reqs = 2;
+        assert_eq!(
+            LeastLoadPolicy::unaccounted_requests(&w, &load, 3),
+            2,
+            "12 held, 7 reported, 3 credited since the sample"
+        );
+        assert_eq!(
+            LeastLoadPolicy::unaccounted_requests(&w, &load, 10),
+            0,
+            "a report that covers the in-flight leaves nothing"
+        );
+    }
+
+    #[test]
+    fn a_report_that_omits_the_requests_the_router_holds_is_floored_by_them() {
+        // Both workers report an empty engine, sampled now; the router holds
+        // 40 requests on `a` that the report does not show (dispatched, not
+        // yet seen by the engine, their credit released by the fresh sample).
+        // `a` must read as 40 requests of work, not as an idle peer of `b`:
+        // every pick goes to `b` until its own credit has grown to the same.
+        let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0, 0).with_tie_break_seed(1);
+        let a = mk("http://a:8000");
+        let b = mk("http://b:8000");
+        for _ in 0..40 {
+            a.increment_load();
+        }
+        let workers = vec![a, b];
+        let mut idle = make_load(0, 0.0, 2000.0);
+        idle.sampled_at = Some(Instant::now());
+        let mut loads = HashMap::new();
+        loads.insert("http://a:8000".to_string(), idle.clone());
+        loads.insert("http://b:8000".to_string(), idle);
+        policy.update_loads(&loads);
+        let info = SelectWorkerInfo::default();
+        for pick in 0..40 {
+            assert_eq!(
+                policy.select_worker(&workers, &info),
+                Some(1),
+                "pick {pick} went to the worker whose report hides its load"
+            );
+        }
+    }
+
+    #[test]
+    fn a_report_that_accounts_for_the_routers_requests_adds_nothing() {
+        // `a` holds 10 requests and reports them running; `b` holds 10 and
+        // reports them waiting, at the mean prefill each. The floor adds
+        // nothing to either, so the reports alone decide: `a`, whose work is
+        // running rather than queued, ties with `b` on the estimate, and a
+        // third worker that holds nothing wins outright.
+        let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0, 0);
+        let a = mk("http://a:8000");
+        let b = mk("http://b:8000");
+        let c = mk("http://c:8000");
+        for _ in 0..10 {
+            a.increment_load();
+            b.increment_load();
+        }
+        let workers = vec![a, b, c];
+        let mut running = make_load(0, 0.0, 2000.0);
+        running.loads[0].num_running_reqs = 10;
+        let mut loads = HashMap::new();
+        loads.insert("http://a:8000".to_string(), running);
+        loads.insert(
+            "http://b:8000".to_string(),
+            make_load_reqs_only(10, 0.0, 2000.0),
+        );
+        loads.insert("http://c:8000".to_string(), make_load(0, 0.0, 2000.0));
+        policy.update_loads(&loads);
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(2)
+        );
+        let inputs = ScoreInputs {
+            loads: Some(&loads),
+            complete_snapshot: None,
+            inflight: &HashMap::new(),
+            nominal_throughput: 2000.0,
+            fleet_has_loads: true,
+            peer_baseline: 0.0,
+        };
+        let score_a = policy.score(&workers[0], &inputs);
+        let score_b = policy.score(&workers[1], &inputs);
+        assert!(
+            (score_a - score_b).abs() < TIE_EPSILON_SECS,
+            "{score_a} vs {score_b}"
+        );
+        assert!((score_a - 10.0 * 1024.0 / 2000.0).abs() < 1e-9, "{score_a}");
+    }
+
+    #[test]
+    fn waiting_queue_veto_counts_the_requests_the_router_holds_beyond_the_report() {
+        // Cap 5: `a` reports 1 waiting and nothing running while the router
+        // holds 6 on it; the 5 the report does not show count toward the
+        // cap, so `a` is skipped and the pick goes to `b` although `b`
+        // scores far worse.
+        let policy = LeastLoadPolicy::with_params(0.0, 1024, 100.0, 5);
+        let a = mk("http://a:8000");
+        for _ in 0..6 {
+            a.increment_load();
+        }
+        let workers = vec![a, mk("http://b:8000")];
+        let mut loads = HashMap::new();
+        loads.insert(
+            "http://a:8000".to_string(),
+            make_load_reqs_only(1, 0.0, 100.0),
+        );
+        loads.insert("http://b:8000".to_string(), make_load(400_000, 0.0, 100.0));
+        policy.update_loads(&loads);
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn the_floor_excludes_hidden_backlogs_without_tilting_the_healthy_fleet() {
+        // Two of eight workers hold 16 requests each that their fresh reports
+        // do not show (admission throttled: the requests wait in front of the
+        // engine); the six healthy ones hold 2 each, reported as running.
+        // Over 60 picks, each dispatched (the load counter moves as the
+        // router's would) with no report in between, the two take nothing
+        // and the six water-fill evenly: the floor steers off the hidden
+        // backlogs, not onto a favourite.
+        let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0, 0);
+        let workers: Vec<Arc<dyn Worker>> =
+            (0..8).map(|i| mk(&format!("http://w{i}:8000"))).collect();
+        let mut loads = HashMap::new();
+        for (i, worker) in workers.iter().enumerate() {
+            let hidden = i < 2;
+            for _ in 0..if hidden { 16 } else { 2 } {
+                worker.increment_load();
+            }
+            let mut load = make_load(0, 0.0, 2000.0);
+            load.loads[0].num_running_reqs = if hidden { 0 } else { 2 };
+            loads.insert(worker.url().to_string(), load);
+        }
+        policy.update_loads(&loads);
+        let mut picks = [0usize; 8];
+        for _ in 0..60 {
+            let idx = policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .unwrap();
+            workers[idx].increment_load();
+            picks[idx] += 1;
+        }
+        assert_eq!(&picks[..2], &[0, 0], "{picks:?}");
+        let healthy = &picks[2..];
+        let spread = healthy.iter().max().unwrap() - healthy.iter().min().unwrap();
+        assert!(spread <= 1, "{picks:?}");
+    }
+
+    #[test]
+    fn a_report_releases_the_dispatches_made_up_to_its_sample_and_keeps_the_rest() {
+        let policy = LeastLoadPolicy::new();
+        let workers = vec![mk("http://a:8000")];
+        let info = SelectWorkerInfo::default();
+        let mut loads = HashMap::new();
+        loads.insert("http://a:8000".to_string(), make_load(0, 0.1, 100.0));
+        policy.update_loads(&loads);
+
+        // Two dispatches, then the engine is sampled, then one more.
+        policy.select_min_expected_wait(&workers, &[0], &info, "test");
+        policy.select_min_expected_wait(&workers, &[0], &info, "test");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let sampled_at = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        policy.select_min_expected_wait(&workers, &[0], &info, "test");
+        assert_eq!(policy.load_state_for_test("http://a:8000"), (true, 3072, 3));
+
+        let mut sampled = make_load(0, 0.1, 100.0);
+        sampled.sampled_at = Some(sampled_at);
+        loads.insert("http://a:8000".to_string(), sampled.clone());
+        policy.update_loads(&loads);
+        assert_eq!(
+            policy.load_state_for_test("http://a:8000"),
+            (true, 1024, 1),
+            "the dispatch after the sample stays as credit"
+        );
+
+        // The same record republished (the monitor's shared snapshot on a
+        // pushed record from another worker) releases nothing more.
+        policy.update_loads(&loads);
+        assert_eq!(policy.load_state_for_test("http://a:8000"), (true, 1024, 1));
+
+        // A report without a sample instant resets, as every poll did before.
+        loads.insert("http://a:8000".to_string(), make_load(0, 0.1, 100.0));
+        policy.update_loads(&loads);
+        assert_eq!(policy.load_state_for_test("http://a:8000"), (true, 0, 0));
+    }
+
+    #[test]
+    fn the_tally_keeps_a_bounded_history_for_a_worker_that_never_reports() {
+        let mut dispatch = SincePollDispatch::default();
+        let at = Instant::now();
+        for _ in 0..(SINCE_POLL_DISPATCHES_KEPT + 100) {
+            dispatch.record(at, 7);
+        }
+        assert_eq!(dispatch.dispatches.len(), SINCE_POLL_DISPATCHES_KEPT);
+        assert_eq!(dispatch.requests as usize, SINCE_POLL_DISPATCHES_KEPT);
+        assert_eq!(dispatch.tokens as usize, 7 * SINCE_POLL_DISPATCHES_KEPT);
+        dispatch.release_through(at);
+        assert_eq!((dispatch.tokens, dispatch.requests), (0, 0));
     }
 
     #[test]

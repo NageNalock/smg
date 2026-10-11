@@ -2,10 +2,11 @@
 //! outer marker rather than hard-coded (e.g. `:6124c78e`).
 use async_trait::async_trait;
 use openai_protocol::common::Tool;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use crate::{
     errors::{ParserError, ParserResult},
+    factory::GrammarStart,
     traits::ToolParser,
     types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
 };
@@ -163,6 +164,84 @@ impl HyV4Parser {
             self.buffer.drain(..i + end.len());
         }
         out
+    }
+
+    /// Constrain a `<tool_calls>` block containing one or more calls. Arguments
+    /// use xgrammar's `glm_xml` style: raw strings and schema-typed JSON values,
+    /// with required/optional properties handled by xgrammar as for GLM-4.7.
+    /// Uses suffix-less markers; this builder has no tokenizer information
+    /// from which to select checkpoint-specific suffixes.
+    pub fn build_structural_tag(tools: &[Tool], at_least_one: bool) -> Value {
+        let calls: Vec<Value> = tools
+            .iter()
+            .filter(|tool| !tool.function.name.is_empty())
+            .map(|tool| {
+                json!({
+                    "type": "tag",
+                    "begin": format!("<tool_call>{}", tool.function.name),
+                    "content": {
+                        "type": "json_schema",
+                        "json_schema": tool.function.parameters,
+                        "style": "glm_xml",
+                    },
+                    "end": "</tool_call>",
+                })
+            })
+            .collect();
+        // An empty `or` is unsatisfiable; with no named tool, admit only an
+        // empty block, which parses to no calls.
+        let content = if calls.is_empty() {
+            json!({ "type": "const_string", "value": "" })
+        } else {
+            json!({ "type": "plus", "content": { "type": "or", "elements": calls } })
+        };
+
+        json!({
+            "format": {
+                "type": "triggered_tags",
+                "triggers": ["<tool_calls>"],
+                "tags": [{
+                    "begin": "<tool_calls>",
+                    "content": content,
+                    "end": "</tool_calls>",
+                }],
+                "at_least_one": at_least_one,
+            }
+        })
+    }
+
+    /// What precedes a forced call on a thinking prompt, by where the engine
+    /// starts the grammar, as `Glm4MoeParser::reasoning_prefix`: nothing
+    /// behind a reasoning parser's gate, the thought block closed by
+    /// `</think>` where the grammar runs from the first token, and free text
+    /// with nothing owed at its end where the worker does not say. The
+    /// excluded markers are spelled without their closing bracket so the
+    /// checkpoint-suffixed spellings are excluded with them.
+    pub fn reasoning_prefix(start: GrammarStart) -> Option<Value> {
+        const CALL_MARKERS: [&str; 6] = [
+            "<tool_call",
+            "</tool_call",
+            "<arg_key",
+            "</arg_key",
+            "<arg_value",
+            "</arg_value",
+        ];
+        match start {
+            GrammarStart::AfterReasoning => None,
+            GrammarStart::Unknown => Some(json!({
+                "type": "any_text",
+                "excludes": CALL_MARKERS,
+            })),
+            GrammarStart::FirstToken => {
+                let excludes = [&["<think", "</think"][..], &CALL_MARKERS[..]].concat();
+                Some(json!({
+                    "type": "tag",
+                    "begin": "",
+                    "content": { "type": "any_text", "excludes": excludes },
+                    "end": "</think>",
+                }))
+            }
+        }
     }
 }
 

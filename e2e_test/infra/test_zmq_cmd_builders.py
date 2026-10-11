@@ -47,6 +47,33 @@ def test_vllm_zmq_cmd_is_headless_with_derived_handshake_port(serve):
     assert cmd[cmd.index("--max-model-len") + 1] == "2048"
 
 
+def test_sglang_zmq_cmd_runs_the_headless_launcher_with_derived_handshake_port(serve):
+    w = _worker("sglang")
+    cmd = w._build_sglang_zmq_cmd(
+        "/models/qwen", 1, {"sglang_args": ["--mem-fraction-static", "0.5"]}
+    )
+    # SGLang itself is unchanged: the scheduler is launched headless by the
+    # smg servicer package, whose SGLang plugin dials SMG from inside it.
+    assert cmd[1:3] == ["-m", "smg_grpc_servicer.sglang.headless"]
+    assert "/models/qwen" in cmd and "--grpc-mode" not in cmd
+    expected_port = serve._zmq_handshake_port(serve._zmq_ipc_url(w.port))
+    assert cmd[cmd.index("--zmq-handshake-address") + 1] == f"tcp://127.0.0.1:{expected_port}"
+    assert cmd[cmd.index("--mem-fraction-static") + 1] == "0.5"
+
+
+def test_sglang_zmq_extra_engine_args_go_through_the_launcher(serve):
+    # Extras reach the launcher's validation (and its output) instead of
+    # being appended behind its back: a DP launch the wire does not carry
+    # is refused up front.
+    w = _worker("sglang")
+    w.extra_engine_args = ["--mem-fraction-static", "0.4"]
+    cmd = w._build_cmd()
+    assert cmd[cmd.index("--mem-fraction-static") + 1] == "0.4"
+    w.extra_engine_args = ["--dp-size", "2"]
+    with pytest.raises(ValueError, match="dp-size"):
+        w._build_cmd()
+
+
 def test_tokenspeed_zmq_cmd_is_headless_with_derived_handshake_port(serve):
     w = _worker("tokenspeed")
     cmd = w._build_tokenspeed_zmq_cmd(
@@ -131,3 +158,29 @@ def test_rust_lane_refuses_a_vllm_without_the_hook(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="no hook"):
         w._build_env()
+
+
+def test_vllm_workers_select_the_prebuilt_flashinfer_allreduce(monkeypatch):
+    from infra.constants import ENV_VLLM_SERVICER_IMPL
+
+    monkeypatch.delenv(ENV_VLLM_SERVICER_IMPL, raising=False)
+    monkeypatch.delenv("SMG_VLLM_SERVICER_IMPL", raising=False)
+    monkeypatch.delenv("VLLM_FLASHINFER_ALLREDUCE_BACKEND", raising=False)
+    w = Worker(
+        model_id=_VLLM_MODEL, engine="vllm", port=50111, gpu_ids=[0], mode=ConnectionMode.GRPC
+    )
+    # vLLM's auto backend picks the MNNVL kernel on Hopper, which FlashInfer's
+    # per-architecture jit-cache wheel does not carry, and the pods cannot
+    # JIT-compile it; the TRT-LLM kernel is prebuilt there.
+    assert w._build_env()["VLLM_FLASHINFER_ALLREDUCE_BACKEND"] == "trtllm"
+
+    # An operator's explicit choice wins over the harness default.
+    monkeypatch.setenv("VLLM_FLASHINFER_ALLREDUCE_BACKEND", "mnnvl")
+    assert w._build_env()["VLLM_FLASHINFER_ALLREDUCE_BACKEND"] == "mnnvl"
+
+    # Other engines are not told anything about vLLM's all-reduce.
+    monkeypatch.delenv("VLLM_FLASHINFER_ALLREDUCE_BACKEND", raising=False)
+    s = Worker(
+        model_id=_VLLM_MODEL, engine="sglang", port=50112, gpu_ids=[0], mode=ConnectionMode.GRPC
+    )
+    assert "VLLM_FLASHINFER_ALLREDUCE_BACKEND" not in s._build_env()

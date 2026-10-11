@@ -26,6 +26,7 @@ use super::{
     MediaBatch, MultimodalIntermediate, MultimodalOutput, PrecomputedMultimodalIntermediate,
     PromptBinding, RegistryTokenizer,
 };
+use crate::observability::metrics::Metrics;
 
 struct PreparedMultimodalPart {
     preprocessed: PreprocessedEncoderInputs,
@@ -76,7 +77,10 @@ pub(crate) async fn process_multimodal_plan(
     let media_started = Instant::now();
     let mut tracker = AsyncMultiModalTracker::new(components.media_connector.clone())
         .with_default_video_sample_fps(spec.default_video_sample_fps())
-        .with_video_frame_sampling(spec.video_frame_sampling());
+        .with_video_frame_sampling(
+            spec.video_frame_sampling()
+                .with_frame_budget(components.video_frame_budget),
+        );
 
     for part in plan.into_parts() {
         tracker
@@ -169,7 +173,7 @@ pub(crate) async fn process_multimodal_plan(
             MediaBatch::Images(images) => {
                 debug!(
                     image_count = images.len(),
-                    item_sizes = ?images.iter().map(|f| (f.image.width(), f.image.height())).collect::<Vec<_>>(),
+                    item_sizes = ?images.iter().map(|f| f.size()).collect::<Vec<_>>(),
                     "Fetched images for multimodal processing"
                 );
             }
@@ -471,15 +475,26 @@ async fn preprocess_modality(
 
     tokio::task::spawn_blocking(move || match media_for_preprocess {
         MediaBatch::Images(images) => {
+            // Decode every frame first, in parallel on the preprocessing
+            // pool, rather than one photo after another on this thread.
+            ImageFrame::decode_all(&images)
+                .map_err(llm_multimodal::MultiModalError::Media)?;
             let processor = registry
                 .find(&model_id_owned, model_type_owned.as_deref())
                 .ok_or_else(|| {
                     anyhow::anyhow!("No vision processor found for model: {model_id_owned}")
                 })?;
-            // Extract DynamicImages inside the blocking closure so the expensive
-            // clone happens off the tokio async runtime.
-            let raw_images: Vec<image::DynamicImage> =
-                images.iter().map(|frame| frame.image.clone()).collect();
+            // Decoded (and cloned) inside the blocking closure, off the async
+            // runtime.
+            let raw_images: Vec<image::DynamicImage> = images
+                .iter()
+                .map(|frame| {
+                    frame
+                        .image()
+                        .cloned()
+                        .map_err(llm_multimodal::MultiModalError::Media)
+                })
+                .collect::<Result<_, _>>()?;
             processor
                 .preprocess(&raw_images, &pp_config)
                 .map_err(|e| anyhow::anyhow!("Image preprocessing failed: {e}"))
@@ -613,8 +628,10 @@ async fn preprocess_image_cached(
         config_fingerprint: fingerprint,
     };
     if let Some(cached) = cache.get(&key) {
+        Metrics::record_mm_pixel_cache_lookup(&model_id, true);
         return Ok(cached.preprocessed.clone());
     }
+    Metrics::record_mm_pixel_cache_lookup(&model_id, false);
 
     let preprocessed = preprocess_image_batch(
         registry,
@@ -642,7 +659,15 @@ async fn preprocess_image_batch(
 ) -> Result<PreprocessedEncoderInputs> {
     let images = images.to_vec();
     tokio::task::spawn_blocking(move || {
-        let raw_images: Vec<image::DynamicImage> = images.iter().map(|f| f.image.clone()).collect();
+        let raw_images: Vec<image::DynamicImage> = images
+            .iter()
+            .map(|frame| {
+                frame
+                    .image()
+                    .cloned()
+                    .map_err(llm_multimodal::MultiModalError::Media)
+            })
+            .collect::<Result<_, _>>()?;
         let processor = registry
             .find(&model_id, model_type.as_deref())
             .ok_or_else(|| anyhow::anyhow!("No vision processor found for model: {model_id}"))?;

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, path::PathBuf};
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
@@ -8,29 +8,47 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// Jemalloc's run-time options for a long-running server (see
+// `SERVER_MALLOC_CONF`): the executable exports them as jemalloc's
+// application-provided `malloc_conf`, as the Python extension does for the
+// router launched from Python.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+use smg::observability::metrics::SERVER_MALLOC_CONF;
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[expect(
+    unsafe_code,
+    reason = "jemalloc reads its options from this exported symbol; a NUL-terminated byte string nothing in Rust dereferences"
+)]
+#[export_name = "_rjem_malloc_conf"]
+pub static MALLOC_CONF: &[u8; 72] = SERVER_MALLOC_CONF;
+
 use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
-        resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
-        CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PdPairingMode,
-        PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
-        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
-        TokenizerCacheConfig, TraceConfig,
+        bind_socket_addr, resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
+        CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, FileDiscoveryConfig,
+        HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind,
+        ManualAssignmentMode, MetricsConfig, OracleConfig, PdPairingMode, PolicyConfig,
+        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig,
+        RoutingMode, SchemaConfig, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+        DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
     },
     mesh_discovery::MeshDiscoveryConfig,
     observability::{
+        logging::close_logging,
         metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
         otel_trace::{is_otel_enabled, shutdown_otel},
     },
+    policies::cost::DEFAULT_POLICY as DEFAULT_SELECTION_POLICY,
     server::{self, ServerConfig},
-    service_discovery::{ModelIdSource, ServiceDiscoveryConfig},
+    service_discovery::{ModelIdSource, RuntimeDiscoveryConfig},
     version,
     worker::{ConnectionMode, RuntimeType},
 };
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
-use smg_mesh::MeshServerConfig;
+use smg_mesh::{MTLSConfig, MeshServerConfig};
 use tracing::info;
 
 /// Parse repeated `<flag> <url> [bootstrap_port|none]` occurrences into
@@ -109,6 +127,15 @@ impl std::fmt::Display for Backend {
     }
 }
 
+/// A worker discovery provider, as `--discovery-provider` names it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum DiscoveryProvider {
+    #[value(name = "kubernetes")]
+    Kubernetes,
+    #[value(name = "file")]
+    File,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "shepherd-model-gateway", alias = "smg", alias = "amg")]
 #[command(about = "Shepherd Model Gateway - High-performance inference gateway")]
@@ -166,6 +193,12 @@ fn parse_transport_mode(value: &str) -> Result<TransportMode, String> {
         .ok_or_else(|| format!("invalid value '{value}'; expected inline, shm, auto, or rdma"))
 }
 
+/// Parse the `--kv-index` value into a `KvIndexKind`.
+fn parse_kv_index_kind(value: &str) -> Result<KvIndexKind, String> {
+    KvIndexKind::parse(value)
+        .ok_or_else(|| format!("invalid value '{value}'; expected positional or chain"))
+}
+
 /// Parse the `--mm-processing` value into an `MmProcessingMode`.
 fn parse_mm_processing(value: &str) -> Result<MmProcessingMode, String> {
     MmProcessingMode::parse(value)
@@ -211,7 +244,8 @@ fn parse_job_queue_concurrency(value: &str) -> Result<usize, String> {
 #[derive(Parser, Debug)]
 struct CliArgs {
     // ==================== Worker Configuration ====================
-    /// Host address to bind the router server
+    /// Host address to bind the router server: an IP literal, IPv6 with or
+    /// without brackets (`0.0.0.0`, `::`, `[::]`, `[fd00::1]`)
     #[arg(long, default_value = "0.0.0.0", help_heading = "Worker Configuration")]
     host: String,
 
@@ -286,50 +320,46 @@ struct CliArgs {
     #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
     overload_token_usage_threshold: f32,
 
-    /// Enable worker overload protection with the gateway default thresholds.
-    ///
-    /// A worker whose load signal crosses a threshold is considered overloaded
-    /// and excluded from routing until the signal recovers; when every worker
-    /// is overloaded, requests are shed immediately rather than queued.
-    ///
-    /// This flag alone applies --worker-overload-token-usage 0.9 and leaves
-    /// --worker-overload-waiting-requests unset: KV token usage means the same
-    /// thing on every engine, while a sensible waiting-requests ceiling is
-    /// workload-dependent, so it has no universal default. Explicit thresholds
-    /// override the default, and either threshold set on its own enables
-    /// protection without this flag — exactly as before it existed. Per-worker
-    /// `overload` blocks on a WorkerSpec override the gateway values per
-    /// signal, and enable protection for that worker even with everything here
-    /// unset.
-    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    /// Worker overload protection (the default; kept so existing command
+    /// lines still parse). A worker whose load report is at or above
+    /// --worker-overload-waiting-requests or --worker-overload-token-usage is
+    /// left out of routing while another worker is under them; when every
+    /// worker is over them the request goes to the least-loaded one, unless
+    /// --worker-overload-shed asks for a 503 instead. Evaluated once per load
+    /// report, never per request. Per-worker `overload` blocks on a WorkerSpec
+    /// override the gateway values per signal
+    #[arg(long, default_value_t = true, help_heading = "Routing Policy")]
     worker_overload_protection: bool,
 
-    /// Queued-request count at or above which a worker is considered
-    /// overloaded and excluded from routing until the signal recovers; when
-    /// every worker is overloaded, requests are shed immediately rather than
-    /// queued. Unset disables overload protection.
-    ///
-    /// Queued (waiting) requests, summed across DP ranks. Must be >= 1: the
-    /// comparison is inclusive, so 0 would veto every worker unconditionally.
-    #[arg(long, value_parser = parse_positive_usize, help_heading = "Routing Policy")]
-    worker_overload_waiting_requests: Option<usize>,
+    /// Switch worker overload protection off: no worker is ever left out of
+    /// routing for its waiting queue or KV usage (per-worker `overload` blocks
+    /// on a WorkerSpec still apply)
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    disable_worker_overload_protection: bool,
 
-    /// KV-cache token usage at or above which a worker is considered
-    /// overloaded and excluded from routing until the signal recovers; when
-    /// every worker is overloaded, requests are shed immediately rather than
-    /// queued. Unset disables overload protection.
-    ///
-    /// Mean KV-cache token usage across DP ranks, the same signal
-    /// `--balance-token-usage-threshold` reads, applied as an absolute
-    /// per-worker ceiling rather than a fleet-relative spread. Backend must
-    /// report token_usage. Must be in (0.0, 1.0]: the comparison is inclusive,
-    /// so 0.0 would veto every worker unconditionally.
-    ///
-    /// Distinct from `--overload-token-usage-threshold`, which only de-ranks
-    /// the hottest backend within cache-aware affinity; this flag removes the
-    /// worker from routing entirely and sheds when every worker crosses it.
-    #[arg(long, value_parser = parse_unit_fraction, help_heading = "Routing Policy")]
-    worker_overload_token_usage: Option<f64>,
+    /// Queued (waiting) requests, summed across DP ranks, at or above which a
+    /// worker counts as overloaded. Must be >= 1: the comparison is inclusive,
+    /// so 0 would veto every worker unconditionally
+    #[arg(long, default_value_t = 8, value_parser = parse_positive_usize, help_heading = "Routing Policy")]
+    worker_overload_waiting_requests: usize,
+
+    /// Mean KV-cache token usage across DP ranks at or above which a worker
+    /// counts as overloaded: the same signal --balance-token-usage-threshold
+    /// reads, applied as an absolute per-worker ceiling rather than a
+    /// fleet-relative spread. Backend must report token_usage. Must be in
+    /// (0.0, 1.0]: the comparison is inclusive, so 0.0 would veto every worker
+    /// unconditionally. Distinct from --overload-token-usage-threshold, which
+    /// only de-ranks the hottest backend within cache-aware affinity
+    #[arg(long, default_value_t = 0.8, value_parser = parse_unit_fraction, help_heading = "Routing Policy")]
+    worker_overload_token_usage: f64,
+
+    /// Refuse a request with a 503 (worker_overload_protection_shed,
+    /// Retry-After the load poll interval) when every worker it could use is
+    /// overloaded, instead of routing it to the least-loaded one; also sheds a
+    /// worker that crossed a threshold between selection and dispatch. Off by
+    /// default: steering never turns a load signal into an outage
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    worker_overload_shed: bool,
 
     /// Anti-hotspot decay: de-rank cache-affine candidates by their
     /// waiting-prefill backlog (overlap score divided by 1 + overlap_decay
@@ -343,6 +373,24 @@ struct CliArgs {
     /// argmax.
     #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
     selection_temperature: f32,
+
+    /// Worker selection policy for cache_aware, run over the per-worker
+    /// inputs the router gathers (prefix overlap, in-flight requests,
+    /// backend load reports); cache-aware-default, the affinity-group
+    /// decision, is the one policy
+    #[arg(
+        long,
+        default_value = "cache-aware-default",
+        help_heading = "Routing Policy"
+    )]
+    selection_policy: String,
+
+    /// Lifetime in milliseconds of optimistic dispatch bookings for
+    /// cache_aware: predicted prefill and prefix placement are charged to the
+    /// chosen worker until the engine reports them or the booking expires.
+    /// 0 disables; set a little above the engine's KV-event lag
+    #[arg(long, default_value_t = 0, help_heading = "Routing Policy")]
+    selection_accounting_ttl_ms: u64,
 
     /// Interval in seconds between cache-tree eviction cycles
     #[arg(long, default_value_t = 120, help_heading = "Routing Policy")]
@@ -522,7 +570,8 @@ struct CliArgs {
     #[arg(long, help_heading = "PD Disaggregation")]
     prefill_queue_size: Option<usize>,
 
-    /// Maximum time in seconds a request may wait for Prefill admission (default: 60 when enabled)
+    /// Maximum time in seconds a request may wait for Prefill admission (default: 60 when enabled);
+    /// in the gRPC router the wait is also held to --queue-timeout-secs, counted from admission
     #[arg(long, help_heading = "PD Disaggregation")]
     prefill_queue_timeout_secs: Option<u64>,
 
@@ -570,6 +619,65 @@ struct CliArgs {
     #[arg(long, default_value_t = 10, help_heading = "Load Monitoring")]
     load_monitor_interval: u64,
 
+    /// Seconds without any contact from a worker (a load poll, a health probe,
+    /// a KV event, a response) after which a transport failure excludes it
+    /// from routing; the first successful contact re-admits it.
+    #[arg(long, default_value_t = 2, help_heading = "Load Monitoring")]
+    worker_stall_secs: u64,
+
+    /// Seconds without a token or a completion from a worker with requests
+    /// in flight whose waiting queue grows, or whose in-flight pile grows or
+    /// is four deep, after which new requests stop being routed to it until
+    /// it makes progress. The bound stretches to the time its in-flight
+    /// prompts may still need in prefill, up to 120 seconds. The pile is the
+    /// streaming gRPC generations in flight; HTTP workers, PD legs and
+    /// non-streaming generations give no signal and never form one. 0
+    /// disables the rule.
+    #[arg(long, default_value_t = 3, help_heading = "Load Monitoring")]
+    worker_wedge_secs: u64,
+
+    /// Seconds without any contact (a load record, a poll answer, a probe, a
+    /// token) from a worker whose KV-event stream pushes load records, after
+    /// which it is excluded from routing as unreachable until it is heard
+    /// from again. A reachable servicer pushes a record at least every few
+    /// seconds, so a longer silence is a dead or one-way link the transport
+    /// has not reported yet. Workers that never pushed a record (HTTP
+    /// workers, older servicers) are not judged by it. Keep it above the
+    /// load-monitor interval. 0 disables the rule.
+    #[arg(long, default_value_t = 15, help_heading = "Load Monitoring")]
+    worker_stale_secs: u64,
+
+    /// Warm-up slice for cache-aware routing: for this many seconds after a
+    /// worker becomes routable, until its index has grown by
+    /// --worker-warmup-blocks blocks, one cache miss in 1/--worker-warmup-share
+    /// is routed to it so it builds a cache instead of idling. 0 disables.
+    #[arg(long, default_value_t = 60, help_heading = "Routing Policy")]
+    worker_warmup_secs: u64,
+
+    /// Share of cache misses offered to warming workers (0.0 to 1.0).
+    #[arg(long, default_value_t = 0.25, help_heading = "Routing Policy")]
+    worker_warmup_share: f32,
+
+    /// A worker whose index has grown by this many blocks since it became
+    /// thin is warm.
+    #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
+    worker_warmup_blocks: usize,
+
+    /// A worker whose index holds less than this share of the fleet's median
+    /// (or nothing) is thin and receives the warm-up slice until it has grown
+    /// by --worker-warmup-blocks, whatever emptied it (a resync after a
+    /// publisher restart, an out-of-range or data-loss resubscription, an
+    /// engine that came back empty). 0 keeps the age rule alone.
+    #[arg(long, default_value_t = 0.5, help_heading = "Routing Policy")]
+    worker_warmup_thin_ratio: f32,
+
+    /// One cache hit in this many is diverted to a thin worker although
+    /// another worker holds its prefix (shallow overlaps first, one in flight
+    /// per thin worker), so an index emptied by a resync refills on a
+    /// workload where every request has a holder. 0 disables.
+    #[arg(long, default_value_t = 8, help_heading = "Routing Policy")]
+    worker_warmup_divert_every: u64,
+
     /// Only poll worker loads when a load-aware routing policy,
     /// --engine-metrics, or worker overload protection needs the data. By
     /// default every worker group is polled from registration onward; this
@@ -580,6 +688,9 @@ struct CliArgs {
 
     /// Force GetLoads polling for smg_engine_* Prometheus gauges even without
     /// a load-aware routing policy. Routing-owned polls are always re-exported.
+    /// A worker whose KV-event stream pushes its load feeds the gauges from
+    /// those records and is not polled while they flow (GetLoads is the
+    /// fallback).
     #[arg(long, default_value_t = false, help_heading = "Load Monitoring")]
     engine_metrics: bool,
 
@@ -606,6 +717,15 @@ struct CliArgs {
     #[arg(long, help_heading = "Routing Policy")]
     kv_indexer_max_entries: Option<usize>,
 
+    /// The event-driven KV index behind cache-aware routing: `positional`
+    /// (one entry per block position, the default) or `chain` (chains as runs
+    /// with per-run worker coverage; lock-free, store-free lookups; `run` is
+    /// its deprecated spelling). The --kv-indexer-* prune bounds apply to the
+    /// positional index only; the chain index holds what the engines report
+    /// and shrinks with their removals.
+    #[arg(long, default_value = "positional", value_parser = parse_kv_index_kind, help_heading = "Routing Policy")]
+    kv_index: KvIndexKind,
+
     /// Multimodal tensor transport mode: `inline` (default), `shm` (same-host
     /// /dev/shm), or `auto` (shm only when the worker shares /dev/shm). A
     /// per-worker `WorkerSpec.multimodal_tensor_transport` overrides this.
@@ -626,7 +746,9 @@ struct CliArgs {
     multimodal_max_inflight_bytes: Option<usize>,
 
     /// Per-request image-count limit applied to every model, replacing each
-    /// spec's built-in limit (e.g. to match the engine's `--limit-mm-per-prompt`).
+    /// spec's built-in limit. It tightens, never loosens, the limit a model's
+    /// workers advertise for their engine (`mm_item_limits`, e.g. vLLM's
+    /// `--limit-mm-per-prompt`), which the router holds requests to by itself.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Multimodal")]
     mm_per_request_image_limit: Option<u64>,
 
@@ -666,13 +788,32 @@ struct CliArgs {
     log_mm_timing: bool,
 
     // ==================== Service Discovery (Kubernetes) ====================
-    /// Enable Kubernetes service discovery
+    /// Enable Kubernetes service discovery (the legacy spelling of
+    /// `--discovery-provider kubernetes`)
     #[arg(
         long,
         default_value_t = false,
         help_heading = "Service Discovery (Kubernetes)"
     )]
     service_discovery: bool,
+
+    /// Worker discovery provider. Give this or `--service-discovery`, not both
+    #[arg(
+        long,
+        value_enum,
+        conflicts_with = "service_discovery",
+        help_heading = "Service Discovery"
+    )]
+    discovery_provider: Option<DiscoveryProvider>,
+
+    /// JSON manifest listing the workers, for `--discovery-provider file`. It
+    /// may be created after startup
+    #[arg(long, help_heading = "Service Discovery (File)")]
+    discovery_file: Option<PathBuf>,
+
+    /// Seconds between rereads of the `--discovery-file` manifest (default: 30)
+    #[arg(long, help_heading = "Service Discovery (File)")]
+    discovery_check_interval_secs: Option<u64>,
 
     /// Label selector for Kubernetes service discovery (format: key=value)
     #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
@@ -732,7 +873,9 @@ struct CliArgs {
     /// (format: alias=canonical, repeatable). Applied to every locally
     /// registered worker whose model ID equals the canonical side,
     /// including workers registered by Kubernetes service discovery.
-    /// Matching is case-sensitive.
+    /// Matching is case-sensitive. A vendor-named alias (kimi-*, minimax-*,
+    /// ...) also gives the served model that vendor's contract profile under
+    /// both names.
     #[arg(long = "model-alias", action = ArgAction::Append, value_parser = parse_model_alias, help_heading = "Service Discovery (Kubernetes)")]
     model_alias: Vec<String>,
 
@@ -754,13 +897,23 @@ struct CliArgs {
     #[arg(long, default_value_t = 29000, help_heading = "Prometheus Metrics")]
     prometheus_port: u16,
 
-    /// Host address to bind the Prometheus metrics server
-    #[arg(long, default_value = "0.0.0.0", help_heading = "Prometheus Metrics")]
-    prometheus_host: String,
+    /// Host address to bind the Prometheus metrics server. Defaults to the
+    /// unspecified address of `--host`'s family: `::` for an IPv6 host,
+    /// `0.0.0.0` otherwise.
+    #[arg(long, help_heading = "Prometheus Metrics")]
+    prometheus_host: Option<String>,
 
     /// Custom buckets for Prometheus duration metrics
     #[arg(long, num_args = 0.., help_heading = "Prometheus Metrics")]
     prometheus_duration_buckets: Vec<f64>,
+
+    // ==================== Profiling ====================
+    /// Directory where `POST /heap_profile` (an admin route) writes a jemalloc
+    /// heap profile of this gateway. Needs a build with the `jemalloc-profiling`
+    /// feature, started with `_RJEM_MALLOC_CONF=prof:true,prof_active:true`;
+    /// unset, the route answers 404
+    #[arg(long, help_heading = "Profiling")]
+    jemalloc_prof_dir: Option<String>,
 
     // ==================== Request Handling ====================
     /// Custom HTTP headers to check for request IDs
@@ -827,8 +980,11 @@ struct CliArgs {
     cors_allowed_origins: Vec<String>,
 
     // ==================== Rate Limiting ====================
-    /// Maximum standing concurrent requests (-1 to disable). Each admission
-    /// permit is held for the full response, including streaming bodies.
+    /// Maximum standing concurrent requests. Each admission permit is held
+    /// for the full response, including streaming bodies. -1 (default)
+    /// derives the bound from the host (1024 per available core, at least
+    /// 4096) so an overloaded router sheds with 429/503 instead of queueing
+    /// without bound; 0 disables the bound.
     #[arg(long, default_value_t = -1, help_heading = "Rate Limiting")]
     max_concurrent_requests: i32,
 
@@ -836,7 +992,11 @@ struct CliArgs {
     #[arg(long, default_value_t = 100, help_heading = "Rate Limiting")]
     queue_size: usize,
 
-    /// Maximum time in seconds a request can wait in queue
+    /// Maximum time in seconds a request can wait in queue, and the longest a
+    /// request may sit inside the gRPC router ahead of worker selection (counted
+    /// from its admission, or its acceptance without an admission layer) before
+    /// it is refused with a 503, the prefill admission wait of a PD or EPD request
+    /// included; the HTTP relay and the HTTP PD router are not bounded
     #[arg(long, default_value_t = 60, help_heading = "Rate Limiting")]
     queue_timeout_secs: u64,
 
@@ -870,10 +1030,18 @@ struct CliArgs {
     #[arg(long, help_heading = "Tenant Rate Limit")]
     tenant_rate_limit_config: Option<String>,
 
-    /// Token bucket refill rate (tokens per second). Unset or 0 = no refill:
-    /// --max-concurrent-requests bounds standing concurrency alone.
+    /// Sustained admission rate in requests per second, bursting up to
+    /// --max-concurrent-requests, which keeps bounding standing concurrency
+    /// (a completed request frees its slot, not rate budget). Unset or 0 =
+    /// no rate limit: --max-concurrent-requests bounds concurrency alone.
     #[arg(long, help_heading = "Rate Limiting")]
     rate_limit_tokens_per_second: Option<i32>,
+
+    /// Most Responses API requests with background: true in flight at once;
+    /// one beyond answers 429. 0 switches background mode off: such requests
+    /// then run in the foreground.
+    #[arg(long, default_value_t = 1024, help_heading = "Rate Limiting")]
+    max_background_responses: usize,
 
     // ==================== Retry Configuration ====================
     /// Maximum number of retry attempts
@@ -901,7 +1069,8 @@ struct CliArgs {
     disable_retries: bool,
 
     // ==================== Circuit Breaker ====================
-    /// Number of failures before circuit opens
+    /// Number of failed requests before the circuit opens (a request's retries
+    /// on a worker count once)
     #[arg(long, default_value_t = 10, help_heading = "Circuit Breaker")]
     cb_failure_threshold: u32,
 
@@ -997,6 +1166,10 @@ struct CliArgs {
     /// Maximum entries in L0 tokenizer cache
     #[arg(long, default_value_t = 10000, help_heading = "Tokenizer")]
     tokenizer_cache_l0_max_entries: usize,
+
+    /// Maximum memory for L0 tokenizer cache in bytes (texts, ids and per-entry overhead)
+    #[arg(long, default_value_t = 268435456, help_heading = "Tokenizer")]
+    tokenizer_cache_l0_max_memory: usize,
 
     /// Enable L1 (prefix matching) tokenizer cache
     #[arg(long, default_value_t = false, help_heading = "Tokenizer")]
@@ -1177,7 +1350,8 @@ struct CliArgs {
     #[arg(long, action = ArgAction::Append, help_heading = "Control Plane Authentication")]
     jwt_role_mapping: Vec<String>,
 
-    /// API keys for control plane access (format: id:name:role:key)
+    /// API keys for control plane access (format: id:name:role:key; role `admin` reaches every
+    /// control plane route, `user` the read-only GET/HEAD routes)
     #[arg(long = "control-plane-api-keys", action = ArgAction::Append, env = "CONTROL_PLANE_API_KEYS", help_heading = "Control Plane Authentication")]
     control_plane_api_keys: Vec<String>,
 
@@ -1196,7 +1370,8 @@ struct CliArgs {
     #[arg(long)]
     mesh_server_name: Option<String>,
 
-    /// Bind address for the mesh listener.
+    /// Bind address for the mesh listener: an IP literal, IPv6 with or
+    /// without brackets (`::`, `[::]`).
     #[arg(long, default_value = "0.0.0.0")]
     mesh_host: String,
 
@@ -1211,10 +1386,26 @@ struct CliArgs {
     #[arg(long, num_args = 0..)]
     mesh_peer_urls: Vec<String>,
 
+    /// The CA certificate (PEM) the mesh peers' certificates chain to. With
+    /// `--mesh-tls-cert` and `--mesh-tls-key` the mesh listener serves TLS
+    /// and requires peer certificates, and every dial presents this node's.
+    #[arg(long, requires_all = ["mesh_tls_cert", "mesh_tls_key"])]
+    mesh_tls_ca_cert: Option<String>,
+
+    /// This mesh node's certificate (PEM), with the node's IP as a SAN.
+    #[arg(long, requires_all = ["mesh_tls_ca_cert", "mesh_tls_key"])]
+    mesh_tls_cert: Option<String>,
+
+    /// This mesh node's private key (PKCS#8 PEM).
+    #[arg(long, requires_all = ["mesh_tls_ca_cert", "mesh_tls_cert"])]
+    mesh_tls_key: Option<String>,
+
     // ==================== WebRTC ====================
     /// Bind address for WebRTC UDP sockets (client-facing ICE candidate IP).
-    /// Default: 0.0.0.0 (auto-detect via routing table).
-    /// Set to 127.0.0.1 for local development on the same machine.
+    /// Default: the unspecified address of `--host`'s family (`::`, dual-stack
+    /// on Linux, for an IPv6 host; `0.0.0.0` otherwise), the candidate IP
+    /// auto-detected via the routing table.
+    /// Set to 127.0.0.1 (or ::1) for local development on the same machine.
     #[arg(long, help_heading = "WebRTC")]
     webrtc_bind_addr: Option<std::net::IpAddr>,
 
@@ -1410,6 +1601,24 @@ impl CliArgs {
             .unwrap_or(ConnectionMode::Http)
     }
 
+    /// The worker discovery provider selected by either spelling:
+    /// `--service-discovery` is `--discovery-provider kubernetes`.
+    fn selected_discovery_provider(&self) -> Option<DiscoveryProvider> {
+        if self.service_discovery {
+            Some(DiscoveryProvider::Kubernetes)
+        } else {
+            self.discovery_provider
+        }
+    }
+
+    /// Selecting a discovery provider, by either spelling, turns IGW mode on.
+    /// Returns whether this call turned it on.
+    fn enable_igw_for_discovery(&mut self) -> bool {
+        let enable = self.selected_discovery_provider().is_some() && !self.enable_igw;
+        self.enable_igw |= enable;
+        enable
+    }
+
     fn parse_selector(selector_list: &[String]) -> HashMap<String, String> {
         let mut map = HashMap::new();
         for item in selector_list {
@@ -1422,18 +1631,24 @@ impl CliArgs {
         map
     }
 
+    /// The metrics bind host: `--prometheus-host`, or the unspecified address
+    /// of `--host`'s family when it is not given.
+    fn metrics_host(&self) -> String {
+        self.prometheus_host
+            .clone()
+            .unwrap_or_else(|| MetricsConfig::default_host_for(&self.host))
+    }
+
     fn parse_mesh_socket_addr(
         host: &str,
         port: u16,
         field: &str,
     ) -> ConfigResult<std::net::SocketAddr> {
-        let addr = format!("{host}:{port}");
-        addr.parse::<std::net::SocketAddr>()
-            .map_err(|e| ConfigError::InvalidValue {
-                field: field.to_string(),
-                value: host.to_string(),
-                reason: format!("invalid mesh socket address '{addr}': {e}"),
-            })
+        bind_socket_addr(host, port).map_err(|e| ConfigError::InvalidValue {
+            field: field.to_string(),
+            value: host.to_string(),
+            reason: format!("invalid mesh socket address: {e}"),
+        })
     }
 
     fn build_mesh_server_config(&self) -> ConfigResult<Option<MeshServerConfig>> {
@@ -1502,7 +1717,37 @@ impl CliArgs {
             bind_addr,
             advertise_addr,
             init_peer: peer,
-            mtls_config: None,
+            mtls_config: self.mesh_mtls_config()?,
+        }))
+    }
+
+    /// The mesh mTLS configuration from `--mesh-tls-ca-cert`, `--mesh-tls-cert`
+    /// and `--mesh-tls-key` (all three or none, which the parser enforces);
+    /// each file has to be readable at start-up, not at the first dial.
+    fn mesh_mtls_config(&self) -> ConfigResult<Option<MTLSConfig>> {
+        let (Some(ca), Some(cert), Some(key)) = (
+            &self.mesh_tls_ca_cert,
+            &self.mesh_tls_cert,
+            &self.mesh_tls_key,
+        ) else {
+            return Ok(None);
+        };
+        for (field, path) in [
+            ("mesh_tls_ca_cert", ca),
+            ("mesh_tls_cert", cert),
+            ("mesh_tls_key", key),
+        ] {
+            std::fs::metadata(path).map_err(|e| ConfigError::InvalidValue {
+                field: field.to_string(),
+                value: path.clone(),
+                reason: format!("cannot read the file: {e}"),
+            })?;
+        }
+        Ok(Some(MTLSConfig {
+            ca_cert_path: ca.into(),
+            server_cert_path: cert.into(),
+            server_key_path: key.into(),
+            ..MTLSConfig::default()
         }))
     }
 
@@ -1525,6 +1770,9 @@ impl CliArgs {
                 cache_index: Self::parse_cache_index(&self.cache_index),
                 cache_ttl_secs: self.cache_ttl_secs,
                 cache_boundaries: self.cache_boundaries.clone(),
+                selection_policy: (self.selection_policy != DEFAULT_SELECTION_POLICY)
+                    .then(|| self.selection_policy.clone()),
+                selection_accounting_ttl_ms: self.selection_accounting_ttl_ms,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
@@ -1778,31 +2026,55 @@ impl CliArgs {
 
         let policy = self.parse_policy(&self.policy);
 
-        let discovery = if self.service_discovery {
-            Some(DiscoveryConfig {
-                enabled: true,
-                namespace: self.service_discovery_namespace.clone(),
-                port: self.service_discovery_port,
-                check_interval_secs: 60,
-                selector: Self::parse_selector(&self.selector),
-                encode_selector: Self::parse_selector(&self.encode_selector),
-                prefill_selector: Self::parse_selector(&self.prefill_selector),
-                decode_selector: Self::parse_selector(&self.decode_selector),
-                bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
-                worker_ports_annotation: "smg.ai/worker-ports".to_string(),
-                kv_connector_annotation: self.kv_connector_annotation.clone(),
-                kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
-                router_selector: Self::parse_selector(&self.router_selector),
-                router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
-                model_id_source: self.model_id_from.clone(),
-            })
-        } else {
-            None
+        // A provider's own flags are ignored under another provider, as the
+        // Kubernetes flags always were without discovery. The file flags have
+        // no other use, so giving them without the file provider is an error.
+        let provider = self.selected_discovery_provider();
+        if provider != Some(DiscoveryProvider::File)
+            && (self.discovery_file.is_some() || self.discovery_check_interval_secs.is_some())
+        {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "--discovery-file and --discovery-check-interval-secs apply only to \
+                         --discovery-provider file"
+                    .to_string(),
+            });
+        }
+        let discovery = match provider {
+            None => None,
+            Some(DiscoveryProvider::Kubernetes) => {
+                Some(DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
+                    namespace: self.service_discovery_namespace.clone(),
+                    port: self.service_discovery_port,
+                    check_interval_secs: 60,
+                    selector: Self::parse_selector(&self.selector),
+                    encode_selector: Self::parse_selector(&self.encode_selector),
+                    prefill_selector: Self::parse_selector(&self.prefill_selector),
+                    decode_selector: Self::parse_selector(&self.decode_selector),
+                    bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+                    worker_ports_annotation: "smg.ai/worker-ports".to_string(),
+                    kv_connector_annotation: self.kv_connector_annotation.clone(),
+                    kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
+                    router_selector: Self::parse_selector(&self.router_selector),
+                    router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
+                    model_id_source: self.model_id_from.clone(),
+                }))
+            }
+            Some(DiscoveryProvider::File) => Some(DiscoveryConfig::File(FileDiscoveryConfig {
+                path: self
+                    .discovery_file
+                    .clone()
+                    .ok_or_else(|| ConfigError::MissingRequired {
+                        field: "--discovery-file".to_string(),
+                    })?,
+                check_interval_secs: self
+                    .discovery_check_interval_secs
+                    .unwrap_or(DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS),
+            })),
         };
 
         let metrics = Some(MetricsConfig {
             port: self.prometheus_port,
-            host: self.prometheus_host.clone(),
+            host: self.metrics_host(),
         });
 
         let trace_config = Some(TraceConfig {
@@ -1856,6 +2128,7 @@ impl CliArgs {
             match self.backend {
                 Some(Backend::Vllm) => Some(RuntimeType::Vllm),
                 Some(Backend::Tokenspeed) => Some(RuntimeType::TokenSpeed),
+                Some(Backend::Sglang) => Some(RuntimeType::Sglang),
                 _ => None,
             }
         } else {
@@ -1930,13 +2203,27 @@ impl CliArgs {
             .job_queue_capacity(self.job_queue_capacity)
             .job_queue_concurrency(self.job_queue_concurrency)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .worker_stall_secs(self.worker_stall_secs)
+            .worker_wedge_secs(self.worker_wedge_secs)
+            .worker_stale_secs(self.worker_stale_secs)
+            .worker_warmup(
+                self.worker_warmup_secs,
+                self.worker_warmup_share,
+                self.worker_warmup_blocks,
+                self.worker_warmup_thin_ratio,
+                self.worker_warmup_divert_every,
+            )
             .pd_admission_wait_secs(self.pd_admission_wait_secs)
             .disable_load_monitoring(self.disable_load_monitoring)
-            .worker_overload_protection(self.worker_overload_protection)
-            .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
-            .worker_overload_token_usage(self.worker_overload_token_usage)
+            .worker_overload_protection(
+                self.worker_overload_protection && !self.disable_worker_overload_protection,
+            )
+            .worker_overload_waiting_requests(Some(self.worker_overload_waiting_requests))
+            .worker_overload_token_usage(Some(self.worker_overload_token_usage))
+            .worker_overload_shed(self.worker_overload_shed)
             .kv_indexer_ttl_secs(self.kv_indexer_ttl_secs)
             .kv_indexer_max_entries(self.kv_indexer_max_entries)
+            .kv_index(self.kv_index)
             .engine_metrics(self.engine_metrics)
             .multimodal_tensor_transport(self.multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
@@ -1983,13 +2270,14 @@ impl CliArgs {
                 disable_health_check: self.disable_health_check,
                 remove_unhealthy_workers: resolve_worker_auto_recovery(
                     self.remove_unhealthy_workers,
-                    self.service_discovery,
+                    self.selected_discovery_provider().is_some(),
                 ),
                 drain_settle_secs: self.drain_settle_secs,
             })
             .tokenizer_cache(TokenizerCacheConfig {
                 enable_l0: self.tokenizer_cache_enable_l0,
                 l0_max_entries: self.tokenizer_cache_l0_max_entries,
+                l0_max_memory: self.tokenizer_cache_l0_max_memory,
                 enable_l1: self.tokenizer_cache_enable_l1,
                 l1_max_memory: self.tokenizer_cache_l1_max_memory,
             })
@@ -2002,6 +2290,7 @@ impl CliArgs {
             .maybe_metrics(metrics)
             .maybe_trace(trace_config)
             .maybe_log_dir(self.log_dir.as_ref())
+            .maybe_jemalloc_prof_dir(self.jemalloc_prof_dir.as_ref())
             .maybe_request_id_headers(
                 (!self.request_id_headers.is_empty()).then(|| self.request_id_headers.clone()),
             )
@@ -2012,6 +2301,7 @@ impl CliArgs {
             .trust_tenant_header(self.trust_tenant_header)
             .tenant_header_name(&self.tenant_header_name)
             .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
+            .max_background_responses(self.max_background_responses)
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
@@ -2052,78 +2342,19 @@ impl CliArgs {
     }
 
     fn to_server_config(&self, router_config: RouterConfig) -> ConfigResult<ServerConfig> {
-        let service_discovery_config = if self.service_discovery {
-            let (kv_connector_annotation, kv_engine_id_annotation) = router_config
-                .discovery
-                .as_ref()
-                .map(|d| {
-                    (
-                        d.kv_connector_annotation.clone(),
-                        d.kv_engine_id_annotation.clone(),
-                    )
-                })
-                .unwrap_or_else(|| {
-                    (
-                        self.kv_connector_annotation.clone(),
-                        self.kv_engine_id_annotation.clone(),
-                    )
-                });
-
-            let model_id_source = self
-                .model_id_from
-                .as_deref()
-                .or_else(|| {
-                    router_config
-                        .discovery
-                        .as_ref()
-                        .and_then(|d| d.model_id_source.as_deref())
-                })
-                .map(|s| {
-                    ModelIdSource::parse(s).map_err(|e| ConfigError::InvalidValue {
-                        field: "model_id_source".to_string(),
-                        value: s.to_string(),
-                        reason: e,
-                    })
-                })
-                .transpose()?;
-
-            Some(ServiceDiscoveryConfig {
-                enabled: true,
-                selector: Self::parse_selector(&self.selector),
-                check_interval: std::time::Duration::from_secs(60),
-                port: self.service_discovery_port,
-                namespace: self.service_discovery_namespace.clone(),
-                disaggregated_mode: self.pd_disaggregation || self.epd_disaggregation,
-                encode_selector: Self::parse_selector(&self.encode_selector),
-                prefill_selector: Self::parse_selector(&self.prefill_selector),
-                decode_selector: Self::parse_selector(&self.decode_selector),
-                bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
-                worker_ports_annotation: "smg.ai/worker-ports".to_string(),
-                kv_connector_annotation,
-                kv_engine_id_annotation,
-                model_id_source,
-            })
-        } else {
-            None
-        };
-
-        // Mesh-router discovery now has its own task and lifetime, but its
-        // configuration still arrives inside `discovery`, so it stays reachable
-        // only under `--service-discovery`. Moving it onto its own config
-        // surface lands with the tagged provider configuration.
+        let service_discovery_config = router_config
+            .discovery
+            .as_ref()
+            .map(|discovery| RuntimeDiscoveryConfig::from_config(discovery, &router_config.mode))
+            .transpose()?;
         let mesh_discovery_config = router_config
             .discovery
             .as_ref()
-            .map(|d| MeshDiscoveryConfig {
-                namespace: d.namespace.clone(),
-                router_selector: d.router_selector.clone(),
-                router_mesh_port_annotation: d.router_mesh_port_annotation.clone(),
-            })
-            .filter(MeshDiscoveryConfig::is_enabled);
+            .and_then(MeshDiscoveryConfig::from_discovery);
 
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port,
-            host: self.prometheus_host.clone(),
+            host: self.metrics_host(),
             duration_buckets: if self.prometheus_duration_buckets.is_empty() {
                 None
             } else {
@@ -2222,10 +2453,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => cli.router_args,
     };
 
-    // Automatically enable IGW mode when service discovery is turned on
-    if cli_args.service_discovery && !cli_args.enable_igw {
+    if cli_args.enable_igw_for_discovery() {
         println!("INFO: IGW mode automatically enabled because service discovery is turned on");
-        cli_args.enable_igw = true;
     }
 
     let mode_str = if cli_args.enable_igw {
@@ -2285,7 +2514,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::runtime::Runtime::new()?
         }
     };
-    runtime.block_on(Box::pin(server::startup(server_config)))?;
+    let served = runtime.block_on(Box::pin(server::startup(server_config)));
+    // The writer threads outlive `startup` (a process may start more than one
+    // router); flush and stop them now that this process is done logging.
+    close_logging();
+    served?;
     if is_otel_enabled() {
         shutdown_otel();
     }
@@ -2302,6 +2535,159 @@ mod tests {
             .chain(args.iter().map(|s| (*s).to_string()))
             .collect();
         Cli::parse_from(argv).router_args
+    }
+
+    /// Mesh bind and advertise hosts go through the shared bind-host rule, so
+    /// IPv6 works with or without brackets, as it does for `--host`.
+    #[test]
+    fn mesh_hosts_accept_both_ipv6_spellings() {
+        for (host, advertise, expected_bind, expected_advertise) in [
+            ("::", "::1", "[::]:39527", "[::1]:39527"),
+            ("[::]", "[::1]", "[::]:39527", "[::1]:39527"),
+            ("0.0.0.0", "127.0.0.1", "0.0.0.0:39527", "127.0.0.1:39527"),
+        ] {
+            let mesh = cli_args_from(&[
+                "--enable-mesh",
+                "--mesh-host",
+                host,
+                "--mesh-advertise-host",
+                advertise,
+            ])
+            .build_mesh_server_config()
+            .unwrap()
+            .unwrap();
+            assert_eq!(mesh.bind_addr.to_string(), expected_bind, "host {host}");
+            assert_eq!(
+                mesh.advertise_addr.to_string(),
+                expected_advertise,
+                "advertise {advertise}"
+            );
+        }
+        let err = cli_args_from(&["--enable-mesh", "--mesh-host", "mesh-host"])
+            .build_mesh_server_config()
+            .err()
+            .expect("a mesh host that is not an IP literal must be rejected");
+        assert!(
+            err.to_string().contains("invalid bind host 'mesh-host'"),
+            "got: {err}"
+        );
+    }
+
+    /// Three files for the mesh TLS flags (their content is not read here).
+    fn mesh_tls_files(tag: &str) -> [String; 3] {
+        let dir = std::env::temp_dir().join(format!("smg-mesh-tls-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        ["ca.pem", "node.pem", "node-key.pem"].map(|name| {
+            let path = dir.join(name);
+            std::fs::write(&path, b"test").unwrap();
+            path.to_string_lossy().into_owned()
+        })
+    }
+
+    #[test]
+    fn mesh_tls_flags_configure_mtls_with_client_certificates_required() {
+        let [ca, cert, key] = mesh_tls_files("all");
+        let mesh = cli_args_from(&[
+            "--enable-mesh",
+            "--mesh-host",
+            "127.0.0.1",
+            "--mesh-tls-ca-cert",
+            &ca,
+            "--mesh-tls-cert",
+            &cert,
+            "--mesh-tls-key",
+            &key,
+        ])
+        .build_mesh_server_config()
+        .unwrap()
+        .unwrap();
+
+        let mtls = mesh.mtls_config.expect("the three flags configure mTLS");
+        assert_eq!(mtls.ca_cert_path.to_string_lossy(), ca);
+        assert_eq!(mtls.server_cert_path.to_string_lossy(), cert);
+        assert_eq!(mtls.server_key_path.to_string_lossy(), key);
+        assert!(mtls.require_client_cert, "peers must present a certificate");
+
+        let plain = cli_args_from(&["--enable-mesh", "--mesh-host", "127.0.0.1"])
+            .build_mesh_server_config()
+            .unwrap()
+            .unwrap();
+        assert!(plain.mtls_config.is_none(), "no flags, no mTLS");
+    }
+
+    #[test]
+    fn the_mesh_tls_flags_come_together() {
+        let [ca, cert, _key] = mesh_tls_files("partial");
+        for partial in [
+            vec!["--mesh-tls-cert", cert.as_str()],
+            vec![
+                "--mesh-tls-ca-cert",
+                ca.as_str(),
+                "--mesh-tls-cert",
+                cert.as_str(),
+            ],
+        ] {
+            let argv: Vec<&str> = ["smg", "--enable-mesh", "--mesh-host", "127.0.0.1"]
+                .into_iter()
+                .chain(partial.iter().copied())
+                .collect();
+            let err = Cli::try_parse_from(argv).expect_err("a partial set is rejected");
+            assert!(
+                err.to_string().contains("--mesh-tls-"),
+                "the error names the missing flag: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_mesh_tls_file_is_a_configuration_error() {
+        let [ca, cert, _key] = mesh_tls_files("missing");
+        let err = cli_args_from(&[
+            "--enable-mesh",
+            "--mesh-host",
+            "127.0.0.1",
+            "--mesh-tls-ca-cert",
+            &ca,
+            "--mesh-tls-cert",
+            &cert,
+            "--mesh-tls-key",
+            "/nonexistent/node-key.pem",
+        ])
+        .build_mesh_server_config()
+        .err()
+        .expect("an unreadable key file is rejected at start-up");
+        assert!(
+            err.to_string().contains("mesh_tls_key"),
+            "the error names the flag: {err}"
+        );
+    }
+
+    /// With no `--prometheus-host`, the metrics listener follows the serving
+    /// listener's address family, so an IPv6-bound gateway is scraped over
+    /// IPv6 too; an explicit value is kept as written.
+    #[test]
+    fn metrics_host_defaults_to_the_serving_family() {
+        for (args, expected) in [
+            (vec!["--host", "[::]"], "::"),
+            (vec!["--host", "::"], "::"),
+            (vec!["--host", "[fd00::1]"], "::"),
+            (vec![], "0.0.0.0"),
+            (vec!["--host", "127.0.0.1"], "0.0.0.0"),
+            (
+                vec!["--host", "[::]", "--prometheus-host", "127.0.0.1"],
+                "127.0.0.1",
+            ),
+            (vec!["--host", "0.0.0.0", "--prometheus-host", "::"], "::"),
+        ] {
+            let cli = cli_args_from(&args);
+            assert_eq!(cli.metrics_host(), expected, "args {args:?}");
+            let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+            assert_eq!(
+                router_config.metrics.unwrap().host,
+                expected,
+                "args {args:?}"
+            );
+        }
     }
 
     /// A grouped ZMQ handshake needs at least one engine, so `0` (and any
@@ -2341,6 +2727,33 @@ mod tests {
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.kv_indexer_ttl_secs, None);
         assert_eq!(defaults.kv_indexer_max_entries, None);
+    }
+
+    /// `--kv-index` selects the event-driven index for cache-aware routing;
+    /// the positional indexer stays the default until the chain index has
+    /// passed a soak in the gateway.
+    #[test]
+    fn kv_index_flag_flows_into_router_config() {
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.kv_index, KvIndexKind::Positional);
+
+        let cli = cli_args_from(&["--kv-index", "chain"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.kv_index, KvIndexKind::Chain);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.router_config.kv_index, KvIndexKind::Chain);
+        // The spelling before the rename still selects the chain index.
+        assert_eq!(
+            cli_args_from(&["--kv-index", "run"]).kv_index,
+            KvIndexKind::Chain
+        );
+        assert!(KvIndexKind::deprecated_alias_used());
+
+        assert_eq!(
+            cli_args_from(&["--kv-index", "Positional"]).kv_index,
+            KvIndexKind::Positional
+        );
+        assert!(parse_kv_index_kind("tree").is_err());
     }
 
     /// The retry-buffer cap must flow through both conversion paths.
@@ -2537,9 +2950,9 @@ mod tests {
     }
 
     /// Mesh-router discovery has its own task and lifetime, but is still
-    /// configured through `discovery`, which only `--service-discovery`
-    /// populates. `--router-selector` alone therefore still does nothing; it
-    /// gains its own config surface with the tagged provider configuration.
+    /// configured through Kubernetes `discovery`, which only a selected
+    /// Kubernetes provider populates. `--router-selector` alone therefore
+    /// still does nothing until router discovery gets its own config surface.
     #[test]
     fn router_selector_alone_does_not_yet_configure_mesh_discovery() {
         let cli = cli_args_from(&["--router-selector", "role=router"]);
@@ -2631,21 +3044,208 @@ mod tests {
             "example.com/engine-id",
         ]);
         let router = cli.to_router_config(vec![], vec![]).unwrap();
-        let discovery = router.discovery.as_ref().unwrap();
+        let Some(DiscoveryConfig::Kubernetes(discovery)) = &router.discovery else {
+            panic!("expected Kubernetes discovery");
+        };
         assert_eq!(discovery.kv_connector_annotation, "example.com/connector");
         assert_eq!(discovery.kv_engine_id_annotation, "example.com/engine-id");
 
         let server = cli.to_server_config(router).unwrap();
-        let discovery = server.service_discovery_config.as_ref().unwrap();
+        let Some(RuntimeDiscoveryConfig::Kubernetes(discovery)) = &server.service_discovery_config
+        else {
+            panic!("expected Kubernetes runtime discovery");
+        };
         assert_eq!(discovery.kv_connector_annotation, "example.com/connector");
         assert_eq!(discovery.kv_engine_id_annotation, "example.com/engine-id");
 
         let defaults = cli_args_from(&["--service-discovery", "--selector", "app=worker"])
             .to_router_config(vec![], vec![])
             .unwrap();
-        let defaults = defaults.discovery.as_ref().unwrap();
+        let Some(DiscoveryConfig::Kubernetes(defaults)) = &defaults.discovery else {
+            panic!("expected Kubernetes discovery");
+        };
         assert_eq!(defaults.kv_connector_annotation, "smg.ai/kv-connector");
         assert_eq!(defaults.kv_engine_id_annotation, "smg.ai/kv-engine-id");
+    }
+
+    /// `--discovery-provider kubernetes` is `--service-discovery` under its
+    /// new name: the same detail flags build the same configuration, worker
+    /// and router discovery alike.
+    #[test]
+    fn discovery_provider_kubernetes_matches_service_discovery() {
+        let details = [
+            "--selector",
+            "app=worker",
+            "--service-discovery-port",
+            "9000",
+            "--service-discovery-namespace",
+            "prod",
+            "--kv-connector-annotation",
+            "example.com/connector",
+            "--model-id-from",
+            "namespace",
+            "--router-selector",
+            "role=router",
+        ];
+        let build = |selection: &[&str]| {
+            let args: Vec<&str> = selection.iter().chain(details.iter()).copied().collect();
+            let cli = cli_args_from(&args);
+            let router = cli.to_router_config(vec![], vec![]).unwrap();
+            let discovery = router.discovery.clone();
+            let server = cli.to_server_config(router).unwrap();
+            (
+                discovery,
+                format!("{:?}", server.service_discovery_config),
+                format!("{:?}", server.mesh_discovery_config),
+            )
+        };
+
+        let legacy = build(&["--service-discovery"]);
+        let tagged = build(&["--discovery-provider", "kubernetes"]);
+        assert!(matches!(legacy.0, Some(DiscoveryConfig::Kubernetes(_))));
+        assert_eq!(legacy, tagged);
+    }
+
+    /// Two spellings of one choice: giving both is a usage error, not a
+    /// precedence rule to remember.
+    #[test]
+    fn service_discovery_and_discovery_provider_conflict() {
+        let err = Cli::try_parse_from([
+            "smg",
+            "--service-discovery",
+            "--discovery-provider",
+            "kubernetes",
+        ])
+        .expect_err("both spellings must be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    /// `--discovery-provider file` builds a file configuration with the
+    /// interval defaulted. Worker discovery runs from it; router discovery,
+    /// configured only inside Kubernetes discovery, does not.
+    #[test]
+    fn discovery_provider_file_builds_a_file_config() {
+        let cli = cli_args_from(&[
+            "--discovery-provider",
+            "file",
+            "--discovery-file",
+            "/run/smg/workers.json",
+        ]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(
+            router.discovery,
+            Some(DiscoveryConfig::File(FileDiscoveryConfig {
+                path: "/run/smg/workers.json".into(),
+                check_interval_secs: DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
+            }))
+        );
+        // Recovery by removal works here too: the next reread re-adds the worker.
+        assert!(router.health_check.remove_unhealthy_workers);
+
+        let server = cli.to_server_config(router).unwrap();
+        assert!(matches!(
+            server.service_discovery_config,
+            Some(RuntimeDiscoveryConfig::File(_))
+        ));
+        assert!(server.mesh_discovery_config.is_none());
+
+        let tuned = cli_args_from(&[
+            "--discovery-provider",
+            "file",
+            "--discovery-file",
+            "w.json",
+            "--discovery-check-interval-secs",
+            "5",
+        ])
+        .to_router_config(vec![], vec![])
+        .unwrap();
+        assert!(matches!(
+            tuned.discovery,
+            Some(DiscoveryConfig::File(FileDiscoveryConfig {
+                check_interval_secs: 5,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn file_provider_needs_a_manifest() {
+        let err = cli_args_from(&["--discovery-provider", "file"])
+            .to_router_config(vec![], vec![])
+            .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::MissingRequired { ref field } if field == "--discovery-file"),
+            "{err}"
+        );
+    }
+
+    /// The file flags configure nothing else, so a forgotten
+    /// `--discovery-provider file` is reported instead of ignored.
+    #[test]
+    fn file_flags_need_the_file_provider() {
+        for args in [
+            &["--discovery-file", "w.json"][..],
+            &["--discovery-check-interval-secs", "5"][..],
+            &[
+                "--service-discovery",
+                "--selector",
+                "app=w",
+                "--discovery-file",
+                "w.json",
+            ][..],
+        ] {
+            let err = cli_args_from(args)
+                .to_router_config(vec![], vec![])
+                .unwrap_err();
+            assert!(
+                matches!(err, ConfigError::IncompatibleConfig { .. }),
+                "{args:?}: {err}"
+            );
+        }
+    }
+
+    /// Under the file provider the Kubernetes flags are ignored, the router
+    /// selector included, as they are without discovery.
+    #[test]
+    fn kubernetes_flags_are_ignored_under_the_file_provider() {
+        let cli = cli_args_from(&[
+            "--discovery-provider",
+            "file",
+            "--discovery-file",
+            "w.json",
+            "--selector",
+            "app=w",
+            "--service-discovery-namespace",
+            "prod",
+            "--router-selector",
+            "role=router",
+        ]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(matches!(router.discovery, Some(DiscoveryConfig::File(_))));
+        let server = cli.to_server_config(router).unwrap();
+        assert!(server.mesh_discovery_config.is_none());
+    }
+
+    /// IGW mode follows the selected provider, whichever spelling selected it.
+    #[test]
+    fn selecting_a_discovery_provider_enables_igw() {
+        for selection in [
+            &["--service-discovery"][..],
+            &["--discovery-provider", "kubernetes"][..],
+            &["--discovery-provider", "file", "--discovery-file", "w.json"][..],
+        ] {
+            let mut cli = cli_args_from(selection);
+            assert!(cli.enable_igw_for_discovery(), "{selection:?}");
+            assert!(cli.enable_igw, "{selection:?}");
+        }
+
+        let mut already_on = cli_args_from(&["--service-discovery", "--enable-igw"]);
+        assert!(!already_on.enable_igw_for_discovery());
+        assert!(already_on.enable_igw);
+
+        let mut no_discovery = cli_args_from(&[]);
+        assert!(!no_discovery.enable_igw_for_discovery());
+        assert!(!no_discovery.enable_igw);
     }
 
     /// `--worker-auto-recovery` defaults to the `--service-discovery`
@@ -2659,6 +3259,12 @@ mod tests {
             .to_router_config(vec![], vec![])
             .unwrap();
         assert!(derived_on.health_check.remove_unhealthy_workers);
+
+        let derived_on_tagged =
+            cli_args_from(&["--discovery-provider", "kubernetes", "--selector", "app=w"])
+                .to_router_config(vec![], vec![])
+                .unwrap();
+        assert!(derived_on_tagged.health_check.remove_unhealthy_workers);
 
         let derived_off = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert!(!derived_off.health_check.remove_unhealthy_workers);
@@ -2773,25 +3379,48 @@ mod tests {
         );
     }
 
-    /// Unset means off on both paths: the feature must be byte-identical to
-    /// pre-feature behavior until an operator opts in.
+    /// Protection is on by default on both signals, steering only, on both
+    /// config paths.
     #[test]
-    fn worker_overload_thresholds_default_to_unset_in_both_configs() {
+    fn worker_overload_protection_defaults_to_on_and_steering_in_both_configs() {
         let cli = cli_args_from(&[]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(router_config.worker_overload_waiting_requests, None);
-        assert_eq!(router_config.worker_overload_token_usage, None);
+        assert!(router_config.worker_overload_protection);
+        assert_eq!(router_config.worker_overload_waiting_requests, Some(8));
+        assert_eq!(router_config.worker_overload_token_usage, Some(0.8));
+        assert!(!router_config.worker_overload_shed);
 
         let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(server_config.router_config.worker_overload_protection);
         assert_eq!(
             server_config.router_config.worker_overload_waiting_requests,
-            None
+            Some(8)
         );
         assert_eq!(
             server_config.router_config.worker_overload_token_usage,
-            None
+            Some(0.8)
         );
+        assert!(!server_config.router_config.worker_overload_shed);
+    }
+
+    /// The two opt-outs: `--disable-worker-overload-protection` switches the
+    /// gateway thresholds off, `--worker-overload-shed` turns steering into
+    /// refusal; both must survive into `ServerConfig.router_config`.
+    #[test]
+    fn worker_overload_opt_outs_flow_into_both_configs() {
+        let cli = cli_args_from(&["--disable-worker-overload-protection"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(!router_config.worker_overload_protection);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(!server_config.router_config.worker_overload_protection);
+
+        let cli = cli_args_from(&["--worker-overload-shed"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(router_config.worker_overload_shed);
+        assert!(router_config.worker_overload_protection);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(server_config.router_config.worker_overload_shed);
     }
 
     /// Both thresholds are `>=` comparisons, so the excluded ends of their
@@ -2832,10 +3461,9 @@ mod tests {
             router_config.disable_load_monitoring,
             "disable_load_monitoring must reach RouterConfig via to_router_config"
         );
-        // The flag alone carries no thresholds; the token default is applied
-        // at resolution, not stored in config.
-        assert_eq!(router_config.worker_overload_waiting_requests, None);
-        assert_eq!(router_config.worker_overload_token_usage, None);
+        // The flag changes nothing: the defaults are already on.
+        assert_eq!(router_config.worker_overload_waiting_requests, Some(8));
+        assert_eq!(router_config.worker_overload_token_usage, Some(0.8));
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert!(
@@ -2848,18 +3476,18 @@ mod tests {
         );
     }
 
-    /// Defaults: protection off, monitoring default-on (opt-out false) — the
-    /// behavior change is monitoring, and it is carried by the default here.
+    /// Defaults: protection on, monitoring on (opt-out false) — both carried
+    /// by the defaults here.
     #[test]
-    fn overload_protection_and_monitoring_flags_default_off_in_both_configs() {
+    fn overload_protection_and_monitoring_default_on_in_both_configs() {
         let cli = cli_args_from(&[]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert!(!router_config.worker_overload_protection);
+        assert!(router_config.worker_overload_protection);
         assert!(!router_config.disable_load_monitoring);
 
         let server_config = cli.to_server_config(router_config).unwrap();
-        assert!(!server_config.router_config.worker_overload_protection);
+        assert!(server_config.router_config.worker_overload_protection);
         assert!(!server_config.router_config.disable_load_monitoring);
     }
 
@@ -3110,6 +3738,21 @@ mod tests {
             server_config.router_config.startup_worker_runtime_type,
             Some(RuntimeType::TokenSpeed),
             "the runtime pin must survive into ServerConfig via to_server_config"
+        );
+
+        let sglang = cli_args_from(&[
+            "--backend",
+            "sglang",
+            "--worker-urls",
+            "ipc:///tmp/smg-zmq/engine-0",
+        ]);
+        assert_eq!(
+            sglang
+                .to_router_config(vec![], vec![])
+                .unwrap()
+                .startup_worker_runtime_type,
+            Some(RuntimeType::Sglang),
+            "--backend sglang must pin the ZMQ startup worker runtime"
         );
     }
 

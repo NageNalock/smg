@@ -1,17 +1,22 @@
 #[cfg(test)]
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration};
 
 use dashmap::DashMap;
 use llm_tokenizer::cache::{cache_activity_stats, CacheActivityStats};
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
-use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{
+    DistributionBuilder, Matcher, PrometheusBuilder, PrometheusHandle,
+};
+use metrics_util::parse_quantiles;
 use once_cell::sync::Lazy;
 use smg_external_router::metrics::Metrics as RouterMetrics;
 pub use smg_external_router::metrics::{
     bool_to_static_str, intern_model_label, intern_tool_label, metrics_labels, STREAMING_FALSE,
     STREAMING_TRUE,
 };
+
+use super::worker_metrics::{self, WorkerSeries, WorkerSeriesRecorder};
 
 // Interned strings are never freed; only intern low-cardinality, server-controlled
 // labels (model IDs, worker URLs, normalized paths), never user-controlled input.
@@ -134,6 +139,80 @@ pub(crate) const UPKEEP_INTERVAL_SECS: u64 = 5 * 60;
 pub(crate) const CACHE_AWARE_MATCH_RATIO_BUCKETS: &[f64] =
     &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
 
+/// Histogram buckets for `smg_kv_index_lookup_seconds` and
+/// `smg_kv_event_apply_seconds`: a lookup takes microseconds and a batch
+/// apply tens of microseconds, below the request-latency buckets' first
+/// edge, so these double from half a microsecond to a quarter of a second.
+pub(crate) const KV_INDEX_MICRO_BUCKETS: &[f64] = &[
+    0.000_000_5,
+    0.000_001,
+    0.000_002,
+    0.000_004,
+    0.000_008,
+    0.000_016,
+    0.000_032,
+    0.000_064,
+    0.000_128,
+    0.000_256,
+    0.000_512,
+    0.001_024,
+    0.002_048,
+    0.004_096,
+    0.008_192,
+    0.016_384,
+    0.065_536,
+    0.262_144,
+];
+
+/// Histogram buckets for `smg_kv_event_lag_seconds`: the age of a KV event
+/// batch when it is applied, publisher clock to router clock. A batch is
+/// normally a few milliseconds old (publish interval plus transport), and
+/// seconds or more when a relay replays history or the router falls behind,
+/// so the edges run from a tenth of a millisecond to a minute. Without
+/// explicit buckets the recorder renders the family as a summary, whose
+/// per-worker quantiles cannot be aggregated across workers or windows.
+pub(crate) const KV_EVENT_LAG_BUCKETS: &[f64] = &[
+    0.000_1, 0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+    5.0, 10.0, 30.0, 60.0,
+];
+
+/// Histogram buckets for `smg_worker_retry_backoff_seconds`: the delay slept
+/// before a retried upstream call. The schedule is exponential with jitter,
+/// from the configured initial backoff (50 ms by default) to the configured
+/// maximum (30 s by default), so the edges run from ten milliseconds to a
+/// minute. Without explicit buckets the recorder renders the family as a
+/// summary, whose per-attempt quantiles cannot be aggregated across gateways
+/// or time windows.
+pub(crate) const WORKER_RETRY_BACKOFF_BUCKETS: &[f64] = &[
+    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+];
+
+/// Jemalloc's run-time options for a long-running gateway, for every final
+/// artifact (the `smg` executable, the Python extension) to export as
+/// `_rjem_malloc_conf` next to its `#[global_allocator]`. With the stock
+/// settings a thread's freed pages decay back to the OS only when that thread
+/// allocates again, so after a traffic burst an idle gateway kept ~1.5 GB
+/// resident over ~270 MB of live objects (soak s2, ten hours). A background
+/// thread purges on schedule instead; dirty pages are returned after 10 s and
+/// muzzy pages at once.
+///
+/// jemalloc runs 16 arenas. Its default is four per CPU of the affinity mask
+/// (one on a single CPU) with every thread on an arena of its own, and each
+/// (arena, size class) pair keeps at least one partly used slab, a 64 KiB
+/// page on the aarch64 build: with ~240 threads on a many-core host a gateway
+/// holding 235 MB of live objects kept 1.6 GB of slabs (1.17 GB resident)
+/// under a steady multi-turn mix, and every new blocking-pool thread added a
+/// fresh set. With 16 arenas the same load and live heap took 0.4 GB of slabs
+/// (0.46 GB resident) at the same CPU per request; 4 arenas saved little more
+/// and cost 12 % CPU in arena contention. On a host with fewer than four CPUs
+/// the fixed count is more arenas than the default, a few mostly empty slabs.
+///
+/// This is jemalloc's application-provided `malloc_conf` string under the
+/// vendored build's `_rjem_` prefix; the `_RJEM_MALLOC_CONF` environment
+/// variable is read after it and overrides it entry by entry.
+pub const SERVER_MALLOC_CONF: &[u8; 72] =
+    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0,narenas:16\0";
+
 /// Marks jemalloc as the final artifact's Rust global allocator.
 ///
 /// Call this before [`start_prometheus`] only from a binary or extension that
@@ -196,7 +275,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_admission_queue_rejected_total",
-        "Requests rejected at admission by reason (full/timeout)"
+        "Requests rejected at admission by reason (full/timeout), or refused ahead of worker selection after waiting longer than the queue timeout inside the gateway (selection_timeout)"
     );
     describe_gauge!(
         "smg_admission_inflight",
@@ -223,6 +302,10 @@ pub(crate) fn init_metrics() {
     describe_counter!(
         "smg_router_upstream_responses_total",
         "Upstream backend HTTP responses by router_type, status_code, error_code"
+    );
+    describe_counter!(
+        "smg_router_upstream_send_retries_total",
+        "Single-shot resends after a pre-response transport failure, by router_type"
     );
     describe_counter!(
         "smg_router_request_buffers_released_early_bytes_total",
@@ -253,17 +336,31 @@ pub(crate) fn init_metrics() {
 
     // Layer 2: PD disaggregation metrics (signals only SMG can measure — it is the
     // only component that observes both the prefill and decode legs of a request).
+    //
+    // The PD time to first token is split into phases the gateway bounds itself.
+    // Under sequential dispatch (the gRPC router relays the legs) the three
+    // phase families add up to `smg_pd_ttft_seconds` exactly:
+    //   prefill  smg_pd_prefill_duration_seconds    prefill dispatch -> prefill response drained
+    //   relay    smg_pd_kv_transfer_duration_seconds prefill drained -> decode dispatch (gateway work only)
+    //   decode   smg_pd_decode_ttft_seconds          decode dispatch -> first decode token
+    // The engines' own KV transfer runs inside the decode phase. Parallel
+    // dispatch sends both legs together: the decode phase is the whole TTFT and
+    // there is no relay phase.
     describe_histogram!(
         "smg_pd_prefill_duration_seconds",
-        "Prefill-leg RPC duration by backend_type, model, runtime"
+        "PD prefill phase: prefill dispatch to the end of the prefill response, the prefill engine's queueing and compute included, by backend_type, model, runtime"
     );
     describe_histogram!(
         "smg_pd_kv_transfer_duration_seconds",
-        "KV-transfer window (prefill drain to decode send) by backend_type, model, runtime (vLLM sequential PD)"
+        "PD relay phase (sequential dispatch): end of the prefill response to the decode dispatch, gateway work only; not the engines' KV transfer, which runs inside smg_pd_decode_ttft_seconds; by backend_type, model, runtime"
+    );
+    describe_histogram!(
+        "smg_pd_decode_ttft_seconds",
+        "PD decode phase: decode dispatch to the first decode token, the engines' KV transfer and the decode scheduling included (the whole TTFT under parallel dispatch), by backend_type, model, runtime"
     );
     describe_histogram!(
         "smg_pd_ttft_seconds",
-        "Honest end-to-end TTFT (prefill start to first decode token) by backend_type, model, runtime"
+        "PD time to first token: prefill dispatch to the first decode token (the decode response head on the HTTP router); under sequential dispatch the prefill, relay and decode phases add up to it; by backend_type, model, runtime"
     );
     describe_counter!(
         "smg_pd_kv_connector_mode_total",
@@ -293,6 +390,18 @@ pub(crate) fn init_metrics() {
         "smg_pd_prefill_admission_rejections_total",
         "Prefill admission rejections by reason"
     );
+    describe_counter!(
+        "smg_pd_admission_waits_total",
+        "PD dispatches that waited for a decode admission slot"
+    );
+    describe_counter!(
+        "smg_pd_admission_sheds_total",
+        "PD dispatches shed because no decode admission slot freed in time"
+    );
+    describe_gauge!(
+        "smg_pd_admission_window",
+        "Running window the PD admission gate bounds a decode worker by; 0 when the engine reports none and admission is off for that worker"
+    );
 
     // Layer 3: Worker metrics
     describe_gauge!(
@@ -306,6 +415,10 @@ pub(crate) fn init_metrics() {
     describe_gauge!(
         "smg_worker_requests_active",
         "Currently running requests per worker"
+    );
+    describe_counter!(
+        "smg_worker_requests_total",
+        "Requests dispatched to a worker by worker (URL) and model, counted at each send"
     );
     describe_gauge!(
         "smg_worker_health",
@@ -332,18 +445,186 @@ pub(crate) fn init_metrics() {
         "KV event subscription task failures by worker and reason \
          (panic, join_error, intern_failed)"
     );
+    describe_counter!(
+        "smg_kv_event_subscriptions_total",
+        "KV event streams connected, by worker; a reconnect counts again"
+    );
+    describe_counter!(
+        "smg_kv_event_stream_errors_total",
+        "KV event streams that failed after connecting, by worker and error (the gRPC \
+         status code: out_of_range, unavailable, data_loss, ...)"
+    );
+    describe_gauge!(
+        "smg_kv_events_unavailable",
+        "1 while a worker's backend serves no KV events (SubscribeKvEvents answered \
+         UNIMPLEMENTED: the engine's publisher is off), 0 once the worker leaves, by \
+         worker. Cache-aware routing is blind to such a worker's cache"
+    );
+    describe_counter!(
+        "smg_kv_event_batches_total",
+        "KV event batches by worker and disposition (applied, stale, tail_overflow, snapshot)"
+    );
+    describe_counter!(
+        "smg_engine_load_polls_total",
+        "Load-monitor tick decisions by worker and mode: poll (no pushed load record on file), \
+         fallback (pushed records older than the tick interval), skipped_fresh_push (the \
+         worker's KV-event stream pushed its load within the interval; no GetLoads RPC)"
+    );
+    describe_counter!(
+        "smg_kv_event_gaps_total",
+        "KV event sequence gaps by worker and outcome (replay_requested, \
+         unrecovered_kept, unrecovered_cleared)"
+    );
+    describe_counter!(
+        "smg_kv_event_missed_batches_total",
+        "KV event batches the publisher skipped and could not replay, by worker"
+    );
+    describe_counter!(
+        "smg_kv_event_resyncs_total",
+        "KV event rank resyncs by worker and reason (out_of_range, data_loss, \
+         publisher_restart, gap_cleared, snapshot)"
+    );
+    describe_histogram!(
+        "smg_kv_event_lag_seconds",
+        "Age of a KV event batch when applied: now minus the publisher timestamp, by worker"
+    );
+    describe_counter!(
+        "smg_kv_event_parentless_stores_total",
+        "Stores whose parent block the index did not hold for the worker, placed as a \
+         new chain from the root instead (a parent evicted, dropped, or cleared), by worker"
+    );
+    describe_counter!(
+        "smg_kv_event_parentless_blocks_total",
+        "Blocks of the parent-less stores, by worker"
+    );
+    describe_counter!(
+        "smg_kv_event_blocks_total",
+        "Blocks named by applied KV events, by worker and op (stored, removed; snapshot: \
+         the live set a relay state snapshot listed)"
+    );
+    describe_histogram!(
+        "smg_kv_event_apply_seconds",
+        "Time to apply one KV event batch to the index, by worker"
+    );
+    describe_histogram!(
+        "smg_kv_index_lookup_seconds",
+        "Time of one KV index lookup (overlap scoring of a request's block hashes) \
+         in cache-aware routing, by index kind (positional, chain)"
+    );
+    describe_gauge!(
+        "smg_kv_event_degraded_ranks",
+        "KV event ranks whose index may be stale after an unreplayed gap, by worker"
+    );
+    describe_gauge!(
+        "smg_kv_event_tail_depth",
+        "Live KV event batches held while a snapshot resync is in flight, by worker"
+    );
+    describe_gauge!(
+        "smg_log_dropped_lines",
+        "Log lines the lossy writer queue dropped since the process started, by sink \
+         (stdout, file)"
+    );
+    describe_gauge!(
+        "smg_kv_index_memberships",
+        "Blocks the KV index holds across a model's workers (a block two workers hold \
+         counts twice), by model; published every 30 s"
+    );
+    describe_gauge!(
+        "smg_kv_index_entries",
+        "Distinct entries in the KV index, by model: (position, content hash) pairs in \
+         the positional indexer, distinct blocks on a chain in the chain index"
+    );
+    describe_gauge!(
+        "smg_kv_index_runs_live",
+        "Runs linked in the chain index, by model (blocks_live over runs_live is the \
+         mean run length; a falling ratio under steady traffic is fragmentation)"
+    );
+    describe_gauge!(
+        "smg_kv_index_blocks_live",
+        "Content hashes held by the chain index's live runs, by model"
+    );
+    describe_gauge!(
+        "smg_kv_index_arena_bytes",
+        "Bytes the chain index's word arena has handed out (hash arrays, child tables, \
+         free lists included), by model"
+    );
+    describe_gauge!(
+        "smg_kv_index_arena_free_bytes",
+        "Bytes of the chain index's word arena sitting in free lists, by model"
+    );
+    describe_gauge!(
+        "smg_kv_index_slab_bytes",
+        "Bytes the chain index's run slab holds from the allocator, by model"
+    );
+    describe_gauge!(
+        "smg_kv_index_moved_hashes",
+        "Stores that moved a held engine hash to another place in the chain index \
+         (cumulative), by model"
+    );
+    describe_gauge!(
+        "smg_kv_index_engine_conflicts",
+        "Stored blocks whose engine hash differed from the one the chain index holds for \
+         the block, a fleet whose engines do not name content alike (cumulative), by model"
+    );
+    describe_gauge!(
+        "smg_kv_index_blocks",
+        "Blocks the positional index holds for a worker, as the index counts them; \
+         set when a KV event batch is applied, when the worker's state is reset \
+         and when the worker is removed"
+    );
     describe_gauge!(
         "smg_workers_overloaded",
         "Workers currently flagged overloaded and excluded from routing, by model"
+    );
+    describe_gauge!(
+        "smg_worker_stalled",
+        "Liveness veto on a worker: 1 while routing skips it, by worker and reason"
+    );
+    describe_counter!(
+        "smg_worker_stall_transitions_total",
+        "Times the liveness veto was set on a worker, by worker and reason"
     );
     describe_counter!(
         "smg_worker_overload_shed_total",
         "Requests shed because every worker for the model is overloaded, by stage \
          (selection, dispatch)"
     );
+    describe_counter!(
+        "smg_worker_overload_fallback_total",
+        "Requests routed to the least-loaded worker because every worker for the model is \
+         overloaded and shedding is off, by stage"
+    );
+    describe_counter!(
+        "smg_worker_liveness_fallback_total",
+        "Requests routed to the least-loaded ready worker because every worker for the model \
+         is vetoed and the ready ones are vetoed by the liveness tracker, by stage"
+    );
     describe_gauge!(
         "smg_manual_policy_cache_entries",
         "Number of routing entries in manual policy cache"
+    );
+    describe_counter!(
+        "smg_manual_policy_branch_total",
+        "Manual policy selection branch (no_healthy_workers, occupied_hit, occupied_miss, \
+         vacant, no_routing_id, cap_respill)"
+    );
+    describe_counter!(
+        "smg_consistent_hashing_policy_branch_total",
+        "Consistent hashing policy selection branch (no_healthy_workers, target_worker_hit, \
+         target_worker_miss, routing_key_hit, random_fallback)"
+    );
+    describe_counter!(
+        "smg_prefix_hash_policy_branch_total",
+        "Prefix hash policy selection branch (no_healthy_workers, no_routing_key, ring_hit, \
+         load_balance_walk, fallback_least_load)"
+    );
+    describe_counter!(
+        "smg_routing_key_source_total",
+        "Keyed requests by the source that supplied the sticky routing key"
+    );
+    describe_gauge!(
+        "smg_worker_routing_keys_active",
+        "Sticky routing keys currently held by a worker"
     );
     describe_gauge!(
         "smg_cache_tree_chars",
@@ -365,6 +646,11 @@ pub(crate) fn init_metrics() {
         "smg_cache_aware_policy_branch_total",
         "Cache-aware tree-mode selection branch (tree_match, spill, expected_wait_fallback, \
          first_healthy_fallback)"
+    );
+    describe_counter!(
+        "smg_policy_inflight_reconciled_total",
+        "Policy bookings released at the per-poll in-flight reconciliation because their \
+         completion never arrived, by policy"
     );
     describe_histogram!(
         "smg_cache_aware_match_ratio",
@@ -462,6 +748,10 @@ pub(crate) fn init_metrics() {
         "smg_discovery_workers_discovered",
         "Workers known via discovery by source"
     );
+    describe_counter!(
+        "smg_discovery_snapshot_errors_total",
+        "Discovery source observations rejected, by source and reason"
+    );
 
     // Layer 5: MCP metrics
     describe_counter!(
@@ -510,6 +800,29 @@ pub(crate) fn init_metrics() {
         "smg_mm_processing_total",
         "Multimodal requests by processing location (router/worker) and resolution reason"
     );
+    describe_gauge!(
+        "smg_mm_turbojpeg_available",
+        "1 when JPEGs decode through libjpeg-turbo (PIL's pixels), 0 through the pure-Rust fallback"
+    );
+    // The router-side pixel cache (--mm-pixel-cache-mb): one per process,
+    // shared by every model, keyed by image and model configuration.
+    describe_counter!(
+        "smg_mm_pixel_cache_hits_total",
+        "Pixel cache lookups that found the image's preprocessed encoder input, by model"
+    );
+    describe_counter!(
+        "smg_mm_pixel_cache_misses_total",
+        "Pixel cache lookups that had to preprocess the image, by model"
+    );
+    describe_counter!(
+        "smg_mm_pixel_cache_evictions_total",
+        "Entries the pixel cache dropped to stay within its byte budget"
+    );
+    describe_gauge!(
+        "smg_mm_pixel_cache_bytes",
+        "Bytes of preprocessed encoder inputs the pixel cache holds"
+    );
+    describe_gauge!("smg_mm_pixel_cache_entries", "Images the pixel cache holds");
     describe_counter!(
         "smg_responses_stream_failures_total",
         "Responses streams that ended with a response.failed terminal, by model and reason"
@@ -528,6 +841,68 @@ pub(crate) fn init_metrics() {
     // is enabled and recording).
     use crate::middleware::scheduler::metrics as scheduler_metrics;
     scheduler_metrics::describe();
+}
+
+/// Publish the protection and retry families at zero.
+///
+/// These counters are otherwise created by their first event, so a fresh
+/// gateway exposes no series for them: dashboards cannot tell "never
+/// happened" from "not exported", `absent()` alerts fire on a healthy
+/// process, and `increase()` misses the first event after a restart. Every
+/// label value the recording paths can emit is enumerated here. Call once the
+/// recorder is installed (see [`start_prometheus`]); `absolute(0)` never
+/// lowers a counter, so calling it again is harmless.
+pub fn init_startup_series() {
+    use metrics_labels::{
+        ENDPOINT_AUDIO_TRANSCRIPTIONS, ENDPOINT_CHAT, ENDPOINT_COMPLETIONS, ENDPOINT_DECISIONS,
+        ENDPOINT_GENERATE, ENDPOINT_MESSAGES, ENDPOINT_RERANK, ENDPOINT_RESPONSES,
+        ENDPOINT_SYSTEMONE, WORKER_DECODE, WORKER_PREFILL, WORKER_REGULAR,
+    };
+
+    use crate::worker::overload::{STAGE_DISPATCH, STAGE_PD_ADMISSION, STAGE_SELECTION};
+
+    // Shedding happens at every stage; the two fallbacks only while the
+    // candidate pool is assembled.
+    for stage in [STAGE_SELECTION, STAGE_DISPATCH, STAGE_PD_ADMISSION] {
+        counter!("smg_worker_overload_shed_total", "stage" => stage).absolute(0);
+    }
+    counter!("smg_worker_overload_fallback_total", "stage" => STAGE_SELECTION).absolute(0);
+    counter!("smg_worker_liveness_fallback_total", "stage" => STAGE_SELECTION).absolute(0);
+
+    // The retrying dispatch loops label their endpoint through
+    // `route_to_endpoint`, whose values these are, for regular and
+    // prefill/decode workers.
+    for worker_type in [WORKER_REGULAR, WORKER_PREFILL, WORKER_DECODE] {
+        for endpoint in [
+            ENDPOINT_CHAT,
+            ENDPOINT_GENERATE,
+            ENDPOINT_COMPLETIONS,
+            ENDPOINT_RERANK,
+            ENDPOINT_RESPONSES,
+            ENDPOINT_DECISIONS,
+            ENDPOINT_SYSTEMONE,
+            ENDPOINT_MESSAGES,
+            ENDPOINT_AUDIO_TRANSCRIPTIONS,
+            "other",
+        ] {
+            counter!(
+                "smg_worker_retries_total",
+                "worker_type" => worker_type,
+                "endpoint" => endpoint
+            )
+            .absolute(0);
+            counter!(
+                "smg_worker_retries_exhausted_total",
+                "worker_type" => worker_type,
+                "endpoint" => endpoint
+            )
+            .absolute(0);
+        }
+    }
+    // A histogram has no zero to set: registering the first attempt's series
+    // publishes the family with an empty distribution.
+    let _ = histogram!("smg_worker_retry_backoff_seconds", "attempt" => "1");
+    super::heap_profile::init_series();
 }
 
 /// Publish process-lifetime totals without scanning or retaining tokenizer instances.
@@ -553,10 +928,56 @@ fn record_tokenizer_cache_activity_snapshot(stats: CacheActivityStats) {
     reason = "startup initialization — metrics exporter must be installed or the process cannot serve metrics"
 )]
 pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
+    let bucket_overrides = histogram_bucket_overrides(config.duration_buckets);
+    let mut builder =
+        PrometheusBuilder::new().upkeep_timeout(Duration::from_secs(UPKEEP_INTERVAL_SECS));
+    for (matcher, buckets) in &bucket_overrides {
+        builder = builder
+            .set_buckets_for_metric(matcher.clone(), buckets)
+            .expect("histogram bucket overrides are not empty");
+    }
+    let recorder = builder.build_recorder();
+    let handle = recorder.handle();
+
+    // Series labelled `worker` live in a store of their own so they can be
+    // dropped with their worker (see `worker_metrics`); it renders histograms
+    // with the exporter's buckets and quantiles.
+    let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
+        parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
+        None,
+        None,
+        None,
+        Some(bucket_overrides),
+        None,
+    )));
+    worker_metrics::install(Arc::clone(&workers));
+    metrics::set_global_recorder(WorkerSeriesRecorder::new(recorder, workers))
+        .expect("failed to install Prometheus recorder");
+    #[cfg(all(
+        feature = "jemalloc-stats",
+        not(target_env = "msvc"),
+        not(target_env = "musl")
+    ))]
+    allocator_stats::start_reporting();
+
+    // Descriptions are kept by whichever recorder is current when they are
+    // registered. Before `set_global_recorder()` that is the no-op recorder, so
+    // the `describe_*!` calls must run after it or `/metrics` has `# TYPE`
+    // lines but no `# HELP` text.
     init_metrics();
 
+    handle
+}
+
+/// The exporter's default summary quantiles, for the summaries of the
+/// per-worker store (`PrometheusBuilder` keeps its own copy private).
+const DEFAULT_SUMMARY_QUANTILES: &[f64] = &[0.0, 0.5, 0.9, 0.95, 0.99, 0.999, 1.0];
+
+/// Histogram buckets by metric name. The exporter renders a histogram with
+/// these buckets for a matching name and a summary for any other name.
+fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Matcher, Vec<f64>> {
     let duration_matcher = Matcher::Suffix(String::from("duration_seconds"));
-    let duration_bucket: Vec<f64> = config.duration_buckets.unwrap_or_else(|| {
+    let duration_bucket: Vec<f64> = duration_buckets.unwrap_or_else(|| {
         vec![
             0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 45.0,
             60.0, 90.0, 120.0, 180.0, 240.0, 300.0, 480.0, 900.0, 1200.0, 1800.0, 2700.0, 3600.0,
@@ -583,31 +1004,37 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
     // summary.
     let match_ratio_matcher = Matcher::Full(String::from("smg_cache_aware_match_ratio"));
 
-    PrometheusBuilder::new()
-        .upkeep_timeout(Duration::from_secs(UPKEEP_INTERVAL_SECS))
-        .set_buckets_for_metric(duration_matcher, &duration_bucket)
-        .expect("failed to set duration bucket")
-        .set_buckets_for_metric(ttft_matcher, &duration_bucket)
-        .expect("failed to set ttft bucket")
-        .set_buckets_for_metric(tpot_matcher, &duration_bucket)
-        .expect("failed to set tpot bucket")
-        .set_buckets_for_metric(
+    // The KV event lag is milliseconds to seconds, between the request
+    // buckets and the microsecond ones below: its own buckets, or the
+    // recorder renders it as a summary.
+    let kv_lag_matcher = Matcher::Full(String::from("smg_kv_event_lag_seconds"));
+
+    // The KV index's lookup and apply times are microseconds: their own
+    // buckets, or the recorder renders them as summaries.
+    let kv_lookup_matcher = Matcher::Full(String::from("smg_kv_index_lookup_seconds"));
+    let kv_apply_matcher = Matcher::Full(String::from("smg_kv_event_apply_seconds"));
+
+    // The retry backoff is tens of milliseconds to the configured maximum
+    // (seconds): its own buckets, or the recorder renders it as a summary.
+    let retry_backoff_matcher = Matcher::Full(String::from("smg_worker_retry_backoff_seconds"));
+
+    HashMap::from([
+        (duration_matcher, duration_bucket.clone()),
+        (ttft_matcher, duration_bucket.clone()),
+        (tpot_matcher, duration_bucket),
+        (
             canary_matcher,
-            super::runtime_metrics::EVENT_LOOP_DELAY_BUCKETS,
-        )
-        .expect("failed to set event loop delay buckets")
-        .set_buckets_for_metric(match_ratio_matcher, CACHE_AWARE_MATCH_RATIO_BUCKETS)
-        .expect("failed to set cache-aware match ratio buckets")
-        .install_recorder()
-        .inspect(|_| {
-            #[cfg(all(
-                feature = "jemalloc-stats",
-                not(target_env = "msvc"),
-                not(target_env = "musl")
-            ))]
-            allocator_stats::start_reporting();
-        })
-        .expect("failed to install Prometheus recorder")
+            super::runtime_metrics::EVENT_LOOP_DELAY_BUCKETS.to_vec(),
+        ),
+        (
+            match_ratio_matcher,
+            CACHE_AWARE_MATCH_RATIO_BUCKETS.to_vec(),
+        ),
+        (kv_lookup_matcher, KV_INDEX_MICRO_BUCKETS.to_vec()),
+        (kv_apply_matcher, KV_INDEX_MICRO_BUCKETS.to_vec()),
+        (kv_lag_matcher, KV_EVENT_LAG_BUCKETS.to_vec()),
+        (retry_backoff_matcher, WORKER_RETRY_BACKOFF_BUCKETS.to_vec()),
+    ])
 }
 
 #[cfg(all(
@@ -909,6 +1336,36 @@ impl Metrics {
         counter!("smg_mm_shm_write_failures_total", "runtime" => runtime).increment(1);
     }
 
+    pub fn set_mm_turbojpeg_available(available: bool) {
+        gauge!("smg_mm_turbojpeg_available").set(if available { 1.0 } else { 0.0 });
+    }
+
+    /// The pixel cache's occupancy and eviction series, at zero: called when
+    /// the cache is built, so they are on the first scrape.
+    pub fn init_mm_pixel_cache_series() {
+        counter!("smg_mm_pixel_cache_evictions_total").absolute(0);
+        gauge!("smg_mm_pixel_cache_bytes").set(0.0);
+        gauge!("smg_mm_pixel_cache_entries").set(0.0);
+    }
+
+    /// One pixel cache lookup for `model_id`: a hit served the image's
+    /// preprocessed encoder input, a miss preprocessed it. Both series exist
+    /// from the model's first lookup, so a hit rate reads from the start.
+    pub fn record_mm_pixel_cache_lookup(model_id: &str, hit: bool) {
+        let model = intern_model_label(model_id);
+        counter!("smg_mm_pixel_cache_hits_total", "model" => model.clone())
+            .increment(u64::from(hit));
+        counter!("smg_mm_pixel_cache_misses_total", "model" => model).increment(u64::from(!hit));
+    }
+
+    /// The pixel cache after an insert: the entries it dropped to stay within
+    /// its budget, and what it holds now.
+    pub fn record_mm_pixel_cache_insert(evicted: u64, bytes: usize, entries: usize) {
+        counter!("smg_mm_pixel_cache_evictions_total").increment(evicted);
+        gauge!("smg_mm_pixel_cache_bytes").set(bytes as f64);
+        gauge!("smg_mm_pixel_cache_entries").set(entries as f64);
+    }
+
     /// Record where a multimodal request's media is processed and why.
     /// Count a Responses stream whose terminal event was `response.failed`.
     ///
@@ -1148,7 +1605,8 @@ impl Metrics {
     // (never per retry attempt).
     // ========================================================================
 
-    /// Record prefill-leg RPC duration.
+    /// Record the PD prefill phase: prefill dispatch to the end of the prefill
+    /// response.
     /// Uses string interning for model_id; runtime is a static label.
     pub fn record_pd_prefill_duration(
         backend_type: &'static str,
@@ -1166,8 +1624,11 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
-    /// Record the KV-transfer window (prefill drain to decode send) for vLLM
-    /// sequential PD. Uses string interning for model_id; runtime is a static label.
+    /// Record the PD relay phase of sequential dispatch: the gateway's own gap
+    /// between the drained prefill response and the decode dispatch. The family
+    /// name predates the phase model and stays for compatibility; this is not
+    /// the engines' KV transfer, which runs inside the decode phase.
+    /// Uses string interning for model_id; runtime is a static label.
     pub fn record_pd_kv_transfer_duration(
         backend_type: &'static str,
         model_id: &str,
@@ -1184,12 +1645,36 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
-    /// Record honest end-to-end TTFT: prefill start to first decode token.
+    /// Record the PD decode phase: decode dispatch to the first decode token.
+    /// Under sequential dispatch this is where the engines' KV transfer and the
+    /// decode scheduling show up; under parallel dispatch both legs go out
+    /// together and the value is the end-to-end TTFT.
+    /// Uses string interning for model_id; runtime is a static label.
+    pub fn record_pd_decode_ttft(
+        backend_type: &'static str,
+        model_id: &str,
+        runtime: &'static str,
+        duration: Duration,
+    ) {
+        let model = intern_model_label(model_id);
+        histogram!(
+            "smg_pd_decode_ttft_seconds",
+            "backend_type" => backend_type,
+            "model" => model,
+            "runtime" => runtime
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    /// Record the PD time to first token: prefill dispatch to the first decode
+    /// token.
     ///
-    /// INVARIANT: this is the user-facing complement to
-    /// `smg_router_ttft_seconds{backend_type="pd"}`, which measures only the
-    /// decode leg (first decode token minus decode-send). For sequential PD the
-    /// two differ by the prefill + KV-transfer time; both are kept on purpose.
+    /// `smg_router_ttft_seconds{backend_type="pd"}` shares the prefill-dispatch
+    /// anchor on the gRPC streaming paths (their stream base is the prefill
+    /// dispatch). This family adds the runtime label and is the total that the
+    /// phase families (`record_pd_prefill_duration`,
+    /// `record_pd_kv_transfer_duration`, `record_pd_decode_ttft`) add up to
+    /// under sequential dispatch.
     /// Uses string interning for model_id; runtime is a static label.
     pub fn record_pd_ttft(
         backend_type: &'static str,
@@ -1234,6 +1719,14 @@ impl Metrics {
     /// Record a PD dispatch shed because no decode slot freed in time.
     pub fn record_pd_admission_shed() {
         counter!("smg_pd_admission_sheds_total").increment(1);
+    }
+
+    /// Publish a decode worker's PD admission window: the running window the
+    /// gate claims rooms against, 0 when the engine reports none and the gate
+    /// abstains for that worker.
+    pub fn set_pd_admission_window(worker_url: &str, window: Option<u16>) {
+        let worker = intern_string(worker_url);
+        gauge!("smg_pd_admission_window", "worker" => worker).set(window.map_or(0.0, f64::from));
     }
 
     /// Set the number of requests SMG has admitted to a prefill worker.
@@ -1360,6 +1853,27 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Record a request steered to the least-loaded worker because every
+    /// worker for the model is overloaded and shedding is off.
+    pub fn record_worker_overload_fallback(stage: &'static str) {
+        counter!(
+            "smg_worker_overload_fallback_total",
+            "stage" => stage
+        )
+        .increment(1);
+    }
+
+    /// Record a request steered to the least-loaded ready worker because
+    /// every worker for the model is vetoed and the ready ones are vetoed by
+    /// the liveness tracker.
+    pub fn record_worker_liveness_fallback(stage: &'static str) {
+        counter!(
+            "smg_worker_liveness_fallback_total",
+            "stage" => stage
+        )
+        .increment(1);
+    }
+
     /// Record manual policy execution branch for routing decisions
     pub fn record_worker_manual_policy_branch(branch: &'static str) {
         counter!(
@@ -1416,6 +1930,16 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Record bookings a policy released at the in-flight reconciliation
+    /// tick: dispatches whose completion never reached it.
+    pub fn record_policy_inflight_reconciled(policy: &'static str, released: usize) {
+        counter!(
+            "smg_policy_inflight_reconciled_total",
+            "policy" => policy
+        )
+        .increment(released as u64);
+    }
+
     /// Record the best prefix match ratio (matched/input, 0..1) of a cache-aware
     /// tree-mode routing decision
     pub fn record_cache_aware_match_ratio(ratio: f64) {
@@ -1441,6 +1965,28 @@ impl Metrics {
     }
 
     /// Set running requests per worker
+    /// A request dispatched to a worker (each attempt, each PD leg), counted
+    /// at the send. The per-worker gauges miss short requests and cannot be
+    /// summed over a window, so this is how the share of traffic per worker
+    /// is read from the scrape.
+    pub fn record_worker_request(worker_url: &str, model_id: &str) {
+        Self::worker_requests(worker_url, model_id).increment(1);
+    }
+
+    /// A worker registered: its request counter exists from zero, so a
+    /// worker that gets no traffic shows as such instead of being absent.
+    pub fn init_worker_requests(worker_url: &str, model_id: &str) {
+        Self::worker_requests(worker_url, model_id).increment(0);
+    }
+
+    fn worker_requests(worker_url: &str, model_id: &str) -> metrics::Counter {
+        counter!(
+            "smg_worker_requests_total",
+            "worker" => intern_string(worker_url),
+            "model" => intern_model_label(model_id)
+        )
+    }
+
     pub fn set_worker_requests_active(worker: &str, count: usize) {
         let worker_interned = intern_string(worker);
         gauge!(
@@ -1458,6 +2004,26 @@ impl Metrics {
             "worker" => worker_interned
         )
         .set(count as f64);
+    }
+
+    /// Flip the liveness veto gauge for a worker; count the transition when
+    /// the veto is set.
+    pub fn set_worker_stalled(worker_url: &str, reason: &'static str, stalled: bool) {
+        let worker = intern_string(worker_url);
+        gauge!(
+            "smg_worker_stalled",
+            "worker" => Arc::clone(&worker),
+            "reason" => reason
+        )
+        .set(if stalled { 1.0 } else { 0.0 });
+        if stalled {
+            counter!(
+                "smg_worker_stall_transitions_total",
+                "worker" => worker,
+                "reason" => reason
+            )
+            .increment(1);
+        }
     }
 
     /// Set worker health status
@@ -1479,6 +2045,57 @@ impl Metrics {
         .set(if http2 { 1.0 } else { 0.0 });
     }
 
+    /// A worker's KV event subscription starts: its integrity families
+    /// exist from zero, so a scrape tells "no gap, no resync yet" from "no
+    /// series". Every label value the recording paths emit is enumerated
+    /// here (the gap outcomes and the failure reasons are the call sites'
+    /// literals, the resync reasons `ResyncReason::as_str`). An
+    /// `increment(0)` creates a series and leaves an existing one alone,
+    /// so a worker added again keeps its counts.
+    pub fn init_kv_event_series(worker_url: &str) {
+        let worker = intern_string(worker_url);
+        for outcome in [
+            "replay_requested",
+            "unrecovered_kept",
+            "unrecovered_cleared",
+        ] {
+            counter!(
+                "smg_kv_event_gaps_total",
+                "worker" => Arc::clone(&worker),
+                "outcome" => outcome
+            )
+            .increment(0);
+        }
+        counter!("smg_kv_event_missed_batches_total", "worker" => Arc::clone(&worker)).increment(0);
+        for reason in [
+            "out_of_range",
+            "data_loss",
+            "publisher_restart",
+            "gap_cleared",
+            "snapshot",
+        ] {
+            counter!(
+                "smg_kv_event_resyncs_total",
+                "worker" => Arc::clone(&worker),
+                "reason" => reason
+            )
+            .increment(0);
+        }
+        for reason in ["panic", "join_error", "intern_failed"] {
+            counter!(
+                "smg_kv_event_subscription_failures_total",
+                "worker" => Arc::clone(&worker),
+                "reason" => reason
+            )
+            .increment(0);
+        }
+        counter!("smg_kv_event_parentless_stores_total", "worker" => Arc::clone(&worker))
+            .increment(0);
+        counter!("smg_kv_event_parentless_blocks_total", "worker" => Arc::clone(&worker))
+            .increment(0);
+        gauge!("smg_kv_event_degraded_ranks", "worker" => worker).set(0.0);
+    }
+
     /// Record a KV event subscription task failure (panic, join error, or
     /// worker-id intern failure)
     pub fn record_kv_event_subscription_failure(worker_url: &str, reason: &'static str) {
@@ -1489,6 +2106,171 @@ impl Metrics {
             "reason" => reason
         )
         .increment(1);
+    }
+
+    /// Count a KV event stream connected: the first time and every reconnect,
+    /// so a drill can time a resubscription without reading the log.
+    pub fn record_kv_event_subscription(worker_url: &str) {
+        counter!(
+            "smg_kv_event_subscriptions_total",
+            "worker" => intern_string(worker_url)
+        )
+        .increment(1);
+    }
+
+    /// Count a KV event stream that failed after it connected, by the
+    /// error's gRPC status code: a stream that dies on its first message at
+    /// every reconnect shows here, where the connect counter alone reads as
+    /// a healthy subscription.
+    pub fn record_kv_event_stream_error(worker_url: &str, error: &'static str) {
+        counter!(
+            "smg_kv_event_stream_errors_total",
+            "worker" => intern_string(worker_url),
+            "error" => error
+        )
+        .increment(1);
+    }
+
+    /// Whether a worker's backend serves no KV events: its subscription ended
+    /// on `UNIMPLEMENTED`, and until the worker leaves cache-aware routing is
+    /// blind to its cache. A gauge per worker, so a dashboard or an alert sees
+    /// a blind cache-aware router where the log had one WARN line.
+    pub fn set_kv_events_unavailable(worker_url: &str, unavailable: bool) {
+        gauge!("smg_kv_events_unavailable", "worker" => intern_string(worker_url))
+            .set(if unavailable { 1.0 } else { 0.0 });
+    }
+
+    /// Count a KV event batch by what the subscriber did with it.
+    /// One load-monitor tick decision for a worker (see `PollMode`).
+    pub fn record_engine_load_poll(worker_url: &str, mode: &'static str) {
+        counter!(
+            "smg_engine_load_polls_total",
+            "worker" => intern_string(worker_url),
+            "mode" => mode
+        )
+        .increment(1);
+    }
+
+    pub fn record_kv_event_batch(worker_url: &str, disposition: &'static str) {
+        counter!(
+            "smg_kv_event_batches_total",
+            "worker" => intern_string(worker_url),
+            "disposition" => disposition
+        )
+        .increment(1);
+    }
+
+    /// Count a sequence gap and the batches it skipped.
+    pub fn record_kv_event_gap(worker_url: &str, outcome: &'static str, missed: u64) {
+        let worker_interned = intern_string(worker_url);
+        counter!(
+            "smg_kv_event_gaps_total",
+            "worker" => Arc::clone(&worker_interned),
+            "outcome" => outcome
+        )
+        .increment(1);
+        if missed > 0 {
+            counter!("smg_kv_event_missed_batches_total", "worker" => worker_interned)
+                .increment(missed);
+        }
+    }
+
+    /// Count a rank resync (its index state dropped) by reason.
+    pub fn record_kv_event_resync(worker_url: &str, reason: &'static str) {
+        counter!(
+            "smg_kv_event_resyncs_total",
+            "worker" => intern_string(worker_url),
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
+    /// Observe how old a batch was when it was applied.
+    pub fn record_kv_event_lag(worker_url: &str, seconds: f64) {
+        histogram!("smg_kv_event_lag_seconds", "worker" => intern_string(worker_url))
+            .record(seconds);
+    }
+
+    /// Count the blocks an applied batch's events named (`stored` or
+    /// `removed`), before the monitor's tier and group filters: the rate the
+    /// index is offered.
+    pub fn record_kv_event_blocks(worker_url: &str, op: &'static str, blocks: usize) {
+        counter!(
+            "smg_kv_event_blocks_total",
+            "worker" => intern_string(worker_url),
+            "op" => op
+        )
+        .increment(blocks as u64);
+    }
+
+    /// Count the stores a batch placed without their parent (as new chains
+    /// from the root) and the blocks they carried.
+    pub fn record_kv_event_parentless(worker_url: &str, stores: u64, blocks: u64) {
+        let worker = intern_string(worker_url);
+        counter!("smg_kv_event_parentless_stores_total", "worker" => worker.clone())
+            .increment(stores);
+        counter!("smg_kv_event_parentless_blocks_total", "worker" => worker).increment(blocks);
+    }
+
+    /// Time to apply one batch to the index.
+    pub fn record_kv_event_apply(worker_url: &str, seconds: f64) {
+        histogram!("smg_kv_event_apply_seconds", "worker" => intern_string(worker_url))
+            .record(seconds);
+    }
+
+    /// Time of one index lookup on the routing path, recorded after the
+    /// lookup returned and outside any lock.
+    pub fn record_kv_index_lookup(index: &'static str, seconds: f64) {
+        histogram!("smg_kv_index_lookup_seconds", "index" => index).record(seconds);
+    }
+
+    /// Ranks of this worker whose index may be stale.
+    pub fn set_kv_event_degraded_ranks(worker_url: &str, count: usize) {
+        gauge!("smg_kv_event_degraded_ranks", "worker" => intern_string(worker_url))
+            .set(count as f64);
+    }
+
+    /// Live batches held for a worker while a snapshot resync is in flight.
+    pub fn set_kv_event_tail_depth(worker_url: &str, depth: usize) {
+        gauge!("smg_kv_event_tail_depth", "worker" => intern_string(worker_url)).set(depth as f64);
+    }
+
+    /// Publish the blocks the positional index holds for a worker. Called from
+    /// the KV event subscriber where it already counts applied batches, never
+    /// from the lookup path, so routing reads nothing that writes.
+    pub fn set_kv_index_blocks(worker_url: &str, blocks: usize) {
+        gauge!("smg_kv_index_blocks", "worker" => intern_string(worker_url)).set(blocks as f64);
+    }
+
+    /// Publish the lines a log writer's queue has dropped so far, by sink.
+    pub fn set_log_dropped_lines(sink: &'static str, dropped: usize) {
+        gauge!("smg_log_dropped_lines", "sink" => sink).set(dropped as f64);
+    }
+
+    /// Publish a model's KV index size: memberships across workers and
+    /// distinct entries. Called from the monitor's periodic stats task, never
+    /// from the lookup path.
+    pub fn set_kv_index_size(model_id: &str, memberships: usize, entries: usize) {
+        let model = intern_string(model_id);
+        gauge!("smg_kv_index_memberships", "model" => model.clone()).set(memberships as f64);
+        gauge!("smg_kv_index_entries", "model" => model).set(entries as f64);
+    }
+
+    /// Publish the chain index's shape and memory for a model, from its own
+    /// counters: live runs and blocks, arena and slab bytes, moved hashes and
+    /// engine conflicts.
+    pub fn set_kv_index_chain_stats(model_id: &str, stats: &kv_index::ChainIndexStats) {
+        let model = intern_string(model_id);
+        gauge!("smg_kv_index_runs_live", "model" => model.clone()).set(stats.runs_live as f64);
+        gauge!("smg_kv_index_blocks_live", "model" => model.clone()).set(stats.blocks_live as f64);
+        gauge!("smg_kv_index_arena_bytes", "model" => model.clone()).set(stats.arena_bytes as f64);
+        gauge!("smg_kv_index_arena_free_bytes", "model" => model.clone())
+            .set(stats.arena_free_bytes as f64);
+        gauge!("smg_kv_index_slab_bytes", "model" => model.clone()).set(stats.slab_bytes as f64);
+        gauge!("smg_kv_index_moved_hashes", "model" => model.clone())
+            .set(stats.moved_hashes as f64);
+        gauge!("smg_kv_index_engine_conflicts", "model" => model)
+            .set(stats.engine_conflicts as f64);
     }
 
     // ========================================================================
@@ -1515,6 +2297,19 @@ impl Metrics {
             "to" => to
         )
         .increment(1);
+    }
+
+    /// Publish a circuit breaker transition counter at zero, so the series
+    /// exists before the breaker first makes that transition.
+    pub fn init_worker_cb_transition(worker: &str, from: &'static str, to: &'static str) {
+        let worker_interned = intern_string(worker);
+        counter!(
+            "smg_worker_cb_transitions_total",
+            "worker" => worker_interned,
+            "from" => from,
+            "to" => to
+        )
+        .absolute(0);
     }
 
     /// Record circuit breaker outcome
@@ -1592,6 +2387,17 @@ impl Metrics {
             "source" => source
         )
         .set(count as f64);
+    }
+
+    /// Record a discovery source observation that was rejected; the provider
+    /// keeps reconciling its last good snapshot meanwhile
+    pub fn record_discovery_snapshot_error(source: &'static str, reason: &'static str) {
+        counter!(
+            "smg_discovery_snapshot_errors_total",
+            "source" => source,
+            "reason" => reason
+        )
+        .increment(1);
     }
 
     // ========================================================================
@@ -1759,19 +2565,24 @@ impl Metrics {
     // Worker cleanup
     // ========================================================================
 
+    /// A worker registered at `worker_url`: its series record again if the
+    /// address was retired by an earlier removal.
+    pub fn worker_registered(worker_url: &str) {
+        if let Some(series) = worker_metrics::installed() {
+            series.activate(worker_url);
+        }
+    }
+
+    /// The registration at `worker_url` was removed: drop the address's
+    /// series (every family labelled `worker`, see `worker_metrics`), so the
+    /// scrape and the time-series database stop growing with pod churn, and
+    /// drop the writes that arrive after the removal until the address
+    /// registers again. The interned label goes with them.
     pub fn remove_worker_metrics(worker_url: &str) {
-        // Intern once, clone (cheap) for each metric
-        let worker = intern_string(worker_url);
-
-        gauge!("smg_worker_cb_consecutive_failures", "worker" => Arc::clone(&worker)).set(0.0);
-        gauge!("smg_worker_cb_consecutive_successes", "worker" => Arc::clone(&worker)).set(0.0);
-        gauge!("smg_worker_requests_active", "worker" => Arc::clone(&worker)).set(0.0);
-        gauge!("smg_pd_prefill_admission_inflight", "worker" => Arc::clone(&worker)).set(0.0);
-
-        // Zero for these metrics have special valid meaning, thus we set to -1 temporarily
-        // (and will remove them completely after https://github.com/metrics-rs/metrics/issues/653)
-        gauge!("smg_worker_cb_state", "worker" => Arc::clone(&worker)).set(-1.0);
-        gauge!("smg_worker_health", "worker" => worker).set(-1.0);
+        if let Some(series) = worker_metrics::installed() {
+            series.retire(worker_url);
+        }
+        STRING_INTERNER.remove(worker_url);
     }
 
     /// Sentinel-out `smg_engine_*` series for a removed worker.
@@ -1827,6 +2638,22 @@ impl Metrics {
     }
 }
 
+/// Metrics helpers for tests elsewhere in the crate.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
+    /// Run `f` under a thread-local Prometheus recorder and return the
+    /// rendered `/metrics` text — the same scrape output the :29000 endpoint
+    /// serves in production.
+    pub(crate) fn render_with_recorder(f: impl FnOnce()) -> String {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, f);
+        handle.render()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::TcpListener;
@@ -1834,17 +2661,7 @@ mod tests {
     use metrics_exporter_prometheus::PrometheusBuilder;
     use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 
-    use super::*;
-
-    /// Run `f` under a thread-local Prometheus recorder and return the
-    /// rendered `/metrics` text — the same scrape output the :29000 endpoint
-    /// serves in production.
-    fn render_with_recorder(f: impl FnOnce()) -> String {
-        let recorder = PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        metrics::with_local_recorder(&recorder, f);
-        handle.render()
-    }
+    use super::{test_support::render_with_recorder, *};
 
     #[test]
     fn tokenizer_activity_registers_both_layers_on_scrape() {
@@ -1916,16 +2733,37 @@ mod tests {
     }
 
     #[test]
-    fn prefill_worker_removal_resets_admission_gauge() {
-        let rendered = render_with_recorder(|| {
+    fn prefill_worker_removal_releases_its_admission_series() {
+        let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
+            parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )));
+        let recorder = WorkerSeriesRecorder::new(
+            PrometheusBuilder::new().build_recorder(),
+            Arc::clone(&workers),
+        );
+        metrics::with_local_recorder(&recorder, || {
             Metrics::set_pd_prefill_admission_inflight("http://removed-prefill", 7);
-            Metrics::remove_worker_metrics("http://removed-prefill");
+            Metrics::set_pd_prefill_admission_inflight("http://kept-prefill", 3);
+            workers.retire("http://removed-prefill");
+            // A release racing the removal must not bring the series back.
+            Metrics::set_pd_prefill_admission_inflight("http://removed-prefill", 6);
         });
+        let mut rendered = String::new();
+        workers.render_into(&mut rendered);
+        assert!(
+            !rendered.contains("http://removed-prefill"),
+            "removed worker still rendered:\n{rendered}"
+        );
         assert_metric(
             &rendered,
             "smg_pd_prefill_admission_inflight",
-            &[r#"worker="http://removed-prefill""#],
-            "0",
+            &[r#"worker="http://kept-prefill""#],
+            "3",
         );
     }
 
@@ -2483,6 +3321,71 @@ mod tests {
             rendered.contains("smg_pd_ttft_seconds_count")
                 && rendered.contains(r#"runtime="sglang""#),
             "pd ttft histogram not emitted; rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_record_pd_decode_ttft_emits_histogram() {
+        let (rendered, ()) = with_test_recorder(|| {
+            Metrics::record_pd_decode_ttft(
+                metrics_labels::BACKEND_PD,
+                "m",
+                "vllm",
+                Duration::from_millis(321),
+            );
+        });
+        assert!(
+            rendered.contains("smg_pd_decode_ttft_seconds_count")
+                && rendered.contains(r#"runtime="vllm""#),
+            "pd decode ttft histogram not emitted; rendered:\n{rendered}"
+        );
+    }
+
+    /// The PD phase families say on `/metrics` what they bound: the relay
+    /// family is the gateway's own gap and not the engines' KV transfer, and
+    /// the prefill phase, the decode phase and the total name their anchors.
+    #[test]
+    fn pd_phase_families_describe_what_they_measure() {
+        let (rendered, ()) = with_test_recorder(|| {
+            init_metrics();
+            let sample = Duration::from_millis(5);
+            Metrics::record_pd_prefill_duration(metrics_labels::BACKEND_PD, "m", "vllm", sample);
+            Metrics::record_pd_kv_transfer_duration(
+                metrics_labels::BACKEND_PD,
+                "m",
+                "vllm",
+                sample,
+            );
+            Metrics::record_pd_decode_ttft(metrics_labels::BACKEND_PD, "m", "vllm", sample);
+            Metrics::record_pd_ttft(metrics_labels::BACKEND_PD, "m", "vllm", sample);
+        });
+        let help = |family: &str| -> String {
+            rendered
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("# HELP {family} ")))
+                .unwrap_or_else(|| panic!("no # HELP for {family}; rendered:\n{rendered}"))
+                .to_owned()
+        };
+        let prefill = help("smg_pd_prefill_duration_seconds");
+        assert!(
+            prefill.contains("prefill dispatch to the end of the prefill response"),
+            "{prefill}"
+        );
+        let relay = help("smg_pd_kv_transfer_duration_seconds");
+        assert!(
+            relay.contains("relay phase") && relay.contains("not the engines' KV transfer"),
+            "{relay}"
+        );
+        let decode = help("smg_pd_decode_ttft_seconds");
+        assert!(
+            decode.contains("decode dispatch to the first decode token"),
+            "{decode}"
+        );
+        let total = help("smg_pd_ttft_seconds");
+        assert!(
+            total.contains("prefill dispatch to the first decode token")
+                && total.contains("add up to it"),
+            "{total}"
         );
     }
 

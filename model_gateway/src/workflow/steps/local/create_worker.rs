@@ -149,17 +149,20 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             }
         })?;
 
-        // Only vLLM EngineCore and TokenSpeed speak the ZMQ direct-backend wire.
-        // Fail registration here rather than letting the connect-time rejection
-        // strand the worker in Pending.
+        // Only vLLM EngineCore, TokenSpeed and SGLang speak the ZMQ direct-backend
+        // wire. Fail registration here rather than letting the connect-time
+        // rejection strand the worker in Pending.
         if *connection_mode == ConnectionMode::Zmq
-            && !matches!(runtime_type, RuntimeType::Vllm | RuntimeType::TokenSpeed)
+            && !matches!(
+                runtime_type,
+                RuntimeType::Vllm | RuntimeType::TokenSpeed | RuntimeType::Sglang
+            )
         {
             return Err(WorkflowError::StepFailed {
                 step_id: StepId::new("create_worker"),
                 message: format!(
-                    "ZMQ worker {} has unsupported runtime {}: only vllm and tokenspeed \
-                     are supported over the ZMQ direct backend",
+                    "ZMQ worker {} has unsupported runtime {}: only vllm, tokenspeed and \
+                     sglang are supported over the ZMQ direct backend",
                     config.url, runtime_type
                 ),
             });
@@ -168,9 +171,9 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         validate_zmq_worker_type(*connection_mode, config.worker_type, &config.url)?;
 
         // A grouped ZMQ worker (`dp_size: N` on the spec) awaits N engines on
-        // one socket set. Both ZMQ runtimes route per rank: vLLM by in-request
-        // DP rank, TokenSpeed by per-rank socket identity with the producing
-        // rank named on each output batch.
+        // one socket set. Every ZMQ runtime routes per rank: vLLM by in-request
+        // DP rank, TokenSpeed and SGLang by per-rank socket identity with the
+        // producing rank named on each output batch.
         let zmq_engine_group = config
             .dp_size
             .filter(|&n| n > 1 && *connection_mode == ConnectionMode::Zmq);
@@ -274,13 +277,13 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                 if let Some(group_size) = zmq_engine_group {
                     builder = builder.zmq_engine_group(group_size);
                 }
-                // ZMQ promotion is event-driven: the worker signals the manager
-                // the instant its handshake completes, so wire the registry's
-                // connect signal. Other transports promote via polling.
-                if *connection_mode == ConnectionMode::Zmq {
-                    builder = builder
-                        .connect_signal_tx(app_context.worker_registry.connect_signal_sender());
-                }
+                // Promotion can be event-driven: a ZMQ worker signals the
+                // manager the instant its handshake completes, and any worker
+                // demoted by health is signalled on its first successful
+                // contact (see `worker::liveness`), so every worker gets the
+                // registry's connect signal.
+                builder =
+                    builder.connect_signal_tx(app_context.worker_registry.connect_signal_sender());
 
                 // Builder sets initial status: Pending if health-checked, Ready if not.
                 Arc::new(builder.build()) as Arc<dyn Worker>
@@ -337,7 +340,10 @@ fn take_kv_transfer_metadata(
 /// Kubernetes service discovery creates a spec without model cards, so its
 /// canonical ID comes from the backend's `served_model_name`. Router aliases
 /// are deliberately absent from this function and cannot change discovery.
-fn resolve_model_id<'a>(config: &'a WorkerSpec, labels: &'a HashMap<String, String>) -> &'a str {
+pub(super) fn resolve_model_id<'a>(
+    config: &'a WorkerSpec,
+    labels: &'a HashMap<String, String>,
+) -> &'a str {
     config
         .models
         .primary()
@@ -789,7 +795,7 @@ mod tests {
 
         Arc::new(crate::app_context::AppContext {
             gateway_auth: AuthConfig::new(None),
-            client: reqwest::Client::new(),
+            client: crate::http_client::client(),
             router_config: router_config.clone(),
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
             rate_limit_manager: None,
@@ -860,7 +866,7 @@ mod tests {
             create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(reqwest::Client::new()));
+        data.http_client_handle = Some(Arc::new(crate::http_client::client()));
         let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
 
         assert_eq!(
@@ -1357,6 +1363,56 @@ mod tests {
         assert_eq!(card.tool_parser.as_deref(), Some("pythonic"));
         // The explicit card left reasoning unset — the label fills it.
         assert_eq!(card.reasoning_parser.as_deref(), Some("basic"));
+    }
+
+    /// An engine's own reasoning parser rides in its own label
+    /// (`engine_reasoning_parser`), not in `reasoning_parser`, the per-model
+    /// parser override registration validates against the gateway's registry:
+    /// the engine's parser names are the engine's (`openai_gptoss`, `kimi_k2`),
+    /// which the gateway may not have, and a shared name must not outrank the
+    /// configured `--reasoning-parser`. Such a worker registers, its card
+    /// carries no override, and its grammar start reads as advertised.
+    #[test]
+    fn an_engines_advertised_reasoning_parser_is_not_a_parser_override() {
+        use tool_parser::GrammarStart;
+
+        use crate::routers::grpc::client::ServerInfo;
+
+        let tool_factory = tool_parser::ParserFactory::default();
+        let reasoning_factory = reasoning_parser::ParserFactory::default();
+        let spec = WorkerSpec::new("grpc://engine:50051");
+        for name in ["openai_gptoss", "kimi_k2", "qwen3", "glm45"] {
+            let info = ServerInfo::Vllm(Box::new(
+                smg_grpc_client::vllm_proto::GetServerInfoResponse {
+                    engine_reasoning_parser: name.to_string(),
+                    structured_outputs_start: "after_reasoning".to_string(),
+                    ..Default::default()
+                },
+            ));
+            let labels = info.to_labels();
+            assert_eq!(
+                labels.get("engine_reasoning_parser").map(String::as_str),
+                Some(name)
+            );
+            let card = build_model_card("m", &spec, &labels, &HashMap::new());
+            assert_eq!(
+                card.reasoning_parser, None,
+                "{name}: no override from the engine's fact"
+            );
+            assert_eq!(card.tool_parser, None);
+            validate_parser_overrides(
+                &card,
+                "grpc://engine:50051",
+                Some(&tool_factory),
+                Some(&reasoning_factory),
+            )
+            .unwrap_or_else(|e| panic!("{name}: the worker must register: {e}"));
+            assert_eq!(
+                GrammarStart::from_label(labels.get(GrammarStart::LABEL).map(String::as_str)),
+                GrammarStart::AfterReasoning,
+                "{name}: the grammar start reads as advertised"
+            );
+        }
     }
 
     #[test]

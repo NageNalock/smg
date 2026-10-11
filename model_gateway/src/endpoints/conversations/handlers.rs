@@ -10,12 +10,16 @@ use axum::{
 use chrono::Utc;
 use serde_json::{json, Value};
 use smg_data_connector::{
-    Conversation, ConversationId, ConversationItem, ConversationItemId, ConversationItemStorage,
-    ConversationStorage, ListParams, NewConversation, NewConversationItem, SortOrder,
+    AddedAtSequence, Conversation, ConversationId, ConversationItem, ConversationItemId,
+    ConversationItemStorage, ConversationStorage, ListParams, NewConversation, NewConversationItem,
+    SortOrder,
 };
 use tracing::info;
 
-use crate::routers::common::{openai_bridge, persistence_utils::item_to_json};
+use crate::routers::{
+    common::{openai_bridge, persistence_utils::item_to_json},
+    error as route_error,
+};
 
 // ============================================================================
 // Constants
@@ -58,28 +62,19 @@ const IMPLEMENTED_ITEM_TYPES: &[&str] = &[
 // Error Response Helpers
 // ============================================================================
 
+// The gateway's envelope (`{"error": {"message", "type", "param", "code"}}`),
+// not a bare string: an SDK decodes `error` as an object.
+
 fn bad_request(message: impl Into<String>) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({"error": message.into()})),
-    )
-        .into_response()
+    route_error::bad_request("invalid_request", message)
 }
 
 fn not_found(message: impl Into<String>) -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({"error": message.into()})),
-    )
-        .into_response()
+    route_error::not_found("not_found", message)
 }
 
 fn internal_error(message: impl Into<String>) -> Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": message.into()})),
-    )
-        .into_response()
+    route_error::internal_error("internal_error", message)
 }
 
 fn bad_request_structured(error_obj: Value) -> Response {
@@ -273,16 +268,9 @@ pub async fn list_conversation_items(
 
     match item_storage.list_items(&conversation_id, params).await {
         Ok(items) => {
-            let item_values: Vec<Value> = items
-                .iter()
-                .map(|item| {
-                    let mut item_json = item_to_json(item);
-                    if let Some(obj) = item_json.as_object_mut() {
-                        obj.insert("created_at".to_string(), json!(item.created_at));
-                    }
-                    item_json
-                })
-                .collect();
+            // The item objects as the public API lists them: each item's own
+            // fields, the same object the single-item GET answers.
+            let item_values: Vec<Value> = items.iter().map(item_to_json).collect();
 
             (
                 StatusCode::OK,
@@ -328,9 +316,12 @@ pub async fn create_conversation_items(
     let mut warnings = Vec::new();
     let mut link_pairs = Vec::new();
     let mut seen_ids = HashSet::new();
-    let added_at = Utc::now();
+    // One stamp per item, each later than the one before: the stores order a conversation's
+    // items by `added_at`, so the items of this call list in the order the request gave them.
+    let mut stamps = AddedAtSequence::new();
 
     for item_val in items_array {
+        let added_at = stamps.next_added_at();
         match process_item(item_storage, &conversation_id, item_val, added_at).await {
             Ok((item_json, item_id, warning)) => {
                 if seen_ids.insert(item_id.0.clone()) {
@@ -486,6 +477,57 @@ async fn process_new_item(
     Ok((created, warning))
 }
 
+/// The `include` values a conversation item GET accepts (the public API's
+/// includable fields).
+const ITEM_INCLUDE_VALUES: [&str; 8] = [
+    "code_interpreter_call.outputs",
+    "computer_call_output.output.image_url",
+    "file_search_call.results",
+    "message.input_image.image_url",
+    "message.output_text.logprobs",
+    "reasoning.encrypted_content",
+    "web_search_call.action.sources",
+    "web_search_call.results",
+];
+
+/// Parse the `include` parameter of `GET /v1/conversations/{id}/items/{item}`
+/// from the raw query string (`include[]=x`, `include=x`, `include[0]=x`).
+/// An empty or unknown value is rejected with `invalid_value` on
+/// `include[<index>]`, as the public API answers.
+pub fn parse_item_include_query(query: Option<&str>) -> Result<Option<Vec<String>>, Response> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
+    let mut include = Vec::new();
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        let is_include = key == "include"
+            || key
+                .strip_prefix("include[")
+                .is_some_and(|rest| rest.ends_with(']'));
+        if !is_include {
+            continue;
+        }
+        if !ITEM_INCLUDE_VALUES.contains(&value.as_ref()) {
+            let index = include.len();
+            return Err(bad_request_structured(json!({
+                "message": format!(
+                    "Invalid value: '{value}'. Supported values are: {}.",
+                    ITEM_INCLUDE_VALUES
+                        .iter()
+                        .map(|v| format!("'{v}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                "type": "invalid_request_error",
+                "param": format!("include[{index}]"),
+                "code": "invalid_value"
+            })));
+        }
+        include.push(value.into_owned());
+    }
+    Ok((!include.is_empty()).then_some(include))
+}
+
 pub async fn get_conversation_item(
     conversation_storage: &Arc<dyn ConversationStorage>,
     item_storage: &Arc<dyn ConversationItemStorage>,
@@ -592,7 +634,9 @@ fn parse_item_from_value(
         .map(String::from)
         .or_else(|| Some("completed".to_string()));
 
-    let content = if item_type == "message" || item_type == "reasoning" {
+    let content = if item_type == "message" {
+        message_content_parts(role.as_deref(), item_val.get("content"))
+    } else if item_type == "reasoning" {
         item_val.get("content").cloned().unwrap_or(json!([]))
     } else {
         // Strip image_generation_call.result base64 before storage. The
@@ -616,18 +660,76 @@ fn parse_item_from_value(
     ))
 }
 
+/// The content of a message item as it is stored and listed: a plain string
+/// becomes the one typed part the public API makes of it for the message's
+/// role, so an item added as `"content": "text"` has the shape of one added
+/// with typed parts or created by a response. An assistant message gets an
+/// `output_text` part (with empty `annotations`), the text part the public
+/// API accepts on that role when the history loaders replay the conversation
+/// upstream; every other role gets an `input_text` part. Typed parts stay as
+/// sent, an absent content is an empty list.
+fn message_content_parts(role: Option<&str>, content: Option<&Value>) -> Value {
+    match content {
+        Some(Value::String(text)) if role == Some("assistant") => {
+            json!([{ "type": "output_text", "text": text, "annotations": [] }])
+        }
+        Some(Value::String(text)) => json!([{ "type": "input_text", "text": text }]),
+        Some(parts) => parts.clone(),
+        None => json!([]),
+    }
+}
+
+/// The Conversation object. `metadata` is always present, an empty object
+/// for a conversation created without any, as the public API answers it.
 pub fn conversation_to_json(conversation: &Conversation) -> Value {
-    let mut obj = json!({
+    json!({
         "id": conversation.id.0,
         "object": "conversation",
-        "created_at": conversation.created_at.timestamp()
-    });
+        "created_at": conversation.created_at.timestamp(),
+        "metadata": Value::Object(conversation.metadata.clone().unwrap_or_default()),
+    })
+}
 
-    if let Some(metadata) = &conversation.metadata {
-        if !metadata.is_empty() {
-            obj["metadata"] = Value::Object(metadata.clone());
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    use super::*;
+
+    /// The CRUD helpers answer with the gateway's envelope, an object an SDK
+    /// decodes (`type` from the public vocabulary, a string `code`, `param`),
+    /// not a bare string under `error`.
+    #[tokio::test]
+    async fn error_helpers_build_the_object_envelope() {
+        for (response, status, code) in [
+            (
+                bad_request("bad"),
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+            ),
+            (
+                not_found("Conversation not found"),
+                StatusCode::NOT_FOUND,
+                "not_found",
+            ),
+            (
+                internal_error("boom"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+            ),
+        ] {
+            assert_eq!(response.status(), status);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            let error = json["error"]
+                .as_object()
+                .unwrap_or_else(|| panic!("error must be an object: {json}"));
+            assert_eq!(error["code"], code);
+            assert_eq!(error["type"], route_error::error_type_for_status(status));
+            assert!(error["message"].is_string());
+            assert!(error["param"].is_null());
         }
     }
-
-    obj
 }

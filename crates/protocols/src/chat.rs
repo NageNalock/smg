@@ -51,8 +51,8 @@ pub enum ChatMessage {
         content: Option<MessageContent>,
         name: Option<String>,
         tool_calls: Option<Vec<ToolCall>>,
-        /// Reasoning content for O1-style models (SGLang extension); vLLM's
-        /// `reasoning` spelling is accepted on input.
+        /// Reasoning content for O1-style models (an engine extension); another
+        /// engine's `reasoning` spelling is accepted on input.
         #[serde(alias = "reasoning")]
         reasoning_content: Option<String>,
         #[serde(flatten)]
@@ -282,8 +282,9 @@ pub struct ChatCompletionRequest {
     #[validate(custom(function = "validate_top_p_value"))]
     pub top_p: Option<f32>,
 
-    /// Verbosity level for debugging
-    pub verbosity: Option<i32>,
+    /// How verbose the answer should be: `low`, `medium` or `high`
+    #[validate(custom(function = "validate_verbosity"))]
+    pub verbosity: Option<String>,
 
     // =============================================================================
     // Engine-Specific Sampling Parameters
@@ -340,10 +341,13 @@ pub struct ChatCompletionRequest {
     )]
     pub continue_final_message: bool,
 
-    /// Skip special tokens during detokenization
+    /// Skip special tokens during detokenization. Serialized only when
+    /// `false`, like `separate_reasoning`: `true` is what the engine applies
+    /// without the field.
     #[serde(
         default = "default_true",
-        deserialize_with = "deserialize_null_as_true"
+        deserialize_with = "deserialize_null_as_true",
+        skip_serializing_if = "is_true"
     )]
     pub skip_special_tokens: bool,
 
@@ -383,7 +387,7 @@ pub struct ChatCompletionRequest {
     /// Random seed for sampling for deterministic outputs
     pub sampling_seed: Option<u64>,
 
-    /// Request ID forwarded to the backend for log correlation (SGLang extension)
+    /// Request ID forwarded to the backend for log correlation (an engine extension)
     pub rid: Option<String>,
 
     /// Additional fields not explicitly defined above (e.g. engine-specific parameters)
@@ -427,6 +431,18 @@ impl ThinkingParam {
 }
 
 impl ChatCompletionRequest {
+    /// The cap the client put on the completion: `max_completion_tokens`,
+    /// else the deprecated `max_tokens`; when the client wrote both, the
+    /// current name wins, as the serving engines resolve the pair. The
+    /// request keeps whichever fields the client wrote, so a proxied body
+    /// reaches its upstream unchanged; everything that needs the number
+    /// reads it here.
+    pub fn output_token_cap(&self) -> Option<u32> {
+        #[expect(deprecated, reason = "the one place the deprecated field is read")]
+        let max_tokens = self.max_tokens;
+        self.max_completion_tokens.or(max_tokens)
+    }
+
     /// The thinking preference stated by `thinking.type`, if any.
     pub fn thinking_toggle(&self) -> Option<bool> {
         self.thinking.as_ref().and_then(ThinkingParam::toggle)
@@ -479,30 +495,31 @@ where
 // Validation Functions
 // ============================================================================
 
-/// Validates messages array is not empty and has valid content
 fn validate_messages(messages: &[ChatMessage]) -> Result<(), validator::ValidationError> {
     if messages.is_empty() {
         return Err(validator::ValidationError::new("messages cannot be empty"));
     }
 
-    for msg in messages {
-        if let ChatMessage::User { content, .. } = msg {
-            match content {
-                MessageContent::Text(text) if text.is_empty() => {
-                    return Err(validator::ValidationError::new(
-                        "message content cannot be empty",
-                    ));
-                }
-                MessageContent::Parts(parts) if parts.is_empty() => {
-                    return Err(validator::ValidationError::new(
-                        "message content parts cannot be empty",
-                    ));
-                }
-                _ => {}
-            }
-        }
-    }
     Ok(())
+}
+
+fn invalid(code: &'static str, message: String) -> validator::ValidationError {
+    let mut e = validator::ValidationError::new(code);
+    e.message = Some(message.into());
+    e
+}
+
+fn validate_verbosity(verbosity: &str) -> Result<(), validator::ValidationError> {
+    match verbosity {
+        "low" | "medium" | "high" => Ok(()),
+        other => Err(invalid(
+            "unsupported_value",
+            format!(
+                "Invalid value: '{other}' for parameter 'verbosity'; supported values are 'low', \
+                 'medium' and 'high'"
+            ),
+        )),
+    }
 }
 
 /// Schema-level validation for cross-field dependencies
@@ -525,7 +542,7 @@ fn validate_chat_cross_parameters(
     }
 
     // 3. Validate token limits - min <= max
-    if let (Some(min), Some(max)) = (req.min_tokens, req.max_completion_tokens) {
+    if let (Some(min), Some(max)) = (req.min_tokens, req.output_token_cap()) {
         if min > max {
             let mut e = validator::ValidationError::new("min_tokens_exceeds_max");
             e.message = Some("min_tokens cannot exceed max_tokens/max_completion_tokens".into());
@@ -673,10 +690,58 @@ fn validate_chat_cross_parameters(
         }
     }
 
-    // 8. Provider-profile contract rules, selected from the model id
+    // 8. A function's `parameters` is a JSON Schema object (null was already
+    //    read as the empty schema)
+    for (index, tool) in req.tools.iter().flatten().enumerate() {
+        if !tool.function.parameters.is_object() {
+            return Err(invalid(
+                "invalid_type",
+                format!(
+                    "Invalid 'tools[{index}].function.parameters': expected an object, but got {} \
+                     instead",
+                    json_type_name(&tool.function.parameters)
+                ),
+            ));
+        }
+    }
+
+    // 9. `logit_bias` is keyed by token ids
+    if let Some(key) = req
+        .logit_bias
+        .iter()
+        .flatten()
+        .map(|(key, _)| key)
+        .find(|key| key.parse::<u64>().is_err())
+    {
+        return Err(invalid(
+            "logit_bias_invalid_key",
+            format!(
+                "Invalid key in 'logit_bias': '{key}'; keys must be non-negative integer token \
+                 ids"
+            ),
+        ));
+    }
+
+    // 10. Provider-profile contract rules, selected from the model id. Both
+    //     token limits at once are judged there: the request keeps whichever
+    //     the client wrote and `output_token_cap` reads `max_completion_tokens`
+    //     first, the precedence the serving engines apply themselves; only
+    //     OpenAI's own contract refuses the pair.
     ProviderProfile::for_model(&req.model).validate_chat(req)?;
 
     Ok(())
+}
+
+/// The JSON type of a value, for error messages (`a string`, `an array`, ...).
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 impl ChatCompletionRequest {
@@ -721,15 +786,12 @@ impl Normalizable for ChatCompletionRequest {
     /// 2. Migrate deprecated fields to their replacements
     /// 3. Clear deprecated fields and log warnings
     /// 4. Apply OpenAI defaults for tool_choice
+    ///
+    /// The deprecated `max_tokens` is not migrated: a proxied request reaches
+    /// its upstream with the cap under the name the client wrote, and the
+    /// router reads the number through [`Self::output_token_cap`].
     fn normalize(&mut self) {
         ProviderProfile::for_model(&self.model).normalize_chat(self);
-
-        // Migrate deprecated max_tokens → max_completion_tokens
-        #[expect(deprecated)]
-        if self.max_completion_tokens.is_none() && self.max_tokens.is_some() {
-            self.max_completion_tokens = self.max_tokens;
-            self.max_tokens = None; // Clear deprecated field
-        }
 
         // Migrate deprecated functions → tools
         #[expect(deprecated)]
@@ -793,7 +855,7 @@ impl GenerationRequest for ChatCompletionRequest {
     fn cache_partition(&self) -> CachePartition<'_> {
         CachePartition {
             // Engine extensions carried in the passthrough map, not typed
-            // fields: vLLM/SGLang `cache_salt`, SGLang `extra_key`.
+            // fields: the engines' `cache_salt`, one engine's `extra_key`.
             cache_salt: self.other.get("cache_salt").and_then(Value::as_str),
             extra_key: self.other.get("extra_key").and_then(Value::as_str),
             lora_path: self.lora_path.as_deref(),
@@ -879,6 +941,17 @@ pub struct ChatCompletionResponse {
     pub choices: Vec<ChatChoice>,
     pub usage: Option<Usage>,
     pub system_fingerprint: Option<String>,
+    /// The service tier the completion ran under. Always present, as the
+    /// OpenAI API sends it; the gateway has one tier, `default`.
+    #[serde(default = "default_service_tier")]
+    pub service_tier: String,
+}
+
+/// The one service tier the gateway serves.
+pub const DEFAULT_SERVICE_TIER: &str = "default";
+
+fn default_service_tier() -> String {
+    DEFAULT_SERVICE_TIER.to_string()
 }
 
 impl ChatCompletionResponse {
@@ -895,26 +968,31 @@ impl ChatCompletionResponse {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ChatCompletionMessage {
     pub role: String, // Always "assistant" for responses
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Always present, `null` on a tool-call turn (as the OpenAI API sends it).
     pub content: Option<String>,
+    /// Always present, as the OpenAI API sends it; the gateway produces no
+    /// refusals, so it is `null`.
+    #[serde(default)]
+    pub refusal: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     pub reasoning_content: Option<String>,
     // Note: function_call is deprecated and not included
-    // Note: refusal, annotations, audio are not added yet
+    // Note: annotations, audio are not added yet
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ChatChoice {
     pub index: u32,
     pub message: ChatCompletionMessage,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Always present (`null` unless log probabilities were requested), as
+    /// the OpenAI API sends it.
     pub logprobs: Option<ChatLogProbs>,
     pub finish_reason: Option<String>, // "stop", "length", "tool_calls", "content_filter", "function_call"
     /// Information about which stop condition was matched
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_stop: Option<Value>, // Can be string or integer
-    /// Hidden states from the model (SGLang extension)
+    /// Hidden states from the model (an engine extension)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hidden_states: Option<Vec<f32>>,
 }
@@ -950,6 +1028,7 @@ pub struct ChatMessageDelta {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallDelta>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
 }
 
@@ -993,6 +1072,7 @@ mod tests {
             "ignore_eos",
             "continue_final_message",
             "return_hidden_states",
+            "skip_special_tokens",
             "separate_reasoning",
             "stream_reasoning",
         ] {
@@ -1004,6 +1084,7 @@ mod tests {
         assert!(!back.ignore_eos);
         assert!(!back.continue_final_message);
         assert!(!back.return_hidden_states);
+        assert!(back.skip_special_tokens);
         assert!(back.separate_reasoning);
         assert!(back.stream_reasoning);
     }
@@ -1015,6 +1096,7 @@ mod tests {
             ("ignore_eos", json!(true)),
             ("continue_final_message", json!(true)),
             ("return_hidden_states", json!(true)),
+            ("skip_special_tokens", json!(false)),
             ("separate_reasoning", json!(false)),
             ("stream_reasoning", json!(false)),
         ]);
@@ -1023,6 +1105,7 @@ mod tests {
         assert_eq!(value["ignore_eos"], true);
         assert_eq!(value["continue_final_message"], true);
         assert_eq!(value["return_hidden_states"], true);
+        assert_eq!(value["skip_special_tokens"], false);
         assert_eq!(value["separate_reasoning"], false);
         assert_eq!(value["stream_reasoning"], false);
 
@@ -1031,6 +1114,7 @@ mod tests {
         assert!(back.ignore_eos);
         assert!(back.continue_final_message);
         assert!(back.return_hidden_states);
+        assert!(!back.skip_special_tokens);
         assert!(!back.separate_reasoning);
         assert!(!back.stream_reasoning);
     }
@@ -1282,5 +1366,123 @@ mod tests {
         assert!(!request.separate_reasoning);
         assert!(!request.stream_reasoning);
         assert!(request.return_hidden_states);
+    }
+
+    #[test]
+    fn tool_call_message_serializes_content_as_null() {
+        let message = super::ChatCompletionMessage {
+            role: "assistant".to_string(),
+            content: None,
+            refusal: None,
+            tool_calls: Some(vec![crate::common::ToolCall {
+                id: "call_1".to_string(),
+                tool_type: "function".to_string(),
+                function: crate::common::FunctionCallResponse {
+                    name: "get_weather".to_string(),
+                    arguments: Some("{}".to_string()),
+                },
+            }]),
+            reasoning_content: None,
+        };
+        let value = serde_json::to_value(&message).expect("serialize");
+        assert_eq!(value.get("content"), Some(&Value::Null), "{value}");
+        assert_eq!(value["tool_calls"][0]["function"]["name"], "get_weather");
+    }
+}
+
+#[cfg(test)]
+mod request_contract_tests {
+    use serde_json::{json, Value};
+    use validator::Validate;
+
+    use super::ChatCompletionRequest;
+
+    fn request(extra: Value) -> ChatCompletionRequest {
+        let mut value = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Say hi in one word."}],
+            "max_completion_tokens": 64
+        });
+        value
+            .as_object_mut()
+            .expect("object")
+            .extend(extra.as_object().expect("object").clone());
+        serde_json::from_value(value).expect("request deserializes")
+    }
+
+    /// The validation error codes and messages, joined, or `None` when valid.
+    fn rejection(req: &ChatCompletionRequest) -> Option<String> {
+        req.validate().err().map(|errors| {
+            errors
+                .field_errors()
+                .values()
+                .flat_map(|errors| errors.iter())
+                .map(|error| {
+                    format!(
+                        "{}: {}",
+                        error.code,
+                        error.message.as_deref().unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+    }
+
+    #[test]
+    fn verbosity_is_the_public_enum() {
+        for level in ["low", "medium", "high"] {
+            let req = request(json!({"verbosity": level}));
+            assert_eq!(req.verbosity.as_deref(), Some(level));
+            assert_eq!(rejection(&req), None, "{level}");
+        }
+        let bogus = request(json!({"verbosity": "extreme"}));
+        assert!(rejection(&bogus).is_some_and(|e| e.contains("unsupported_value")));
+        assert!(serde_json::from_value::<ChatCompletionRequest>(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "verbosity": 3
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn function_parameters_must_be_an_object() {
+        let bad = request(
+            json!({"tools": [{"type": "function", "function": {"name": "f", "parameters": "oops"}}]}),
+        );
+        let error = rejection(&bad).expect("rejected");
+        assert!(
+            error.contains("invalid_type") && error.contains("tools[0].function.parameters"),
+            "{error}"
+        );
+        let empty = request(json!({"tools": [{"type": "function", "function": {"name": "f"}}]}));
+        assert_eq!(rejection(&empty), None);
+    }
+
+    #[test]
+    fn logit_bias_is_keyed_by_token_ids() {
+        let bad = request(json!({"logit_bias": {"not-a-token": 1}}));
+        assert!(rejection(&bad).is_some_and(|e| e.contains("logit_bias_invalid_key")));
+        let good = request(json!({"logit_bias": {"50256": -100, "0": 1.5}}));
+        assert_eq!(rejection(&good), None);
+    }
+
+    /// Both token limits at once are accepted outside OpenAI's own contract
+    /// (a self-hosted model, a vendor profile), whatever the two values, and
+    /// `max_completion_tokens` is the cap; the deprecated name alone still
+    /// carries it.
+    #[test]
+    fn both_token_limits_are_accepted_and_max_completion_tokens_wins() {
+        for model in ["test-model", "MiniMax-M2"] {
+            for (legacy, current) in [(32, 64), (64, 32), (64, 64)] {
+                let both = request(
+                    json!({"model": model, "max_tokens": legacy, "max_completion_tokens": current}),
+                );
+                assert_eq!(rejection(&both), None, "{model}: {legacy} and {current}");
+                assert_eq!(both.output_token_cap(), Some(current), "{model}");
+            }
+        }
+        let legacy = request(json!({"max_tokens": 32, "max_completion_tokens": null}));
+        assert_eq!(rejection(&legacy), None);
+        assert_eq!(legacy.output_token_cap(), Some(32));
     }
 }

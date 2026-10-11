@@ -163,6 +163,15 @@ pub fn create_test_app_with_context(
     router: Arc<dyn RouterTrait>,
     app_context: Arc<AppContext>,
 ) -> Router {
+    create_test_app_with_context_and_auth(router, app_context, None)
+}
+
+/// Exercise the production route wrapper with initialized control-plane auth.
+pub fn create_test_app_with_context_and_auth(
+    router: Arc<dyn RouterTrait>,
+    app_context: Arc<AppContext>,
+    control_plane_auth: Option<smg_auth::ControlPlaneAuthState>,
+) -> Router {
     // Create AppState with the test router and context
     let app_state = Arc::new(AppState {
         router,
@@ -202,7 +211,7 @@ pub fn create_test_app_with_context(
         app_state,
         serving_auth_config,
         admin_auth_config,
-        None, // No control plane auth for tests
+        control_plane_auth,
         router_config.max_payload_size,
         request_id_headers,
         router_config.cors_allowed_origins.clone(),
@@ -218,7 +227,12 @@ pub fn create_test_app_with_context(
 )]
 pub async fn create_test_app_context() -> Arc<AppContext> {
     let router_config = RouterConfig::default();
-    let client = Client::new();
+    // A test's upstreams are its own loopback servers; the environment's
+    // proxy would otherwise sit in the path of every request.
+    let client = smg::http_client::client_builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     // Initialize empty OnceLocks
     let worker_job_queue = Arc::new(OnceLock::new());

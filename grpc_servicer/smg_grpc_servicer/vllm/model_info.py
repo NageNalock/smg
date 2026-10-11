@@ -20,6 +20,10 @@ from typing import Any
 
 from smg_grpc_servicer import mm_shm
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
+from smg_grpc_servicer.structured_outputs import (
+    STRUCTURED_OUTPUTS_AFTER_REASONING,
+    STRUCTURED_OUTPUTS_FIRST_TOKEN,
+)
 from smg_grpc_servicer.vllm.kv_transfer import pairing_fields, resolve_pd_connector
 from smg_grpc_servicer.vllm.mm_salt import engine_accepts_mm_inputs
 
@@ -118,10 +122,103 @@ def model_facts(model_config: Any) -> dict[str, Any]:
     }
 
 
+def mm_device_do_normalize(vllm_config: Any) -> bool:
+    """Whether the engine rescales and normalizes pixels on device: vLLM's
+    ``mm_device_do_normalize`` as its model config resolved it (off where the
+    model class does not support it). Such an engine takes the pixels' own
+    ``uint8`` bytes and would normalize anything else twice, so both servicers
+    advertise it and whoever preprocesses sends raw pixels."""
+    model_config = vllm_config.model_config
+    if not getattr(model_config, "is_multimodal_model", False):
+        return False
+    mm_config = getattr(model_config, "multimodal_config", None)
+    return bool(getattr(mm_config, "mm_device_do_normalize", False))
+
+
+# The modalities a router request can carry to a vLLM worker, whose per-prompt
+# limits the engine resolves from `--limit-mm-per-prompt`.
+MM_ITEM_LIMIT_MODALITIES = ("image", "video")
+
+
+def mm_item_limits(vllm_config: Any) -> str:
+    """The engine's per-prompt media limits as the ``mm_item_limits`` label the
+    Router reads: sorted ``<modality>=<count>`` pairs (``image=8,video=2``), from
+    vLLM's resolved ``--limit-mm-per-prompt``, whose own server refuses a prompt
+    above them. Empty on a text model or a config that does not carry them,
+    which leaves the Router to its own caps."""
+    model_config = vllm_config.model_config
+    if not getattr(model_config, "is_multimodal_model", False):
+        return ""
+    mm_config = getattr(model_config, "multimodal_config", None)
+    get_limit = getattr(mm_config, "get_limit_per_prompt", None)
+    if not callable(get_limit):
+        return ""
+    pairs = []
+    for modality in sorted(MM_ITEM_LIMIT_MODALITIES):
+        try:
+            limit = int(get_limit(modality))
+        except (TypeError, ValueError):
+            continue
+        if limit > 0:
+            pairs.append(f"{modality}={limit}")
+    return ",".join(pairs)
+
+
+def running_window(vllm_config: Any) -> int:
+    """The scheduler's running window (``--max-num-seqs``): how many requests
+    the engine runs at once, which ``GetServerInfo`` advertises as
+    ``max_num_seqs`` for the Router's PD admission gate and its fleet capacity
+    accounting; 0 when the config does not carry it, which leaves both as
+    they were."""
+    scheduler = getattr(vllm_config, "scheduler_config", None)
+    window = getattr(scheduler, "max_num_seqs", None)
+    if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+        return 0
+    return int(window)
+
+
+def engine_reasoning_parser(vllm_config: Any) -> str:
+    """The engine's reasoning parser (``--reasoning-parser``), as its
+    structured-outputs config carries it, for the ``engine_reasoning_parser``
+    label (a name of its own: ``reasoning_parser`` is the per-model parser
+    override the Router reads off a worker's labels); "" when the engine runs
+    none or the config has no such section."""
+    structured = getattr(vllm_config, "structured_outputs_config", None)
+    return str(getattr(structured, "reasoning_parser", None) or "")
+
+
+# The `structured_outputs_start` label's values (where the engine starts a
+# request's grammar on a prompt that ends inside the model's thinking block)
+# are `smg_grpc_servicer.structured_outputs`', shared with the servicers of
+# the engines that carry them as server args.
+# A config attribute that is not there at all, as opposed to one set to "".
+_UNKNOWN = object()
+
+
+def structured_outputs_start(vllm_config: Any) -> str:
+    """Where the engine starts a request's grammar on a thinking prompt, as the
+    ``structured_outputs_start`` label the Router shapes a forced tool call's
+    grammar by. vLLM's structured-output manager holds a grammar back until
+    its reasoning parser has seen the thought's end when a reasoning parser is
+    set and ``enable_in_reasoning`` is off (``after_reasoning``); otherwise the
+    grammar runs from the first generated token (``first_token``). "" when
+    the config has no structured-outputs section, or one without the reasoning
+    parser attribute, which leaves the Router to the shape that fits either
+    kind of engine."""
+    structured = getattr(vllm_config, "structured_outputs_config", None)
+    parser = getattr(structured, "reasoning_parser", _UNKNOWN)
+    if parser is _UNKNOWN:
+        # No section, or one that predates the reasoning parser: unknown.
+        return ""
+    if parser and not getattr(structured, "enable_in_reasoning", False):
+        return STRUCTURED_OUTPUTS_AFTER_REASONING
+    return STRUCTURED_OUTPUTS_FIRST_TOKEN
+
+
 def server_facts(vllm_config: Any) -> dict[str, Any]:
     """`GetServerInfo`'s config-derived fields, keyed as the proto names them:
-    the PD identity and pairing facts, the data-parallel size, this host's
-    `/dev/shm` identity."""
+    the PD identity and pairing facts, the data-parallel size, the running
+    window, this host's `/dev/shm` identity."""
     kv_config = getattr(vllm_config, "kv_transfer_config", None)
     kv_connector, kv_engine_id, kv_role = "", "", ""
     if kv_config is not None:
@@ -130,12 +227,18 @@ def server_facts(vllm_config: Any) -> dict[str, Any]:
         # pins per request.
         kv_connector, kv_engine_id = resolve_pd_connector(kv_config)
         kv_role = getattr(kv_config, "kv_role", None) or ""
+    pairing = pairing_fields(vllm_config)
+    encoder_dtype = pairing.get("model_dtype", "").removeprefix("torch.")
+    if encoder_dtype not in {"float32", "float16", "bfloat16"}:
+        encoder_dtype = ""
     return {
         "kv_connector": str(kv_connector or ""),
         "kv_role": str(kv_role),
         "kv_engine_id": str(kv_engine_id or ""),
         "data_parallel_size": int(vllm_config.parallel_config.data_parallel_size),
+        "multimodal_encoder_dtype": encoder_dtype,
+        "max_num_seqs": running_window(vllm_config),
         "shm_namespace_id": mm_shm.shm_namespace_id(),
         "pairing_protocol": pairing_protocol_from_env(),
-        **pairing_fields(vllm_config),
+        **pairing,
     }

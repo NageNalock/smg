@@ -13,6 +13,7 @@ use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
     completion::CompletionRequest,
+    decisions::DecisionsRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     interactions::InteractionsRequest,
@@ -23,6 +24,7 @@ use openai_protocol::{
     },
     rerank::RerankRequest,
     responses::ResponsesRequest,
+    systemone::SystemOneRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
 
@@ -190,6 +192,34 @@ pub trait RouterTrait: Send + Sync + Debug {
         _model_id: &str,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Classify not implemented").into_response()
+    }
+
+    /// Route OpenAI Decisions requests on regular HTTP workers.
+    async fn route_decisions(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        _body: DecisionsRequest,
+        _model_id: &str,
+    ) -> Response {
+        error::not_implemented(
+            "decisions_not_supported",
+            "Decisions is supported by regular HTTP and SGLang gRPC routers",
+        )
+    }
+
+    /// Route native SystemOne requests on regular HTTP workers.
+    async fn route_systemone(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        _body: SystemOneRequest,
+        _model_id: &str,
+    ) -> Response {
+        error::not_implemented(
+            "systemone_not_supported",
+            "SystemOne is supported only by the regular HTTP router",
+        )
     }
 
     /// Route audio transcription requests (OpenAI-compatible /v1/audio/transcriptions).

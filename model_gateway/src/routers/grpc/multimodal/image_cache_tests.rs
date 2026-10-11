@@ -132,13 +132,13 @@ async fn run(
     let media = MediaBatch::Images(
         ids.iter()
             .map(|&id| {
-                Arc::new(ImageFrame {
-                    image: image::DynamicImage::new_rgb8(id, 1),
-                    raw_bytes: Default::default(),
-                    detail: Default::default(),
-                    source: ImageSource::InlineBytes,
-                    hash: id.to_string(),
-                })
+                Arc::new(ImageFrame::new(
+                    image::DynamicImage::new_rgb8(id, 1),
+                    Default::default(),
+                    Default::default(),
+                    ImageSource::InlineBytes,
+                    id.to_string(),
+                ))
             })
             .collect(),
     );
@@ -171,7 +171,7 @@ async fn mixed_hits_and_out_of_order_misses_preserve_order() {
     assert_eq!(result.feature_token_counts, [1, 3, 2, 3]);
     assert_eq!(result.item_sizes, [(1, 1), (3, 1), (2, 1), (3, 1)]);
     assert_eq!(
-        result.encoder_input.as_slice().unwrap(),
+        result.encoder_input.flat_f32().into_owned(),
         [1.0, 3.0, 2.0, 3.0]
     );
     calls.batches.lock().unwrap().clear();
@@ -187,7 +187,7 @@ async fn repeated_cold_images_keep_every_occurrence() {
         let result = run(&components, &config, &[1, 2, 1, 2, 1], "tok").await;
         assert_eq!(*calls.batches.lock().unwrap(), vec![vec![2], vec![1]]);
         assert_eq!(
-            result.encoder_input.as_slice().unwrap(),
+            result.encoder_input.flat_f32().into_owned(),
             [1.0, 2.0, 1.0, 2.0, 1.0]
         );
         assert_eq!(result.feature_token_counts, [1, 2, 1, 2, 1]);
@@ -206,7 +206,7 @@ async fn cache_separates_preprocessing_model_and_tokenizer_parameters() {
     config.preprocessor_config.rescale_factor = Some(2.0);
     calls.batches.lock().unwrap().clear();
     let result = run(&components, &config, &[3, 4], "tok").await;
-    assert_eq!(result.encoder_input.as_slice().unwrap(), [6.0, 8.0]);
+    assert_eq!(result.encoder_input.flat_f32().into_owned(), [6.0, 8.0]);
     assert_eq!(calls.batches.lock().unwrap().len(), 2);
     config.config["revision"] = serde_json::json!(2);
     calls.batches.lock().unwrap().clear();
@@ -239,4 +239,49 @@ async fn large_batches_unconfirmed_processors_and_disabled_cache_use_batch_path(
             assert_eq!(*batches, vec![ids]);
         }
     }
+}
+
+/// Hits and misses per model, as `(hits, misses)`; `None` until both series
+/// are rendered.
+fn lookups(
+    handle: &metrics_exporter_prometheus::PrometheusHandle,
+    model: &str,
+) -> Option<(f64, f64)> {
+    let body = handle.render();
+    let sample = |family: &str| -> Option<f64> {
+        let prefix = format!("{family}{{model=\"{model}\"}} ");
+        body.lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .and_then(|value| value.trim().parse().ok())
+    };
+    Some((
+        sample("smg_mm_pixel_cache_hits_total")?,
+        sample("smg_mm_pixel_cache_misses_total")?,
+    ))
+}
+
+/// Every lookup is a hit or a miss on `/metrics`, by model, with both series
+/// present from the first lookup. An image repeated within one request is
+/// deduplicated before the cache and is neither.
+#[test]
+fn lookups_are_counted_as_hits_and_misses_by_model() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (components, _calls, config) = setup(true, false);
+            run(&components, &config, &[1, 2], "tok").await;
+            assert_eq!(lookups(&handle, "qwen2-vl"), Some((0.0, 2.0)));
+
+            run(&components, &config, &[1, 2, 1], "tok").await;
+            assert_eq!(lookups(&handle, "qwen2-vl"), Some((2.0, 2.0)));
+
+            run(&components, &config, &[3], "tok").await;
+            assert_eq!(lookups(&handle, "qwen2-vl"), Some((2.0, 3.0)));
+        });
+    });
 }

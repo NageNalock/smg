@@ -17,6 +17,7 @@ use super::{
     pixel_cache::{pixel_cache_with_budget, PixelCache},
     settings::MultimodalSettings,
 };
+use crate::worker::http_client::build_client;
 
 /// Cached model configuration files loaded from the tokenizer directory.
 #[derive(Debug, Clone)]
@@ -252,6 +253,10 @@ pub(crate) struct MultimodalComponents {
     pub processing: MmProcessingMode,
     /// Cap on preprocessed media bytes in flight; `None` leaves it unbounded.
     pub inflight: Option<Arc<MultimodalInflight>>,
+    /// The engine's own video frame budget, for the specs that sample a clip
+    /// the way its loader does (the worker-side pipeline knows it; `None`
+    /// keeps each spec's own constant).
+    pub video_frame_budget: Option<usize>,
 }
 
 impl MultimodalComponents {
@@ -264,13 +269,16 @@ impl MultimodalComponents {
         max_inflight_bytes: Option<usize>,
         settings: &MultimodalSettings,
     ) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .context("Failed to create reqwest client")?;
+        let client = build_client(
+            || crate::http_client::client_builder().timeout(std::time::Duration::from_secs(30)),
+            false,
+            "media HTTP client",
+        )
+        .map_err(anyhow::Error::msg)?;
         let media_connector = MediaConnector::new(client, MediaConnectorConfig::default())
             .context("Failed to create MediaConnector")?;
 
+        super::report_jpeg_decoder();
         let processing = settings.processing.value;
         tracing::info!(
             mode = %processing,
@@ -305,6 +313,7 @@ impl MultimodalComponents {
                 .unwrap_or_default(),
             processing,
             inflight,
+            video_frame_budget: None,
         })
     }
 }

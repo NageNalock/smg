@@ -43,28 +43,68 @@ pub(crate) fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
         .with_speculative_tokens(total_spec_accepted, total_spec_drafted)
 }
 
+/// Account for the reasoning the gateway's own reasoning parser split off:
+/// `parsed` is the number of output tokens it routed to `reasoning_content`
+/// for the request, `None` when it did not run. Like an engine with a
+/// reasoning parser, the details are then always reported, zero included; an
+/// engine that counts reasoning itself is not overruled, whatever its count.
+pub(crate) fn with_parsed_reasoning_tokens(mut usage: Usage, parsed: Option<u32>) -> Usage {
+    if let Some(parsed) = parsed {
+        let details = usage.completion_tokens_details.get_or_insert_default();
+        details.reasoning_tokens.get_or_insert(parsed);
+    }
+    usage
+}
+
+/// The version to report on a generate response: what the engine stamped on
+/// this very response (the proto accessors already treat an empty string and
+/// the engine's `"default"` placeholder as unset) beats the dispatch-time
+/// label (kept as registered, so an empty one counts as unset here), which
+/// beats the historical `"default"`.
+///
+/// Borrowed on purpose: the SSE call sites run once per chunk and serialize
+/// the value straight into the event, so no per-chunk allocation.
+pub(crate) fn effective_weight_version<'a>(
+    reported: Option<&'a str>,
+    dispatch: Option<&'a str>,
+) -> &'a str {
+    reported
+        .or(dispatch)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("default")
+}
+
 /// Tracks per-index completion token counts across streaming chunks.
 ///
 /// Handles the two chunk conventions (`ChunkSemantics`):
 /// - delta streams send per-chunk token counts (must accumulate)
-/// - cumulative streams send the count in the Complete message
+/// - cumulative streams send the count in the Complete message, and the
+///   running count in every chunk before it
 pub(crate) struct CompletionTokenTracker {
     tokens: HashMap<u32, u32>,
+    /// The running count a cumulative stream reported in its latest chunk:
+    /// how far it had come, for a stream that ends before its Complete.
+    reported: HashMap<u32, u32>,
 }
 
 impl CompletionTokenTracker {
     pub fn new() -> Self {
         Self {
             tokens: HashMap::new(),
+            reported: HashMap::new(),
         }
     }
 
     /// Record tokens from a streaming chunk.
     /// Delta streams accumulate the chunk's token count; cumulative streams
-    /// report it in Complete instead, so this is a no-op for them.
+    /// report it in Complete instead, so a chunk of theirs only notes the
+    /// running count it carries.
     pub fn record_chunk(&mut self, chunk: &ProtoGenerateStreamChunk) {
         if chunk.chunk_semantics().is_delta() {
             *self.tokens.entry(chunk.index()).or_insert(0) += chunk.token_ids().len() as u32;
+        } else {
+            self.reported
+                .insert(chunk.index(), chunk.completion_tokens());
         }
     }
 
@@ -84,6 +124,19 @@ impl CompletionTokenTracker {
     /// Get total completion tokens across all indices
     pub fn total(&self) -> u32 {
         self.tokens.values().sum()
+    }
+
+    /// Completion tokens delivered so far across all indices: the count
+    /// [`total`](Self::total) knows, else the running count a cumulative
+    /// stream last reported. How far a stream that ends before its Complete
+    /// had come.
+    pub fn delivered(&self) -> u32 {
+        let mut per_index = self.reported.clone();
+        for (index, tokens) in &self.tokens {
+            let known = per_index.entry(*index).or_insert(0);
+            *known = (*known).max(*tokens);
+        }
+        per_index.values().sum()
     }
 }
 
@@ -123,6 +176,43 @@ mod tests {
         assert_eq!(
             usage.completion_tokens, 10,
             "each choice generates its own completion -- must be summed"
+        );
+    }
+
+    #[test]
+    fn parsed_reasoning_tokens_are_reported_once_the_parser_ran() {
+        let reasoning_tokens = |usage: Usage| {
+            usage
+                .completion_tokens_details
+                .and_then(|d| d.reasoning_tokens)
+        };
+        let usage = build_usage(&[complete(10, 8, 4)]);
+        assert_eq!(reasoning_tokens(usage.clone()), None);
+        assert_eq!(
+            reasoning_tokens(with_parsed_reasoning_tokens(usage.clone(), None)),
+            None,
+            "no reasoning parser: nothing to report"
+        );
+        assert_eq!(
+            reasoning_tokens(with_parsed_reasoning_tokens(usage.clone(), Some(0))),
+            Some(0),
+            "the parser ran and found no reasoning: zero, not absent"
+        );
+        assert_eq!(
+            reasoning_tokens(with_parsed_reasoning_tokens(usage, Some(7))),
+            Some(7)
+        );
+        let engine_counted = Usage::from_counts(10, 4).with_reasoning_tokens(5);
+        assert_eq!(
+            reasoning_tokens(with_parsed_reasoning_tokens(engine_counted, Some(3))),
+            Some(5),
+            "an engine that counts reasoning itself is not overruled"
+        );
+        let engine_counted_fewer = Usage::from_counts(10, 4).with_reasoning_tokens(3);
+        assert_eq!(
+            reasoning_tokens(with_parsed_reasoning_tokens(engine_counted_fewer, Some(5))),
+            Some(3),
+            "nor when its count is lower than the parser's"
         );
     }
 
@@ -176,6 +266,48 @@ mod tests {
             tracker.total(),
             7,
             "cumulative stream reports it in Complete"
+        );
+    }
+
+    #[test]
+    fn delivered_tokens_follow_a_stream_that_ends_before_complete() {
+        // Cumulative stream: a chunk carries the running count; the total is
+        // unknown until Complete, the delivered count is not.
+        let mut tracker = CompletionTokenTracker::new();
+        tracker.record_chunk(&ProtoGenerateStreamChunk::TokenSpeed(
+            tokenspeed::GenerateStreamChunk {
+                token_ids: vec![5],
+                completion_tokens: 41,
+                ..Default::default()
+            },
+        ));
+        assert_eq!(tracker.total(), 0, "no authoritative count before Complete");
+        assert_eq!(
+            tracker.delivered(),
+            41,
+            "the running count the engine reported"
+        );
+        tracker.record_complete(&complete(0, 0, 42));
+        assert_eq!((tracker.total(), tracker.delivered()), (42, 42));
+
+        // Delta stream: the accumulated chunks are both.
+        let mut tracker = CompletionTokenTracker::new();
+        tracker.record_chunk(&ProtoGenerateStreamChunk::Vllm(vllm::GenerateStreamChunk {
+            token_ids: vec![1, 2, 3],
+            ..Default::default()
+        }));
+        assert_eq!((tracker.total(), tracker.delivered()), (3, 3));
+    }
+
+    #[test]
+    fn engine_reported_version_beats_dispatch_which_beats_default() {
+        assert_eq!(effective_weight_version(Some("v7"), Some("v3")), "v7");
+        assert_eq!(effective_weight_version(None, Some("v3")), "v3");
+        assert_eq!(effective_weight_version(None, None), "default");
+        assert_eq!(
+            effective_weight_version(None, Some("")),
+            "default",
+            "an empty registration label is unset"
         );
     }
 }

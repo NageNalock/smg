@@ -72,8 +72,9 @@ pub(crate) async fn prepare_chat_like(
         let tokenizer =
             utils::resolve_tokenizer(ctx, "ChatPreparationStage::prepare_chat").map_err(|e| *e)?;
 
-        // Step 1: Filter tools if needed
-        let body_ref = utils::filter_chat_request_by_tool_choice(request);
+        // Step 1: the request whose tools the template renders (every tool
+        // for a named tool_choice; the constraint built below forces the call)
+        let body_ref = utils::request_as_rendered(request);
 
         // Resolve media-part ordering from the model registry so it stays owned
         // by the per-model spec. Falls back to vLLM-compatible media-first when
@@ -120,6 +121,10 @@ pub(crate) async fn prepare_chat_like(
                 }
             };
 
+            // The per-request media limits the model's workers advertise for
+            // their engine, which the plan is held to before any fetch.
+            let engine_limits =
+                multimodal::engine_item_limits(&ctx.components.worker_registry, model_id);
             let placeholders = multimodal::prepare_placeholder_tokens(
                 &media_plan,
                 model_id,
@@ -127,6 +132,7 @@ pub(crate) async fn prepare_chat_like(
                 mm_components,
                 &tokenizer_id,
                 &tokenizer_source,
+                &engine_limits,
             )
             .await
             .map_err(|e| {
@@ -264,15 +270,13 @@ pub(crate) async fn prepare_chat_like(
                         multimodal_intermediate = Some(output.intermediate);
                     }
                     Err(e) => {
+                        let message = multimodal::processing_failed_message(&e);
                         error!(
                             function = "ChatPreparationStage::execute",
-                            error = %e,
+                            error = %message,
                             "Multimodal processing failed"
                         );
-                        return Err(error::bad_request(
-                            "multimodal_processing_failed",
-                            format!("Multimodal processing failed: {e}"),
-                        ));
+                        return Err(error::bad_request("multimodal_processing_failed", message));
                     }
                 }
             }

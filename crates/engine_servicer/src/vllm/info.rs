@@ -168,20 +168,46 @@ fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
         attention_backend: model.attention_backend.clone(),
         pairing_protocol: model.pairing_protocol.clone(),
         block_size,
+        multimodal_encoder_dtype: match model_dtype.strip_prefix("torch.").unwrap_or(&model_dtype) {
+            dtype @ ("float32" | "float16" | "bfloat16") => dtype.to_string(),
+            _ => String::new(),
+        },
         model_dtype,
         shm_namespace_id: model.shm_namespace_id.clone(),
+        mm_device_do_normalize: model.mm_device_do_normalize,
+        mm_item_limits: model.mm_item_limits.clone(),
+        max_num_seqs: max_num_seqs(state),
+        engine_reasoning_parser: model.engine_reasoning_parser.clone(),
+        structured_outputs_start: model.structured_outputs_start.clone(),
         ..Default::default()
     }
 }
 
+/// The scheduler's running window: the launcher's `--max-num-seqs`, else the
+/// handshake's; 0 before the engine is up on a launcher that reported none.
+fn max_num_seqs(state: &State) -> i32 {
+    if state.model.max_num_seqs > 0 {
+        return state.model.max_num_seqs;
+    }
+    state
+        .engine
+        .client
+        .get()
+        .and_then(ZmqEngineClient::ready_response)
+        .map(|ready| i32::try_from(ready.max_num_seqs).unwrap_or(i32::MAX))
+        .unwrap_or_default()
+}
+
 /// `GetLoads`: the per-rank load piggybacked on engine output, in the gRPC
-/// response shape, with the handshake's capacity figures.
+/// response shape, with the handshake's capacity figures and, from this
+/// servicer's own bookkeeping ([`crate::load_tracker`]), the queued
+/// token-work, generation throughput and hit rate that vLLM's stats do not
+/// carry. The servicer forwards to one engine process, so those three go on
+/// the first rank's entry.
 pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
     let client = state.engine()?;
     let ready = client.ready_response();
-    let max_running_requests = ready
-        .map(|ready| i32::try_from(ready.max_num_seqs).unwrap_or(i32::MAX))
-        .unwrap_or_default();
+    let max_running_requests = max_num_seqs(state);
     let max_total_num_tokens = ready
         .and_then(|ready| ready.kv_cache_size_tokens)
         .map(|tokens| i32::try_from(tokens).unwrap_or(i32::MAX))
@@ -191,17 +217,28 @@ pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
     let mut loads: Vec<vllm::SchedulerLoad> = snapshot
         .loads
         .into_iter()
-        .map(|load| vllm::SchedulerLoad {
-            dp_rank: load.dp_rank,
-            num_running_reqs: load.num_running_reqs,
-            num_waiting_reqs: load.num_waiting_reqs,
-            num_total_reqs: load.num_running_reqs.saturating_add(load.num_waiting_reqs),
-            token_usage: load.token_usage,
-            max_running_requests,
-            max_total_num_tokens,
-            ..Default::default()
+        .map(|load| {
+            let num_used_tokens = (load.token_usage * f64::from(max_total_num_tokens)).round();
+            vllm::SchedulerLoad {
+                dp_rank: load.dp_rank,
+                num_running_reqs: load.num_running_reqs,
+                num_waiting_reqs: load.num_waiting_reqs,
+                num_total_reqs: load.num_running_reqs.saturating_add(load.num_waiting_reqs),
+                num_used_tokens: num_used_tokens.clamp(0.0, f64::from(i32::MAX)) as i32,
+                token_usage: load.token_usage,
+                utilization: load.token_usage,
+                max_running_requests,
+                max_total_num_tokens,
+                ..Default::default()
+            }
         })
         .collect();
+    if let Some(first) = loads.first_mut() {
+        let estimate = state.loads.estimate(first.num_waiting_reqs);
+        first.num_waiting_uncached_tokens = estimate.queued_token_work;
+        first.gen_throughput = estimate.gen_throughput;
+        first.cache_hit_rate = estimate.cache_hit_rate;
+    }
     if loads.is_empty() {
         // No output batch has carried a snapshot yet. The Python servicer
         // reports a zero-filled entry per rank, and the Router reads an

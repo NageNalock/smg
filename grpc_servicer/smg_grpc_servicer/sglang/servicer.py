@@ -23,10 +23,6 @@ from google.protobuf.struct_pb2 import Struct
 from google.protobuf.timestamp_pb2 import Timestamp
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.kv_events import (
-    AllBlocksCleared,
-    BlockRemoved,
-    BlockStored,
-    KVEventBatch,
     KVEventsConfig,
 )
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
@@ -52,13 +48,18 @@ from smg_grpc_proto.generated import common_pb2
 
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.kv_events import subscribe_kv_events
-from smg_grpc_servicer.sglang.loads import convert_loads_to_protobuf
-from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager
+from smg_grpc_servicer.sglang.loads import convert_loads_to_protobuf, load_record
+from smg_grpc_servicer.sglang.request_manager import (
+    GrpcRequestManager,
+    _validate_token_ids_logprobs,
+)
 from smg_grpc_servicer.sglang.utils import abort_code_from_output, to_token_id_array
 from smg_grpc_servicer.tensor_wire import tensor_from_parts
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
 
+from ..mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
 from ..pd_pairing import pairing_protocol_from_env
+from ..structured_outputs import grammar_start_labels, sglang_structured_outputs_start
 
 logger = logging.getLogger(__name__)
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
@@ -162,7 +163,6 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
         # Parse KV events config for SubscribeKvEvents support
         self._kv_events_config: KVEventsConfig | None = None
-        self._kv_event_id_counter = 0
         if server_args.kv_events_config:
             try:
                 self._kv_events_config = KVEventsConfig.from_cli(server_args.kv_events_config)
@@ -502,6 +502,21 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         pairing_protocol = pairing_protocol_from_env()
         if pairing_protocol:
             serializable_args["pairing_protocol"] = pairing_protocol
+        # The engine's own per-request media limits, flat, for the gateway's
+        # media pipeline to hold requests to: the precomputed inputs it sends
+        # bypass the tokenizer manager's own check.
+        item_limits = sglang_item_limits(self.server_args)
+        if item_limits:
+            serializable_args[MM_ITEM_LIMITS_KEY] = item_limits
+        # The engine's reasoning parser and where it starts a grammar on a
+        # thinking prompt (after the thought with a parser, from the first
+        # token without), for the gateway to shape a forced tool call's
+        # grammar by.
+        serializable_args.update(
+            grammar_start_labels(
+                self.server_args, sglang_structured_outputs_start(self.server_args)
+            )
+        )
         server_args_struct.update(serializable_args)
 
         # Convert scheduler_info to Struct
@@ -734,11 +749,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         request: common_pb2.SubscribeKvEventsRequest,
         context: grpc.aio.ServicerContext,
     ) -> AsyncIterator[common_pb2.KvEventBatch]:
-        """Bridge internal ZMQ KV cache events to gRPC server-streaming.
-
-        Uses the ZMQ publisher's native sequence numbers as gRPC sequence
-        numbers directly.
-        """
+        """Relay the scheduler's ZMQ KV cache events, every DP rank's publisher,
+        as one gRPC stream (see ``smg_grpc_servicer.kv_relay``)."""
         if self._kv_events_config is None:
             await context.abort(
                 grpc.StatusCode.UNIMPLEMENTED,
@@ -747,71 +759,24 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             )
             return
 
-        decoder = msgspec.msgpack.Decoder(KVEventBatch)
         async for batch in subscribe_kv_events(
             self._kv_events_config,
+            self.server_args,
             request.start_sequence_number,
             context,
-            decoder.decode,
-            self._convert_kv_event_batch,
+            load_source=self._load_record,
         ):
             yield batch
 
-    def _convert_kv_event_batch(
-        self, raw_batch: KVEventBatch, seq_num: int
-    ) -> common_pb2.KvEventBatch:
-        """Convert a ZMQ KVEventBatch to proto KvEventBatch."""
-        proto_batch = common_pb2.KvEventBatch(
-            sequence_number=seq_num,
-            timestamp=raw_batch.ts,
-        )
-        if raw_batch.attn_dp_rank is not None:
-            proto_batch.dp_rank = raw_batch.attn_dp_rank
-
-        for event in raw_batch.events:
-            proto_event = self._convert_kv_event(event)
-            if proto_event is not None:
-                proto_batch.events.append(proto_event)
-
-        return proto_batch
-
-    def _convert_kv_event(self, event) -> common_pb2.KvCacheEvent | None:
-        """Convert a single raw KV event to proto KvCacheEvent."""
-        self._kv_event_id_counter += 1
-        event_id = self._kv_event_id_counter
-
-        if isinstance(event, BlockStored):
-            # SGLang emits one BlockStored per page with block_hashes=[single_hash]
-            # and token_ids containing only that page's tokens.
-            blocks = []
-            for i, bh in enumerate(event.block_hashes):
-                start = i * event.block_size
-                end = start + event.block_size
-                block = common_pb2.KvBlock(
-                    block_hash=bh,
-                    token_ids=event.token_ids[start:end],
-                    block_size=event.block_size,
-                )
-                if event.lora_id is not None:
-                    block.lora_id = event.lora_id
-                blocks.append(block)
-
-            stored = common_pb2.KvBlocksStored(blocks=blocks)
-            if event.parent_block_hash is not None:
-                stored.parent_block_hash = event.parent_block_hash
-
-            return common_pb2.KvCacheEvent(event_id=event_id, stored=stored)
-
-        elif isinstance(event, BlockRemoved):
-            return common_pb2.KvCacheEvent(
-                event_id=event_id,
-                removed=common_pb2.KvBlocksRemoved(block_hashes=event.block_hashes),
-            )
-
-        elif isinstance(event, AllBlocksCleared):
-            return common_pb2.KvCacheEvent(event_id=event_id, cleared=common_pb2.KvCacheCleared())
-
-        return None
+    def _load_record(self, dp_rank: int | None) -> common_pb2.EngineLoad | None:
+        """The load record the KV-event stream carries for ``dp_rank``: the
+        scheduler's published snapshot as ``GetLoads`` reports it, read for
+        every batch and heartbeat; ``None`` while none is published."""
+        try:
+            return load_record(self.request_manager.load_snapshot_reader.read_all(), dp_rank)
+        except Exception:  # noqa: BLE001 - a record that cannot be read leaves the batch without one
+            logger.debug("load record unavailable", exc_info=True)
+            return None
 
     def _handle_epd_disaggregation_encode_request(
         self,
@@ -1044,6 +1009,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         token_logprobs_idx = logprobs_data.get("token_logprobs_idx", [])
         top_logprobs_val = logprobs_data.get("top_logprobs_val", [])
         top_logprobs_idx = logprobs_data.get("top_logprobs_idx", [])
+        selected_values = logprobs_data.get("token_ids_logprobs_val", [])
+        selected_ids = logprobs_data.get("token_ids_logprobs_idx", [])
+        _validate_token_ids_logprobs(selected_values, selected_ids)
 
         # Build TopLogProbs entries
         top_logprobs_proto = []
@@ -1060,6 +1028,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             token_logprobs=token_logprobs_val,  # Plain float array
             token_ids=token_logprobs_idx,
             top_logprobs=top_logprobs_proto,
+            token_ids_logprobs=[
+                sglang_scheduler_pb2.TopLogProbs(values=values, token_ids=token_ids)
+                for values, token_ids in zip(selected_values, selected_ids)
+            ],
         )
 
     def _convert_input_logprobs_to_proto(
@@ -1161,10 +1133,15 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             elif isinstance(matched, str):
                 matched_stop_kwargs["matched_stop_str"] = matched
 
-        # Convert output logprobs if present
-        output_logprobs_proto = self._convert_output_logprobs_to_proto(
-            output.get("output_logprobs")
-        )
+        # Complete includes all selected rows, while the last stream chunk
+        # contains only that scheduler tick's rows.
+        logprobs_data = output.get("output_logprobs")
+        if "complete_token_ids_logprobs" in output:
+            logprobs_data = {
+                **(logprobs_data or {}),
+                **output["complete_token_ids_logprobs"],
+            }
+        output_logprobs_proto = self._convert_output_logprobs_to_proto(logprobs_data)
 
         # Convert input logprobs if present
         input_logprobs_proto = self._convert_input_logprobs_to_proto(output.get("input_logprobs"))

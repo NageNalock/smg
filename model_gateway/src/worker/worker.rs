@@ -2,7 +2,7 @@ use std::{
     any::Any,
     fmt,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
     time::Duration,
@@ -18,9 +18,10 @@ use openai_protocol::{
     model_type::{Endpoint, ModelType},
     worker::{HealthCheckConfig, ProviderType, WorkerInfo, WorkerModels, WorkerSpec, WorkerStatus},
 };
+use parking_lot::Mutex;
 use smg_grpc_client::common_proto;
 use tokio::{
-    sync::{mpsc, OnceCell},
+    sync::{mpsc, Notify, OnceCell},
     task::AbortHandle,
     time,
 };
@@ -85,7 +86,8 @@ impl LazyHttpClient {
     }
 
     fn init(&self) -> &Arc<reqwest::Client> {
-        self.cell.get_or_init(|| Arc::new(reqwest::Client::new()))
+        self.cell
+            .get_or_init(|| Arc::new(crate::http_client::client()))
     }
 }
 
@@ -337,6 +339,12 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         0
     }
 
+    /// Epochs reported during metadata discovery, invalidated after a health
+    /// failure. These are observations, not proof against an undetected restart.
+    fn cache_trace_epochs(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Set the worker's lifecycle status.
     fn set_status(&self, status: WorkerStatus);
 
@@ -411,6 +419,15 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Decrement the load counter
     fn decrement_load(&self);
+
+    /// The request-completion observer installed on this worker, if any
+    /// (see [`RequestCompletionSink`]).
+    fn completion_sink(&self) -> Option<Arc<dyn RequestCompletionSink>> {
+        None
+    }
+
+    /// Install (or clear) the request-completion observer.
+    fn set_completion_sink(&self, _sink: Option<Arc<dyn RequestCompletionSink>>) {}
 
     /// Claim `count` PD bootstrap rooms while the worker's claimed total
     /// stays within `window`; a refusal claims nothing.
@@ -517,14 +534,17 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Check if the worker is available (healthy + circuit closed/half-open +
     /// not vetoed by the absolute overload guard).
     fn is_available(&self) -> bool {
-        self.is_healthy() && self.circuit_breaker_can_execute() && !self.is_overloaded()
+        self.is_healthy()
+            && self.circuit_breaker_can_execute()
+            && !self.is_overloaded()
+            && self.stall_reason().is_none()
     }
 
     /// [`Self::is_healthy`] fused with the overload veto. For the hash policies,
     /// which route on health alone and never consult the circuit breaker;
     /// `BasicWorker` overrides it to read both under a single runtime guard.
     fn is_healthy_and_eligible(&self) -> bool {
-        self.is_healthy() && !self.is_overloaded()
+        self.is_healthy() && !self.is_overloaded() && self.stall_reason().is_none()
     }
 
     /// Whether the absolute overload guard currently vetoes this worker.
@@ -544,6 +564,147 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         false
     }
 
+    /// Why the liveness tracker vetoes this worker, if it does.
+    fn stall_reason(&self) -> Option<StallReason> {
+        None
+    }
+
+    /// Set or clear the liveness veto, returning `true` when it changed.
+    /// Route writes through [`super::liveness`], which logs and counts the
+    /// transition.
+    fn set_stall(&self, _reason: Option<StallReason>) -> bool {
+        false
+    }
+
+    /// Record a successful interaction with the worker (a poll answered, a
+    /// probe passed, an event batch, a response).
+    fn note_contact(&self) {}
+
+    /// Record a token or a completion from the worker.
+    fn note_token_progress(&self) {}
+
+    /// Record a transport failure (a poll, probe or stream that failed on the
+    /// connection); cleared by the next contact.
+    fn note_transport_failure(&self) {}
+
+    /// Whether a transport failure happened since the last contact.
+    fn transport_failure_pending(&self) -> bool {
+        false
+    }
+
+    /// Time since the last successful contact.
+    fn contact_age(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// Time since the last token or completion.
+    fn token_progress_age(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// Record a load record pushed on the worker's own KV-event stream: from
+    /// here on the worker is expected to be heard from at the stream's
+    /// cadence (see [`super::liveness`]).
+    fn note_load_record(&self) {}
+
+    /// Whether the worker's stream has ever pushed a load record.
+    fn pushes_load_records(&self) -> bool {
+        false
+    }
+    /// Record the start of a request whose responses the gateway sees one by
+    /// one (a streaming generation to this worker over gRPC): the pile the
+    /// wedged rule counts, and the start of its clock when a run begins.
+    /// Requests without that signal (HTTP, a PD leg, a non-streaming
+    /// generation) never form a pile.
+    fn note_tracked_started(&self) {}
+    /// Record the end of a tracked request.
+    fn note_tracked_ended(&self) {}
+    /// Requests in flight whose responses the gateway sees one by one.
+    fn tracked_load(&self) -> usize {
+        0
+    }
+
+    /// Store the engine's reported waiting-queue depth, returning the previous
+    /// value.
+    fn swap_waiting_reqs(&self, _waiting: i64) -> i64 {
+        0
+    }
+
+    /// Store the in-flight count seen by the liveness sweep, returning the
+    /// previous sample.
+    fn swap_load_sample(&self, _load: usize) -> usize {
+        0
+    }
+
+    /// A notifier fired on every contact with the worker, for loops that back
+    /// off from it and should retry as soon as it is heard from again.
+    fn contact_wake(&self) -> Option<Arc<Notify>> {
+        None
+    }
+
+    /// Ask the health manager to promote the worker now, on the strength of a
+    /// successful contact, instead of at its next scheduled probe.
+    fn signal_connected(&self) {}
+
+    /// Close the circuit breaker: the worker has returned (a liveness veto
+    /// cleared by a contact, or health promoted it back to Ready) and the
+    /// failures that opened it belong to the outage. It reopens on fresh
+    /// failures like any closed breaker.
+    fn reset_circuit_breaker(&self) {}
+
+    /// Record that the worker just became routable (promotion to Ready, or a
+    /// liveness veto cleared); the warm-up slice counts from here.
+    fn note_admitted(&self) {}
+
+    /// Time since the worker last became routable; `Duration::MAX` for a
+    /// worker that does not track it (never warming).
+    fn admitted_age(&self) -> Duration {
+        Duration::MAX
+    }
+
+    /// Blocks the worker's index has gained since its current admission, for
+    /// the warm-up slice; `indexed` is what the index holds for it now. A
+    /// worker that does not track admissions reports the count itself.
+    fn warmup_growth(&self, indexed: usize) -> usize {
+        indexed
+    }
+
+    /// Gateway clock (`liveness::now_ms`) before which a thin worker with
+    /// requests in flight takes no further diverted hit (see
+    /// `CacheAwarePolicy::warmup_divert`); zero for a worker that does not
+    /// track it.
+    fn divert_until_ms(&self) -> u64 {
+        0
+    }
+
+    /// A hit was diverted to this thin worker; the next one waits until
+    /// `until_ms` while it has anything in flight.
+    fn note_diverted(&self, _until_ms: u64) {}
+
+    /// A request of `tokens` prompt tokens was dispatched: work the engine
+    /// still has to prefill before its first token (see
+    /// [`Self::prefill_backlog`]). `timed` says the gateway will see that
+    /// first token on its own (a streaming generation), so the prompt's
+    /// prefill can be timed for the worker's rate; a non-streaming
+    /// generation answers once, at its end, and its prompt counts in the
+    /// backlog only.
+    fn note_prefill_started(&self, _tokens: u64, _timed: bool) {}
+
+    /// The request's first token came back, with `cached` of its prompt
+    /// tokens reported served from the engine's prefix cache (`Some`; zero
+    /// when the engine reports no count), or its stream ended or was dropped
+    /// before one (`None`): its prompt is no longer pending prefill. `timed`
+    /// as at its start.
+    fn note_prefill_ended(&self, _tokens: u64, _timed: bool, _cached: Option<u64>) {}
+
+    /// How long the engine may still need before the first token of its
+    /// in-flight work is due: the prompt tokens dispatched and not yet
+    /// answered, over the prefill rate observed on this worker (a cold prior
+    /// until one is). Zero for a worker that does not track it.
+    fn prefill_backlog(&self) -> Duration {
+        Duration::ZERO
+    }
+
     /// One-shot routing snapshot for the per-request O(workers) selection loops:
     /// reads status, load, processed and the overload veto together so the hot
     /// path takes one `ArcSwap` guard per backing cell per worker instead of one
@@ -556,6 +717,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
             load: self.load(),
             processed: self.processed_requests(),
             overloaded: self.is_overloaded(),
+            stalled: self.stall_reason().is_some(),
         }
     }
 
@@ -572,18 +734,31 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// pass the status code returned to the client (e.g., 502 for a send
     /// error, 504 for a timeout).
     fn record_outcome(&self, status_code: u16) {
-        let resilience = self.resilience();
         // Capacity pushback (429 by default) is a routing signal, not a
         // worker fault: the request is retried elsewhere, but no
         // circuit-breaker sample is recorded in either direction — opening
         // the breaker on backpressure would amplify a load spike into
         // unavailability, and crediting a success would close a half-open
         // breaker on a request the worker refused.
-        if resilience.capacity_status_codes.contains(&status_code) {
+        if self
+            .resilience()
+            .capacity_status_codes
+            .contains(&status_code)
+        {
             return;
         }
-        let is_failure = resilience.retryable_status_codes.contains(&status_code);
-        self.record_circuit_breaker_outcome(!is_failure);
+        self.record_circuit_breaker_outcome(!self.is_breaker_failure(status_code));
+    }
+
+    /// Whether `status_code` counts as a circuit-breaker failure for this
+    /// worker: a status in its `retryable_status_codes` that is not capacity
+    /// pushback. The per-request accounting in
+    /// `routers::common::attempt_ledger` asks this before charging, so a
+    /// request's retries charge a worker once.
+    fn is_breaker_failure(&self, status_code: u16) -> bool {
+        let resilience = self.resilience();
+        !resilience.capacity_status_codes.contains(&status_code)
+            && resilience.retryable_status_codes.contains(&status_code)
     }
 
     /// Get the resolved resilience config for this worker.
@@ -1137,6 +1312,35 @@ impl WorkerMetadata {
 }
 
 /// One-shot routing snapshot — see [`Worker::routing_state`].
+/// Why the liveness tracker vetoes a worker (see [`super::liveness`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StallReason {
+    /// Its transport fails and nothing has been heard from it for the stall
+    /// threshold.
+    Unreachable = 1,
+    /// It answers polls but holds requests that make no progress while its
+    /// queue grows.
+    Wedged = 2,
+}
+
+impl StallReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unreachable => "unreachable",
+            Self::Wedged => "wedged",
+        }
+    }
+
+    const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Unreachable),
+            2 => Some(Self::Wedged),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RoutingState {
     /// `status == Ready`.
@@ -1149,6 +1353,8 @@ pub struct RoutingState {
     pub processed: usize,
     /// Absolute overload veto, set by the load monitor at ingestion time.
     pub overloaded: bool,
+    /// Liveness veto: unreachable or wedged (see [`super::liveness`]).
+    pub stalled: bool,
 }
 
 impl RoutingState {
@@ -1156,7 +1362,7 @@ impl RoutingState {
     /// gather pass already performed: every field rides the one guard
     /// [`Worker::routing_state`] took.
     pub const fn eligible(self) -> bool {
-        self.healthy && self.can_execute && !self.overloaded
+        self.healthy && self.can_execute && !self.overloaded && !self.stalled
     }
 }
 
@@ -1164,6 +1370,7 @@ impl RoutingState {
 #[derive(Debug)]
 pub struct WorkerRuntime {
     status: AtomicU8,
+    cache_trace_epochs_valid: AtomicBool,
     consecutive_failures: AtomicUsize,
     consecutive_successes: AtomicUsize,
     total_pending_probes: AtomicUsize,
@@ -1182,12 +1389,210 @@ pub struct WorkerRuntime {
     /// so selection reads it under the guard it already holds, and so a
     /// same-URL replacement inherits it with the rest of the shared runtime.
     overloaded: AtomicBool,
+    /// Liveness veto, a [`StallReason`] as `u8` (0 = none).
+    stall: AtomicU8,
+    /// Last successful contact and last token or completion, in
+    /// [`super::liveness::now_ms`] milliseconds.
+    last_contact_ms: AtomicU64,
+    last_token_ms: AtomicU64,
+    /// Waiting-queue depth from the previous load report.
+    last_waiting_reqs: AtomicI64,
+    /// A transport failure happened since the last contact.
+    transport_failed: AtomicBool,
+    /// The worker's KV-event stream has pushed a load record: silence is
+    /// then judged by the stream's cadence (see [`super::liveness`]).
+    pushed_loads: AtomicBool,
+    /// In-flight count at the previous liveness sweep.
+    last_load_sample: AtomicUsize,
+    /// Woken on every contact, so a loop backing off from this worker (the
+    /// KV event subscriber) retries the moment the worker is heard from.
+    contact_wake: Arc<Notify>,
+    /// When the worker last became routable (promoted to Ready, or a liveness
+    /// veto cleared), in [`super::liveness::now_ms`] milliseconds.
+    admitted_at_ms: AtomicU64,
+    /// The warm-up slice's baseline: the admission it was taken for and the
+    /// blocks the index held for the worker then (see [`Self::warmup_growth`]).
+    warmup_base_admitted_ms: AtomicU64,
+    warmup_base_blocks: AtomicUsize,
+    /// Clock before which this thin worker, with requests in flight, takes
+    /// no further diverted hit.
+    divert_until_ms: AtomicU64,
+    /// When the current run of in-flight requests began (the load counter
+    /// left zero), in [`super::liveness::now_ms`] milliseconds; zero while
+    /// idle. The no-progress clock of the wedged rule starts here, not at
+    /// registration or the last token before an idle spell.
+    busy_since_ms: AtomicU64,
+    /// Requests in flight whose responses the gateway sees one by one (see
+    /// [`Worker::tracked_load`]).
+    tracked_in_flight: AtomicUsize,
+    /// The prefill book: pending prompt tokens, the busy interval and the
+    /// rate window, moved together under one lock so a request's end and
+    /// another's start cannot race the interval away (see [`PrefillBook`]).
+    prefill: Mutex<PrefillBook>,
+}
+
+/// Prefill rate assumed for a worker that has not shown one yet: slow enough
+/// that a cold engine handed a burst of long prompts is not called wedged
+/// before it can have answered (10k tokens/s is a small model on a modest
+/// GPU; a current datacenter GPU prefills 8B weights at ~90k).
+const COLD_PREFILL_TOKENS_PER_SEC: u64 = 10_000;
+
+/// First tokens are summed over windows at least this long before they make
+/// a rate sample, so the sample is the engine's aggregate throughput and not
+/// one request's time to first token (which includes its wait in the batch).
+const PREFILL_WINDOW_MS: u64 = 1_000;
+
+/// The prefill books of one worker: what is pending, how long the engine
+/// has been prefilling, and the rate window. One struct under one lock, so
+/// that a request's end racing another's start cannot lose the busy
+/// interval (a lost interval would leave the window open for good on a
+/// worker that never drains, and its rate stale).
+///
+/// The rate is measured over busy time only: time with timed prompt tokens
+/// pending on the worker (overlapping prompts share one interval), banked
+/// when the last of them ends. First tokens are summed over windows of at
+/// least [`PREFILL_WINDOW_MS`] of busy time, and a window closes at the
+/// first token that completes it, whether or not the pending count ever
+/// touches zero: a worker that is never idle still updates its rate at
+/// every first token past a second of prefill.
+///
+/// Only the prompts whose first token the gateway will see (streaming
+/// generations) are timed. A non-streaming generation answers once, at its
+/// end, so its prompt stays pending through its whole decode: it counts in
+/// the backlog (the engine prefills it before anything dispatched behind it
+/// streams) but opens no busy interval and makes no sample, or the idle
+/// gaps around it would count as prefill again and its decode would be
+/// timed as the prefill of its prompt.
+///
+/// A first token teaches the tokens the engine computed for its prompt:
+/// the prompt's length less the prefix-cache hit the engine reports with
+/// it (the servicers forward the engine's per-request cached-token count
+/// on every chunk; one that reports none teaches the full length). Counted
+/// at full length, a worker fed mostly cache hits (a multi-turn chat)
+/// learned a rate many times its cold one, and a later burst of cold
+/// prompts got a bound at the bare threshold: the false positive the bound
+/// exists to prevent. Two things still err toward patience: the backlog
+/// counts a pending prompt at full length, since its hit is known only
+/// when the engine answers; and the time to first token of a mostly cached
+/// prompt is the engine's step latency more than prefill, so a worker fed
+/// mostly hits learns a rate below its cold one. An underestimate is
+/// halved away by the next cold first token; an overestimate vetoes a
+/// healthy worker, and nothing corrects it.
+#[derive(Debug, Default)]
+struct PrefillBook {
+    /// Prompt tokens dispatched to the worker and not yet answered with a
+    /// first token or, for a non-streaming generation, with its one answer
+    /// (or released by a dropped stream): the backlog.
+    pending: u64,
+    /// The part of `pending` whose prefill is timed: the prompts whose
+    /// first token the gateway will see.
+    timed: u64,
+    /// Observed prefill rate in tokens per second; zero until a window of
+    /// first tokens has been seen.
+    rate_tps: u64,
+    /// Gateway clock at which the timed tokens left zero; `None` while
+    /// none is pending.
+    busy_since_ms: Option<u64>,
+    /// Busy time banked into the open window from closed intervals.
+    window_busy_ms: u64,
+    /// First tokens' prompt tokens in the open window.
+    window_tokens: u64,
+}
+
+impl PrefillBook {
+    fn started(&mut self, tokens: u64, timed: bool, now_ms: u64) {
+        if tokens == 0 {
+            return;
+        }
+        self.pending = self.pending.saturating_add(tokens);
+        if !timed {
+            return;
+        }
+        if self.timed == 0 {
+            self.busy_since_ms = Some(now_ms);
+        }
+        self.timed = self.timed.saturating_add(tokens);
+    }
+
+    fn ended(&mut self, tokens: u64, timed: bool, cached: Option<u64>, now_ms: u64) {
+        self.pending = self.pending.saturating_sub(tokens);
+        if !timed {
+            return;
+        }
+        self.timed = self.timed.saturating_sub(tokens);
+        if tokens > 0 {
+            if let Some(cached) = cached {
+                // What the engine computed: the prompt less its cache hit.
+                self.observe(tokens.saturating_sub(cached), now_ms);
+            }
+        }
+        if self.timed == 0 {
+            if let Some(since) = self.busy_since_ms.take() {
+                self.window_busy_ms = self
+                    .window_busy_ms
+                    .saturating_add(now_ms.saturating_sub(since));
+            }
+        }
+    }
+
+    /// Busy time in the open window as of `now_ms`: what is banked plus the
+    /// interval still running.
+    fn window_span_ms(&self, now_ms: u64) -> u64 {
+        let open = self
+            .busy_since_ms
+            .map_or(0, |since| now_ms.saturating_sub(since));
+        self.window_busy_ms.saturating_add(open)
+    }
+
+    /// Fold `tokens` computed for a prompt whose first token came back at
+    /// `now_ms` into the observed rate: once the window holds
+    /// [`PREFILL_WINDOW_MS`] of busy time its tokens over that time are a
+    /// sample, and each sample halves into the running estimate. A window
+    /// in which the engine computed nothing (every prompt a whole cache
+    /// hit) makes no sample.
+    fn observe(&mut self, tokens: u64, now_ms: u64) {
+        self.window_tokens = self.window_tokens.saturating_add(tokens);
+        let span_ms = self.window_span_ms(now_ms);
+        if span_ms < PREFILL_WINDOW_MS {
+            return;
+        }
+        if self.window_tokens > 0 {
+            let sample = self.window_tokens.saturating_mul(1000) / span_ms;
+            self.rate_tps = if self.rate_tps == 0 {
+                sample
+            } else {
+                self.rate_tps.midpoint(sample)
+            }
+            .max(1);
+        }
+        self.window_busy_ms = 0;
+        self.window_tokens = 0;
+        if self.busy_since_ms.is_some() {
+            // Still prefilling: the next window's busy time starts here.
+            self.busy_since_ms = Some(now_ms);
+        }
+    }
+
+    fn backlog(&self) -> Duration {
+        if self.pending == 0 {
+            return Duration::ZERO;
+        }
+        let rate = match self.rate_tps {
+            0 => COLD_PREFILL_TOKENS_PER_SEC,
+            rate => rate,
+        };
+        Duration::from_millis(self.pending.saturating_mul(1000) / rate)
+    }
 }
 
 impl WorkerRuntime {
     pub fn new(url: &str, initial_status: WorkerStatus) -> Self {
         Self {
             status: AtomicU8::new(initial_status as u8),
+            cache_trace_epochs_valid: AtomicBool::new(!matches!(
+                initial_status,
+                WorkerStatus::NotReady | WorkerStatus::Failed
+            )),
             consecutive_failures: AtomicUsize::new(0),
             consecutive_successes: AtomicUsize::new(0),
             total_pending_probes: AtomicUsize::new(0),
@@ -1197,7 +1602,178 @@ impl WorkerRuntime {
             worker_routing_key_load: WorkerRoutingKeyLoad::new(url),
             revision: AtomicU64::new(0),
             overloaded: AtomicBool::new(false),
+            stall: AtomicU8::new(0),
+            last_contact_ms: AtomicU64::new(super::liveness::now_ms()),
+            last_token_ms: AtomicU64::new(super::liveness::now_ms()),
+            last_waiting_reqs: AtomicI64::new(0),
+            transport_failed: AtomicBool::new(false),
+            pushed_loads: AtomicBool::new(false),
+            last_load_sample: AtomicUsize::new(0),
+            contact_wake: Arc::new(Notify::new()),
+            admitted_at_ms: AtomicU64::new(super::liveness::now_ms()),
+            warmup_base_admitted_ms: AtomicU64::new(u64::MAX),
+            warmup_base_blocks: AtomicUsize::new(0),
+            divert_until_ms: AtomicU64::new(0),
+            busy_since_ms: AtomicU64::new(0),
+            tracked_in_flight: AtomicUsize::new(0),
+            prefill: Mutex::new(PrefillBook::default()),
         }
+    }
+
+    pub fn note_admitted(&self) {
+        self.admitted_at_ms
+            .store(super::liveness::now_ms(), Ordering::Relaxed);
+    }
+
+    pub fn admitted_age(&self) -> Duration {
+        Self::age_of(self.admitted_at_ms.load(Ordering::Relaxed))
+    }
+
+    pub fn divert_until_ms(&self) -> u64 {
+        self.divert_until_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn note_diverted(&self, until_ms: u64) {
+        self.divert_until_ms.store(until_ms, Ordering::Relaxed);
+    }
+
+    /// Blocks the index has gained for the worker since its current admission.
+    /// The index size itself is no measure of a returned worker's cache: a
+    /// restarted engine's stale blocks stay indexed until its first batch
+    /// reveals the restart, and an engine that gets no request sends no batch,
+    /// so the stale count would end the warm-up meant to break that circle.
+    /// The baseline is the count first seen for the current admission, and
+    /// drops to zero when the index was cleared underneath (the count went
+    /// down). Two racing callers may both take the same baseline; nothing
+    /// worse.
+    pub fn warmup_growth(&self, indexed: usize) -> usize {
+        let admitted = self.admitted_at_ms.load(Ordering::Relaxed);
+        if self.warmup_base_admitted_ms.load(Ordering::Relaxed) != admitted {
+            self.warmup_base_admitted_ms
+                .store(admitted, Ordering::Relaxed);
+            self.warmup_base_blocks.store(indexed, Ordering::Relaxed);
+            return 0;
+        }
+        let base = self.warmup_base_blocks.load(Ordering::Relaxed);
+        if indexed < base {
+            self.warmup_base_blocks.store(0, Ordering::Relaxed);
+            return indexed;
+        }
+        indexed - base
+    }
+
+    // ── Liveness ────────────────────────────────────────────────────
+
+    pub fn note_transport_failure(&self) {
+        self.transport_failed.store(true, Ordering::Relaxed);
+    }
+
+    pub fn transport_failure_pending(&self) -> bool {
+        self.transport_failed.load(Ordering::Relaxed)
+    }
+
+    pub fn stall_reason(&self) -> Option<StallReason> {
+        StallReason::from_u8(self.stall.load(Ordering::Acquire))
+    }
+
+    /// Set or clear the veto; `true` when it changed.
+    pub fn set_stall(&self, reason: Option<StallReason>) -> bool {
+        let next = reason.map_or(0, |reason| reason as u8);
+        self.stall.swap(next, Ordering::AcqRel) != next
+    }
+
+    pub fn note_contact(&self) {
+        self.last_contact_ms
+            .store(super::liveness::now_ms(), Ordering::Relaxed);
+        self.transport_failed.store(false, Ordering::Relaxed);
+        self.contact_wake.notify_one();
+    }
+
+    pub fn note_token_progress(&self) {
+        let now = super::liveness::now_ms();
+        self.last_token_ms.store(now, Ordering::Relaxed);
+        self.last_contact_ms.store(now, Ordering::Relaxed);
+        self.transport_failed.store(false, Ordering::Relaxed);
+        self.contact_wake.notify_one();
+    }
+
+    /// The notifier [`Self::note_contact`] fires; `notify_one` semantics, so
+    /// a contact that happens before anyone waits is not lost.
+    pub fn contact_wake(&self) -> Arc<Notify> {
+        Arc::clone(&self.contact_wake)
+    }
+
+    pub fn contact_age(&self) -> Duration {
+        Self::age_of(self.last_contact_ms.load(Ordering::Relaxed))
+    }
+
+    pub fn note_load_record(&self) {
+        self.pushed_loads.store(true, Ordering::Relaxed);
+    }
+
+    pub fn pushes_load_records(&self) -> bool {
+        self.pushed_loads.load(Ordering::Relaxed)
+    }
+
+    /// Time without a token or completion, counted from the later of the last
+    /// one and the start of the current run of in-flight requests: a worker
+    /// that was idle (or just registered) has nothing to show progress on
+    /// until something is dispatched to it.
+    pub fn token_progress_age(&self) -> Duration {
+        Self::age_of(self.progress_reference_ms())
+    }
+
+    /// The stamp [`Self::token_progress_age`] counts from.
+    pub fn progress_reference_ms(&self) -> u64 {
+        self.last_token_ms
+            .load(Ordering::Relaxed)
+            .max(self.busy_since_ms.load(Ordering::Relaxed))
+    }
+
+    // ── Prefill backlog (the wedged rule's bound) ───────────────────
+
+    pub fn note_prefill_started(&self, tokens: u64, timed: bool) {
+        self.note_prefill_started_at(tokens, timed, super::liveness::now_ms().max(1));
+    }
+
+    /// [`Self::note_prefill_started`] at `now_ms` on the gateway clock.
+    pub fn note_prefill_started_at(&self, tokens: u64, timed: bool, now_ms: u64) {
+        self.prefill.lock().started(tokens, timed, now_ms);
+    }
+
+    pub fn note_prefill_ended(&self, tokens: u64, timed: bool, cached: Option<u64>) {
+        self.note_prefill_ended_at(tokens, timed, cached, super::liveness::now_ms().max(1));
+    }
+
+    /// [`Self::note_prefill_ended`] at `now_ms` on the gateway clock.
+    pub fn note_prefill_ended_at(
+        &self,
+        tokens: u64,
+        timed: bool,
+        cached: Option<u64>,
+        now_ms: u64,
+    ) {
+        self.prefill.lock().ended(tokens, timed, cached, now_ms);
+    }
+
+    pub fn prefill_rate_tps(&self) -> u64 {
+        self.prefill.lock().rate_tps
+    }
+
+    pub fn prefill_backlog(&self) -> Duration {
+        self.prefill.lock().backlog()
+    }
+
+    pub fn swap_waiting_reqs(&self, waiting: i64) -> i64 {
+        self.last_waiting_reqs.swap(waiting, Ordering::Relaxed)
+    }
+
+    pub fn swap_load_sample(&self, load: usize) -> usize {
+        self.last_load_sample.swap(load, Ordering::Relaxed)
+    }
+
+    fn age_of(stamp_ms: u64) -> Duration {
+        Duration::from_millis(super::liveness::now_ms().saturating_sub(stamp_ms))
     }
 
     // ── Lifecycle status ────────────────────────────────────────────
@@ -1207,6 +1783,10 @@ impl WorkerRuntime {
     }
 
     pub fn set_status(&self, status: WorkerStatus) {
+        if matches!(status, WorkerStatus::NotReady | WorkerStatus::Failed) {
+            self.cache_trace_epochs_valid
+                .store(false, Ordering::Release);
+        }
         self.status.store(status as u8, Ordering::Release);
     }
 
@@ -1255,25 +1835,66 @@ impl WorkerRuntime {
     }
 
     pub fn increment_load(&self) {
-        self.load_counter.fetch_add(1, Ordering::Relaxed);
+        if self.load_counter.fetch_add(1, Ordering::Relaxed) == 0 {
+            self.note_busy_started();
+        }
     }
 
     pub fn try_increment_load(&self, max: usize) -> bool {
-        self.load_counter
+        match self
+            .load_counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1).filter(|next| *next <= max)
-            })
-            .is_ok()
+            }) {
+            Ok(0) => {
+                self.note_busy_started();
+                true
+            }
+            Ok(_) => true,
+            Err(_) => false,
+        }
+    }
+
+    /// A tracked request started. The wedged rule's clock starts with the
+    /// first of a run, so an untracked request dispatched earlier (an HTTP or
+    /// a non-streaming one) cannot age the run before it begins.
+    pub fn note_tracked_started(&self) {
+        if self.tracked_in_flight.fetch_add(1, Ordering::Relaxed) == 0 {
+            self.note_busy_started();
+        }
+    }
+    pub fn note_tracked_ended(&self) {
+        let _ =
+            self.tracked_in_flight
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |tracked| {
+                    Some(tracked.saturating_sub(1))
+                });
+    }
+    pub fn tracked_load(&self) -> usize {
+        self.tracked_in_flight.load(Ordering::Relaxed)
+    }
+    /// The load counter left zero: the wedged rule's clock starts now.
+    fn note_busy_started(&self) {
+        self.busy_since_ms
+            .store(super::liveness::now_ms().max(1), Ordering::Relaxed);
     }
 
     /// Saturating decrement. Returns `true` if the counter was decremented,
     /// `false` if it was already zero — callers can log when that happens.
     pub fn try_decrement_load(&self) -> bool {
-        self.load_counter
+        match self
+            .load_counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_sub(1)
-            })
-            .is_ok()
+            }) {
+            Ok(1) => {
+                // Idle again: nothing in flight to wait for.
+                self.busy_since_ms.store(0, Ordering::Relaxed);
+                true
+            }
+            Ok(_) => true,
+            Err(_) => false,
+        }
     }
 
     // ── PD admission claims ─────────────────────────────────────────
@@ -1340,6 +1961,16 @@ impl WorkerRuntime {
     }
 }
 
+/// Observer of request completions on a worker. The request's load guard
+/// notifies it when it drops, which is the one point every path that holds
+/// worker load (HTTP, gRPC, both PD legs, admitted prefill) passes through on
+/// success, error and client disconnect alike. The policy registry installs
+/// one on each worker it learns about, so policies that book state at
+/// dispatch (reservations, bookings) see the request end.
+pub trait RequestCompletionSink: Send + Sync + fmt::Debug {
+    fn request_completed(&self, worker: &dyn Worker);
+}
+
 /// Basic worker implementation
 pub struct BasicWorker {
     pub metadata: WorkerMetadata,
@@ -1381,12 +2012,16 @@ pub struct BasicWorker {
     pub http_client: Arc<LazyHttpClient>,
     /// Resolved resilience config (retry + circuit breaker settings).
     pub resilience: ResolvedResilience,
+    /// Request-completion observer, installed by the policy registry; shared
+    /// by clones so a DP-rank view reports to the same sink.
+    pub completion_sink: Arc<std::sync::RwLock<Option<Arc<dyn RequestCompletionSink>>>>,
 }
 
 impl Clone for BasicWorker {
     fn clone(&self) -> Self {
         Self {
             metadata: self.metadata.clone(),
+            completion_sink: Arc::clone(&self.completion_sink),
             runtime: ArcSwap::from(self.runtime.load_full()),
             circuit_breaker: ArcSwap::from(self.circuit_breaker.load_full()),
             backend_client: Arc::clone(&self.backend_client),
@@ -1604,6 +2239,23 @@ impl Worker for BasicWorker {
         self.runtime.load().revision()
     }
 
+    fn cache_trace_epochs(&self) -> Vec<String> {
+        if !self
+            .runtime
+            .load()
+            .cache_trace_epochs_valid
+            .load(Ordering::Acquire)
+        {
+            return Vec::new();
+        }
+        self.metadata
+            .spec
+            .labels
+            .get("cache_trace_epochs")
+            .and_then(|epochs| serde_json::from_str(epochs).ok())
+            .unwrap_or_default()
+    }
+
     fn set_status(&self, status: WorkerStatus) {
         self.runtime.load().set_status(status);
         Metrics::set_worker_health(self.url(), status == WorkerStatus::Ready);
@@ -1749,18 +2401,144 @@ impl Worker for BasicWorker {
         self.runtime.load().set_overloaded(overloaded)
     }
 
+    fn stall_reason(&self) -> Option<StallReason> {
+        self.runtime.load().stall_reason()
+    }
+
+    fn set_stall(&self, reason: Option<StallReason>) -> bool {
+        self.runtime.load().set_stall(reason)
+    }
+
+    fn note_contact(&self) {
+        self.runtime.load().note_contact();
+    }
+
+    fn note_token_progress(&self) {
+        self.runtime.load().note_token_progress();
+    }
+
+    fn note_transport_failure(&self) {
+        self.runtime.load().note_transport_failure();
+    }
+
+    fn transport_failure_pending(&self) -> bool {
+        self.runtime.load().transport_failure_pending()
+    }
+
+    fn contact_age(&self) -> Duration {
+        self.runtime.load().contact_age()
+    }
+
+    fn token_progress_age(&self) -> Duration {
+        self.runtime.load().token_progress_age()
+    }
+
+    fn note_load_record(&self) {
+        self.runtime.load().note_load_record();
+    }
+
+    fn pushes_load_records(&self) -> bool {
+        self.runtime.load().pushes_load_records()
+    }
+
+    fn swap_waiting_reqs(&self, waiting: i64) -> i64 {
+        self.runtime.load().swap_waiting_reqs(waiting)
+    }
+
+    fn swap_load_sample(&self, load: usize) -> usize {
+        self.runtime.load().swap_load_sample(load)
+    }
+
+    fn contact_wake(&self) -> Option<Arc<Notify>> {
+        Some(self.runtime.load().contact_wake())
+    }
+
+    fn signal_connected(&self) {
+        if let Some(tx) = &self.connect_signal_tx {
+            let _ = tx.send(WorkerConnected {
+                url: self.url().to_string(),
+                revision: self.revision(),
+            });
+        }
+    }
+
+    fn reset_circuit_breaker(&self) {
+        self.circuit_breaker.load().reset();
+    }
+
+    fn note_admitted(&self) {
+        self.runtime.load().note_admitted();
+    }
+
+    fn admitted_age(&self) -> Duration {
+        self.runtime.load().admitted_age()
+    }
+
+    fn warmup_growth(&self, indexed: usize) -> usize {
+        self.runtime.load().warmup_growth(indexed)
+    }
+
+    fn divert_until_ms(&self) -> u64 {
+        self.runtime.load().divert_until_ms()
+    }
+
+    fn note_diverted(&self, until_ms: u64) {
+        self.runtime.load().note_diverted(until_ms);
+    }
+
+    fn note_prefill_started(&self, tokens: u64, timed: bool) {
+        self.runtime.load().note_prefill_started(tokens, timed);
+    }
+
+    fn note_prefill_ended(&self, tokens: u64, timed: bool, cached: Option<u64>) {
+        self.runtime
+            .load()
+            .note_prefill_ended(tokens, timed, cached);
+    }
+
+    fn prefill_backlog(&self) -> Duration {
+        self.runtime.load().prefill_backlog()
+    }
+
+    fn note_tracked_started(&self) {
+        self.runtime.load().note_tracked_started();
+    }
+
+    fn note_tracked_ended(&self) {
+        self.runtime.load().note_tracked_ended();
+    }
+
+    fn tracked_load(&self) -> usize {
+        self.runtime.load().tracked_load()
+    }
+
     fn is_available(&self) -> bool {
         // Same two guards the pre-veto version took (`is_healthy` +
-        // `circuit_breaker_can_execute`): the veto rides the runtime guard.
+        // `circuit_breaker_can_execute`): the vetoes ride the runtime guard.
         let rt = self.runtime.load();
         rt.status() == WorkerStatus::Ready
             && !rt.is_overloaded()
+            && rt.stall_reason().is_none()
             && self.circuit_breaker.load().can_execute()
     }
 
     fn is_healthy_and_eligible(&self) -> bool {
         let rt = self.runtime.load();
-        rt.status() == WorkerStatus::Ready && !rt.is_overloaded()
+        rt.status() == WorkerStatus::Ready && !rt.is_overloaded() && rt.stall_reason().is_none()
+    }
+
+    fn completion_sink(&self) -> Option<Arc<dyn RequestCompletionSink>> {
+        self.completion_sink
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set_completion_sink(&self, sink: Option<Arc<dyn RequestCompletionSink>>) {
+        *self
+            .completion_sink
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = sink;
     }
 
     fn routing_state(&self) -> RoutingState {
@@ -1774,6 +2552,7 @@ impl Worker for BasicWorker {
             load: rt.load(),
             processed: rt.processed_requests(),
             overloaded: rt.is_overloaded(),
+            stalled: rt.stall_reason().is_some(),
         }
     }
 
@@ -2096,6 +2875,11 @@ impl Drop for WorkerLoadGuard {
         if let Some(ref key) = self.routing_key {
             self.worker.decrement_routing_key_load(key);
         }
+        // Every request path releases its worker load here, so this is where
+        // policies learn that the request ended, whatever the outcome.
+        if let Some(sink) = self.worker.completion_sink() {
+            sink.request_completed(self.worker.as_ref());
+        }
     }
 }
 
@@ -2173,6 +2957,9 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         load: worker.load(),
         http2: metadata.http2,
         pd_pairing,
+        stalled: worker
+            .stall_reason()
+            .map(|reason| reason.as_str().to_string()),
         engine_load: None,
         job_status: None,
     }
@@ -3610,5 +4397,328 @@ mod tests {
             !worker.zmq_connect_started.load(Ordering::SeqCst),
             "handshake guard must reset so a later probe can retry"
         );
+    }
+
+    /// Records which worker URLs reported a completion.
+    #[derive(Debug, Default)]
+    struct CompletionSpy(std::sync::Mutex<Vec<String>>);
+
+    impl RequestCompletionSink for CompletionSpy {
+        fn request_completed(&self, worker: &dyn Worker) {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(worker.url().to_string());
+        }
+    }
+
+    #[test]
+    fn load_guard_drop_reports_the_completion_to_the_installed_sink() {
+        let spy = Arc::new(CompletionSpy::default());
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w1:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        worker.set_completion_sink(Some(Arc::clone(&spy) as Arc<dyn RequestCompletionSink>));
+
+        let guard = WorkerLoadGuard::with_key(Arc::clone(&worker), Some("session-a"));
+        let twin = guard.replicate();
+        assert_eq!(worker.load(), 2);
+        assert!(
+            spy.0.lock().unwrap().is_empty(),
+            "nothing completes while guards live"
+        );
+        drop(guard);
+        assert_eq!(worker.load(), 1);
+        assert_eq!(spy.0.lock().unwrap().as_slice(), ["http://w1:8000"]);
+        drop(twin);
+        assert_eq!(worker.load(), 0);
+        assert_eq!(
+            spy.0.lock().unwrap().len(),
+            2,
+            "each held load reports once"
+        );
+
+        // Without a sink the guard is exactly what it was.
+        worker.set_completion_sink(None);
+        drop(WorkerLoadGuard::with_key(Arc::clone(&worker), None));
+        assert_eq!(spy.0.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn progress_is_counted_from_the_first_dispatch_not_registration() {
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        let registered = runtime.progress_reference_ms();
+        thread::sleep(Duration::from_millis(15));
+        runtime.increment_load();
+        assert!(
+            runtime.progress_reference_ms() > registered,
+            "the clock starts at the dispatch, not at registration"
+        );
+        assert!(runtime.token_progress_age() < Duration::from_millis(10));
+        assert!(runtime.try_decrement_load());
+        assert_eq!(
+            runtime.progress_reference_ms(),
+            registered,
+            "idle again: back to the last token"
+        );
+        assert!(runtime.try_increment_load(4));
+        assert!(runtime.progress_reference_ms() > registered);
+    }
+
+    #[test]
+    fn prefill_backlog_follows_pending_tokens_and_the_observed_rate() {
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        assert_eq!(runtime.prefill_backlog(), Duration::ZERO);
+        // 128 prompts of 1,152 tokens on a worker that has shown no rate yet:
+        // the cold prior, 10k tokens/s, gives the engine 14.7 s.
+        runtime.note_prefill_started_at(128 * 1_152, true, 1_000);
+        assert_eq!(runtime.prefill_backlog(), Duration::from_millis(14_745));
+        // Their first tokens come back within 1.5 s of busy time (the window
+        // closes at the first one past a second): an observed rate of ~98k
+        // tokens/s replaces the prior, and nothing is pending.
+        runtime.note_prefill_ended_at(64 * 1_152, true, Some(0), 1_600);
+        runtime.note_prefill_ended_at(64 * 1_152, true, Some(0), 2_500);
+        assert_eq!(runtime.prefill_backlog(), Duration::ZERO);
+        assert_eq!(runtime.prefill_rate_tps(), 98_304);
+        runtime.note_prefill_started_at(1_000_000, true, 3_000);
+        assert_eq!(runtime.prefill_backlog(), Duration::from_millis(10_172));
+        // A dropped stream releases its tokens without a rate sample.
+        runtime.note_prefill_ended_at(2_000_000, true, None, 3_500);
+        assert_eq!(runtime.prefill_backlog(), Duration::ZERO);
+    }
+
+    #[test]
+    fn an_idle_gap_between_sparse_prompts_is_not_slow_prefill() {
+        // A lightly used worker: a 47-token prompt, answered in 10 ms, then a
+        // minute of nothing, then another. Measured over wall time the two
+        // made a rate of about one token per second, and one pending prompt
+        // then stretched the wedge bound to the better part of a minute: the
+        // pile rule went blind exactly where a frozen engine holds one
+        // request and no pile. Only busy time counts now.
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        runtime.note_prefill_started_at(47, true, 1_000);
+        runtime.note_prefill_ended_at(47, true, Some(0), 1_010);
+        runtime.note_prefill_started_at(47, true, 61_000);
+        runtime.note_prefill_ended_at(47, true, Some(0), 61_010);
+        assert_eq!(
+            runtime.prefill_rate_tps(),
+            0,
+            "20 ms of busy time is no window yet: the prior stands"
+        );
+        runtime.note_prefill_started_at(47, true, 62_000);
+        assert_eq!(
+            runtime.prefill_backlog(),
+            Duration::from_millis(4),
+            "one short pending prompt at the cold prior, not 47 s"
+        );
+        runtime.note_prefill_ended_at(47, true, Some(0), 62_010);
+        // Short prompts do make a rate once their busy time adds up to the
+        // window: 100 of them at 10 ms each are a second of prefill.
+        let mut now = 100_000;
+        for _ in 0..97 {
+            runtime.note_prefill_started_at(47, true, now);
+            runtime.note_prefill_ended_at(47, true, Some(0), now + 10);
+            now += 5_000;
+        }
+        assert_eq!(
+            runtime.prefill_rate_tps(),
+            4_700,
+            "4,700 tokens over 1,000 ms of busy time"
+        );
+        // Overlapping prompts share one busy interval: their tokens count
+        // over the union of their prefill time, not the sum of their waits.
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        runtime.note_prefill_started_at(10_000, true, 1_000);
+        runtime.note_prefill_started_at(10_000, true, 1_200);
+        runtime.note_prefill_ended_at(10_000, true, Some(0), 1_900);
+        runtime.note_prefill_ended_at(10_000, true, Some(0), 2_400);
+        assert_eq!(runtime.prefill_rate_tps(), 20_000 * 1000 / 1_400);
+    }
+
+    #[test]
+    fn a_worker_that_is_never_idle_keeps_updating_its_prefill_rate() {
+        // Continuous arrivals: a new 500-token prompt every 200 ms, each
+        // answered 300 ms after its dispatch, so the pending count never
+        // touches zero. The window still closes at every first token past a
+        // second of busy time, the rate follows the engine (500 tokens per
+        // 200 ms = 2,500 tokens/s), and the bound stays near the threshold.
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        let mut now = 1_000;
+        let mut samples = 0;
+        let mut last_rate = 0;
+        for i in 0..60u64 {
+            runtime.note_prefill_started_at(500, true, now);
+            if i >= 2 {
+                // the prompt dispatched 400 ms ago gets its first token
+                runtime.note_prefill_ended_at(500, true, Some(0), now - 100);
+            }
+            if runtime.prefill_rate_tps() != last_rate {
+                samples += 1;
+                last_rate = runtime.prefill_rate_tps();
+            }
+            now += 200;
+        }
+        assert!(samples >= 8, "the rate kept updating: {samples} samples");
+        let rate = runtime.prefill_rate_tps();
+        assert!(
+            (2_000..=3_000).contains(&rate),
+            "about 2,500 tokens/s, got {rate}"
+        );
+        // Two prompts pending (1,000 tokens): a bound well under a second.
+        assert!(runtime.prefill_backlog() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_request_ending_as_another_starts_never_loses_the_busy_interval() {
+        // The race the review described: one request's end (pending to
+        // zero) and another's start happen at the same instant. Whichever
+        // order the two are applied in, the book ends up with the new
+        // prompt pending and a busy interval running from that instant, so
+        // the window keeps measuring; a lost interval would have left this
+        // worker's rate stale for as long as it stayed busy.
+        for order in ["end-then-start", "start-then-end"] {
+            let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+            runtime.note_prefill_started_at(100, true, 1_000);
+            match order {
+                "end-then-start" => {
+                    runtime.note_prefill_ended_at(100, true, Some(0), 1_500);
+                    runtime.note_prefill_started_at(50, true, 1_500);
+                }
+                _ => {
+                    runtime.note_prefill_started_at(50, true, 1_500);
+                    runtime.note_prefill_ended_at(100, true, Some(0), 1_500);
+                }
+            }
+            // The next first token, 600 ms later, completes a window of
+            // 1.1 s of busy time either way (500 ms banked or still open,
+            // plus 600 ms) and makes a rate: 150 tokens over 1.1 s.
+            runtime.note_prefill_ended_at(50, true, Some(0), 2_100);
+            assert_eq!(
+                runtime.prefill_rate_tps(),
+                150 * 1000 / 1_100,
+                "{order}: the window closed and the rate is measured"
+            );
+            assert_eq!(runtime.prefill_backlog(), Duration::ZERO, "{order}");
+        }
+    }
+
+    #[test]
+    fn a_non_streaming_generation_in_flight_times_no_prefill() {
+        // A non-streaming generation answers once, at its end: the gateway
+        // never sees its first token, so its prompt stays pending through
+        // its whole decode. Counted as busy time, that decode turned the
+        // idle gaps between the streaming prompts around it back into
+        // prefill time (five short prompts 5 s apart learned 9 tokens/s,
+        // the rate this change takes out), and its one answer timed the
+        // 30-s decode as the prefill of 4,000 tokens (a 405 tokens/s rate
+        // and a 116-ms bound for the next short prompt). Its prompt is in
+        // the backlog (the engine prefills it before anything dispatched
+        // behind it streams) but opens no busy interval and makes no sample.
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        runtime.note_prefill_started_at(4_000, false, 1_000);
+        assert_eq!(
+            runtime.prefill_backlog(),
+            Duration::from_millis(400),
+            "its prompt is in the backlog at the cold prior"
+        );
+        // Streaming 47-token prompts every 5 s, answered in 10 ms each,
+        // while it decodes.
+        let mut now = 6_000;
+        for _ in 0..5 {
+            runtime.note_prefill_started_at(47, true, now);
+            runtime.note_prefill_ended_at(47, true, Some(0), now + 10);
+            now += 5_000;
+        }
+        assert_eq!(
+            runtime.prefill_rate_tps(),
+            0,
+            "50 ms of busy time is no window: the gaps stayed idle"
+        );
+        // Its answer, 30 s after dispatch: no sample, and the backlog is gone.
+        runtime.note_prefill_ended_at(4_000, false, Some(0), 31_000);
+        assert_eq!(
+            runtime.prefill_rate_tps(),
+            0,
+            "its one answer times no prefill"
+        );
+        assert_eq!(runtime.prefill_backlog(), Duration::ZERO);
+        // The next short prompt gets the prior's bound, not the gaps'.
+        runtime.note_prefill_started_at(47, true, 31_500);
+        assert_eq!(runtime.prefill_backlog(), Duration::from_millis(4));
+    }
+
+    #[test]
+    fn a_prefix_cache_hit_teaches_the_tokens_the_engine_computed() {
+        // A worker serving multi-turn conversations: 2,000-token prompts of
+        // which the engine's prefix cache holds 1,900, so it computes 100
+        // tokens per turn, 10 ms each at its 10k tokens/s. Counted at their
+        // full length, a hundred such turns taught 200k tokens/s, and a
+        // burst of four cold 16,000-token prompts then got a backlog of
+        // 320 ms, the bare threshold, for a prefill the engine needs 6.4 s
+        // for, during which nothing streams: the false positive the bound
+        // exists to prevent. A first token teaches the tokens the engine
+        // computed, the prompt less the hit it reports.
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        let mut now = 1_000;
+        for _ in 0..100 {
+            runtime.note_prefill_started_at(2_000, true, now);
+            runtime.note_prefill_ended_at(2_000, true, Some(1_900), now + 10);
+            now += 500;
+        }
+        assert_eq!(
+            runtime.prefill_rate_tps(),
+            10_000,
+            "a hundred turns of 100 computed tokens over a second of busy time"
+        );
+        runtime.note_prefill_started_at(4 * 16_000, true, now);
+        assert_eq!(
+            runtime.prefill_backlog(),
+            Duration::from_millis(6_400),
+            "the cold burst's prefill time at the rate learned, not 320 ms"
+        );
+        // The cold prompts' first tokens, with no hit, teach their full
+        // length: 64,000 tokens over 6.4 s, the same rate.
+        runtime.note_prefill_ended_at(4 * 16_000, true, Some(0), now + 6_400);
+        assert_eq!(runtime.prefill_rate_tps(), 10_000);
+        assert_eq!(runtime.prefill_backlog(), Duration::ZERO);
+        // An engine that serves whole prompts from its cache computes
+        // nothing the window can time: no sample, the prior stands.
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        for i in 0..100u64 {
+            let now = 1_000 + i * 500;
+            runtime.note_prefill_started_at(2_000, true, now);
+            runtime.note_prefill_ended_at(2_000, true, Some(2_000), now + 10);
+        }
+        assert_eq!(
+            runtime.prefill_rate_tps(),
+            0,
+            "nothing computed, nothing learned"
+        );
+        runtime.note_prefill_started_at(4 * 16_000, true, 60_000);
+        assert_eq!(
+            runtime.prefill_backlog(),
+            Duration::from_millis(6_400),
+            "the cold prior, 10k tokens/s"
+        );
+    }
+
+    #[test]
+    fn warm_up_growth_is_measured_since_admission_and_survives_a_clear() {
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        // A returned worker is first seen with its stale blocks still indexed:
+        // those are the baseline, not growth.
+        assert_eq!(runtime.warmup_growth(2000), 0);
+        assert_eq!(runtime.warmup_growth(2100), 100);
+        // The restart is detected and the index cleared: growth restarts from
+        // zero, not from a baseline the index no longer holds.
+        assert_eq!(runtime.warmup_growth(50), 50);
+        assert_eq!(runtime.warmup_growth(700), 700);
+        // Admitted again: a fresh baseline.
+        thread::sleep(Duration::from_millis(2));
+        runtime.note_admitted();
+        assert_eq!(runtime.warmup_growth(900), 0);
+        assert_eq!(runtime.warmup_growth(1300), 400);
     }
 }

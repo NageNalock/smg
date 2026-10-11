@@ -24,6 +24,8 @@ COMMON_POLICY_CHOICES = [
 
 PREFILL_POLICY_CHOICES = [*COMMON_POLICY_CHOICES, "bucket"]
 ENCODE_POLICY_CHOICES = ["random", "round_robin", "consistent_hashing"]
+# Worker discovery providers --discovery-provider accepts.
+DISCOVERY_PROVIDER_CHOICES = ["kubernetes", "file"]
 
 
 def _parse_int_csv(value: str) -> list[int]:
@@ -127,7 +129,8 @@ class RouterArgs:
     queue_size: int = 100
     # Maximum time (in seconds) a request can wait in queue before timing out
     queue_timeout_secs: int = 60
-    # Token bucket refill rate (tokens per second). Unset or 0 = no refill
+    # Sustained admission rate (requests per second), bursting up to
+    # max_concurrent_requests. Unset or 0 = no rate limit
     rate_limit_tokens_per_second: int | None = None
     # CORS allowed origins
     cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
@@ -246,11 +249,13 @@ class RouterArgs:
     # Control-plane job queue sizing (worker registration/removal jobs)
     job_queue_capacity: int = 1000
     job_queue_concurrency: int = 200
-    # Absolute per-worker overload thresholds; both None disables the feature
-    worker_overload_waiting_requests: int | None = None
-    worker_overload_token_usage: float | None = None
-    # Enable overload protection with the gateway default token ceiling (0.9)
-    worker_overload_protection: bool = False
+    # Absolute per-worker overload thresholds, as the Rust CLI defaults them;
+    # None switches one signal off
+    worker_overload_waiting_requests: int | None = 8
+    worker_overload_token_usage: float | None = 0.8
+    # Worker overload protection is on by default; False switches both
+    # thresholds off (--disable-worker-overload-protection)
+    worker_overload_protection: bool = True
     # Restore the conditional load-monitor poll gate (default: poll always)
     disable_load_monitoring: bool = False
     # Most bytes the router may buffer for a request it holds only to keep
@@ -286,6 +291,62 @@ class RouterArgs:
     prefill_max_inflight_requests_per_worker: int = -1
     prefill_queue_size: int | None = None
     prefill_queue_timeout_secs: int | None = None
+    # The worker discovery provider. service_discovery=True is the legacy
+    # spelling of discovery_provider="kubernetes"; set one or the other.
+    discovery_provider: str | None = None
+    # Refuse with a 503 when every worker a request could use is overloaded,
+    # instead of routing it to the least-loaded one
+    worker_overload_shed: bool = False
+    # The event-driven KV index behind cache-aware routing: "positional"
+    # (one entry per block position) or "chain" (chains as runs)
+    kv_index: str = "positional"
+    # Liveness: seconds without contact after a transport failure before a
+    # worker is vetoed; seconds without progress before a loaded one is wedged
+    worker_stall_secs: int = 2
+    worker_wedge_secs: int = 3
+    # Liveness: seconds without any contact from a worker whose KV-event
+    # stream pushes load records before it is vetoed as unreachable (0 = off)
+    worker_stale_secs: int = 15
+    # Warm-up slice for cache-aware routing (see the --worker-warmup-* flags)
+    worker_warmup_secs: int = 60
+    worker_warmup_share: float = 0.25
+    worker_warmup_blocks: int = 1024
+    worker_warmup_thin_ratio: float = 0.5
+    worker_warmup_divert_every: int = 8
+    # The cache-aware selection policy and the optimistic accounting TTL
+    selection_policy: str = "cache-aware-default"
+    selection_accounting_ttl_ms: int = 0
+    # Tenant resolution: trust an upstream tenant header, and its name
+    trust_tenant_header: bool = False
+    tenant_header_name: str = "x-smg-tenant-id"
+    # Per-tenant data-plane keys as (tenant_id, key) pairs (--tenant-api-key)
+    tenant_api_keys: list[tuple] = dataclasses.field(default_factory=list)
+    # Priority-aware admission scheduler
+    priority_scheduler_enabled: bool = False
+    priority_scheduler_default_max_class: str = "default"
+    priority_scheduler_config: str | None = None
+    priority_scheduler_tenant_metric_top_n: int = 32
+    # Per-tenant token/request rate limiting
+    tenant_rate_limit_enabled: bool = False
+    tenant_rate_limit_config: str | None = None
+    # Heap profiles of the router process (a jemalloc-profiling build); appended
+    # last: positional callers bind the fields by position
+    jemalloc_prof_dir: str | None = None
+    # Mesh mTLS: the CA, this node's certificate and key (PEM paths); all three or none.
+    mesh_tls_ca_cert: str | None = None
+    mesh_tls_cert: str | None = None
+    mesh_tls_key: str | None = None
+    # Byte budget of the L0 tokenizer cache (--tokenizer-cache-l0-max-memory);
+    # appended last for the same reason
+    tokenizer_cache_l0_max_memory: int = 256 * 1024 * 1024  # 256MB
+    # File discovery (discovery_provider="file"): the JSON manifest, and how
+    # often to reread it (None = 30s).
+    discovery_file: str | None = None
+    discovery_check_interval_secs: int | None = None
+    # Most Responses API requests with background: true in flight at once;
+    # one beyond answers 429. 0 = background mode off (such requests run in
+    # the foreground); appended last for the same reason
+    max_background_responses: int = 1024
 
     @staticmethod
     def add_cli_args(
@@ -319,9 +380,15 @@ class RouterArgs:
         k8s_group = parser.add_argument_group(
             "Service Discovery (Kubernetes)", "Kubernetes-based worker discovery"
         )
+        file_discovery_group = parser.add_argument_group(
+            "Service Discovery (File)", "Workers listed in a JSON manifest"
+        )
         logging_group = parser.add_argument_group("Logging", "Log output configuration")
         prometheus_group = parser.add_argument_group(
             "Prometheus Metrics", "Metrics export configuration"
+        )
+        profiling_group = parser.add_argument_group(
+            "Profiling", "Heap profiles of the router process"
         )
         request_group = parser.add_argument_group(
             "Request Handling", "Request timeout and ID configuration"
@@ -367,6 +434,15 @@ class RouterArgs:
         )
         rl_group = parser.add_argument_group(
             "RL Control Plane", "Worker discovery and engine-route passthrough for RL training"
+        )
+        dp_auth_group = parser.add_argument_group(
+            "Data Plane Authentication", "Per-tenant API keys for the serving path"
+        )
+        scheduler_group = parser.add_argument_group(
+            "Priority Scheduler", "Priority-aware admission scheduler"
+        )
+        tenant_rate_limit_group = parser.add_argument_group(
+            "Tenant Rate Limit", "Per-tenant token and request rate limiting"
         )
 
         if use_router_prefix:
@@ -602,12 +678,13 @@ class RouterArgs:
             default=RouterArgs.worker_overload_waiting_requests,
             help=(
                 "Queued-request count AT OR ABOVE which a worker is considered"
-                " overloaded and excluded from routing until the signal recovers;"
-                " when every worker is overloaded, requests are shed immediately"
-                " rather than queued. Unset disables overload protection. This"
-                " signal is the queued (waiting) request count, summed across DP"
-                " ranks. Must be >= 1: the comparison is inclusive, so 0 would veto"
-                " every worker unconditionally."
+                " overloaded and left out of routing while another worker is"
+                " under the thresholds; when every worker is over them the"
+                " request goes to the least-loaded one (see"
+                " --worker-overload-shed). The signal is the queued (waiting)"
+                " request count, summed across DP ranks. Must be >= 1: the"
+                " comparison is inclusive, so 0 would veto every worker"
+                " unconditionally. Defaults to 8."
             ),
         )
         routing_group.add_argument(
@@ -616,10 +693,10 @@ class RouterArgs:
             default=RouterArgs.worker_overload_token_usage,
             help=(
                 "KV-cache token usage AT OR ABOVE which a worker is considered"
-                " overloaded and excluded from routing until the signal recovers;"
-                " when every worker is overloaded, requests are shed immediately"
-                " rather than queued. Unset disables overload protection. This"
-                " signal is mean KV-cache token usage across DP ranks, the same one"
+                " overloaded and left out of routing while another worker is"
+                " under the thresholds (see --worker-overload-waiting-requests)."
+                " Defaults to 0.8. This signal is mean KV-cache token usage"
+                " across DP ranks, the same one"
                 " --balance-token-usage-threshold reads, applied as an absolute"
                 " per-worker CEILING rather than a fleet-relative spread. Backend"
                 " must report token_usage. Must be in (0.0, 1.0]: the comparison is"
@@ -632,16 +709,150 @@ class RouterArgs:
         routing_group.add_argument(
             f"--{prefix}worker-overload-protection",
             action="store_true",
+            default=None,
             help=(
-                "Enable worker overload protection with the gateway default"
-                " thresholds. This flag alone applies"
-                " --worker-overload-token-usage 0.9 and leaves"
-                " --worker-overload-waiting-requests unset: KV token usage means"
-                " the same thing on every engine, while a sensible"
-                " waiting-requests ceiling is workload-dependent, so it has no"
-                " universal default. Explicit thresholds override the default,"
-                " and either threshold set on its own enables protection without"
-                " this flag."
+                "Worker overload protection is on by default (8 waiting requests,"
+                " 0.8 KV usage); this flag keeps it on and is accepted so older"
+                " command lines still parse. --disable-worker-overload-protection"
+                " switches both thresholds off."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}disable-worker-overload-protection",
+            action="store_true",
+            default=None,
+            help=(
+                "Switch worker overload protection off: no worker is left out of"
+                " routing for its waiting queue or KV usage (per-worker overload"
+                " blocks on a WorkerSpec still apply)."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-overload-shed",
+            action="store_true",
+            help=(
+                "Refuse a request with a 503 (worker_overload_protection_shed,"
+                " Retry-After the load poll interval) when every worker it could"
+                " use is overloaded, instead of routing it to the least-loaded one;"
+                " also sheds a worker that crossed a threshold between selection"
+                " and dispatch. Off by default."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}kv-index",
+            type=str,
+            default=RouterArgs.kv_index,
+            help=(
+                "The event-driven KV index behind cache-aware routing: 'positional'"
+                " (one entry per block position, the default) or 'chain' (chains as"
+                " runs with per-run worker coverage; lock-free, store-free lookups)."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-stall-secs",
+            type=int,
+            default=RouterArgs.worker_stall_secs,
+            help=(
+                "Seconds without any contact from a worker (a load poll, a health"
+                " probe, a KV event, a response) after which a transport failure"
+                " excludes it from routing; the first successful contact re-admits"
+                " it. Defaults to 2."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-wedge-secs",
+            type=int,
+            default=RouterArgs.worker_wedge_secs,
+            help=(
+                "Seconds without a token or a completion from a worker with requests"
+                " in flight whose waiting queue grows, or whose in-flight pile grows"
+                " or is four deep, after which new requests stop being routed to it"
+                " until it makes progress; the bound stretches to the time its"
+                " in-flight prompts may still need in prefill, up to 120 seconds."
+                " Defaults to 3."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-stale-secs",
+            type=int,
+            default=RouterArgs.worker_stale_secs,
+            help=(
+                "Seconds without any contact (a load record, a poll answer, a probe,"
+                " a token) from a worker whose KV-event stream pushes load records,"
+                " after which it is excluded from routing as unreachable until it is"
+                " heard from again; workers that never pushed a record are not"
+                " judged by it. Keep it above the load-monitor interval. 0 disables."
+                " Defaults to 15."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-warmup-secs",
+            type=int,
+            default=RouterArgs.worker_warmup_secs,
+            help=(
+                "Warm-up slice for cache-aware routing: for this many seconds after"
+                " a worker becomes routable, until its index has grown by"
+                " --worker-warmup-blocks blocks, one cache miss in"
+                " 1/--worker-warmup-share is routed to it so it builds a cache"
+                " instead of idling. 0 disables. Defaults to 60."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-warmup-share",
+            type=float,
+            default=RouterArgs.worker_warmup_share,
+            help="Share of cache misses offered to warming workers (0.0 to 1.0). Defaults to 0.25.",
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-warmup-blocks",
+            type=int,
+            default=RouterArgs.worker_warmup_blocks,
+            help=(
+                "A worker whose index has grown by this many blocks since it became"
+                " thin is warm. Defaults to 1024."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-warmup-thin-ratio",
+            type=float,
+            default=RouterArgs.worker_warmup_thin_ratio,
+            help=(
+                "A worker whose index holds less than this share of the fleet's"
+                " median (or nothing) is thin and receives the warm-up slice until"
+                " it has grown by --worker-warmup-blocks, whatever emptied it. 0"
+                " keeps the age rule alone. Defaults to 0.5."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-warmup-divert-every",
+            type=int,
+            default=RouterArgs.worker_warmup_divert_every,
+            help=(
+                "One cache hit in this many is diverted to a thin worker although"
+                " another worker holds its prefix (shallow overlaps first, one in"
+                " flight per thin worker), so an index emptied by a resync refills"
+                " on a workload where every request has a holder. 0 disables."
+                " Defaults to 8."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}selection-policy",
+            type=str,
+            default=RouterArgs.selection_policy,
+            help=(
+                "The cache-aware worker selection policy. 'cache-aware-default', the"
+                " pre-policy decision, is the one policy."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}selection-accounting-ttl-ms",
+            type=int,
+            default=RouterArgs.selection_accounting_ttl_ms,
+            help=(
+                "Lifetime in milliseconds of optimistic dispatch bookings for"
+                " cache_aware: predicted prefill and prefix placement are charged to"
+                " the chosen worker until the engine reports them or the booking"
+                " expires. 0 disables; set a little above the engine's KV-event lag."
             ),
         )
         routing_group.add_argument(
@@ -1079,10 +1290,36 @@ class RouterArgs:
         )
 
         # Service discovery configuration
-        k8s_group.add_argument(
+        discovery_selection = k8s_group.add_mutually_exclusive_group()
+        discovery_selection.add_argument(
             f"--{prefix}service-discovery",
             action="store_true",
-            help="Enable Kubernetes service discovery",
+            help=(
+                "Enable Kubernetes service discovery (the legacy spelling of"
+                " --discovery-provider kubernetes)"
+            ),
+        )
+        discovery_selection.add_argument(
+            f"--{prefix}discovery-provider",
+            type=str,
+            choices=DISCOVERY_PROVIDER_CHOICES,
+            default=None,
+            help="Worker discovery provider. Give this or --service-discovery, not both",
+        )
+        file_discovery_group.add_argument(
+            f"--{prefix}discovery-file",
+            type=str,
+            default=None,
+            help=(
+                "JSON manifest listing the workers, for --discovery-provider file."
+                " It may be created after startup"
+            ),
+        )
+        file_discovery_group.add_argument(
+            f"--{prefix}discovery-check-interval-secs",
+            type=int,
+            default=None,
+            help="Seconds between rereads of the --discovery-file manifest (default: 30)",
         )
         k8s_group.add_argument(
             f"--{prefix}selector",
@@ -1178,7 +1415,9 @@ class RouterArgs:
             help=(
                 "Accept an extra client-facing model name for a served model."
                 " Format: <alias>=<canonical>. Repeat for multiple aliases."
-                " Matching is case-sensitive."
+                " Matching is case-sensitive. A vendor-named alias (kimi-*,"
+                " minimax-*, ...) also gives the served model that vendor's"
+                " contract profile under both names."
             ),
         )
         # Prometheus configuration
@@ -1194,10 +1433,11 @@ class RouterArgs:
         prometheus_group.add_argument(
             f"--{prefix}prometheus-host",
             type=str,
-            default="0.0.0.0",
+            default=None,
             help=(
                 "Host address to bind the Prometheus metrics server. Supports IPv4, IPv6"
-                " (e.g., ::, ::1), or 0.0.0.0 for all interfaces"
+                " (e.g., ::, ::1), or 0.0.0.0 for all interfaces. Default: the unspecified"
+                " address of --host's family (:: for an IPv6 host, 0.0.0.0 otherwise)"
             ),
         )
         prometheus_group.add_argument(
@@ -1206,6 +1446,17 @@ class RouterArgs:
             nargs="+",
             action="extend",
             help="Buckets for Prometheus duration metrics",
+        )
+        profiling_group.add_argument(
+            f"--{prefix}jemalloc-prof-dir",
+            type=str,
+            default=None,
+            help=(
+                "Directory where POST /heap_profile (an admin route) writes a jemalloc heap"
+                " profile of the router. Needs a build with the jemalloc-profiling feature,"
+                " started with _RJEM_MALLOC_CONF=prof:true,prof_active:true; unset, the route"
+                " answers 404"
+            ),
         )
 
         # Request handling configuration
@@ -1243,6 +1494,18 @@ class RouterArgs:
             help="Grace period in seconds to wait for in-flight requests during shutdown",
         )
         request_group.add_argument(
+            f"--{prefix}trust-tenant-header",
+            action="store_true",
+            default=False,
+            help="Trust an upstream-provided tenant header for canonical tenant resolution.",
+        )
+        request_group.add_argument(
+            f"--{prefix}tenant-header-name",
+            type=str,
+            default=RouterArgs.tenant_header_name,
+            help="Header name to use when --trust-tenant-header is enabled.",
+        )
+        request_group.add_argument(
             f"--{prefix}cors-allowed-origins",
             type=str,
             nargs="*",
@@ -1259,7 +1522,8 @@ class RouterArgs:
             help=(
                 "Maximum standing concurrent requests; each admission permit"
                 " is held for the full response, including streaming bodies."
-                " Set to -1 to disable."
+                " -1 (default) derives the bound from the host (1024 per"
+                " available core, at least 4096); 0 disables it."
             ),
         )
         rate_limit_group.add_argument(
@@ -1282,9 +1546,71 @@ class RouterArgs:
             type=int,
             default=RouterArgs.rate_limit_tokens_per_second,
             help=(
-                "Token bucket refill rate (tokens per second). Unset or 0 ="
-                " no refill: --max-concurrent-requests bounds standing"
-                " concurrency alone."
+                "Sustained admission rate in requests per second, bursting up"
+                " to --max-concurrent-requests, which keeps bounding standing"
+                " concurrency. Unset or 0 = no rate limit."
+            ),
+        )
+        rate_limit_group.add_argument(
+            f"--{prefix}max-background-responses",
+            type=int,
+            default=RouterArgs.max_background_responses,
+            help=(
+                "Most Responses API requests with background: true in flight"
+                " at once; one beyond answers 429. 0 switches background mode"
+                " off: such requests then run in the foreground."
+            ),
+        )
+
+        # Priority scheduler configuration
+        scheduler_group.add_argument(
+            f"--{prefix}priority-scheduler-enabled",
+            action="store_true",
+            default=False,
+            help=(
+                "Enable the priority-aware admission scheduler. When unset (default),"
+                " the legacy concurrency-limit middleware stays wired."
+            ),
+        )
+        scheduler_group.add_argument(
+            f"--{prefix}priority-scheduler-default-max-class",
+            type=str,
+            default=RouterArgs.priority_scheduler_default_max_class,
+            help=(
+                "Max priority class for tenants not listed in the scheduler YAML"
+                " (system | interactive | default | bulk)."
+            ),
+        )
+        scheduler_group.add_argument(
+            f"--{prefix}priority-scheduler-config",
+            type=str,
+            default=None,
+            help="Optional path to the priority-scheduler YAML config.",
+        )
+        scheduler_group.add_argument(
+            f"--{prefix}priority-scheduler-tenant-metric-top-n",
+            type=int,
+            default=RouterArgs.priority_scheduler_tenant_metric_top_n,
+            help='Cap on per-tenant scheduler metric label cardinality (top-N + "other").',
+        )
+
+        # Tenant rate limit configuration
+        tenant_rate_limit_group.add_argument(
+            f"--{prefix}tenant-rate-limit-enabled",
+            action="store_true",
+            default=False,
+            help=(
+                "Enable per-tenant LLM token/request rate limiting. When unset (default),"
+                " no rate limiter is constructed."
+            ),
+        )
+        tenant_rate_limit_group.add_argument(
+            f"--{prefix}tenant-rate-limit-config",
+            type=str,
+            default=None,
+            help=(
+                "Path to the tenant-rate-limit YAML. Required when"
+                " --tenant-rate-limit-enabled is set."
             ),
         )
 
@@ -1455,6 +1781,12 @@ class RouterArgs:
             help="Enable L1 (prefix matching) tokenizer cache (default: False)",
         )
         tokenizer_group.add_argument(
+            f"--{prefix}tokenizer-cache-l0-max-memory",
+            type=int,
+            default=RouterArgs.tokenizer_cache_l0_max_memory,
+            help="Maximum memory for L0 tokenizer cache in bytes: texts, ids and per-entry overhead (default: 256MB)",
+        )
+        tokenizer_group.add_argument(
             f"--{prefix}tokenizer-cache-l1-max-memory",
             type=int,
             default=RouterArgs.tokenizer_cache_l1_max_memory,
@@ -1492,8 +1824,9 @@ class RouterArgs:
             default=RouterArgs.backend,
             choices=["sglang", "openai", "anthropic", "vllm", "tokenspeed"],
             help=(
-                "Backend runtime to use (default: sglang). For ZMQ workers, vllm/"
-                "tokenspeed also pin the wire protocol (it cannot be auto-detected)"
+                "Backend runtime to use (default: sglang). Over ZMQ the backend names the "
+                "workers' engine and pins the wire protocol (it cannot be auto-detected): "
+                "pass vllm or tokenspeed for those engines; the default serves SGLang schedulers"
             ),
         )
         backend_group.add_argument(
@@ -1687,6 +2020,18 @@ class RouterArgs:
                 " Useful when the dp aware scheduling strategy is enabled."
             ),
         )
+        dp_auth_group.add_argument(
+            f"--{prefix}tenant-api-key",
+            type=str,
+            action="append",
+            default=[],
+            metavar="TENANT_ID:KEY",
+            help=(
+                "Per-tenant API keys for serving-path auth (format: tenant_id:key,"
+                " repeatable). Layers on top of --api-key, each resolving to its own"
+                " tenant identity."
+            ),
+        )
         auth_group.add_argument(
             f"--{prefix}control-plane-api-keys",
             type=str,
@@ -1788,6 +2133,28 @@ class RouterArgs:
             default=[],
             help="Peer mesh server addresses to join (format: host:port)",
         )
+        mesh_group.add_argument(
+            f"--{prefix}mesh-tls-ca-cert",
+            type=str,
+            default=None,
+            help=(
+                "CA certificate (PEM) the mesh peers' certificates chain to. With"
+                " --mesh-tls-cert and --mesh-tls-key the mesh listener serves TLS and requires"
+                " peer certificates, and every dial presents this node's."
+            ),
+        )
+        mesh_group.add_argument(
+            f"--{prefix}mesh-tls-cert",
+            type=str,
+            default=None,
+            help="This mesh node's certificate (PEM), with the node's IP as a SAN",
+        )
+        mesh_group.add_argument(
+            f"--{prefix}mesh-tls-key",
+            type=str,
+            default=None,
+            help="This mesh node's private key (PKCS#8 PEM)",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace, use_router_prefix: bool = False) -> RouterArgs:
@@ -1825,6 +2192,15 @@ class RouterArgs:
             # Wait, dataclass fields are server_cert_path/server_key_path
             # CLI args are tls_cert_path/tls_key_path
             # We need to manually map them if names don't match
+
+        # --disable-worker-overload-protection is the CLI spelling of
+        # worker_overload_protection=False; the prefixed form wins, the
+        # unprefixed one applies unless the fallback is disabled.
+        disable_protection = cli_args_dict.get(f"{prefix}disable_worker_overload_protection")
+        if disable_protection is None and not disable_arg_fallback:
+            disable_protection = cli_args_dict.get("disable_worker_overload_protection")
+        if disable_protection:
+            args_dict["worker_overload_protection"] = False
 
         # Map tls args to server cert/key path
         if f"{prefix}tls_cert_path" in cli_args_dict:
@@ -1876,7 +2252,29 @@ class RouterArgs:
             cli_args_dict.get(f"{prefix}jwt_role_mapping", [])
         )
 
+        # Parse per-tenant data-plane API keys
+        args_dict["tenant_api_keys"] = cls._parse_tenant_api_keys(
+            cli_args_dict.get(f"{prefix}tenant_api_key", [])
+        )
+
         return cls(**args_dict)
+
+    def selected_discovery_provider(self) -> str | None:
+        """The worker discovery provider selected by either spelling.
+
+        ``service_discovery=True`` is ``discovery_provider="kubernetes"``.
+        Setting both is an error rather than a precedence rule, as on the CLI.
+        """
+        if self.discovery_provider is not None:
+            if self.service_discovery:
+                raise ValueError("Set service_discovery=True or discovery_provider, not both")
+            if self.discovery_provider not in DISCOVERY_PROVIDER_CHOICES:
+                raise ValueError(
+                    f"Unknown discovery provider {self.discovery_provider!r};"
+                    f" expected one of {DISCOVERY_PROVIDER_CHOICES}"
+                )
+            return self.discovery_provider
+        return "kubernetes" if self.service_discovery else None
 
     def _validate_router_args(self):
         # Validate configuration based on mode
@@ -2030,6 +2428,27 @@ class RouterArgs:
             if role_lower not in ("admin", "user"):
                 raise ValueError(f"Invalid role: '{role}'. Must be 'admin' or 'user'")
             parsed_keys.append((key_id, name, key, role_lower))
+        return parsed_keys
+
+    @staticmethod
+    def _parse_tenant_api_keys(api_keys_list):
+        """Parse per-tenant data-plane keys from --tenant-api-key arguments.
+
+        Format: tenant_id:key, split at the first ':' with both parts trimmed,
+        as the Rust CLI parses it. The key is never echoed in an error.
+        """
+        if not api_keys_list:
+            return []
+
+        parsed_keys = []
+        for key_str in api_keys_list:
+            tenant_id, sep, key = key_str.partition(":")
+            if not sep:
+                raise ValueError(
+                    "Invalid --tenant-api-key value: expected 'tenant_id:key'"
+                    " (missing ':' separator)"
+                )
+            parsed_keys.append((tenant_id.strip(), key.strip()))
         return parsed_keys
 
     @staticmethod

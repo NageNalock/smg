@@ -1,6 +1,6 @@
 [package]
 name = "llm-tokenizer"
-version = "1.8.0"
+version = "1.9.0"
 edition = "2021"
 description = "LLM tokenizer library with caching and chat template support"
 license = "Apache-2.0"
@@ -38,15 +38,21 @@ hf-hub = { version = "0.5.0", default-features = false, features = ["tokio", "ru
 # unit-tests lane. Bump deliberately, revalidating template output.
 minijinja = { version = "=2.24.0", features = ["unstable_machinery", "json", "builtins", "loader", "loop_controls", "preserve_order"] }
 minijinja-contrib = { version = "=2.24.0", features = ["pycompat"] }
+chrono.workspace = true
 rayon = "1.12"
+thread_local = "1.1"
 tiktoken-rs = "0.12"
 tokenizers = "0.23.1"
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 criterion = "0.8"
 openai-protocol.workspace = true
-reqwest = { workspace = true, features = ["blocking"] }
+reqwest = { workspace = true, features = ["blocking", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tempfile = "3.27"
+# The bellwether fixtures test reads the fixture manifests (TOML).
+toml = "1.1"
 
 [[bench]]
 name = "stop_sequence_search"
@@ -56,5 +62,13 @@ harness = false
 name = "stop_decoder"
 harness = false
 
+[[bench]]
+name = "incremental_decode"
+harness = false
+
 [lints]
 workspace = true
+
+[[bench]]
+name = "encode_cost"
+harness = false

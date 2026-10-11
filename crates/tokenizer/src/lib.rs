@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+mod byte_level;
 pub mod cache;
 pub mod encoders;
 pub mod eos;
@@ -9,6 +10,7 @@ pub mod factory;
 pub mod hub;
 pub(crate) mod json_dumps;
 pub mod mock;
+mod native;
 pub mod registry;
 pub mod sequence;
 pub mod stop;
@@ -38,8 +40,8 @@ pub use stop::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
 pub use stream::DecodeStream;
 pub use tiktoken::{TiktokenModel, TiktokenTokenizer};
 pub use traits::{
-    ChatTemplateOutput, Decoder, EncodeJob, Encoder, Encoding, PromptEncoding, SpecialTokens,
-    TokenIdType, Tokenizer as TokenizerTrait,
+    ChatTemplateOutput, Decoder, EncodeJob, Encoder, Encoding, IncrementalDecoder, PromptEncoding,
+    SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
 };
 
 /// Main tokenizer wrapper that provides a unified interface for different tokenizer implementations

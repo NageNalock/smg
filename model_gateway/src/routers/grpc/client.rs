@@ -1,24 +1,28 @@
 //! Unified gRPC client wrapper for SGLang, vLLM, and TensorRT-LLM backends
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
     messages::CreateMessageRequest, worker::WorkerLoadResponse,
 };
 use smg_grpc_client::{
-    common_proto, tokenizer_bundle, tokenizer_bundle::StreamBundle, MlxEngineClient,
-    SglangGenerateRequestOptions, SglangSchedulerClient, TokenSpeedSchedulerClient,
-    TrtllmServiceClient, VllmEngineClient,
+    common_proto, tokenizer_bundle, tokenizer_bundle::StreamBundle, BoxedTraceInjector,
+    MlxEngineClient, SglangGenerateRequestOptions, SglangSchedulerClient,
+    TokenSpeedSchedulerClient, TrtllmServiceClient, VllmEngineClient,
 };
 
-use crate::routers::grpc::{
-    proto_wrapper::{
-        cleanup_mm_shm_handles, collect_tokenspeed_generate_request_shm_handles,
-        collect_vllm_generate_request_shm_handles, finish_tokenspeed_request, finish_vllm_request,
-        ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest, ProtoStream,
+use crate::{
+    observability::otel_trace::OtelTraceInjector,
+    routers::grpc::{
+        proto_wrapper::{
+            cleanup_mm_shm_handles, collect_tokenspeed_generate_request_shm_handles,
+            collect_vllm_generate_request_shm_handles, finish_tokenspeed_request,
+            finish_vllm_request, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
+            ProtoStream,
+        },
+        MultimodalData,
     },
-    MultimodalData,
 };
 
 /// Health check response (common across backends)
@@ -201,13 +205,25 @@ impl GrpcClient {
         url: &str,
         runtime_type: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // Every RPC carries the current span's W3C trace context in its
+        // metadata, so the engine side can continue the gateway's trace (a
+        // no-op while tracing is off).
+        let trace_injector: BoxedTraceInjector = Arc::new(OtelTraceInjector);
         match runtime_type {
-            "sglang" => Ok(Self::Sglang(SglangSchedulerClient::connect(url).await?)),
-            "vllm" => Ok(Self::Vllm(VllmEngineClient::connect(url).await?)),
-            "trtllm" | "tensorrt-llm" => Ok(Self::Trtllm(TrtllmServiceClient::connect(url).await?)),
-            "mlx" => Ok(Self::Mlx(MlxEngineClient::connect(url).await?)),
+            "sglang" => Ok(Self::Sglang(
+                SglangSchedulerClient::connect_with_trace_injector(url, trace_injector).await?,
+            )),
+            "vllm" => Ok(Self::Vllm(
+                VllmEngineClient::connect_with_trace_injector(url, trace_injector).await?,
+            )),
+            "trtllm" | "tensorrt-llm" => Ok(Self::Trtllm(
+                TrtllmServiceClient::connect_with_trace_injector(url, trace_injector).await?,
+            )),
+            "mlx" => Ok(Self::Mlx(
+                MlxEngineClient::connect_with_trace_injector(url, trace_injector).await?,
+            )),
             "tokenspeed" => Ok(Self::TokenSpeed(
-                TokenSpeedSchedulerClient::connect(url).await?,
+                TokenSpeedSchedulerClient::connect_with_trace_injector(url, trace_injector).await?,
             )),
             _ => Err(format!("Unknown runtime type: {runtime_type}").into()),
         }
@@ -830,6 +846,29 @@ impl ServerInfo {
                 // inferring it from the worker URL. See `worker_shares_dev_shm`.
                 if let Some(ref sched) = info.scheduler_info {
                     pick_prost_fields(&mut labels, sched, &["shm_namespace_id"]);
+                    if let Some(prost_types::Value {
+                        kind: Some(prost_types::value::Kind::ListValue(values)),
+                    }) = sched.fields.get("cache_trace_epochs")
+                    {
+                        let epochs: Option<Vec<&str>> = values
+                            .values
+                            .iter()
+                            .map(|value| match &value.kind {
+                                Some(prost_types::value::Kind::StringValue(epoch))
+                                    if !epoch.is_empty() =>
+                                {
+                                    Some(epoch.as_str())
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        if let Some(epochs) = epochs.filter(|epochs| !epochs.is_empty()) {
+                            labels.insert(
+                                "cache_trace_epochs".to_string(),
+                                serde_json::json!(epochs).to_string(),
+                            );
+                        }
+                    }
                 }
                 labels
             }
@@ -863,6 +902,17 @@ const SGLANG_GRPC_KEYS: &[&str] = &[
     // The operator's explicit protocol, which the servicer reads from the
     // engine's SMG_PAIRING_PROTOCOL environment.
     "pairing_protocol",
+    // The engine's own per-request media limits (`--limit-mm-data-per-request`),
+    // flattened by the servicer to `image=1,video=1`: the gateway's own media
+    // pipeline holds requests to them, as the engine's front end would.
+    "mm_item_limits",
+    // The engine's reasoning parser, under a name of its own (`reasoning_parser`
+    // is the per-model parser override read off a worker's labels), and where
+    // the engine starts a request's grammar on a thinking prompt, which shapes
+    // a forced tool call's grammar (`utils::tool_constraints_for_worker`); the
+    // servicer writes both.
+    "engine_reasoning_parser",
+    "structured_outputs_start",
 ];
 
 /// Keys worth extracting from TokenSpeed gRPC `server_args` (post-rename: bare
@@ -898,6 +948,23 @@ const TOKENSPEED_GRPC_KEYS: &[&str] = &[
     "kv_cache_dtype",
     "attention_backend",
     "pairing_protocol",
+    // The engine's own per-request media limits, flattened by the servicer as
+    // for SGLang (`image=4`); TokenSpeed's engine has none to advertise today.
+    "mm_item_limits",
+    // The engine's reasoning parser and where it starts a request's grammar
+    // on a thinking prompt, as for SGLang above; the servicer writes both.
+    "engine_reasoning_parser",
+    "structured_outputs_start",
+    // RL control plane (crates/rl): where the engine's SGLang-compatible
+    // control app listens and what it implements. The engine advertises
+    // these; SMG's discovery turns them into the labels the RL crate reads.
+    "rl.control_url",
+    "rl.pause_modes",
+    "rl.update_from",
+    "rl.abort",
+    "rl.flush_cache",
+    "rl.sleep_wake",
+    "rl.reports_weight_version",
 ];
 
 // ---------------------------------------------------------------------------
@@ -970,9 +1037,56 @@ fn pick_prost_fields(labels: &mut HashMap<String, String>, s: &prost_types::Stru
 mod tests {
     use std::collections::BTreeMap;
 
-    use smg_grpc_client::{sglang_proto, tokenspeed_proto};
+    use smg_grpc_client::{sglang_proto, tokenspeed_proto, vllm_proto};
 
     use super::{trtllm_status_healthy, ModelInfo, ServerInfo};
+
+    /// A vLLM worker's `GetServerInfo` fields flatten into labels as they
+    /// are: the engine's per-prompt media limits arrive as `mm_item_limits`,
+    /// and an engine without them (a text model) sets no such label.
+    #[test]
+    fn server_info_to_labels_vllm_carries_the_engines_item_limits() {
+        let info = ServerInfo::Vllm(Box::new(vllm_proto::GetServerInfoResponse {
+            server_type: "vllm-grpc".to_string(),
+            mm_item_limits: "image=8,video=2".to_string(),
+            ..Default::default()
+        }));
+        let labels = info.to_labels();
+        assert_eq!(
+            labels.get("mm_item_limits").map(String::as_str),
+            Some("image=8,video=2")
+        );
+        let text_only = ServerInfo::Vllm(Box::default());
+        assert!(!text_only.to_labels().contains_key("mm_item_limits"));
+    }
+
+    /// A servicer's reasoning-parser facts flatten into the
+    /// `engine_reasoning_parser` and `structured_outputs_start` labels the
+    /// forced tool-call grammar is shaped by, and never into
+    /// `reasoning_parser`, the per-model parser override registration
+    /// validates against the router's own registry; an engine whose servicer
+    /// reports neither (the proto default) sets no such labels.
+    #[test]
+    fn server_info_to_labels_carries_where_the_engine_starts_a_grammar() {
+        let info = ServerInfo::Vllm(Box::new(vllm_proto::GetServerInfoResponse {
+            engine_reasoning_parser: "glm45".to_string(),
+            structured_outputs_start: "after_reasoning".to_string(),
+            ..Default::default()
+        }));
+        let labels = info.to_labels();
+        assert_eq!(
+            labels.get("engine_reasoning_parser").map(String::as_str),
+            Some("glm45")
+        );
+        assert_eq!(
+            labels.get("structured_outputs_start").map(String::as_str),
+            Some("after_reasoning")
+        );
+        assert!(!labels.contains_key("reasoning_parser"));
+        let silent = ServerInfo::Vllm(Box::default()).to_labels();
+        assert!(!silent.contains_key("engine_reasoning_parser"));
+        assert!(!silent.contains_key("structured_outputs_start"));
+    }
 
     #[test]
     fn trtllm_status_healthy_matches_ok_exactly() {
@@ -996,6 +1110,27 @@ mod tests {
         prost_types::Value {
             kind: Some(prost_types::value::Kind::NumberValue(n)),
         }
+    }
+
+    /// The vLLM servicer's running window flattens into the `max_num_seqs`
+    /// label the PD admission gate and the capacity tracker read; an engine
+    /// that reports none (the proto default) leaves no label, as before.
+    #[test]
+    fn server_info_to_labels_vllm_carries_the_running_window() {
+        let info = ServerInfo::Vllm(Box::new(vllm_proto::GetServerInfoResponse {
+            kv_connector: "NixlConnector".to_string(),
+            max_num_seqs: 64,
+            ..Default::default()
+        }));
+        let labels = info.to_labels();
+        assert_eq!(labels.get("max_num_seqs").map(String::as_str), Some("64"));
+        assert_eq!(
+            labels.get("kv_connector").map(String::as_str),
+            Some("NixlConnector")
+        );
+
+        let unknown = ServerInfo::Vllm(Box::default());
+        assert!(!unknown.to_labels().contains_key("max_num_seqs"));
     }
 
     /// The `/workers` metadata path for TokenSpeed: curated `server_args` keys
@@ -1022,12 +1157,40 @@ mod tests {
                     ("kv_cache_dtype".to_string(), string_value("auto")),
                     ("attention_backend".to_string(), string_value("flashinfer")),
                     ("pipeline_parallel_size".to_string(), number_value(2.0)),
+                    (
+                        "rl.control_url".to_string(),
+                        string_value("http://10.0.0.5:40100"),
+                    ),
+                    (
+                        "rl.pause_modes".to_string(),
+                        string_value("wait,abort,keep"),
+                    ),
+                    (
+                        "rl.reports_weight_version".to_string(),
+                        string_value("true"),
+                    ),
+                    ("mm_item_limits".to_string(), string_value("image=4")),
                     // Not in TOKENSPEED_GRPC_KEYS — must not become a label.
                     ("host".to_string(), string_value("127.0.0.1")),
                 ]),
             }),
             scheduler_info: Some(prost_types::Struct {
-                fields: BTreeMap::from([("status".to_string(), string_value("ready"))]),
+                fields: BTreeMap::from([
+                    ("status".to_string(), string_value("ready")),
+                    (
+                        "cache_trace_epochs".to_string(),
+                        prost_types::Value {
+                            kind: Some(prost_types::value::Kind::ListValue(
+                                prost_types::ListValue {
+                                    values: vec![
+                                        string_value("replica-one"),
+                                        string_value("replica-two"),
+                                    ],
+                                },
+                            )),
+                        },
+                    ),
+                ]),
             }),
             active_requests: 3,
             uptime_seconds: 12.5,
@@ -1053,6 +1216,10 @@ mod tests {
             Some("8192")
         );
         assert_eq!(labels.get("version").map(String::as_str), Some("0.1.0"));
+        assert_eq!(
+            labels.get("cache_trace_epochs").map(String::as_str),
+            Some(r#"["replica-one","replica-two"]"#)
+        );
         assert!(!labels.contains_key("host"));
         // The pairing-protocol facts survive, under the engine's own names;
         // the discovery step canonicalises the parallelism spellings.
@@ -1084,10 +1251,79 @@ mod tests {
             labels.get("pipeline_parallel_size").map(String::as_str),
             Some("2")
         );
+        assert_eq!(
+            labels.get("rl.control_url").map(String::as_str),
+            Some("http://10.0.0.5:40100")
+        );
+        assert_eq!(
+            labels.get("rl.pause_modes").map(String::as_str),
+            Some("wait,abort,keep")
+        );
+        assert_eq!(
+            labels.get("rl.reports_weight_version").map(String::as_str),
+            Some("true")
+        );
+        // The engine's per-request media limits, for the media pipeline.
+        assert_eq!(
+            labels.get("mm_item_limits").map(String::as_str),
+            Some("image=4")
+        );
         // scheduler_info and transient runtime state never become labels.
         assert!(!labels.contains_key("status"));
         assert!(!labels.contains_key("active_requests"));
         assert!(!labels.contains_key("uptime_seconds"));
+    }
+
+    /// The TokenSpeed servicer's grammar-start facts ride with the server args
+    /// and become the `engine_reasoning_parser` and `structured_outputs_start`
+    /// labels, as for SGLang; the engine's own `reasoning_parser` argument is
+    /// not the router's parser override and stays out.
+    #[test]
+    fn server_info_to_labels_tokenspeed_carries_where_the_engine_starts_a_grammar() {
+        let info = ServerInfo::TokenSpeed(Box::new(tokenspeed_proto::GetServerInfoResponse {
+            server_args: Some(prost_types::Struct {
+                fields: BTreeMap::from([
+                    ("reasoning_parser".to_string(), string_value("kimi_k25")),
+                    (
+                        "engine_reasoning_parser".to_string(),
+                        string_value("kimi_k25"),
+                    ),
+                    (
+                        "structured_outputs_start".to_string(),
+                        string_value("first_token"),
+                    ),
+                ]),
+            }),
+            ..Default::default()
+        }));
+
+        let labels = info.to_labels();
+
+        assert_eq!(
+            labels.get("engine_reasoning_parser").map(String::as_str),
+            Some("kimi_k25")
+        );
+        assert_eq!(
+            labels.get("structured_outputs_start").map(String::as_str),
+            Some("first_token")
+        );
+        assert!(!labels.contains_key("reasoning_parser"));
+
+        // A servicer that writes neither key: no label, the router keeps the
+        // grammar shape that fits either engine.
+        let silent = ServerInfo::TokenSpeed(Box::new(tokenspeed_proto::GetServerInfoResponse {
+            server_args: Some(prost_types::Struct {
+                fields: BTreeMap::from([(
+                    "reasoning_parser".to_string(),
+                    string_value("kimi_k25"),
+                )]),
+            }),
+            ..Default::default()
+        }))
+        .to_labels();
+        assert!(!silent.contains_key("engine_reasoning_parser"));
+        assert!(!silent.contains_key("structured_outputs_start"));
+        assert!(!silent.contains_key("reasoning_parser"));
     }
 
     #[test]
@@ -1115,6 +1351,10 @@ mod tests {
                     ("page_size".to_string(), number_value(64.0)),
                     ("attention_backend".to_string(), string_value("fa3")),
                     ("pairing_protocol".to_string(), string_value("kv-v1")),
+                    (
+                        "mm_item_limits".to_string(),
+                        string_value("image=1,video=1"),
+                    ),
                     // Not in SGLANG_GRPC_KEYS — must not become a label.
                     ("api_key".to_string(), string_value("secret")),
                 ]),
@@ -1164,6 +1404,60 @@ mod tests {
             labels.get("pairing_protocol").map(String::as_str),
             Some("kv-v1")
         );
+        // The engine's per-request media limits, for the media pipeline.
+        assert_eq!(
+            labels.get("mm_item_limits").map(String::as_str),
+            Some("image=1,video=1")
+        );
+    }
+
+    /// The servicer's grammar-start facts ride with the server args and become
+    /// the `engine_reasoning_parser` and `structured_outputs_start` labels. The
+    /// engine's own `reasoning_parser` argument, which the server args carry
+    /// as well, is not the router's parser override and stays out.
+    #[test]
+    fn server_info_to_labels_sglang_carries_where_the_engine_starts_a_grammar() {
+        let info = ServerInfo::Sglang(Box::new(sglang_proto::GetServerInfoResponse {
+            server_args: Some(prost_types::Struct {
+                fields: BTreeMap::from([
+                    ("reasoning_parser".to_string(), string_value("qwen3")),
+                    ("engine_reasoning_parser".to_string(), string_value("qwen3")),
+                    (
+                        "structured_outputs_start".to_string(),
+                        string_value("after_reasoning"),
+                    ),
+                ]),
+            }),
+            ..Default::default()
+        }));
+
+        let labels = info.to_labels();
+
+        assert_eq!(
+            labels.get("engine_reasoning_parser").map(String::as_str),
+            Some("qwen3")
+        );
+        assert_eq!(
+            labels.get("structured_outputs_start").map(String::as_str),
+            Some("after_reasoning")
+        );
+        assert!(
+            !labels.contains_key("reasoning_parser"),
+            "the engine's parser argument is not the router's parser override"
+        );
+
+        // A servicer that writes neither key (one from before the facts): no
+        // label, so the router keeps the grammar shape that fits either engine.
+        let silent = ServerInfo::Sglang(Box::new(sglang_proto::GetServerInfoResponse {
+            server_args: Some(prost_types::Struct {
+                fields: BTreeMap::from([("reasoning_parser".to_string(), string_value("qwen3"))]),
+            }),
+            ..Default::default()
+        }))
+        .to_labels();
+        assert!(!silent.contains_key("engine_reasoning_parser"));
+        assert!(!silent.contains_key("structured_outputs_start"));
+        assert!(!silent.contains_key("reasoning_parser"));
     }
 
     /// `GetModelInfoResponse` is flat for every backend, so it serializes via

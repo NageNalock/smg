@@ -27,8 +27,10 @@ from sglang.srt.utils import kill_process_tree
 from sglang.utils import get_exception_traceback
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 
+from smg_grpc_servicer.hostport import host_port, loopback_target
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager
+from smg_grpc_servicer.sglang.rust import SERVICER_IMPL_ENV, serve_rust, servicer_impl_source
 from smg_grpc_servicer.sglang.scheduler_launcher import (
     launch_scheduler_process_only,
     terminate_scheduler_processes,
@@ -107,6 +109,20 @@ async def serve_grpc(
             this to wire its admin endpoints to the scheduler, so the
             callback signature is a public contract.
     """
+
+    # One flag selects the Rust request path (--servicer-impl, this package's
+    # flag on SGLang's parser, else the environment); the entrypoint and every
+    # ServerArgs flag stay the same, and the Router cannot tell them apart.
+    impl, origin = servicer_impl_source(server_args)
+    logger.info("Servicer implementation: %s (source=%s)", impl, origin)
+    if impl == "rust":
+        if on_request_manager_ready is not None:
+            logger.warning(
+                "%s=rust: SGLang's HTTP sidecar (metrics, profiling endpoints) stays off; "
+                "the Rust servicer has no request manager to wire it to",
+                SERVICER_IMPL_ENV,
+            )
+        raise SystemExit(await serve_rust(server_args))
 
     # Install the process-wide runtime context before any sglang machinery
     # runs here. Since 0.5.18 the config is published per process and read
@@ -231,7 +247,7 @@ async def serve_grpc(
         reflection.enable_server_reflection(SERVICE_NAMES, server)
 
         # Start server
-        listen_addr = f"{server_args.host}:{server_args.port}"
+        listen_addr = host_port(server_args.host, server_args.port)
         if server_args.ssl_certfile and server_args.ssl_keyfile:
             if server_args.ssl_keyfile_password:
                 raise ValueError(
@@ -409,7 +425,7 @@ def _execute_grpc_server_warmup(server_args: ServerArgs):
     """Execute warmup for gRPC server by checking health and sending test request."""
     try:
         # Connect to the gRPC server
-        grpc_url = f"{server_args.host}:{server_args.port}"
+        grpc_url = loopback_target(server_args.host, server_args.port)
         channel = grpc.insecure_channel(
             grpc_url,
             options=[
@@ -467,6 +483,10 @@ def _execute_grpc_server_warmup(server_args: ServerArgs):
                 ),
                 "sampling_params": sglang_scheduler_pb2.SamplingParams(
                     temperature=0.0,
+                    top_p=1.0,
+                    top_k=1,
+                    repetition_penalty=1.0,
+                    n=1,
                     max_new_tokens=max_new_tokens,
                 ),
                 "stream": False,

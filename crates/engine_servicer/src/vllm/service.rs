@@ -10,8 +10,8 @@ use smg_grpc_client::{
 };
 use tonic::{Request, Response, Status};
 
-use super::{admin, embed, generate, info, kv_events, requests, tokenizer_bundle, State};
-use crate::BoxStream;
+use super::{admin, embed, generate, info, State};
+use crate::{kv_events, tokenizer_bundle, BoxStream};
 
 /// The `VllmEngine` service over the shared state.
 #[derive(Clone)]
@@ -29,7 +29,8 @@ impl VllmEngine for VllmEngineService {
         &self,
         request: Request<vllm::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
-        generate::generate(&self.state, request.into_inner())
+        let trace_headers = generate::trace_headers(request.metadata());
+        generate::generate(&self.state, request.into_inner(), trace_headers)
             .await
             .map(Response::new)
     }
@@ -63,7 +64,9 @@ impl VllmEngine for VllmEngineService {
         &self,
         request: Request<vllm::AbortRequest>,
     ) -> Result<Response<vllm::AbortResponse>, Status> {
-        requests::abort(&self.state, &request.into_inner().request_ids)?;
+        self.state
+            .registry
+            .abort(&request.into_inner().request_ids)?;
         Ok(Response::new(vllm::AbortResponse::default()))
     }
 
@@ -92,7 +95,7 @@ impl VllmEngine for VllmEngineService {
         &self,
         _request: Request<common::GetTokenizerRequest>,
     ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        tokenizer_bundle::get_tokenizer(&self.state)
+        tokenizer_bundle::get_tokenizer(self.state.tokenizer_dir.clone())
             .await
             .map(Response::new)
     }
@@ -101,6 +104,9 @@ impl VllmEngine for VllmEngineService {
         &self,
         request: Request<common::SubscribeKvEventsRequest>,
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        kv_events::subscribe(&self.state.model, request.into_inner()).map(Response::new)
+        let Some(relay) = &self.state.kv_relay else {
+            return Err(Status::unimplemented(kv_events::VLLM_DISABLED_MESSAGE));
+        };
+        relay.subscribe(request.into_inner()).map(Response::new)
     }
 }

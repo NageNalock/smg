@@ -35,6 +35,12 @@ pub struct MockTokenizer {
     native_reasoning_effort_off_values: &'static [&'static str],
     renderer_capabilities: RendererCapabilities,
     content_format: ChatTemplateContentFormat,
+    /// Reported from `think_in_prefill`: the generation prompt opens the
+    /// think block.
+    think_in_prefill: bool,
+    /// Reported from `prefill_opens_think_block`; `None` mirrors
+    /// `think_in_prefill`, as the trait's default does.
+    prefill_opens_think_block: Option<bool>,
     /// When set, `apply_chat_template` renders the message list and the
     /// generation-prompt flag as JSON, so a test can assert exactly what
     /// reached the template.
@@ -97,6 +103,8 @@ impl MockTokenizer {
             thinking_key_name: None,
             native_reasoning_effort_values: &[],
             native_reasoning_effort_off_values: &[],
+            think_in_prefill: false,
+            prefill_opens_think_block: None,
             renderer_capabilities: RendererCapabilities::default(),
             content_format: ChatTemplateContentFormat::default(),
             json_chat_template: false,
@@ -121,6 +129,19 @@ impl MockTokenizer {
     /// Report `n` unbilled prompt tokens on every rendering.
     pub fn with_unbilled_prompt_tokens(mut self, n: u32) -> Self {
         self.unbilled_prompt_tokens = n;
+        self
+    }
+
+    /// Report `value` from `think_in_prefill()`.
+    pub fn with_think_in_prefill(mut self, value: bool) -> Self {
+        self.think_in_prefill = value;
+        self
+    }
+
+    /// Report `value` from `prefill_opens_think_block()` instead of
+    /// mirroring `think_in_prefill()`.
+    pub fn with_prefill_opens_think_block(mut self, value: bool) -> Self {
+        self.prefill_opens_think_block = Some(value);
         self
     }
 
@@ -163,9 +184,10 @@ impl MockTokenizer {
         self
     }
 
-    /// Render `{"messages": [...], "add_generation_prompt": bool}` instead of
-    /// the `role: content` lines, so a test can assert on the exact message
-    /// list the template received.
+    /// Render `{"messages": [...], "add_generation_prompt": bool}`, plus
+    /// `"tools": [...]` when the call carries tools, instead of the
+    /// `role: content` lines, so a test can assert on the exact message list
+    /// and tool list the template received.
     pub fn with_json_chat_template(mut self) -> Self {
         self.json_chat_template = true;
         self
@@ -237,6 +259,15 @@ impl TokenizerTrait for MockTokenizer {
         self.thinking_toggle
     }
 
+    fn think_in_prefill(&self) -> bool {
+        self.think_in_prefill
+    }
+
+    fn prefill_opens_think_block(&self) -> bool {
+        self.prefill_opens_think_block
+            .unwrap_or(self.think_in_prefill)
+    }
+
     fn thinking_key_name(&self) -> Option<ThinkingKeyName> {
         self.thinking_key_name
     }
@@ -265,11 +296,14 @@ impl TokenizerTrait for MockTokenizer {
         params: ChatTemplateParams,
     ) -> Result<String> {
         if self.json_chat_template {
-            return Ok(serde_json::json!({
+            let mut rendered = serde_json::json!({
                 "messages": messages,
                 "add_generation_prompt": params.add_generation_prompt,
-            })
-            .to_string());
+            });
+            if let Some(tools) = params.tools {
+                rendered["tools"] = serde_json::Value::from(tools.to_vec());
+            }
+            return Ok(rendered.to_string());
         }
         let mut text = String::new();
         for message in messages {

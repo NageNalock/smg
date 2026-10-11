@@ -50,6 +50,7 @@ mod capability;
 mod config;
 mod detect;
 mod inflight;
+mod item_limits;
 mod pixel_cache;
 mod plan;
 mod process;
@@ -72,6 +73,7 @@ pub(crate) use config::{
 };
 pub(crate) use detect::{media_plan_chat, media_plan_messages};
 pub(crate) use inflight::{reserve_multimodal_inflight, InflightPermit};
+pub(crate) use item_limits::engine_item_limits;
 pub(crate) use plan::{
     prepare_placeholder_tokens, resolve_media_part_order, validate_rendered_media_anchors,
     MediaPlan, PlaceholderTokens,
@@ -87,6 +89,13 @@ pub(crate) use transport::{init_mm_transport_defaults, mm_rdma_exporter};
 /// Whether verbose multimodal timing logs are enabled (`--log-mm-timing` /
 /// `SMG_LOG_MM_TIMING`). Resolved once at startup; called on every multimodal
 /// request.
+/// The client-facing message for a media pipeline failure: the whole error
+/// chain, so the cause (the URL whose fetch ran out of its budget, the clip
+/// the decoder refused) reaches the caller, not only the outermost context.
+pub(crate) fn processing_failed_message(error: &anyhow::Error) -> String {
+    format!("Multimodal processing failed: {error:#}")
+}
+
 pub(crate) fn log_mm_timing_enabled() -> bool {
     mm_settings().log_mm_timing.value
 }
@@ -203,4 +212,50 @@ pub(crate) struct PrecomputedMultimodalIntermediate {
     /// not take `pixel_values` (DeepSeek-V4.1 takes `patches`); `None` keeps
     /// the default name.
     pub encoder_input_key: Option<String>,
+}
+
+/// Say once which JPEG decoder this process has, and publish it: without
+/// libjpeg-turbo the pure-Rust decoder's pixels differ from PIL's by a few
+/// levels, an embedding shift against an engine that decodes with PIL.
+pub(crate) fn report_jpeg_decoder() {
+    use crate::observability::metrics::Metrics;
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let available = llm_multimodal::jpeg_turbo::turbojpeg_available();
+        Metrics::set_mm_turbojpeg_available(available);
+        if available {
+            tracing::info!("JPEG decode uses libjpeg-turbo with PIL's defaults");
+        } else {
+            tracing::warn!(
+                "libturbojpeg not found: JPEGs decode with the pure-Rust decoder, whose pixels \
+                 differ from PIL's by a few levels; install libjpeg-turbo for exact parity with \
+                 an engine that decodes with PIL"
+            );
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use llm_multimodal::{MediaConnectorError, MultiModalError};
+
+    use super::processing_failed_message;
+
+    /// A fetch that ran out of its budget is reported with its URL and the
+    /// budget, not as the bare "failed to finalize" context around it.
+    #[test]
+    fn a_processing_failure_names_its_cause() {
+        let error = anyhow::Error::new(MultiModalError::Media(MediaConnectorError::Timeout {
+            url: "https://media.example/clip.mp4".to_string(),
+            budget: Duration::from_secs(30),
+        }))
+        .context("Failed to finalize multimodal tracker");
+        assert_eq!(
+            processing_failed_message(&error),
+            "Multimodal processing failed: Failed to finalize multimodal tracker: media fetch of \
+             https://media.example/clip.mp4 timed out after 30s"
+        );
+    }
 }

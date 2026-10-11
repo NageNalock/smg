@@ -7,6 +7,8 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
+    future::{pending, Future},
+    pin::pin,
     sync::Arc,
     time::Duration,
 };
@@ -23,16 +25,33 @@ use engine_zmq_client::{
     },
     EngineId,
 };
-use tokio::{sync::mpsc, task::AbortHandle};
+use tokio::{
+    sync::mpsc,
+    task::{AbortHandle, JoinSet},
+};
 
 use crate::{
     config::Config,
+    drain::InFlight,
     engine::{Engine, GenEvent, LoadSnapshot, NewRequest},
 };
 
 /// Run one mock ZMQ EngineCore rank: connect to `handshake_address`, then serve
 /// requests until the frontend disconnects.
 pub async fn serve(cfg: Arc<Config>, handshake_address: String, engine_index: u32) {
+    serve_until(cfg, handshake_address, engine_index, pending()).await;
+}
+
+/// [`serve`] until `shutdown` resolves as well: from then on the rank admits
+/// no request and returns once the ones in flight have finished and their
+/// last outputs are on the socket (the drain of a termination signal), as an
+/// engine process does under SIGTERM.
+pub async fn serve_until(
+    cfg: Arc<Config>,
+    handshake_address: String,
+    engine_index: u32,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) {
     let mut ready = default_ready_response();
     ready.data_parallel_rank = engine_index;
     ready.instance_id = format!("mock-zmq-{engine_index}");
@@ -53,16 +72,33 @@ pub async fn serve(cfg: Arc<Config>, handshake_address: String, engine_index: u3
     tracing::info!("zmq mock engine {engine_index} connected to {handshake_address}");
 
     let (mut input, output) = mock.split();
-    let engine = cfg.realistic.then(|| Engine::spawn(cfg.engine.clone()));
+    let engine = cfg
+        .realistic
+        .then(|| Engine::spawn_named(cfg.engine.clone(), format!("zmq:{engine_index}"), true));
+    // The rank's KV-event publisher, numbered after the gRPC workers and
+    // stamping the batches with the rank this engine advertised.
+    let publisher = engine.as_ref().and_then(|engine| {
+        let index = cfg
+            .grpc_count
+            .checked_add(u16::try_from(engine_index).ok()?)?;
+        let dp_rank = i32::try_from(engine_index).ok()?;
+        cfg.kv_zmq_for(index, dp_rank)
+            .map(|kv| (engine.clone(), kv))
+    });
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "publisher self-terminates when the engine's event channel closes"
+    )]
+    let _publisher = publisher.map(|(engine, kv)| tokio::spawn(crate::kv_zmq::serve(engine, kv)));
 
     // A single writer owns the output PUSH socket; per-request forwarders funnel
     // their outputs here so concurrent requests serialize onto the one socket.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<EngineCoreOutputs>();
     #[expect(
         clippy::disallowed_methods,
-        reason = "writer self-terminates when the output channel closes"
+        reason = "the writer ends with the output channel; a drain awaits it"
     )]
-    let _writer = tokio::spawn(async move {
+    let writer = tokio::spawn(async move {
         let mut output = output;
         while let Some(outputs) = out_rx.recv().await {
             if let Err(error) = output.send_outputs(&outputs).await {
@@ -72,10 +108,55 @@ pub async fn serve(cfg: Arc<Config>, handshake_address: String, engine_index: u3
         }
     });
 
+    let mut shutdown = pin!(shutdown);
+    let mut stopped = false;
+    // The forwarders of the admitted requests, and their abort handles by
+    // request id. A stop admits nothing more and keeps reading the input
+    // (an Abort still lands) until the last forwarder is done.
+    let mut forwarders = JoinSet::new();
     let mut inflight: HashMap<String, AbortHandle> = HashMap::new();
-    loop {
-        match input.recv().await {
+    // Whether the loop ended with the last forwarder of a stop (drained) or
+    // with the frontend gone.
+    let drained = loop {
+        let inbound = tokio::select! {
+            inbound = input.recv() => inbound,
+            () = &mut shutdown, if !stopped => {
+                tracing::info!(
+                    "zmq engine {engine_index}: stopping, admitting no more requests; {} in flight",
+                    forwarders.len()
+                );
+                stopped = true;
+                continue;
+            }
+            // Finished forwarders are reaped as they go; after the stop the
+            // last of them ends the rank (the guard keeps an empty set from
+            // yielding `None` before it).
+            joined = forwarders.join_next(), if stopped || !forwarders.is_empty() => {
+                match joined {
+                    Some(Ok(())) => continue,
+                    Some(Err(e)) if e.is_panic() => {
+                        tracing::error!("zmq engine {engine_index} forwarder panicked: {e}");
+                        continue;
+                    }
+                    // Aborted through its handle (the frontend's Abort below):
+                    // the normal end of a cancelled request, not a fault.
+                    Some(Err(_)) => continue,
+                    None => break true,
+                }
+            }
+        };
+        match inbound {
+            Ok(EngineInbound::Add(request)) if stopped => {
+                // Nothing is admitted during the drain: the frontend's stream
+                // for the request ends with a terminal Abort.
+                let _ = out_tx.send(terminal_batch(
+                    engine_index,
+                    request.request_id,
+                    EngineCoreFinishReason::Abort,
+                ));
+            }
             Ok(EngineInbound::Add(request)) => {
+                inflight.retain(|_, forwarder| !forwarder.is_finished());
                 let request_id = request.request_id.clone();
                 let prompt = request.prompt_token_ids.clone().unwrap_or_default();
                 // Honor the request's max_tokens; fall back to the worker default.
@@ -86,6 +167,7 @@ pub async fn serve(cfg: Arc<Config>, handshake_address: String, engine_index: u3
                     .filter(|&max| max > 0)
                     .unwrap_or(cfg.output_tokens);
 
+                let in_flight = InFlight::enter();
                 let (gen_tx, gen_rx) = mpsc::unbounded_channel::<GenEvent>();
                 match &engine {
                     Some(engine) => engine.submit(NewRequest {
@@ -104,18 +186,15 @@ pub async fn serve(cfg: Arc<Config>, handshake_address: String, engine_index: u3
                     }
                 }
 
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "forwarder self-terminates on Done or abort"
-                )]
-                let forwarder = tokio::spawn(forward_request(
+                let forwarder = forwarders.spawn(forward_request(
                     request_id.clone(),
                     engine_index,
                     gen_rx,
                     out_tx.clone(),
                     engine.clone(),
+                    in_flight,
                 ));
-                inflight.insert(request_id, forwarder.abort_handle());
+                inflight.insert(request_id, forwarder);
             }
             Ok(EngineInbound::Abort(request_ids)) => {
                 for request_id in request_ids {
@@ -136,8 +215,8 @@ pub async fn serve(cfg: Arc<Config>, handshake_address: String, engine_index: u3
                 tracing::debug!("zmq engine {engine_index} ignoring start of wave {wave}");
             }
             Ok(EngineInbound::Utility(call)) => {
-                // The mock holds no KV blocks, so a prefix-cache reset always
-                // succeeds; no other EngineCore method exists here.
+                // A prefix-cache reset is acknowledged and leaves the simulated
+                // engine's cache as it is; no other EngineCore method exists here.
                 let outcome = if call.method == "reset_prefix_cache" {
                     Ok(OpaqueValue::from(true))
                 } else {
@@ -154,10 +233,25 @@ pub async fn serve(cfg: Arc<Config>, handshake_address: String, engine_index: u3
             }
             Err(error) => {
                 tracing::info!("zmq engine {engine_index} input closed: {error}");
-                break;
+                break false;
             }
         }
+    };
+    if drained {
+        // The last forwarder's terminal batch is only in the funnel so far.
+        // Closing the funnel lets the writer end once everything queued is on
+        // the socket, and the rank returns after that, not before: the
+        // process exits right behind its last rank, and a batch still in the
+        // funnel would go with it.
+        drop(out_tx);
+        if let Err(e) = writer.await {
+            tracing::error!("zmq engine {engine_index} output writer panicked: {e}");
+        }
+        return;
     }
+    // The input closed with forwarders still running: they finish on their
+    // own, as before (their outputs go nowhere once the writer fails).
+    forwarders.detach_all();
 }
 
 /// Forward one request's generation events to the output funnel as
@@ -168,6 +262,9 @@ async fn forward_request(
     mut gen_rx: mpsc::UnboundedReceiver<GenEvent>,
     out_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
     engine: Option<Engine>,
+    // Held until the forwarder is done or aborted: the request's share of
+    // the in-flight count.
+    _in_flight: InFlight,
 ) {
     while let Some(event) = gen_rx.recv().await {
         let load = engine
@@ -303,11 +400,12 @@ mod tests {
             zmq_count: 0,
             zmq_start_index: 0,
             model_id: "mock-model".to_string(),
-            tokenizer_path: "mock-model".to_string(),
-            gen_delay: Duration::ZERO,
+            tokenizer_path: String::new(),
+            gen_delay: Duration::from_millis(0),
             output_tokens: 4,
-            realistic: false,
+            realistic: true,
             engine: EngineParams::default(),
+            ..Config::default()
         }
     }
 
@@ -357,7 +455,11 @@ mod tests {
             }
         }
         assert!(finished, "stream should reach a terminal output");
-        assert_eq!(tokens.len(), 4, "canned mode emits output_tokens tokens");
+        assert_eq!(
+            tokens.len(),
+            4,
+            "a request without max_tokens gets output_tokens tokens"
+        );
     }
 
     /// Two mock ranks dial one socket set — the grouped-worker topology the
@@ -411,7 +513,11 @@ mod tests {
                 }
             }
             assert!(finished, "rank {rank} should reach a terminal output");
-            assert_eq!(tokens.len(), 4, "rank {rank} emits output_tokens tokens");
+            assert_eq!(
+                tokens.len(),
+                4,
+                "rank {rank} answers with output_tokens tokens"
+            );
         }
     }
 }

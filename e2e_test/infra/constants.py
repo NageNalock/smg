@@ -69,11 +69,20 @@ ENV_ZMQ_ENGINE_COUNT = (
 ENV_VLLM_SERVICER_IMPL = (
     "E2E_VLLM_SERVICER_IMPL"  # vLLM gRPC servicer implementation: python (default) or rust
 )
+ENV_SGLANG_SERVICER_IMPL = (
+    "E2E_SGLANG_SERVICER_IMPL"  # SGLang gRPC servicer implementation: python (default) or rust
+)
+ENV_TOKENSPEED_SERVICER_IMPL = (
+    "E2E_TOKENSPEED_SERVICER_IMPL"  # TokenSpeed gRPC servicer implementation: python or rust
+)
 ENV_MM_PROCESSING = (
     "E2E_MM_PROCESSING"  # Per-lane multimodal processing location — see get_mm_processing
 )
 ENV_VLLM_MM_PROCESSOR = "E2E_VLLM_MM_PROCESSOR"  # Worker-lane processor — see get_vllm_mm_processor
-ENV_STARTUP_TIMEOUT = "E2E_STARTUP_TIMEOUT"
+ENV_STARTUP_TIMEOUT = (
+    "E2E_STARTUP_TIMEOUT"  # Floor on every startup wait — see effective_startup_timeout
+)
+ENV_GPU_OFFSET = "E2E_GPU_OFFSET"  # First GPU index a lane's workers take — see get_gpu_offset
 ENV_SKIP_MODEL_POOL = "SKIP_MODEL_POOL"
 ENV_SKIP_BACKEND_SETUP = "SKIP_BACKEND_SETUP"
 
@@ -232,6 +241,47 @@ def get_vllm_servicer_impl() -> str:
     return value
 
 
+def get_tokenspeed_servicer_impl() -> str:
+    """Which implementation serves the TokenSpeed gRPC contract on gRPC lanes.
+
+    Set ``E2E_TOKENSPEED_SERVICER_IMPL=rust`` to run TokenSpeed gRPC workers
+    with the Rust servicer: the worker command stays
+    ``python -m smg_grpc_servicer.tokenspeed`` and the flag travels to it as
+    ``SMG_TOKENSPEED_SERVICER_IMPL`` in the worker's environment. The Router
+    and every test case stay the same. Unset/blank means python.
+    """
+    value = os.environ.get(ENV_TOKENSPEED_SERVICER_IMPL, "").strip().lower()
+    if not value:
+        return "python"
+    if value not in VLLM_SERVICER_IMPLS:
+        raise ValueError(
+            f"{ENV_TOKENSPEED_SERVICER_IMPL}={value!r} is not a valid servicer impl; "
+            f"use one of {VLLM_SERVICER_IMPLS}"
+        )
+    return value
+
+
+def get_sglang_servicer_impl() -> str:
+    """Which implementation serves the SGLang gRPC contract on gRPC lanes.
+
+    Set ``E2E_SGLANG_SERVICER_IMPL=rust`` to run SGLang gRPC workers
+    with the Rust servicer: the worker command stays
+    ``sglang.launch_server --grpc-mode`` and the flag travels to it as
+    ``SMG_SGLANG_SERVICER_IMPL`` in the worker's environment, read at the
+    smg entry that mode calls. The Router and every test case stay the
+    same. Unset/blank means python.
+    """
+    value = os.environ.get(ENV_SGLANG_SERVICER_IMPL, "").strip().lower()
+    if not value:
+        return "python"
+    if value not in VLLM_SERVICER_IMPLS:
+        raise ValueError(
+            f"{ENV_SGLANG_SERVICER_IMPL}={value!r} is not a valid servicer impl; "
+            f"use one of {VLLM_SERVICER_IMPLS}"
+        )
+    return value
+
+
 def get_zmq_engine_count() -> int:
     """DP engines per ZMQ worker (grouped vLLM/TokenSpeed launch).
 
@@ -246,6 +296,45 @@ def get_zmq_engine_count() -> int:
     if count < 1:
         raise ValueError(f"{ENV_ZMQ_ENGINE_COUNT}={value!r} must be a positive integer")
     return count
+
+
+def get_gpu_offset() -> int:
+    """The first GPU index a lane's workers are placed on.
+
+    Workers take GPUs sequentially from 0; on a multi-GPU host, set
+    ``E2E_GPU_OFFSET`` to run several lanes side by side, each on its own
+    GPUs. Every worker of the lane (regular and PD legs) shifts by it.
+    Unset/blank means 0.
+    """
+    value = os.environ.get(ENV_GPU_OFFSET, "").strip()
+    if not value:
+        return 0
+    offset = int(value)
+    if offset < 0:
+        raise ValueError(f"{ENV_GPU_OFFSET}={value!r} must be a non-negative integer")
+    return offset
+
+
+def get_startup_timeout() -> int | None:
+    """``E2E_STARTUP_TIMEOUT`` in seconds, or ``None`` when unset/blank."""
+    value = os.environ.get(ENV_STARTUP_TIMEOUT, "").strip()
+    if not value:
+        return None
+    timeout = int(value)
+    if timeout <= 0:
+        raise ValueError(f"{ENV_STARTUP_TIMEOUT}={value!r} must be a positive number of seconds")
+    return timeout
+
+
+def effective_startup_timeout(spec_timeout: int) -> int:
+    """A model's startup wait (its spec's ``startup_timeout`` or the default),
+    raised to ``E2E_STARTUP_TIMEOUT`` when that is larger. The per-model bound
+    assumes warm caches; on a fresh host an engine's first start JIT-compiles
+    and autotunes kernels for minutes, which the env floor covers for every
+    wait that gates on a loaded model (worker health, ZMQ gateway readiness).
+    An explicitly larger per-model bound is never shrunk.
+    """
+    return max(spec_timeout, get_startup_timeout() or 0)
 
 
 ENV_VLLM_KV_BACKEND = "E2E_VLLM_KV_BACKEND"
@@ -280,10 +369,30 @@ ENV_SHOW_ROUTER_LOGS = "SHOW_ROUTER_LOGS"
 ENV_SHOW_WORKER_LOGS = "SHOW_WORKER_LOGS"
 
 # Network
-DEFAULT_HOST = "127.0.0.1"
+ENV_HOST = "E2E_HOST"  # The loopback the lane binds and dials — see default_host
+
+
+def default_host() -> str:
+    """The loopback the harness binds gateways and workers to and dials them at.
+
+    ``127.0.0.1`` unless ``E2E_HOST`` names another address; ``E2E_HOST=::1`` runs
+    a lane over IPv6 (bare literal, no brackets: it is passed to ``--host`` flags
+    as is, and every URL goes through :func:`host_port`).
+    """
+    return os.environ.get(ENV_HOST, "").strip() or "127.0.0.1"
+
+
+def host_port(host: str, port: int | str) -> str:
+    """``host:port`` for a URL or a dial string: an IPv6 literal goes in brackets."""
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
+
+
+DEFAULT_HOST = default_host()
 BRAVE_MCP_PORT = int(os.environ.get("BRAVE_MCP_PORT") or 8080)
 BRAVE_MCP_HOST = os.environ.get("BRAVE_MCP_HOST") or DEFAULT_HOST
-BRAVE_MCP_URL = f"http://{BRAVE_MCP_HOST}:{BRAVE_MCP_PORT}/mcp"
+BRAVE_MCP_URL = f"http://{host_port(BRAVE_MCP_HOST, BRAVE_MCP_PORT)}/mcp"
 
 # In-process mock MCP server (see infra/mock_mcp_server.py). Bound to localhost
 # on an auto-allocated port; host is exposed as a constant so tests and

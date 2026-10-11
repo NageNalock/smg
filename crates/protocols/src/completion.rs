@@ -18,7 +18,7 @@ use crate::validated::Normalizable;
 #[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
 #[validate(schema(function = "validate_completion_cross_parameters"))]
 pub struct CompletionRequest {
-    /// ID of the model to use (required for OpenAI, optional for some implementations, such as SGLang)
+    /// ID of the model to use (required for OpenAI, optional for some serving engines)
     pub model: String,
 
     /// The prompt(s) to generate completions for
@@ -123,8 +123,9 @@ pub struct CompletionRequest {
     #[serde(default, skip_serializing_if = "is_false")]
     pub ignore_eos: bool,
 
-    /// Skip special tokens during detokenization
-    #[serde(default = "default_true")]
+    /// Skip special tokens during detokenization. Serialized only when
+    /// `false`: `true` is what the engine applies without the field.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub skip_special_tokens: bool,
 
     /// Path to LoRA adapter(s) for model customization
@@ -140,7 +141,7 @@ pub struct CompletionRequest {
     /// Sampling seed for deterministic outputs
     pub sampling_seed: Option<u64>,
 
-    /// Request ID forwarded to the backend for log correlation (SGLang extension)
+    /// Request ID forwarded to the backend for log correlation (an engine extension)
     pub rid: Option<String>,
 
     /// Additional fields including bootstrap info for PD routing
@@ -223,7 +224,7 @@ impl GenerationRequest for CompletionRequest {
     fn cache_partition(&self) -> CachePartition<'_> {
         CachePartition {
             // Engine extensions carried in the passthrough map, not typed
-            // fields: vLLM/SGLang `cache_salt`, SGLang `extra_key`.
+            // fields: the engines' `cache_salt`, one engine's `extra_key`.
             cache_salt: self.other.get("cache_salt").and_then(Value::as_str),
             extra_key: self.other.get("extra_key").and_then(Value::as_str),
             lora_path: self.lora_path.as_deref(),
@@ -308,7 +309,12 @@ mod tests {
     #[test]
     fn default_sglang_flags_are_omitted_and_absent_reads_defaults() {
         let value = serde_json::to_value(req(serde_json::json!({}))).expect("serialize");
-        for field in ["no_stop_trim", "ignore_eos", "return_hidden_states"] {
+        for field in [
+            "no_stop_trim",
+            "ignore_eos",
+            "return_hidden_states",
+            "skip_special_tokens",
+        ] {
             assert!(value.get(field).is_none(), "{field} serialized at default");
         }
 
@@ -316,6 +322,7 @@ mod tests {
         assert!(!back.no_stop_trim);
         assert!(!back.ignore_eos);
         assert!(!back.return_hidden_states);
+        assert!(back.skip_special_tokens);
     }
 
     #[test]
@@ -323,16 +330,19 @@ mod tests {
         let value = serde_json::to_value(req(serde_json::json!({
             "no_stop_trim": true,
             "ignore_eos": true,
-            "return_hidden_states": true
+            "return_hidden_states": true,
+            "skip_special_tokens": false
         })))
         .expect("serialize");
         assert_eq!(value["no_stop_trim"], true);
         assert_eq!(value["ignore_eos"], true);
         assert_eq!(value["return_hidden_states"], true);
+        assert_eq!(value["skip_special_tokens"], false);
 
         let back: CompletionRequest = serde_json::from_value(value).expect("roundtrip");
         assert!(back.no_stop_trim);
         assert!(back.ignore_eos);
         assert!(back.return_hidden_states);
+        assert!(!back.skip_special_tokens);
     }
 }

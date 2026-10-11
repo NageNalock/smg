@@ -228,6 +228,10 @@ class Router:
         service_discovery: Enable Kubernetes service discovery. When enabled, the
             router will automatically discover worker pods based on the selector.
             Default: False
+        discovery: The worker discovery provider's configuration, keyword-only:
+            a mapping with a ``provider`` key and that provider's fields, read
+            like ``RouterConfig.discovery`` (no ``provider`` means Kubernetes).
+            Mutually exclusive with ``service_discovery``. Default: None
         selector: Dictionary mapping of label keys to values for Kubernetes pod
             selection. Example: {"app": "sglang-worker"}. Default: {}
         service_discovery_port: Port to use for service discovery. The router will
@@ -241,7 +245,11 @@ class Router:
             selection for decode servers (PD mode only). Default: {}
         prometheus_port: Port to expose Prometheus metrics. Default: None
         prometheus_host: Host address to bind the Prometheus metrics server. Default:
-            None
+            None, which binds the unspecified address of host's family (:: for an IPv6
+            host, 0.0.0.0 otherwise)
+        jemalloc_prof_dir: Directory where POST /heap_profile writes a jemalloc heap
+            profile of the router (a build with the jemalloc-profiling feature, started
+            with _RJEM_MALLOC_CONF=prof:true,prof_active:true). Default: None
         pd_disaggregation: Enable PD (Prefill-Decode) disaggregated mode. Default:
             False
         prefill_urls: List of (url, bootstrap_port) tuples for prefill servers (PD
@@ -278,14 +286,16 @@ class Router:
         kv_engine_id_annotation: Kubernetes annotation containing KV engine IDs,
             aligned with worker_ports_annotation. Default: 'smg.ai/kv-engine-id'
         request_timeout_secs: Request timeout in seconds. Default: 600
-        max_concurrent_requests: Maximum number of concurrent requests allowed for
-            rate limiting. Default: 256
+        max_concurrent_requests: Maximum standing concurrent requests. -1 derives
+            the bound from the host (1024 per available core, at least 4096); 0
+            disables it. Default: -1
         queue_size: Queue size for pending requests when max concurrent limit reached
             (0 = no queue, return 429 immediately). Default: 100
         queue_timeout_secs: Maximum time (in seconds) a request can wait in queue
             before timing out. Default: 60
-        rate_limit_tokens_per_second: Token bucket refill rate (tokens per second). If
-            not set, defaults to max_concurrent_requests. Default: None
+        rate_limit_tokens_per_second: Sustained admission rate (requests per
+            second), bursting up to max_concurrent_requests, which keeps bounding
+            standing concurrency. Unset or 0 = no rate limit. Default: None
         cors_allowed_origins: List of allowed origins for CORS. Empty list allows all
             origins. Default: []
         health_failure_threshold: Number of consecutive health check failures before
@@ -313,11 +323,38 @@ class Router:
         """Create a router from a RouterArgs instance."""
 
         args_dict = vars(args).copy()
+        # Kubernetes, by either spelling, reaches Rust as service_discovery;
+        # the file provider as the tagged `discovery` mapping. A provider this
+        # cannot pass on fails here instead of quietly starting the router
+        # without discovery.
+        provider = args.selected_discovery_provider()
+        file_flags = (
+            args.discovery_file is not None or args.discovery_check_interval_secs is not None
+        )
+        if file_flags and provider != "file":
+            raise ValueError(
+                "discovery_file and discovery_check_interval_secs apply only to"
+                " discovery_provider='file'"
+            )
+        if provider == "file":
+            if not args.discovery_file:
+                raise ValueError("discovery_provider='file' needs discovery_file")
+            discovery: dict[str, str | int] = {"provider": "file", "path": args.discovery_file}
+            if args.discovery_check_interval_secs is not None:
+                discovery["check_interval_secs"] = args.discovery_check_interval_secs
+            args_dict["discovery"] = discovery
+        elif provider not in (None, "kubernetes"):
+            raise ValueError(
+                f"Router.from_args cannot pass discovery provider {provider!r} to Rust"
+            )
+        args_dict["service_discovery"] = provider == "kubernetes"
+        for key in ("discovery_provider", "discovery_file", "discovery_check_interval_secs"):
+            args_dict.pop(key)
         # Convert RouterArgs to _Router parameters
         args_dict["worker_urls"] = (
             []
             if (
-                args_dict["service_discovery"]
+                provider is not None
                 or args_dict["pd_disaggregation"]
                 or args_dict["epd_disaggregation"]
             )

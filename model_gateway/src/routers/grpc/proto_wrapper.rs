@@ -14,7 +14,7 @@ use std::{
     process,
     sync::{
         atomic::{AtomicU64, Ordering},
-        OnceLock,
+        Arc, OnceLock,
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -42,9 +42,12 @@ use smg_grpc_client::{
 };
 use smg_mm_rdma::RdmaExporter;
 
-use crate::routers::grpc::{
-    multimodal::{log_mm_timing_enabled, mm_rdma_exporter},
-    zmq_client::ZmqGenerateStream,
+use crate::{
+    routers::grpc::{
+        multimodal::{log_mm_timing_enabled, mm_rdma_exporter},
+        zmq_client::ZmqGenerateStream,
+    },
+    worker::{liveness, Worker},
 };
 
 /// How a streaming response's per-token payloads (token ids, sampled
@@ -1466,6 +1469,18 @@ impl ProtoGenerateRequest {
         }
     }
 
+    /// Whether the engine streams this request's responses as it produces
+    /// them, or answers once at the end.
+    pub fn stream(&self) -> bool {
+        match self {
+            Self::Vllm(req) => req.stream,
+            Self::Sglang(req) => req.stream,
+            Self::Trtllm(req) => req.streaming,
+            Self::Mlx(req) => req.stream,
+            Self::TokenSpeed(req) => req.stream,
+        }
+    }
+
     /// Serialized wire size, for the release metric.
     pub fn wire_len(&self) -> usize {
         use prost::Message;
@@ -1536,7 +1551,7 @@ impl ProtoGenerateRequest {
     /// every multimodal payload beyond the content hashes goes: pixels,
     /// placeholders, grid tensors and media references. The decode engine
     /// then sees a pure-text TokensPrompt and never touches its (zero-budget)
-    /// encoder cache, mirroring the Dynamo P/D contract; the kept hashes ride
+    /// encoder cache, as the language-model-only P/D contract requires; the kept hashes ride
     /// into `cache_salt` servicer-side so different images cannot alias in
     /// the decode prefix cache. Non-vLLM backends have no language-model-only
     /// mode, so they take the pixel-stripping clone.
@@ -1647,6 +1662,34 @@ impl ProtoGenerateRequest {
         }
     }
 
+    /// Prompt tokens the engine has to prefill for this request: the
+    /// tokenized input's length (zero for a text input, which the engine
+    /// tokenizes itself).
+    pub fn prompt_len(&self) -> usize {
+        match self {
+            Self::Sglang(req) => req
+                .tokenized
+                .as_ref()
+                .map_or(0, |input| input.input_ids.len()),
+            Self::Vllm(req) => match &req.input {
+                Some(vllm::generate_request::Input::Tokenized(input)) => input.input_ids.len(),
+                _ => 0,
+            },
+            Self::Trtllm(req) => req
+                .tokenized
+                .as_ref()
+                .map_or(0, |input| input.input_token_ids.len()),
+            Self::Mlx(req) => match &req.input {
+                Some(mlx::generate_request::Input::Tokenized(input)) => input.input_ids.len(),
+                _ => 0,
+            },
+            Self::TokenSpeed(req) => req
+                .tokenized
+                .as_ref()
+                .map_or(0, |input| input.input_ids.len()),
+        }
+    }
+
     /// Attach media references for worker-side multimodal processing (vLLM only).
     pub fn set_vllm_media_refs(&mut self, refs: vllm::MediaRefs) -> Result<(), String> {
         match self {
@@ -1720,6 +1763,77 @@ impl ProtoGenerateRequest {
                 }
             }
             Self::Trtllm(_) | Self::Mlx(_) => {}
+        }
+    }
+
+    /// The structural tag the request's constraint carries, when that is its
+    /// constraint (TRT-LLM: a structural-tag guide; MLX: never, its builder
+    /// refuses constraints).
+    pub fn structural_tag(&self) -> Option<&str> {
+        match self {
+            Self::Sglang(req) => match req.sampling_params.as_ref()?.constraint.as_ref()? {
+                sglang::sampling_params::Constraint::StructuralTag(tag) => Some(tag),
+                _ => None,
+            },
+            Self::Vllm(req) => match req.sampling_params.as_ref()?.constraint.as_ref()? {
+                vllm::sampling_params::Constraint::StructuralTag(tag) => Some(tag),
+                _ => None,
+            },
+            Self::TokenSpeed(req) => match req.sampling_params.as_ref()?.constraint.as_ref()? {
+                tokenspeed::sampling_params::Constraint::StructuralTag(tag) => Some(tag),
+                _ => None,
+            },
+            Self::Trtllm(req) => {
+                let guided = req.guided_decoding.as_ref()?;
+                (guided.guide_type
+                    == trtllm::guided_decoding_params::GuideType::StructuralTag as i32)
+                    .then_some(guided.guide.as_str())
+            }
+            Self::Mlx(_) => None,
+        }
+    }
+
+    /// Replace the structural tag the request's constraint carries; a request
+    /// whose constraint is anything else, or none, is left as it is.
+    pub fn set_structural_tag(&mut self, tag: String) {
+        match self {
+            Self::Sglang(req) => {
+                if let Some(sglang::sampling_params::Constraint::StructuralTag(current)) = req
+                    .sampling_params
+                    .as_mut()
+                    .and_then(|params| params.constraint.as_mut())
+                {
+                    *current = tag;
+                }
+            }
+            Self::Vllm(req) => {
+                if let Some(vllm::sampling_params::Constraint::StructuralTag(current)) = req
+                    .sampling_params
+                    .as_mut()
+                    .and_then(|params| params.constraint.as_mut())
+                {
+                    *current = tag;
+                }
+            }
+            Self::TokenSpeed(req) => {
+                if let Some(tokenspeed::sampling_params::Constraint::StructuralTag(current)) = req
+                    .sampling_params
+                    .as_mut()
+                    .and_then(|params| params.constraint.as_mut())
+                {
+                    *current = tag;
+                }
+            }
+            Self::Trtllm(req) => {
+                if let Some(guided) = req.guided_decoding.as_mut() {
+                    if guided.guide_type
+                        == trtllm::guided_decoding_params::GuideType::StructuralTag as i32
+                    {
+                        guided.guide = tag;
+                    }
+                }
+            }
+            Self::Mlx(_) => {}
         }
     }
 
@@ -1916,6 +2030,38 @@ impl ProtoGenerateResponse {
                 &resp.response,
                 Some(tokenspeed::generate_response::Response::Complete(c)) if c.finish_reason == "error"
             ),
+        }
+    }
+
+    /// The prompt tokens the engine reports served from its prefix cache, on
+    /// a chunk or a complete; zero when it reports none.
+    pub fn cached_tokens(&self) -> u32 {
+        match self {
+            Self::Sglang(resp) => match &resp.response {
+                Some(sglang::generate_response::Response::Chunk(c)) => c.cached_tokens,
+                Some(sglang::generate_response::Response::Complete(c)) => c.cached_tokens,
+                None => 0,
+            },
+            Self::Vllm(resp) => match &resp.response {
+                Some(vllm::generate_response::Response::Chunk(c)) => c.cached_tokens,
+                Some(vllm::generate_response::Response::Complete(c)) => c.cached_tokens,
+                None => 0,
+            },
+            Self::Trtllm(resp) => match &resp.response {
+                Some(trtllm::generate_response::Response::Chunk(c)) => c.cached_tokens,
+                Some(trtllm::generate_response::Response::Complete(c)) => c.cached_tokens,
+                None => 0,
+            },
+            Self::Mlx(resp) => match &resp.response {
+                Some(mlx::generate_response::Response::Chunk(c)) => c.cached_tokens,
+                Some(mlx::generate_response::Response::Complete(c)) => c.cached_tokens,
+                None => 0,
+            },
+            Self::TokenSpeed(resp) => match &resp.response {
+                Some(tokenspeed::generate_response::Response::Chunk(c)) => c.cached_tokens,
+                Some(tokenspeed::generate_response::Response::Complete(c)) => c.cached_tokens,
+                None => 0,
+            },
         }
     }
 
@@ -2160,6 +2306,26 @@ impl ProtoGenerateStreamChunk {
             Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => 0,
         }
     }
+
+    /// Weight version the engine reported for this chunk. Only TokenSpeed
+    /// carries it on the wire; see [`is_reported_version`] for what counts.
+    pub fn weight_version(&self) -> Option<&str> {
+        match self {
+            Self::TokenSpeed(c) => c
+                .weight_version
+                .as_deref()
+                .filter(|v| is_reported_version(v)),
+            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => None,
+        }
+    }
+}
+
+/// Whether an engine-stamped `weight_version` names a real version. TokenSpeed
+/// always stamps `server_args.weight_version`, whose default is the literal
+/// `"default"`: that is the engine saying it was never given a version, so it
+/// must not shadow a registration label, exactly like an empty string.
+fn is_reported_version(version: &str) -> bool {
+    !version.is_empty() && version != "default"
 }
 
 /// Unified GenerateComplete response
@@ -2384,6 +2550,18 @@ impl ProtoGenerateComplete {
         }
     }
 
+    /// Weight version the engine reported for this completion. Only TokenSpeed
+    /// carries it on the wire; see [`is_reported_version`] for what counts.
+    pub fn weight_version(&self) -> Option<&str> {
+        match self {
+            Self::TokenSpeed(c) => c
+                .weight_version
+                .as_deref()
+                .filter(|v| is_reported_version(v)),
+            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => None,
+        }
+    }
+
     /// Get accepted speculative draft tokens.
     pub fn spec_accepted_tokens(&self) -> u32 {
         match self {
@@ -2519,23 +2697,260 @@ pub enum ProtoStream {
     /// An n>1 fan-out over rendezvous-room PD pairs: one child per sample,
     /// each response stamped with its sample's index (see [`FanoutStream`]).
     Fanout(FanoutStream),
+    /// Any of the above, with the worker it came from: every response is a
+    /// sign of life for that worker (see [`crate::worker::liveness`]).
+    Tracked(Box<TrackedStream>),
 }
+
+/// A [`ProtoStream`] paired with the worker serving it, so each response it
+/// yields counts as token progress for that worker, and its prompt counts as
+/// pending prefill on the worker until the first response.
+pub struct TrackedStream {
+    inner: ProtoStream,
+    worker: Arc<dyn Worker>,
+    prefill: Option<PrefillTicket>,
+    /// The request's place in the worker's pile; a non-streaming generation
+    /// holds none.
+    progress: Option<ProgressTicket>,
+}
+
+/// The request's place in its worker's tracked pile (see
+/// [`Worker::tracked_load`]), held for the stream's life.
+struct ProgressTicket {
+    worker: Arc<dyn Worker>,
+}
+
+impl Drop for ProgressTicket {
+    fn drop(&mut self) {
+        self.worker.note_tracked_ended();
+    }
+}
+
+/// The prompt tokens a dispatched request adds to its worker's prefill
+/// backlog (see [`Worker::prefill_backlog`]), released by the first response
+/// (with the prefix-cache hit it reports, so the worker's rate learns the
+/// tokens the engine computed) or, failing that, when the stream is dropped.
+struct PrefillTicket {
+    worker: Arc<dyn Worker>,
+    tokens: u64,
+    /// The first response is the request's first token (a streaming
+    /// generation), so the prompt's prefill is timed for the worker's rate;
+    /// a non-streaming generation's one response is its whole answer.
+    timed: bool,
+    released: bool,
+}
+
+impl PrefillTicket {
+    /// The first response came back, reporting `cached` prompt tokens served
+    /// from the engine's prefix cache.
+    fn first_response(&mut self, cached: u64) {
+        if !self.released {
+            self.released = true;
+            self.worker
+                .note_prefill_ended(self.tokens, self.timed, Some(cached));
+        }
+    }
+}
+
+impl Drop for PrefillTicket {
+    fn drop(&mut self) {
+        if !self.released {
+            self.worker
+                .note_prefill_ended(self.tokens, self.timed, None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tracked_tests {
+    use std::sync::Arc;
+
+    use super::{sglang, vllm, FanoutStream, ProtoGenerateResponse, ProtoStream};
+    use crate::worker::{BasicWorkerBuilder, Worker};
+
+    #[test]
+    fn the_cache_hit_a_first_response_reports_is_read_from_a_chunk_or_a_complete() {
+        // The prefill ticket hands the worker the hit with the first
+        // response, whichever shape it has; a response that carries no
+        // count reads as no hit, and the prompt teaches its full length.
+        let chunk = ProtoGenerateResponse::Vllm(Box::new(vllm::GenerateResponse {
+            response: Some(vllm::generate_response::Response::Chunk(
+                vllm::GenerateStreamChunk {
+                    cached_tokens: 1_900,
+                    ..Default::default()
+                },
+            )),
+        }));
+        assert_eq!(chunk.cached_tokens(), 1_900);
+        let complete = ProtoGenerateResponse::Sglang(Box::new(sglang::GenerateResponse {
+            response: Some(sglang::generate_response::Response::Complete(
+                sglang::GenerateComplete {
+                    cached_tokens: 64,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }));
+        assert_eq!(complete.cached_tokens(), 64);
+        let empty = ProtoGenerateResponse::Vllm(Box::default());
+        assert_eq!(empty.cached_tokens(), 0);
+    }
+
+    #[test]
+    fn a_tracked_stream_is_one_of_its_workers_pile_for_its_life() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w1:8000").build());
+        let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new())).tracked(
+            Arc::clone(&worker),
+            0,
+            true,
+        );
+        assert_eq!(worker.tracked_load(), 1, "counted at dispatch");
+        let stream = stream.defer_abort_until_first_item();
+        assert_eq!(worker.tracked_load(), 1, "and across the stream's rewraps");
+        drop(stream);
+        assert_eq!(worker.tracked_load(), 0, "released with the stream");
+    }
+
+    #[tokio::test]
+    async fn a_tracked_stream_inside_a_tracked_stream_ends_and_releases_both_piles() {
+        // The in-place poll of `next` covers one tracked layer over a
+        // transport stream; a second layer takes the recursive path. Both
+        // layers' bookkeeping holds either way.
+        let outer: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w1:8000").build());
+        let inner: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w2:8000").build());
+        let mut stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
+            .tracked(Arc::clone(&inner), 0, true)
+            .tracked(Arc::clone(&outer), 0, true);
+        assert_eq!((inner.tracked_load(), outer.tracked_load()), (1, 1));
+        assert!(
+            stream.next().await.is_none(),
+            "an empty fanout ends at once"
+        );
+        drop(stream);
+        assert_eq!((inner.tracked_load(), outer.tracked_load()), (0, 0));
+    }
+
+    #[test]
+    fn a_non_streaming_generation_joins_no_pile_but_keeps_its_prefill_and_its_progress() {
+        // Review finding on the pushed head: left untracked altogether, a
+        // non-streaming generation's one answer no longer counted as progress
+        // and its prompt left the prefill backlog, so a saturated engine
+        // finishing such requests while streaming ones waited was wedged. It
+        // is tracked like any other, minus the pile slot.
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w1:8000").build());
+        let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new())).tracked(
+            Arc::clone(&worker),
+            64,
+            false,
+        );
+        assert_eq!(
+            worker.tracked_load(),
+            0,
+            "nothing to see progress on until it answers"
+        );
+        match &stream {
+            ProtoStream::Tracked(tracked) => {
+                assert!(tracked.progress.is_none(), "no pile slot");
+                assert!(
+                    tracked.prefill.as_ref().is_some_and(|ticket| !ticket.timed),
+                    "pending prefill like any other, untimed: its first response is its whole answer"
+                );
+                // Its one answer goes through the same `Tracked` arm of
+                // `next` as a token, which is where progress is recorded.
+            }
+            _ => panic!("a tracked stream"),
+        }
+        let stream = stream.defer_abort_until_first_item();
+        assert_eq!(worker.tracked_load(), 0);
+        drop(stream);
+        assert_eq!(worker.tracked_load(), 0);
+    }
+}
+
+/// The message of the `Internal` status a stream ends with when the engine
+/// itself finished the request with an error. The ZMQ lane's adapters end
+/// theirs with the same words, and the stream-failure accounting keys its
+/// `engine_error` label on it.
+pub(crate) const ENGINE_ERROR_MESSAGE: &str =
+    "engine finished the request with an error (see engine logs)";
 
 /// Surface an engine-side failure (`finish_reason == "error"`) as a stream error, like the ZMQ lane.
 fn reject_engine_error(
     item: Result<ProtoGenerateResponse, tonic::Status>,
 ) -> Result<ProtoGenerateResponse, tonic::Status> {
     match item {
-        Ok(response) if response.engine_error() => Err(tonic::Status::internal(
-            "engine finished the request with an error (see engine logs)",
-        )),
+        Ok(response) if response.engine_error() => {
+            Err(tonic::Status::internal(ENGINE_ERROR_MESSAGE))
+        }
         item => item,
     }
 }
 
 impl ProtoStream {
+    /// Count this stream's responses as progress for `worker` (a response is
+    /// progress whether it is a token of a streaming generation or the one
+    /// answer of a non-streaming one), its `prompt_tokens` as pending prefill
+    /// there until the first response, and, when the engine streams the
+    /// generation (`streaming`), the request as one of the worker's tracked
+    /// pile while the stream lives, with its prefill timed by its first
+    /// token over the tokens the engine computed for it (its prompt less the
+    /// prefix-cache hit that first response reports). A non-streaming
+    /// generation shows nothing between dispatch and
+    /// completion, so it joins no pile and times no prefill (its one answer
+    /// comes after its decode): the pile rule never judges a worker by
+    /// requests it cannot see progress on, and the prefill rate is learned
+    /// from first tokens only.
+    #[must_use]
+    pub fn tracked(self, worker: Arc<dyn Worker>, prompt_tokens: u64, streaming: bool) -> Self {
+        let progress = streaming.then(|| {
+            worker.note_tracked_started();
+            ProgressTicket {
+                worker: Arc::clone(&worker),
+            }
+        });
+        let prefill = (prompt_tokens > 0).then(|| {
+            worker.note_prefill_started(prompt_tokens, streaming);
+            PrefillTicket {
+                worker: Arc::clone(&worker),
+                tokens: prompt_tokens,
+                timed: streaming,
+                released: false,
+            }
+        });
+        Self::Tracked(Box::new(TrackedStream {
+            inner: self,
+            worker,
+            prefill,
+            progress,
+        }))
+    }
+
     /// Get next item from stream
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+        let Self::Tracked(tracked) = self else {
+            return self.next_untracked().await;
+        };
+        // Every dispatched stream is one tracked layer over a transport
+        // stream: its messages are polled in place, without a boxed future
+        // per message. A tracked stream inside a tracked stream recurses.
+        let item = if matches!(tracked.inner, Self::Tracked(_)) {
+            Box::pin(tracked.inner.next()).await
+        } else {
+            tracked.inner.next_untracked().await
+        };
+        if let Some(Ok(response)) = &item {
+            liveness::on_token_progress(&tracked.worker);
+            if let Some(ticket) = tracked.prefill.as_mut() {
+                ticket.first_response(u64::from(response.cached_tokens()));
+            }
+            tracked.prefill = None;
+        }
+        item
+    }
+
+    /// The next item of a stream that is not [`Self::Tracked`]; a tracked
+    /// stream goes through [`Self::next`], which does its bookkeeping.
+    async fn next_untracked(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
         let item = match self {
             Self::Sglang(stream) => stream
                 .next()
@@ -2570,6 +2985,7 @@ impl ProtoStream {
                 .await
                 .map(|result| result.map(|r| ProtoGenerateResponse::Vllm(Box::new(r)))),
             Self::Fanout(stream) => stream.next().await,
+            Self::Tracked(_) => return Box::pin(self.next()).await,
         };
         item.map(reject_engine_error)
     }
@@ -2584,6 +3000,7 @@ impl ProtoStream {
             Self::TokenSpeed(stream) => stream.mark_completed(),
             Self::Zmq(stream) => stream.mark_completed(),
             Self::Fanout(stream) => stream.mark_completed(),
+            Self::Tracked(stream) => stream.inner.mark_completed(),
         }
     }
 
@@ -2605,6 +3022,20 @@ impl ProtoStream {
             Self::TokenSpeed(stream) => Self::TokenSpeed(stream.defer_abort_until_first_item()),
             Self::Zmq(stream) => Self::Zmq(stream),
             Self::Fanout(stream) => Self::Fanout(stream.defer_abort_until_first_item()),
+            Self::Tracked(stream) => {
+                let TrackedStream {
+                    inner,
+                    worker,
+                    prefill,
+                    progress,
+                } = *stream;
+                Self::Tracked(Box::new(TrackedStream {
+                    inner: inner.defer_abort_until_first_item(),
+                    worker,
+                    prefill,
+                    progress,
+                }))
+            }
         }
     }
 }
@@ -3540,5 +3971,42 @@ mod tests {
         ] {
             assert_eq!(complete.chunk_semantics(), ChunkSemantics::Cumulative);
         }
+    }
+
+    #[test]
+    fn tokenspeed_generate_messages_expose_the_engine_weight_version() {
+        let complete = ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete {
+            weight_version: Some("v7".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(complete.weight_version(), Some("v7"));
+        let empty = ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete {
+            weight_version: Some(String::new()),
+            ..Default::default()
+        });
+        assert_eq!(empty.weight_version(), None, "empty is the same as unset");
+        let placeholder = ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete {
+            weight_version: Some("default".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            placeholder.weight_version(),
+            None,
+            "the engine's own placeholder is not a version and must not shadow a label"
+        );
+        let unset = ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete::default());
+        assert_eq!(unset.weight_version(), None);
+
+        let chunk = ProtoGenerateStreamChunk::TokenSpeed(tokenspeed::GenerateStreamChunk {
+            weight_version: Some("v7".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(chunk.weight_version(), Some("v7"));
+        let sglang = ProtoGenerateComplete::Sglang(sglang::GenerateComplete::default());
+        assert_eq!(
+            sglang.weight_version(),
+            None,
+            "no other proto carries the field"
+        );
     }
 }

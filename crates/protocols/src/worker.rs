@@ -309,11 +309,11 @@ impl std::str::FromStr for RuntimeType {
 ///
 /// Different providers have different API formats and requirements.
 /// `None` (when used as `Option<ProviderType>`) means native/passthrough —
-/// no transformation needed (local SGLang backends).
+/// no transformation needed (local engine backends).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderType {
-    /// OpenAI API — strip SGLang-specific fields.
+    /// OpenAI API — strip the engine-specific fields.
     #[serde(alias = "openai")]
     OpenAI,
     /// xAI/Grok — special handling for input items.
@@ -677,13 +677,13 @@ pub struct WorkerSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_role: Option<String>,
 
-    /// KV transfer engine id (vLLM `kv_transfer_config.engine_id`; Mooncake PD).
+    /// KV transfer engine id (the engine's `kv_transfer_config.engine_id`; Mooncake PD).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_engine_id: Option<String>,
 
     /// KV cache block size (tokens per block) for event-driven routing.
     /// When set, overrides the router-level default for this worker's model.
-    /// Typically matches the backend engine's page size (e.g. 16 for SGLang).
+    /// Typically matches the backend engine's page size (e.g. 16 for one of the engines).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_block_size: Option<usize>,
     /// Explicit PD pairing protocol. A prefill and a decode with this set
@@ -841,7 +841,7 @@ impl std::str::FromStr for TransportMode {
     }
 }
 
-/// Where media is fetched and preprocessed for vLLM gRPC workers.
+/// Where media is fetched and preprocessed for one engine's gRPC workers.
 ///
 /// - `Auto`: forward media references when every worker serving the model
 ///   advertises worker-side processing; otherwise preprocess on the router.
@@ -939,6 +939,12 @@ pub struct WorkerInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pd_pairing: Option<String>,
 
+    /// Why the gateway's liveness tracker currently keeps the worker out of
+    /// routing (`unreachable` or `wedged`) while its health status stands;
+    /// absent when it is routable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled: Option<String>,
+
     /// The worker's last polled engine load, as published by the load
     /// monitor. `None` when load monitoring has produced nothing for this
     /// worker yet. Unrelated to `load` above, which counts in-flight
@@ -962,6 +968,7 @@ impl WorkerInfo {
             load: 0,
             http2: false,
             pd_pairing: None,
+            stalled: None,
             engine_load: None,
             job_status,
         }
@@ -1335,7 +1342,7 @@ pub struct StopProfileRequest {
 
 /// Per-DP-rank load snapshot from a backend.
 ///
-/// Contains core metrics from the sglang `/v1/loads` endpoint or `GetLoads` gRPC RPC.
+/// Contains core metrics from the engine's `/v1/loads` endpoint or the `GetLoads` gRPC RPC.
 /// Each snapshot represents one data-parallel rank's scheduler state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -1358,6 +1365,10 @@ pub struct SchedulerLoadSnapshot {
     pub max_total_num_tokens: i32,
     /// Token usage ratio (0.0–1.0).
     pub token_usage: f64,
+    /// Non-evictable KV occupancy, excluding retained, reclaimable prefix cache.
+    /// Older backends omit this; pressure then uses their legacy token usage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_token_usage: Option<f64>,
     pub gen_throughput: f64,
     pub cache_hit_rate: f64,
     pub utilization: f64,
@@ -1368,7 +1379,7 @@ pub struct SchedulerLoadSnapshot {
     pub queues: Option<EngineQueueMetricsSnapshot>,
     /// PD disaggregation signals, populated only when the backend reports a
     /// `disagg` section. `None` for HTTP or older engines. Canonical schema
-    /// other engines map into; SGLang derives the queue depths from its
+    /// other engines map into; one engine derives the queue depths from its
     /// per-stage DisaggregationMetrics counters.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_transfer_latency_ms: Option<f64>,
@@ -1455,6 +1466,14 @@ pub struct WorkerLoadResponse {
     pub loads: Vec<SchedulerLoadSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aggregate: Option<EngineAggregateMetricsSnapshot>,
+    /// When the engine's state behind this report was sampled, on the
+    /// gateway's clock: the poll's receipt, or a pushed record's receipt
+    /// less its age and the one-way latency. A policy that books in-flight
+    /// work locally releases only what it dispatched before this instant.
+    /// Not serialized: it is meaningful only in the process that set it.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub sampled_at: Option<std::time::Instant>,
 }
 
 impl WorkerLoadResponse {
@@ -1464,6 +1483,18 @@ impl WorkerLoadResponse {
             return 0.0;
         }
         self.loads.iter().map(|l| l.token_usage).sum::<f64>() / self.loads.len() as f64
+    }
+
+    /// Average non-evictable KV pressure, with the legacy fallback per rank.
+    pub fn effective_kv_pressure(&self) -> f64 {
+        if self.loads.is_empty() {
+            return 0.0;
+        }
+        self.loads
+            .iter()
+            .map(|load| load.active_token_usage.unwrap_or(load.token_usage))
+            .sum::<f64>()
+            / self.loads.len() as f64
     }
 
     /// Total used tokens summed across all DP ranks.
@@ -1492,6 +1523,11 @@ impl WorkerLoadResponse {
             .iter()
             .map(|l| l.num_waiting_uncached_tokens as i64)
             .sum()
+    }
+
+    /// Total running requests summed across all DP ranks.
+    pub fn total_running_reqs(&self) -> i64 {
+        self.loads.iter().map(|l| l.num_running_reqs as i64).sum()
     }
 
     /// Total waiting (queued) requests summed across all DP ranks.

@@ -322,7 +322,7 @@ impl TokenSpeedSchedulerClient {
             frequency_penalty: Some(request.frequency_penalty.unwrap_or(0.0)),
             presence_penalty: Some(request.presence_penalty.unwrap_or(0.0)),
             repetition_penalty: Some(request.repetition_penalty.unwrap_or(1.0)),
-            max_new_tokens: request.max_completion_tokens,
+            max_new_tokens: request.output_token_cap(),
             stop: stop_sequences,
             stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
             skip_special_tokens: true,
@@ -715,6 +715,7 @@ impl From<tokenspeed_proto::SchedulerLoad> for openai_protocol::worker::Schedule
             num_used_tokens: load.num_used_tokens,
             max_total_num_tokens: load.max_total_num_tokens,
             token_usage: load.token_usage,
+            active_token_usage: load.active_token_usage,
             gen_throughput: load.gen_throughput,
             cache_hit_rate: load.cache_hit_rate,
             utilization: load.utilization,
@@ -745,6 +746,7 @@ impl From<tokenspeed_proto::GetLoadsResponse> for openai_protocol::worker::Worke
             dp_rank_count: resp.dp_rank_count,
             loads: resp.loads.into_iter().map(Into::into).collect(),
             aggregate,
+            sampled_at: None,
         }
     }
 }
@@ -769,6 +771,7 @@ mod load_conversion_tests {
                 max_running_requests: 32,
                 num_waiting_uncached_tokens: 1_280,
                 token_usage: 0.5,
+                active_token_usage: Some(0.25),
                 gen_throughput: 105.25,
                 cache_hit_rate: 0.75,
                 utilization: 0.5,
@@ -799,6 +802,9 @@ mod load_conversion_tests {
         assert_eq!(converted.timestamp, "2026-08-09T12:34:56Z");
         assert_eq!(converted.version, "dsv4-engine/0.1.0");
         let load = &converted.loads[0];
+        assert_eq!(load.active_token_usage, Some(0.25));
+        assert_eq!(converted.effective_kv_pressure(), 0.25);
+        assert_eq!(converted.effective_token_usage(), 0.5);
         assert!(matches!(
             load.memory,
             Some(ref memory)

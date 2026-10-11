@@ -7,7 +7,7 @@ use std::{
 };
 
 use axum::{
-    extract::{Extension, Path, Query, Request, State},
+    extract::{Extension, Path, Query, RawQuery, Request, State},
     http::{header::InvalidHeaderName, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -18,6 +18,7 @@ use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
     completion::CompletionRequest,
+    decisions::DecisionsRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     interactions::InteractionsRequest,
@@ -30,13 +31,13 @@ use openai_protocol::{
     },
     rerank::{RerankRequest, V1RerankReqInput},
     responses::ResponsesRequest,
+    systemone::SystemOneRequest,
     tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
     validated::ValidatedJson,
     worker::{
         ListWorkersQuery, StartProfileRequest, StopProfileRequest, WorkerSpec, WorkerUpdateRequest,
     },
 };
-use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::Value;
 use smg_mesh::{MeshServerBuilder, MeshServerConfig, MeshServerHandler};
@@ -52,6 +53,7 @@ use crate::{
     mesh_discovery::{start_mesh_discovery, MeshDiscoveryConfig},
     middleware::{self, AdmissionQueue, AuthConfig},
     observability::{
+        heap_profile,
         inflight_tracker::InFlightRequestTracker,
         logging::{self, LoggingConfig},
         metrics::{self, PrometheusConfig},
@@ -59,11 +61,12 @@ use crate::{
     },
     routers::{
         common::realtime::ws::RealtimeQueryParams,
+        error as route_error,
         gateway::Gateway,
         http::router::{stream_eligible_request_bodies, StreamBodyState},
         RouterTrait,
     },
-    service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
+    service_discovery::{start_service_discovery, RuntimeDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
         manager::{WorkerManager, WorkerManagerConfig},
@@ -102,8 +105,34 @@ async fn parse_reasoning(
     parse::parse_reasoning(&state.context, &req).await
 }
 
-async fn sink_handler() -> Response {
-    StatusCode::NOT_FOUND.into_response()
+/// An unknown URL: a JSON envelope, never an empty body.
+async fn sink_handler(request: Request) -> Response {
+    unknown_route(StatusCode::NOT_FOUND, "unknown_url", request).await
+}
+
+/// A known URL with the wrong method (axum adds the `Allow` header).
+async fn method_not_allowed_handler(request: Request) -> Response {
+    unknown_route(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        request,
+    )
+    .await
+}
+
+/// The envelope of the API the request speaks: the Messages API's on a
+/// Messages route or when the request carries `anthropic-version` (a model
+/// lookup by an Anthropic SDK), the OpenAI-shaped one otherwise.
+async fn unknown_route(status: StatusCode, code: &str, request: Request) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let response =
+        route_error::create_error(status, code, format!("Invalid URL ({method} {path})"));
+    if middleware::wants_messages_envelope(request.headers(), &path) {
+        middleware::into_messages_envelope(response, middleware::request_id_of(&request)).await
+    } else {
+        response
+    }
 }
 
 async fn liveness() -> Response {
@@ -139,6 +168,15 @@ async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Re
 
 async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response {
     models::list_models(&state.context, req.headers()).await
+}
+
+async fn v1_model(
+    State(state): State<Arc<AppState>>,
+    Path(model_id): Path<String>,
+    req: Request,
+) -> Response {
+    let request_id = middleware::request_id_of(&req);
+    models::retrieve_model(&state.context, req.headers(), &model_id, request_id).await
 }
 
 async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
@@ -266,6 +304,40 @@ async fn v1_interactions(
         .await
 }
 
+async fn v1_decisions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
+    ValidatedJson(body): ValidatedJson<DecisionsRequest>,
+) -> Response {
+    let model = body.model.clone();
+    cancel
+        .guard(
+            state
+                .router
+                .route_decisions(Some(&headers), &tenant_meta, body, &model),
+        )
+        .await
+}
+
+async fn v1_systemone(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
+    ValidatedJson(body): ValidatedJson<SystemOneRequest>,
+) -> Response {
+    let model = body.model.clone();
+    cancel
+        .guard(
+            state
+                .router
+                .route_systemone(Some(&headers), &tenant_meta, body, &model),
+        )
+        .await
+}
+
 async fn v1_embeddings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -283,6 +355,81 @@ async fn v1_embeddings(
         .await
 }
 
+/// The public Messages API knows only its dated versions: a request whose
+/// `anthropic-version` is not a calendar date of 2023 or later is refused as
+/// the public API refuses it, before anything is routed. A request without
+/// the header is served as the current version: this gateway's own SDK
+/// clients send none, and the header selects nothing here.
+fn check_anthropic_version(headers: &HeaderMap) -> Result<(), Response> {
+    let Some(value) = headers.get("anthropic-version") else {
+        return Ok(());
+    };
+    let version = value.to_str().unwrap_or_default();
+    if is_anthropic_version(version) {
+        Ok(())
+    } else {
+        Err(route_error::bad_request(
+            "invalid_anthropic_version",
+            format!("anthropic-version: \"{version}\" is not a valid version"),
+        ))
+    }
+}
+
+/// `YYYY-MM-DD`, a real calendar date, 2023 (the first public version) or
+/// later.
+fn is_anthropic_version(version: &str) -> bool {
+    let bytes = version.as_bytes();
+    let shaped = bytes.len() == 10
+        && bytes.iter().enumerate().all(|(i, b)| {
+            if i == 4 || i == 7 {
+                *b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        });
+    if !shaped {
+        return false;
+    }
+    let field = |range: std::ops::Range<usize>| version[range].parse::<u32>().unwrap_or(0);
+    let (year, month, day) = (field(0..4), field(5..7), field(8..10));
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 0,
+    };
+    year >= 2023 && (1..=days).contains(&day)
+}
+
+/// `thinking.budget_tokens` must leave room under `max_tokens` for the
+/// answer, unless the interleaved-thinking beta is on: then the budget covers
+/// every thinking block of the turn and the public API takes a budget at or
+/// above `max_tokens`. The rule reads the `anthropic-beta` header, so it runs
+/// here rather than in the request's own validation.
+fn check_thinking_budget(headers: &HeaderMap, body: &CreateMessageRequest) -> Result<(), Response> {
+    let Some(openai_protocol::messages::ThinkingConfig::Enabled { budget_tokens, .. }) =
+        &body.thinking
+    else {
+        return Ok(());
+    };
+    let interleaved = headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|beta| beta.trim().starts_with("interleaved-thinking"));
+    if interleaved || *budget_tokens < body.max_tokens {
+        Ok(())
+    } else {
+        Err(route_error::bad_request(
+            "thinking_budget_exceeds_max_tokens",
+            "`max_tokens` must be greater than `thinking.budget_tokens`",
+        ))
+    }
+}
+
 async fn v1_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -290,6 +437,12 @@ async fn v1_messages(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<CreateMessageRequest>,
 ) -> Response {
+    if let Err(refused) = check_anthropic_version(&headers) {
+        return refused;
+    }
+    if let Err(refused) = check_thinking_budget(&headers, &body) {
+        return refused;
+    }
     let model = body.model.clone();
     cancel
         .guard(
@@ -305,8 +458,11 @@ async fn v1_messages_count_tokens(
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
-    Json(body): Json<CountMessageTokensRequest>,
+    ValidatedJson(body): ValidatedJson<CountMessageTokensRequest>,
 ) -> Response {
+    if let Err(refused) = check_anthropic_version(&headers) {
+        return refused;
+    }
     let model = body.model.clone();
     cancel
         .guard(
@@ -442,12 +598,6 @@ async fn v1_conversations_list_items(
     .await
 }
 
-#[derive(Deserialize, Default)]
-struct GetItemQuery {
-    /// Additional fields to include in response (not yet implemented)
-    include: Option<Vec<String>>,
-}
-
 async fn v1_conversations_create_items(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<String>,
@@ -465,14 +615,20 @@ async fn v1_conversations_create_items(
 async fn v1_conversations_get_item(
     State(state): State<Arc<AppState>>,
     Path((conversation_id, item_id)): Path<(String, String)>,
-    Query(query): Query<GetItemQuery>,
+    RawQuery(query): RawQuery,
 ) -> Response {
+    // `include` arrives as repeated `include[]=` / `include=` pairs; each value
+    // must name an includable field, as the public API requires.
+    let include = match conversations::parse_item_include_query(query.as_deref()) {
+        Ok(include) => include,
+        Err(response) => return response,
+    };
     conversations::get_conversation_item(
         &state.context.conversation_storage,
         &state.context.conversation_item_storage,
         &conversation_id,
         &item_id,
-        query.include,
+        include,
     )
     .await
 }
@@ -578,6 +734,15 @@ async fn stop_profile(
 ) -> Response {
     let body = body.map_or_else(StopProfileRequest::default, |Json(body)| body);
     WorkerManager::stop_profile_all(&state.context.worker_registry, body.url.as_deref())
+        .await
+        .into_response()
+}
+
+/// `POST /heap_profile`: a heap profile of this gateway process, written
+/// under `--jemalloc-prof-dir` by a `jemalloc-profiling` build (see
+/// [`heap_profile`]).
+async fn dump_heap_profile(State(state): State<Arc<AppState>>) -> Response {
+    heap_profile::dump_blocking(state.context.router_config.jemalloc_prof_dir.clone())
         .await
         .into_response()
 }
@@ -755,7 +920,7 @@ pub struct ServerConfig {
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
     pub log_json: bool,
-    pub service_discovery_config: Option<ServiceDiscoveryConfig>,
+    pub service_discovery_config: Option<RuntimeDiscoveryConfig>,
     /// Kubernetes discovery of SMG mesh router peers. Independent of the
     /// worker discovery provider: either may run without the other.
     pub mesh_discovery_config: Option<MeshDiscoveryConfig>,
@@ -879,6 +1044,15 @@ pub fn build_app(
             .route("/v1/messages/count_tokens", post(v1_messages_count_tokens))
             .route("/v1/interactions", post(v1_interactions))
             .route("/v1/classify", post(v1_classify))
+            .route("/v1/decisions", post(v1_decisions))
+            .route("/v1/systemone", post(v1_systemone))
+            // Bound the buffered body read: inside admission, so a stalled
+            // upload releases its permit, and inside the stream-vs-buffer
+            // decision, since the streamed relay has its own watchdog.
+            .route_layer(axum::middleware::from_fn_with_state(
+                middleware::RequestBodyTimeouts::from_config(&app_state.context.router_config),
+                middleware::request_body_timeout_middleware,
+            ))
             // Per-request buffer-vs-stream decision for typed-JSON bodies;
             // declined requests pass to the handlers untouched.
             .route_layer(axum::middleware::from_fn_with_state(
@@ -912,6 +1086,11 @@ pub fn build_app(
     .route_layer(axum::middleware::from_fn_with_state(
         app_state.clone(),
         middleware::wasm_middleware,
+    ))
+    // Outermost on these routes: a refusal by any layer inside (authentication,
+    // admission, the body timeout) leaves in the Messages envelope as well.
+    .route_layer(axum::middleware::from_fn(
+        middleware::messages_error_envelope_middleware,
     ));
 
     // WebSocket and WebRTC routes: auth + concurrency but NO WASM middleware.
@@ -960,6 +1139,9 @@ pub fn build_app(
         .route("/engine_metrics", get(engine_metrics))
         .route("/loads", get(get_loads))
         .route("/v1/models", get(v1_models))
+        // The rest of the path: a self-hosted id usually carries a slash
+        // (an organisation and a name), raw or percent-encoded.
+        .route("/v1/models/{*id}", get(v1_model))
         .route("/get_model_info", get(get_model_info))
         .route("/get_server_info", get(get_server_info));
 
@@ -968,6 +1150,7 @@ pub fn build_app(
         .route("/flush_cache", post(flush_cache))
         .route("/start_profile", post(start_profile))
         .route("/stop_profile", post(stop_profile))
+        .route("/heap_profile", post(dump_heap_profile))
         // Deprecated alias of the public `/loads`.
         .route("/get_loads", get(get_loads))
         .route("/parse/function_call", post(parse_function_call))
@@ -1057,8 +1240,8 @@ pub fn build_app(
     .with_state(app_state))
 }
 
-/// The middleware every request crosses, matched or not: body limits, access
-/// logging, HTTP metrics, request ids and CORS.
+/// The middleware every request crosses, matched or not: body limits, the
+/// trace-context echo, access logging, HTTP metrics, request ids and CORS.
 ///
 /// `Router::layer` wraps only what the router holds when it is called, so the
 /// not-found fallback goes in first. Registered after the layers, unknown
@@ -1075,9 +1258,19 @@ where
     S: Clone + Send + Sync + 'static,
 {
     app.fallback(sink_handler)
+        .method_not_allowed_fallback(method_not_allowed_handler)
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
+        ))
+        // The Messages envelope once more, outside the body-size limit: a
+        // declared over-limit length is refused by the limit layer before any
+        // route layer runs, and still leaves in the envelope.
+        .layer(axum::middleware::from_fn(
+            middleware::messages_error_envelope_middleware,
+        ))
+        .layer(axum::middleware::from_fn(
+            middleware::trace_context_response,
         ))
         .layer(middleware::create_logging_layer())
         .layer(middleware::HttpMetricsLayer::new(inflight_tracker))
@@ -1125,6 +1318,8 @@ fn supervise_discovery(
 }
 
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    crate::tls::install_crypto_provider();
+
     // Defense in depth: the CLI and Python bindings both validate via
     // `RouterConfigBuilder::build()` before reaching here, but `RouterConfig`
     // is public and `Deserialize`, so a Rust library caller can construct
@@ -1190,6 +1385,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // port conflicts or bad addresses.
     if let Some(prometheus_config) = &config.prometheus_config {
         let handle = metrics::start_prometheus(prometheus_config.clone());
+        metrics::init_startup_series();
         let (_metrics_addr, _server_handle) = metrics_server::start_metrics_server(
             handle,
             prometheus_config.host.clone(),
@@ -1431,11 +1627,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         };
 
     if app_context.rate_limiter.is_none() {
-        info!("Rate limiting is disabled (max_concurrent_requests = -1)");
+        info!("Admission control is disabled (max_concurrent_requests = 0)");
     } else if admission_queue.is_none() {
         debug!(
-            "Rate limiting enabled (max_concurrent_requests = {}, queue disabled)",
-            config.router_config.max_concurrent_requests
+            "Admission queue disabled (queue_size = 0): requests past the in-flight bound are rejected at once"
         );
     }
 
@@ -1484,19 +1679,17 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let mut discovery_tasks = DiscoveryTasks::default();
 
     if let Some(service_discovery_config) = config.service_discovery_config {
-        if service_discovery_config.enabled {
-            let app_context_arc = Arc::clone(&app_state.context);
-            match start_service_discovery(service_discovery_config, app_context_arc).await {
-                Ok(handle) => {
-                    info!("Service discovery started");
-                    discovery_tasks
-                        .0
-                        .push(supervise_discovery("Worker discovery", handle));
-                }
-                Err(e) => {
-                    error!("Failed to start service discovery: {e}");
-                    warn!("Continuing without service discovery");
-                }
+        let app_context_arc = Arc::clone(&app_state.context);
+        match start_service_discovery(service_discovery_config, app_context_arc).await {
+            Ok(handle) => {
+                info!("Service discovery started");
+                discovery_tasks
+                    .0
+                    .push(supervise_discovery("Worker discovery", handle));
+            }
+            Err(e) => {
+                error!("Failed to start service discovery: {e}");
+                warn!("Continuing without service discovery");
             }
         }
     }
@@ -1556,6 +1749,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let control_plane_auth_state =
         smg_auth::ControlPlaneAuthState::try_init(config.control_plane_auth.as_ref()).await;
 
+    // Name what this start leaves open, once, before the listener opens:
+    // an unauthenticated gateway is a decision, not an omission.
+    crate::posture::log_open_posture(
+        &serving_auth_config,
+        &admin_auth_config,
+        control_plane_auth_state.is_some(),
+        config.prometheus_config.as_ref(),
+        config.mesh_server_config.as_ref(),
+    );
+
     let app = build_app(
         app_state,
         serving_auth_config,
@@ -1566,14 +1769,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.cors_allowed_origins.clone(),
     )?;
 
-    // TcpListener::bind accepts &str and handles IPv4/IPv6 via ToSocketAddrs
-    let bind_addr = format!("{}:{}", config.host, config.port);
-    info!("Starting server on {}", bind_addr);
-
-    // Parse address and set up graceful shutdown (common to both TLS and non-TLS)
-    let addr: std::net::SocketAddr = bind_addr
-        .parse()
+    // One bind-host rule for every listener: IPv6 with or without brackets.
+    let addr = crate::config::bind_socket_addr(&config.host, config.port)
         .map_err(|e| format!("Invalid address: {e}"))?;
+    info!("Starting server on {addr}");
+
+    // Set up graceful shutdown (common to both TLS and non-TLS)
 
     let handle = axum_server::Handle::new();
     let handle_clone = handle.clone();
@@ -1635,10 +1836,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         &config.router_config.server_key,
     ) {
         info!("TLS enabled");
-        ring::default_provider()
-            .install_default()
-            .map_err(|e| format!("Failed to install rustls ring provider: {e:?}"))?;
-
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem(cert.clone(), key.clone())
             .await
             .map_err(|e| format!("Failed to create TLS config: {e}"))?;
@@ -1741,8 +1938,16 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
                 http::header::AUTHORIZATION,
                 http::header::HeaderName::from_static("anthropic-version"),
                 http::header::HeaderName::from_static("anthropic-beta"),
+                http::header::HeaderName::from_static("traceparent"),
+                http::header::HeaderName::from_static("tracestate"),
             ])
-            .expose_headers([http::header::HeaderName::from_static("x-request-id")])
+            // The request id and the echoed trace context, readable by
+            // browser clients.
+            .expose_headers([
+                http::header::HeaderName::from_static("x-request-id"),
+                http::header::HeaderName::from_static("traceparent"),
+                http::header::HeaderName::from_static("tracestate"),
+            ])
     };
 
     cors.max_age(Duration::from_secs(3600))
@@ -1758,6 +1963,72 @@ mod tests {
 
     use super::*;
     use crate::config::TenantApiKeyEntry;
+
+    /// A request without `anthropic-version` is served (this gateway's own
+    /// SDK clients send none); a version that is not a real calendar date of
+    /// 2023 or later is refused, as the public API refuses it.
+    #[test]
+    fn messages_requests_take_a_missing_version_and_refuse_a_malformed_one() {
+        let with = |value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("anthropic-version", http::HeaderValue::from_static(value));
+            headers
+        };
+        assert!(check_anthropic_version(&HeaderMap::new()).is_ok());
+        for ok in ["2023-06-01", "2023-01-01", "2024-02-29", "2026-12-31"] {
+            assert!(check_anthropic_version(&with(ok)).is_ok(), "{ok}");
+        }
+        for bad in [
+            "1999-01-01",
+            "latest",
+            "2023-6-1",
+            "2023-02-30",
+            "2023-13-01",
+            "2023-00-10",
+            "2023-02-29",
+        ] {
+            let refused = check_anthropic_version(&with(bad)).expect_err(bad);
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{bad}");
+            assert_eq!(
+                route_error::extract_error_code_from_response(&refused),
+                "invalid_anthropic_version",
+                "{bad}"
+            );
+        }
+    }
+
+    /// A thinking budget at or above `max_tokens` is refused as the public
+    /// API refuses it, except under the interleaved-thinking beta, where the
+    /// public API takes it.
+    #[test]
+    fn thinking_budget_must_stay_under_max_tokens_unless_interleaved() {
+        let request = |max_tokens: u32, budget: u32| -> CreateMessageRequest {
+            serde_json::from_value(serde_json::json!({
+                "model": "m", "max_tokens": max_tokens,
+                "thinking": {"type": "enabled", "budget_tokens": budget},
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap()
+        };
+        let plain = HeaderMap::new();
+        assert!(check_thinking_budget(&plain, &request(4096, 1024)).is_ok());
+        let refused = check_thinking_budget(&plain, &request(1024, 1024)).expect_err("refused");
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            route_error::extract_error_code_from_response(&refused),
+            "thinking_budget_exceeds_max_tokens"
+        );
+
+        let mut interleaved = HeaderMap::new();
+        interleaved.insert(
+            "anthropic-beta",
+            http::HeaderValue::from_static(
+                "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
+            ),
+        );
+        assert!(check_thinking_budget(&interleaved, &request(1024, 1024)).is_ok());
+        assert!(check_thinking_budget(&interleaved, &request(1024, 8192)).is_ok());
+    }
 
     /// The not-found fallback sits inside the edge layers: an unknown route
     /// gets a request id (and a log line and a metric) like a known one.
@@ -1790,6 +2061,287 @@ mod tests {
                 "{path} skipped the edge middleware"
             );
         }
+    }
+
+    /// An unknown URL and a wrong method answer a JSON envelope in the shape
+    /// of the API the request speaks: the Messages envelope on a Messages
+    /// route or with the `anthropic-version` header, the OpenAI-shaped one
+    /// otherwise; never an empty body.
+    #[tokio::test]
+    async fn unknown_routes_answer_the_envelope_of_the_api_spoken() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let app = attach_edge_layers(
+            Router::new().route("/v1/chat/completions", post(|| async { StatusCode::OK })),
+            1024,
+            InFlightRequestTracker::new(),
+            vec![],
+            vec![],
+        );
+        for (method, path, version, status, messages_shape) in [
+            (
+                "GET",
+                "/v1/models/claude-x",
+                None,
+                StatusCode::NOT_FOUND,
+                false,
+            ),
+            (
+                "GET",
+                "/v1/models/claude-x",
+                Some("2023-06-01"),
+                StatusCode::NOT_FOUND,
+                true,
+            ),
+            (
+                "GET",
+                "/v1/messages/batches",
+                None,
+                StatusCode::NOT_FOUND,
+                true,
+            ),
+            (
+                "GET",
+                "/v1/chat/completions",
+                None,
+                StatusCode::METHOD_NOT_ALLOWED,
+                false,
+            ),
+        ] {
+            let mut request = http::Request::builder().method(method).uri(path);
+            if let Some(version) = version {
+                request = request.header("anthropic-version", version);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{method} {path}");
+            let request_id = response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_string();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body)
+                .unwrap_or_else(|_| panic!("{method} {path}: not JSON: {body:?}"));
+            if messages_shape {
+                assert_eq!(json["type"], "error", "{json}");
+                let expected = if status == StatusCode::NOT_FOUND {
+                    "not_found_error"
+                } else {
+                    "invalid_request_error"
+                };
+                assert_eq!(json["error"]["type"], expected, "{json}");
+                assert_eq!(json["request_id"], request_id, "{json}");
+            } else {
+                assert!(json["error"].is_object(), "{json}");
+                assert!(
+                    json["error"]["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains(path)),
+                    "{json}"
+                );
+            }
+        }
+    }
+
+    /// An over-limit body answers 413 whatever its framing: a declared
+    /// Content-Length over the limit is refused by the limit layer before the
+    /// body, and a chunked upload is refused the moment it crosses the limit,
+    /// with the same status, the JSON error envelope (not 400
+    /// json_parse_error) and no further frame pulled from the client.
+    #[tokio::test]
+    async fn over_limit_bodies_answer_413_whatever_the_framing() {
+        use std::sync::atomic::AtomicUsize;
+
+        use axum::{
+            body::{to_bytes, Body},
+            http::header::{CONTENT_LENGTH, CONTENT_TYPE},
+        };
+        use bytes::Bytes;
+        use futures::StreamExt;
+        use tower::ServiceExt;
+
+        let app = attach_edge_layers(
+            Router::new()
+                .route(
+                    "/v1/chat/completions",
+                    post(
+                        |ValidatedJson(_): ValidatedJson<ChatCompletionRequest>| async {
+                            StatusCode::OK
+                        },
+                    ),
+                )
+                .route(
+                    "/v1/messages",
+                    post(
+                        |ValidatedJson(_): ValidatedJson<ChatCompletionRequest>| async {
+                            StatusCode::OK
+                        },
+                    ),
+                ),
+            1024,
+            InFlightRequestTracker::new(),
+            vec![],
+            vec![],
+        );
+        let oversized = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
+            "x".repeat(2048)
+        );
+
+        // Chunked: 256-byte frames and no Content-Length, so only the body
+        // read can discover the overrun; four frames fit, the fifth crosses.
+        let frames: Vec<Result<Bytes, Infallible>> = oversized
+            .as_bytes()
+            .chunks(256)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+            .collect();
+        let total_frames = frames.len();
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&pulled);
+        let body = Body::from_stream(futures::stream::iter(frames).inspect(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        let response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "request_body_too_large");
+        let pulled = pulled.load(Ordering::SeqCst);
+        assert!(
+            pulled <= 5 && pulled < total_frames,
+            "reading must stop at the limit: {pulled} of {total_frames} frames pulled"
+        );
+
+        // Declared length on a Messages route: refused by the limit layer
+        // before the body, and still the Messages envelope.
+        let response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(CONTENT_LENGTH, oversized.len())
+                    .body(Body::from(oversized.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let request_id = response.headers()["x-request-id"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["type"], "error", "{json}");
+        assert_eq!(json["error"]["type"], "request_too_large", "{json}");
+        assert_eq!(json["request_id"], request_id, "{json}");
+
+        // Declared length: refused by the limit layer before the body.
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(CONTENT_LENGTH, oversized.len())
+                    .body(Body::from(oversized))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// The same answer survives the request-body watchdog the typed-JSON
+    /// routes add inside the edge layers: it wraps the body, which boxes the
+    /// limit error once more, past where the extractor looks for it. A
+    /// chunked upload over the limit is still 413 request_body_too_large
+    /// (not 400 json_parse_error) and no frame past the limit is pulled.
+    #[tokio::test]
+    async fn chunked_over_limit_body_is_413_behind_the_body_watchdog() {
+        use std::sync::atomic::AtomicUsize;
+
+        use axum::{
+            body::{to_bytes, Body},
+            http::header::CONTENT_TYPE,
+        };
+        use bytes::Bytes;
+        use futures::StreamExt;
+        use tower::ServiceExt;
+
+        let app = attach_edge_layers(
+            Router::new()
+                .route(
+                    "/v1/chat/completions",
+                    post(
+                        |ValidatedJson(_): ValidatedJson<ChatCompletionRequest>| async {
+                            StatusCode::OK
+                        },
+                    ),
+                )
+                .route_layer(axum::middleware::from_fn_with_state(
+                    middleware::RequestBodyTimeouts::from_config(&RouterConfig::default()),
+                    middleware::request_body_timeout_middleware,
+                )),
+            1024,
+            InFlightRequestTracker::new(),
+            vec![],
+            vec![],
+        );
+        let oversized = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
+            "x".repeat(2048)
+        );
+        let frames: Vec<Result<Bytes, Infallible>> = oversized
+            .as_bytes()
+            .chunks(256)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+            .collect();
+        let total_frames = frames.len();
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&pulled);
+        let body = Body::from_stream(futures::stream::iter(frames).inspect(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "request_body_too_large");
+        let pulled = pulled.load(Ordering::SeqCst);
+        assert!(
+            pulled <= 5 && pulled < total_frames,
+            "reading must stop at the limit: {pulled} of {total_frames} frames pulled"
+        );
     }
 
     #[tokio::test]
@@ -1887,7 +2439,10 @@ mod tests {
                 .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>());
             let checking = async {
                 let addr = handle.listening().await.expect("HTTP server did not bind");
-                let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                let client = crate::http_client::client_builder()
+                    .no_proxy()
+                    .build()
+                    .unwrap();
                 for (path, content_type, expected) in [
                     ("plain", "application/json", "{\"ok\":true}"),
                     (

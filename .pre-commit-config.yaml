@@ -7,7 +7,12 @@ repos:
       - id: check-symlinks
       - id: destroyed-symlinks
       - id: trailing-whitespace
+        # Patch files keep their whitespace: a blank context line is a single space.
+        exclude: \.patch$
       - id: end-of-file-fixer
+        # Recorded SSE streams end with the protocol's blank line, and the
+        # streaming tests compare them byte for byte.
+        exclude: \.sse$
       - id: check-yaml
         args: [--allow-multiple-documents, --unsafe]
         exclude: ^deploy/helm/.*/templates/|^deploy/helm/.*/tests/

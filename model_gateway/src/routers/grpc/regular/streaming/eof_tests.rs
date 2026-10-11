@@ -4,27 +4,31 @@ use std::time::Duration;
 
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use bytes::BufMut;
+use futures::{stream, StreamExt as _};
 use http_body::Frame;
 use http_body_util::StreamBody;
 use llm_tokenizer::{traits::Encoding, SpecialTokens};
-use openai_protocol::chat::ChatCompletionRequest;
+use openai_protocol::{chat::ChatCompletionRequest, worker::HealthCheckConfig};
 use prost::Message as ProstMessage;
 use smg_grpc_client::vllm_engine::{
     proto, proto::generate_response::Response as GenerationEvent, AbortOnDropStream,
     VllmEngineClient,
 };
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle, time::timeout};
 use tonic::codec::Codec;
 use tool_parser::types::ToolCallItem;
 
 use super::*;
 use crate::{
     routers::{common::sse::SseReceiver, grpc::regular::processor::ResponseProcessor},
-    worker::WorkerRegistry,
+    worker::{
+        circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        BasicWorkerBuilder, Worker, WorkerRegistry,
+    },
 };
 
 #[derive(Default)]
-struct CharacterTokenizer {
+pub(super) struct CharacterTokenizer {
     special_tokens: SpecialTokens,
 }
 
@@ -75,7 +79,7 @@ impl Tokenizer for CharacterTokenizer {
     }
 }
 
-fn chunk(index: u32, text: &str) -> proto::GenerateResponse {
+pub(super) fn chunk(index: u32, text: &str) -> proto::GenerateResponse {
     let token_ids: Vec<_> = text.chars().map(u32::from).collect();
     proto::GenerateResponse {
         response: Some(GenerationEvent::Chunk(proto::GenerateStreamChunk {
@@ -87,11 +91,28 @@ fn chunk(index: u32, text: &str) -> proto::GenerateResponse {
     }
 }
 
-fn complete(index: u32, reason: &str) -> proto::GenerateResponse {
+/// A chunk that also reports one logprob per token.
+pub(super) fn chunk_with_logprobs(index: u32, text: &str) -> proto::GenerateResponse {
+    let mut response = chunk(index, text);
+    if let Some(GenerationEvent::Chunk(chunk)) = &mut response.response {
+        chunk.output_logprobs = Some(proto::OutputLogProbs {
+            token_logprobs: vec![-0.5; chunk.token_ids.len()],
+            token_ids: chunk.token_ids.clone(),
+            top_logprobs: Vec::new(),
+        });
+    }
+    response
+}
+
+pub(super) fn complete(index: u32, reason: &str) -> proto::GenerateResponse {
     complete_with_prompt(index, reason, 1)
 }
 
-fn complete_with_prompt(index: u32, reason: &str, prompt_tokens: u32) -> proto::GenerateResponse {
+pub(super) fn complete_with_prompt(
+    index: u32,
+    reason: &str,
+    prompt_tokens: u32,
+) -> proto::GenerateResponse {
     proto::GenerateResponse {
         response: Some(GenerationEvent::Complete(proto::GenerateComplete {
             index,
@@ -105,19 +126,99 @@ fn complete_with_prompt(index: u32, reason: &str, prompt_tokens: u32) -> proto::
 
 /// The mock server accepts the client connection. This test supplies the
 /// response frames and controls EOF.
+pub(super) async fn scripted_stream(
+    responses: Vec<proto::GenerateResponse>,
+    grpc_status: &'static str,
+) -> (ProtoStream, JoinHandle<()>) {
+    let frames: Vec<Result<Frame<Bytes>, tonic::Status>> = responses
+        .iter()
+        .map(|response| Ok(data_frame(response)))
+        .chain(std::iter::once(Ok(trailers_frame(grpc_status))))
+        .collect();
+    let (client, server) = mock_client().await;
+    let stream = response_stream(stream::iter(frames), client);
+    (stream, server)
+}
+
+/// [`scripted_stream`] with the frames after `first` held back until `gate`
+/// fires: the processor sees the first engine output on its own.
+pub(super) async fn gated_stream(
+    first: Vec<proto::GenerateResponse>,
+    gate: oneshot::Receiver<()>,
+    rest: Vec<proto::GenerateResponse>,
+    grpc_status: &'static str,
+) -> (ProtoStream, JoinHandle<()>) {
+    let head: Vec<Result<Frame<Bytes>, tonic::Status>> = first
+        .iter()
+        .map(|response| Ok(data_frame(response)))
+        .collect();
+    let tail: Vec<Result<Frame<Bytes>, tonic::Status>> = rest
+        .iter()
+        .map(|response| Ok(data_frame(response)))
+        .chain(std::iter::once(Ok(trailers_frame(grpc_status))))
+        .collect();
+    let (client, server) = mock_client().await;
+    let gated = stream::once(async move {
+        let _ = gate.await;
+        stream::iter(tail)
+    })
+    .flatten();
+    let stream = response_stream(stream::iter(head).chain(gated), client);
+    (stream, server)
+}
+
+/// One length-prefixed gRPC data frame carrying `response`.
+fn data_frame(response: &proto::GenerateResponse) -> Frame<Bytes> {
+    let encoded = response.encode_to_vec();
+    let mut frame = Vec::with_capacity(encoded.len() + 5);
+    frame.put_u8(0);
+    frame.put_u32(encoded.len() as u32);
+    frame.extend_from_slice(&encoded);
+    Frame::data(Bytes::from(frame))
+}
+
+/// The trailers frame that ends a gRPC response with `grpc_status`.
+fn trailers_frame(grpc_status: &'static str) -> Frame<Bytes> {
+    let mut trailers = HeaderMap::new();
+    trailers.insert("grpc-status", HeaderValue::from_static(grpc_status));
+    Frame::trailers(trailers)
+}
+
+/// A decoded response stream over `body`, owned by `client` as a worker
+/// stream that was never dispatched (nothing to cancel on drop).
+fn response_stream<S>(body: S, client: VllmEngineClient) -> ProtoStream
+where
+    S: futures::Stream<Item = Result<Frame<Bytes>, tonic::Status>> + Send + 'static,
+{
+    let mut codec =
+        tonic_prost::ProstCodec::<proto::GenerateResponse, proto::GenerateResponse>::default();
+    let stream = tonic::Streaming::new_response(
+        codec.decoder(),
+        StreamBody::new(body),
+        StatusCode::OK,
+        None,
+        None,
+    );
+    let stream = AbortOnDropStream::new(stream, "eof-test".to_string(), client);
+    // No generation was sent to the mock, so there is nothing to cancel.
+    stream.mark_completed();
+    ProtoStream::Vllm(stream)
+}
+
+/// The mock worker a test's client connects to. The test supplies the
+/// response frames itself; the server only accepts the connection.
 #[expect(
     clippy::disallowed_methods,
     reason = "bounded test fixture; server task is explicitly aborted"
 )]
-async fn scripted_stream(
-    responses: Vec<proto::GenerateResponse>,
-    grpc_status: &'static str,
-) -> (ProtoStream, JoinHandle<()>) {
+async fn mock_client() -> (VllmEngineClient, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock worker");
     let port = listener.local_addr().expect("mock worker address").port();
     let config = Arc::new(mock_worker::config::Config {
+        admin_port: None,
+        context_length: 32768,
         host: "127.0.0.1".to_string(),
         http_base_port: 0,
         http_count: 0,
@@ -132,39 +233,16 @@ async fn scripted_stream(
         output_tokens: 0,
         realistic: false,
         engine: mock_worker::engine::EngineParams::default(),
+        ..mock_worker::config::Config::default()
     });
     let server = tokio::spawn(mock_worker::grpc::serve_with_listener(config, listener));
     let client = VllmEngineClient::connect(&format!("http://127.0.0.1:{port}"))
         .await
         .expect("connect mock worker");
-    let mut frames = Vec::new();
-    for response in responses {
-        let encoded = response.encode_to_vec();
-        let mut frame = Vec::with_capacity(encoded.len() + 5);
-        frame.put_u8(0);
-        frame.put_u32(encoded.len() as u32);
-        frame.extend_from_slice(&encoded);
-        frames.push(Ok::<_, tonic::Status>(Frame::data(Bytes::from(frame))));
-    }
-    let mut trailers = HeaderMap::new();
-    trailers.insert("grpc-status", HeaderValue::from_static(grpc_status));
-    frames.push(Ok(Frame::trailers(trailers)));
-    let mut codec =
-        tonic_prost::ProstCodec::<proto::GenerateResponse, proto::GenerateResponse>::default();
-    let stream = tonic::Streaming::new_response(
-        codec.decoder(),
-        StreamBody::new(futures::stream::iter(frames)),
-        StatusCode::OK,
-        None,
-        None,
-    );
-    let stream = AbortOnDropStream::new(stream, "eof-test".to_string(), client);
-    // No generation was sent to the mock, so there is nothing to cancel.
-    stream.mark_completed();
-    (ProtoStream::Vllm(stream), server)
+    (client, server)
 }
 
-fn processor(with_tools: bool) -> StreamingProcessor {
+pub(super) fn processor(with_tools: bool) -> StreamingProcessor {
     StreamingProcessor::new(
         ToolParserFactory::new(),
         ReasoningParserFactory::new(),
@@ -186,7 +264,12 @@ fn dispatch() -> context::DispatchMetadata {
     }
 }
 
-fn chat_spec(with_tools: bool) -> ChatResponseSpec {
+pub(super) fn chat_spec(with_tools: bool) -> ChatResponseSpec {
+    chat_spec_with(with_tools, None)
+}
+
+/// [`chat_spec`] with a `tool_choice` (`"required"`, a named function, ...).
+fn chat_spec_with(with_tools: bool, tool_choice: Option<Value>) -> ChatResponseSpec {
     let mut request = serde_json::json!({
         "model": "eof-test", "messages": [], "stream": true,
         "separate_reasoning": true, "n": 2
@@ -198,12 +281,15 @@ fn chat_spec(with_tools: bool) -> ChatResponseSpec {
             }
         }]);
     }
+    if let Some(tool_choice) = tool_choice {
+        request["tool_choice"] = tool_choice;
+    }
     ChatResponseSpec::from(
         &serde_json::from_value::<ChatCompletionRequest>(request).expect("chat request"),
     )
 }
 
-async fn collect_events(mut rx: SseReceiver) -> Vec<Value> {
+pub(super) async fn collect_events(mut rx: SseReceiver) -> Vec<Value> {
     let mut events = Vec::new();
     while let Some(frame) = rx.recv().await {
         let frame = frame.expect("successful SSE write");
@@ -221,7 +307,16 @@ async fn chat_events(
     responses: Vec<proto::GenerateResponse>,
     with_tools: bool,
     grpc_status: &'static str,
-) -> (Result<(), String>, Vec<Value>) {
+) -> (Result<(), utils::StreamFailure>, Vec<Value>) {
+    chat_events_with_spec(responses, with_tools, chat_spec(with_tools), grpc_status).await
+}
+
+async fn chat_events_with_spec(
+    responses: Vec<proto::GenerateResponse>,
+    with_tools: bool,
+    spec: ChatResponseSpec,
+    grpc_status: &'static str,
+) -> (Result<(), utils::StreamFailure>, Vec<Value>) {
     let (stream, server) = scripted_stream(responses, grpc_status).await;
     let (tx, rx) = sse_channel();
     let result = processor(with_tools)
@@ -230,7 +325,7 @@ async fn chat_events(
             dispatch(),
             Arc::new(CharacterTokenizer::default()),
             (None, None, false, false, false),
-            chat_spec(with_tools),
+            spec,
             &tx,
             None,
         )
@@ -253,6 +348,59 @@ fn chat_text(events: &[Value], index: u32, field: &str) -> String {
             }
         })
         .collect()
+}
+
+#[tokio::test]
+async fn chat_role_chunk_goes_out_on_the_first_engine_output() {
+    // The engine's first output carries nothing visible (as a special token the
+    // decoder skips does); the first visible text is held back behind the gate.
+    let (gate_tx, gate_rx) = oneshot::channel();
+    let (stream, server) = gated_stream(
+        vec![chunk(0, "")],
+        gate_rx,
+        vec![chunk(0, "hi"), complete(0, "stop")],
+        "0",
+    )
+    .await;
+    let (tx, mut rx) = sse_channel();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "bounded test fixture; the task ends with the stream"
+    )]
+    let task = tokio::spawn(async move {
+        let result = processor(false)
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, false),
+                chat_spec(false),
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        result
+    });
+    // The role chunk opens the choice on the engine's first output, not on
+    // its first visible text one step later.
+    let first = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("the role chunk arrives before any visible text")
+        .expect("stream open")
+        .expect("successful SSE write");
+    let text = std::str::from_utf8(&first).expect("UTF-8 SSE");
+    let data = text.trim().strip_prefix("data: ").expect("SSE data line");
+    let event: Value = serde_json::from_str(data).expect("SSE JSON");
+    assert_eq!(event["choices"][0]["delta"]["role"], "assistant");
+    // The role chunk carries an empty content, the shape the engines' own
+    // servers send (role once, content ""), not a null.
+    assert_eq!(event["choices"][0]["delta"]["content"], "");
+    gate_tx.send(()).expect("open the gate");
+    let events = collect_events(rx).await;
+    task.await.expect("stream task").expect("stream processed");
+    assert_eq!(chat_text(&events, 0, "content"), "hi");
+    server.abort();
 }
 
 #[tokio::test]
@@ -296,6 +444,85 @@ async fn chat_eof_preserves_reasoning_and_normal_tails_per_choice() {
     }
 }
 
+/// A stream carries `role` once, in the first delta the OpenAI API opens a
+/// text stream with (`{"role": "assistant", "content": "", "refusal": null}`,
+/// whether the model then answers with text, reasoning or a tool call it
+/// chose itself); later deltas carry neither the role nor a
+/// `reasoning_content: null` placeholder.
+#[tokio::test]
+async fn chat_stream_sends_role_once_in_an_empty_first_content_delta() {
+    let text = vec![chunk(0, "Hi"), chunk(0, "!"), complete(0, "stop")];
+    let reasoning = vec![chunk(0, "<think>why</think>answer"), complete(0, "stop")];
+    let tool = vec![
+        chunk(0, r#"{"name": "lookup", "arguments": {}}"#),
+        complete(0, "stop"),
+    ];
+    for (frames, with_tools, content) in [
+        (text, false, "Hi!"),
+        (reasoning, false, "answer"),
+        (tool, true, ""),
+    ] {
+        let (result, events) = chat_events(frames, with_tools, "0").await;
+        assert!(result.is_ok(), "{result:?}");
+        let deltas: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["choices"][0]["index"] == 0)
+            .map(|event| &event["choices"][0]["delta"])
+            .collect();
+        assert!(deltas.len() > 2, "{events:?}");
+        assert_eq!(
+            deltas[0],
+            &serde_json::json!({"role": "assistant", "content": "", "refusal": null}),
+            "{events:?}"
+        );
+        for delta in &deltas[1..] {
+            assert!(delta.get("role").is_none(), "role repeated: {events:?}");
+            assert!(
+                delta.get("refusal").is_none(),
+                "refusal repeated: {events:?}"
+            );
+            assert!(
+                delta.get("reasoning_content").is_none_or(Value::is_string),
+                "null reasoning placeholder: {events:?}"
+            );
+        }
+        assert_eq!(chat_text(&events, 0, "content"), content, "{events:?}");
+        assert_eq!(
+            deltas.iter().any(|delta| delta["tool_calls"].is_array()),
+            with_tools,
+            "{events:?}"
+        );
+    }
+}
+
+/// A request that forces a tool call (`tool_choice: "required"`, a named
+/// function) opens as the OpenAI API opens a tool-call stream:
+/// `{"role": "assistant", "content": null}`, no `refusal`; the opening chunk
+/// still goes out on the engine's first output.
+#[tokio::test]
+async fn chat_stream_opens_a_forced_tool_call_with_a_null_content() {
+    for tool_choice in [
+        serde_json::json!("required"),
+        serde_json::json!({"type": "function", "function": {"name": "lookup"}}),
+    ] {
+        let frames = vec![
+            chunk(0, r#"{"name": "lookup", "arguments": {}}"#),
+            complete(0, "stop"),
+        ];
+        let spec = chat_spec_with(true, Some(tool_choice.clone()));
+        let (result, events) = chat_events_with_spec(frames, true, spec, "0").await;
+        assert!(result.is_ok(), "{result:?}");
+        let first = &events[0]["choices"][0];
+        assert_eq!(first["index"], 0, "{events:?}");
+        assert_eq!(
+            first["delta"],
+            serde_json::json!({"role": "assistant", "content": null}),
+            "{tool_choice}: {events:?}"
+        );
+        assert!(first["logprobs"].is_null() && first["finish_reason"].is_null());
+    }
+}
+
 #[tokio::test]
 async fn chat_eof_tail_passes_through_buffered_tool_text_in_order() {
     let (result, events) = chat_events(
@@ -311,6 +538,105 @@ async fn chat_eof_tail_passes_through_buffered_tool_text_in_order() {
         .all(|event| event["choices"][0]["delta"]["tool_calls"].is_null()));
 }
 
+/// The Kimi K3 parsers on an output `max_tokens` cuts inside the turn's closing
+/// structure: no marker reaches the content, streamed or whole.
+#[tokio::test]
+async fn kimi_k3_cut_inside_the_closing_structure_keeps_the_markers_out_of_content() {
+    // Thinking off: the prompt opened the response channel; the model answers and
+    // closes the turn, one marker a token. Cut after 8 of the 10 tokens the client
+    // used to receive `Pong.<|close|>message` (smg-lab #115); after 6, and at the
+    // natural end, `Pong.`.
+    let tokens = [
+        "P",
+        "ong",
+        ".",
+        "<|close|>",
+        "response",
+        "<|sep|>",
+        "<|close|>",
+        "message",
+        "<|sep|>",
+    ];
+    for (cut, finish) in [(6, "length"), (8, "length"), (9, "stop")] {
+        let text: String = tokens[..cut].concat();
+        let resolver = || {
+            utils::ParserResolver::new(
+                Arc::new(WorkerRegistry::new()),
+                Some("kimi_k3".to_string()),
+                Some("kimi_k3".to_string()),
+            )
+        };
+        // Streamed, a chunk per token.
+        let mut frames: Vec<_> = tokens[..cut].iter().map(|token| chunk(0, token)).collect();
+        frames.push(complete(0, finish));
+        let (stream, server) = scripted_stream(frames, "0").await;
+        let (tx, rx) = sse_channel();
+        let processor = StreamingProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            resolver(),
+            "vllm",
+        );
+        let result = processor
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, false),
+                chat_spec(false),
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collect_events(rx).await;
+        server.abort();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            chat_text(&events, 0, "content"),
+            "Pong.",
+            "streamed, cut after {cut} tokens"
+        );
+        assert_eq!(chat_text(&events, 0, "reasoning_content"), "");
+        assert!(
+            events
+                .iter()
+                .any(|event| event["choices"][0]["finish_reason"] == finish),
+            "{events:?}"
+        );
+        // Whole, the non-streaming path.
+        let mut last = complete(0, finish);
+        if let Some(GenerationEvent::Complete(complete)) = &mut last.response {
+            complete.output_ids = text.chars().map(u32::from).collect();
+        }
+        let (stream, server) = scripted_stream(vec![chunk(0, &text), last], "0").await;
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+        let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
+        let response = ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            resolver(),
+        )
+        .process_non_streaming_chat_response(
+            context::ExecutionResult::Single { stream },
+            chat_spec(false),
+            dispatch(),
+            tokenizer,
+            &mut decoder,
+            false,
+        )
+        .await
+        .unwrap_or_else(|response| panic!("{}", response.status()));
+        server.abort();
+        let response = serde_json::to_value(response).unwrap();
+        assert_eq!(
+            response["choices"][0]["message"]["content"], "Pong.",
+            "whole, cut after {cut} tokens"
+        );
+        assert_eq!(response["choices"][0]["finish_reason"], finish);
+    }
+}
+
 #[tokio::test]
 async fn chat_stream_error_does_not_flush_a_success_tail() {
     let (result, events) = chat_events(
@@ -324,6 +650,44 @@ async fn chat_stream_error_does_not_flush_a_success_tail() {
     assert!(events
         .iter()
         .all(|event| event["choices"][0]["finish_reason"].is_null()));
+}
+
+/// Token logprobs reach the client on reasoning deltas as they do on content
+/// deltas: a chunk whose text is all reasoning carries its logprobs there.
+#[tokio::test]
+async fn chat_stream_keeps_logprobs_on_reasoning_deltas() {
+    let (result, events) = chat_events(
+        vec![
+            chunk_with_logprobs(0, "<think>why"),
+            chunk_with_logprobs(0, "</think>ok"),
+            complete(0, "stop"),
+        ],
+        false,
+        "0",
+    )
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(chat_text(&events, 0, "reasoning_content"), "why");
+    assert_eq!(chat_text(&events, 0, "content"), "ok");
+    let mut with_text = 0;
+    for event in &events {
+        let choice = &event["choices"][0];
+        let delta = &choice["delta"];
+        let has_text = delta["reasoning_content"].is_string()
+            || delta["content"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty());
+        if has_text {
+            with_text += 1;
+            assert!(
+                choice["logprobs"]["content"]
+                    .as_array()
+                    .is_some_and(|items| !items.is_empty()),
+                "text delta without logprobs: {event}"
+            );
+        }
+    }
+    assert!(with_text >= 2, "{events:?}");
 }
 
 #[tokio::test]
@@ -397,6 +761,67 @@ async fn chat_usage_chunk_excludes_unbilled_prompt_tokens() {
             usage["total_tokens"],
             usage["prompt_tokens"].as_u64().unwrap() + usage["completion_tokens"].as_u64().unwrap()
         );
+    }
+}
+
+/// The engine on this path does not count reasoning tokens; the gateway's
+/// reasoning parser does, and reports them whenever it ran (zero included),
+/// as an engine with a reasoning parser does.
+#[tokio::test]
+async fn chat_usage_counts_the_tokens_the_reasoning_parser_split_off() {
+    for (texts, reasoning, expected) in [
+        (vec!["<think>", "ab", "</think>", "de"], "ab", 2),
+        // Both delimiters in the reasoning chunk, alone and with content:
+        // they are not reasoning tokens.
+        (vec!["<think>ab</think>", "de"], "ab", 2),
+        (vec!["<think>ab</think>de"], "ab", 2),
+        (vec!["hi"], "", 0),
+    ] {
+        let mut responses: Vec<_> = texts.iter().map(|text| chunk(0, text)).collect();
+        responses.push(complete(0, "stop"));
+        let (stream, server) = scripted_stream(responses, "0").await;
+        let (tx, rx) = sse_channel();
+        let request = serde_json::json!({
+            "model": "eof-test", "messages": [], "stream": true,
+            "separate_reasoning": true,
+            "stream_options": {"include_usage": true, "continuous_usage_stats": true}
+        });
+        let spec = ChatResponseSpec::from(
+            &serde_json::from_value::<ChatCompletionRequest>(request).expect("chat request"),
+        );
+        let result = processor(false)
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, false),
+                spec,
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collect_events(rx).await;
+        server.abort();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(chat_text(&events, 0, "reasoning_content"), reasoning);
+        let usage = &events.last().expect("final usage event")["usage"];
+        assert_eq!(
+            usage["completion_tokens_details"]["reasoning_tokens"], expected,
+            "{usage}"
+        );
+        // The continuous usage never counts fewer reasoning tokens than the
+        // chunk before it: the content chunk after a crossed delimiter agrees
+        // with the reasoning chunk of its frame.
+        let mut last = 0;
+        for event in &events {
+            if let Some(count) =
+                event["usage"]["completion_tokens_details"]["reasoning_tokens"].as_u64()
+            {
+                assert!(count >= last, "reasoning count fell from {last}: {event}");
+                last = count;
+            }
+        }
     }
 }
 
@@ -630,7 +1055,12 @@ async fn deepseek_usage_rides_on_the_last_finish_chunk() {
                 last["usage"]["prompt_tokens_details"]["cached_tokens"],
                 8.min(10 - unbilled)
             );
-            assert!(last["usage"]["completion_tokens_details"]["reasoning_tokens"].is_null());
+            // The six tokens of `reason` per choice, split out of the one
+            // chunk by the gateway's reasoning parser.
+            assert_eq!(
+                last["usage"]["completion_tokens_details"]["reasoning_tokens"],
+                6 * choices
+            );
             for event in &events[..events.len() - 1] {
                 if options["include_usage"] == true {
                     assert_eq!(event.get("usage"), Some(&Value::Null), "{event}");
@@ -1120,4 +1550,165 @@ async fn messages_tool_arguments_need_an_open_block() {
         );
         assert_eq!(inputs, [input]);
     }
+}
+
+// ── A stream the engine ends before completion ─────────────────────────────
+
+/// A stream the engine ends with `status` after `responses`: what a worker
+/// that goes away mid-stream looks like from the gateway's side.
+async fn cut_stream(
+    responses: Vec<proto::GenerateResponse>,
+    status: tonic::Status,
+) -> (ProtoStream, JoinHandle<()>) {
+    let frames: Vec<Result<Frame<Bytes>, tonic::Status>> = responses
+        .iter()
+        .map(|response| Ok(data_frame(response)))
+        .chain(std::iter::once(Err(status)))
+        .collect();
+    let (client, server) = mock_client().await;
+    let stream = response_stream(stream::iter(frames), client);
+    (stream, server)
+}
+
+/// What a connection to the engine that breaks mid-stream surfaces as.
+fn connection_lost() -> tonic::Status {
+    tonic::Status::internal("h2 protocol error: error reading a body from connection")
+}
+
+/// A worker whose breaker opens on the first failure.
+fn breaker_worker() -> Arc<dyn Worker> {
+    Arc::new(
+        BasicWorkerBuilder::new("http://engine-under-test:8000")
+            .circuit_breaker_config(CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..Default::default()
+            })
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build(),
+    )
+}
+
+#[tokio::test]
+async fn chat_stream_cut_by_the_engine_is_an_upstream_failure_with_the_tokens_so_far() {
+    let (stream, server) = cut_stream(vec![chunk(0, "Hel")], connection_lost()).await;
+    let (tx, rx) = sse_channel();
+    let result = processor(false)
+        .process_streaming_chunks(
+            stream,
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            (None, None, false, false, false),
+            chat_spec(false),
+            &tx,
+            None,
+        )
+        .await;
+    drop(tx);
+    let events = collect_events(rx).await;
+    server.abort();
+
+    match result {
+        Err(utils::StreamFailure::Upstream {
+            status,
+            completion_tokens,
+            ..
+        }) => {
+            assert_eq!(
+                status.message(),
+                "h2 protocol error: error reading a body from connection"
+            );
+            assert_eq!(completion_tokens, 3, "the tokens delivered before the cut");
+        }
+        other => panic!("an upstream failure, not {other:?}"),
+    }
+    // What the engine produced before the failure went out.
+    assert_eq!(chat_text(&events, 0, "content"), "Hel");
+}
+
+/// A chat stream of one chunk that the engine ends with `status`, through
+/// `process_streaming_response`: the SSE frames the client read, and the
+/// worker the stream was read from (its breaker opens on the first failure).
+async fn frames_of_a_chat_stream_cut_with(status: tonic::Status) -> (Vec<String>, Arc<dyn Worker>) {
+    let (stream, server) = cut_stream(vec![chunk(0, "Hi")], status).await;
+    let worker = breaker_worker();
+    let selection = context::WorkerSelection::Single {
+        worker: Arc::clone(&worker),
+    };
+    let source =
+        utils::StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT);
+    let response = Arc::new(processor(false))
+        .process_streaming_response(
+            context::ExecutionResult::Single { stream },
+            chat_spec(false),
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            false,
+            None,
+            source,
+        )
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the headers were out before the cut"
+    );
+    let body = http_body_util::BodyExt::collect(response.into_body())
+        .await
+        .expect("the SSE body")
+        .to_bytes();
+    let text = std::str::from_utf8(&body).expect("UTF-8 SSE");
+    server.abort();
+    let frames = text
+        .split("\n\n")
+        .filter(|frame| !frame.is_empty())
+        .map(str::to_string)
+        .collect();
+    (frames, worker)
+}
+
+/// The error event that ends a cut stream, which `[DONE]` follows.
+fn error_event_before_done(frames: &[String]) -> Value {
+    let [.., error, done] = frames else {
+        panic!("an error event and [DONE]: {frames:?}");
+    };
+    assert_eq!(done, "data: [DONE]");
+    serde_json::from_str(error.strip_prefix("data: ").expect("a data line"))
+        .expect("the error event is JSON")
+}
+
+#[tokio::test]
+async fn chat_stream_cut_by_the_engine_ends_with_a_stream_error_event_then_done() {
+    let (frames, worker) = frames_of_a_chat_stream_cut_with(connection_lost()).await;
+
+    // The response ends with the error event, typed as the engine's failure,
+    // then [DONE], the shape clients already parse.
+    let error = error_event_before_done(&frames);
+    assert_eq!(error["error"]["type"], "stream_error");
+    assert_eq!(
+        error["error"]["message"],
+        "Stream error: h2 protocol error: error reading a body from connection"
+    );
+    // The worker that ended the stream is charged the failure.
+    assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+}
+
+#[tokio::test]
+async fn chat_stream_the_engine_rejects_after_its_first_chunk_is_the_requests_fault() {
+    let (frames, worker) = frames_of_a_chat_stream_cut_with(tonic::Status::invalid_argument(
+        "the grammar does not compile",
+    ))
+    .await;
+
+    // The event is typed as a failed dispatch of the same status would have
+    // been, and the worker, which did nothing wrong, is not charged.
+    let error = error_event_before_done(&frames);
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        error["error"]["message"],
+        "Stream error: the grammar does not compile"
+    );
+    assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
 }

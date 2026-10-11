@@ -14,6 +14,7 @@
 //! run in this process.
 
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -21,7 +22,10 @@ use std::{
 use bytes::Bytes;
 use engine_servicer::{
     BoxFuture, MediaError, MediaFeatures, MediaProcessor, MediaRequest, ProcessedMedia,
-    ServicerError, VllmModelInfo, VllmServicerConfig, VllmServicerServer,
+    ServicerError, SglangModelInfo, SglangServicerConfig, SglangServicerServer,
+    TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer, VllmModelInfo,
+    VllmServicerConfig, VllmServicerServer, DEFAULT_ENGINE_STARTUP_CEILING,
+    DEFAULT_ENGINE_STARTUP_TIMEOUT,
 };
 use llm_multimodal::Modality;
 use prost::Message;
@@ -45,6 +49,41 @@ fn to_py_err(error: ServicerError) -> PyErr {
             PyRuntimeError::new_err(error.to_string())
         }
     }
+}
+
+/// The engine startup bound from the launcher's seconds; `None` is the crate
+/// default.
+fn startup_timeout(secs: Option<f64>) -> PyResult<Duration> {
+    match secs {
+        None => Ok(DEFAULT_ENGINE_STARTUP_TIMEOUT),
+        Some(secs) if secs > 0.0 => Duration::try_from_secs_f64(secs).map_err(|error| {
+            PyValueError::new_err(format!("engine_startup_timeout_secs {secs}: {error}"))
+        }),
+        Some(secs) => Err(PyValueError::new_err(format!(
+            "engine_startup_timeout_secs must be positive, got {secs}"
+        ))),
+    }
+}
+
+/// The bound on the whole engine start from the launcher's seconds: `None`
+/// is the crate default, `0` is no ceiling.
+fn startup_ceiling(secs: Option<f64>) -> PyResult<Option<Duration>> {
+    let Some(secs) = secs else {
+        return Ok(Some(DEFAULT_ENGINE_STARTUP_CEILING));
+    };
+    if secs == 0.0 {
+        return Ok(None);
+    }
+    if secs < 0.0 || secs.is_nan() {
+        return Err(PyValueError::new_err(format!(
+            "engine_startup_ceiling_secs must be positive, or 0 for no ceiling, got {secs}"
+        )));
+    }
+    Duration::try_from_secs_f64(secs)
+        .map(Some)
+        .map_err(|error| {
+            PyValueError::new_err(format!("engine_startup_ceiling_secs {secs}: {error}"))
+        })
 }
 
 /// Install the Rust tracing subscriber for a process that only hosts a
@@ -420,7 +459,9 @@ impl MediaProcessor for SmgMediaProcessor {
                 .await
                 .map_err(|error| match error {
                     WorkerMediaError::Invalid(message) => MediaError::Invalid(message),
-                    WorkerMediaError::Unavailable(message) => MediaError::Unavailable(message),
+                    WorkerMediaError::Media { fault, message } => {
+                        MediaError::Media { fault, message }
+                    }
                     WorkerMediaError::Internal(message) => MediaError::Internal(message),
                 })?;
             Ok(ProcessedMedia {
@@ -440,7 +481,10 @@ struct NativeMediaOptions {
     max_inflight: usize,
 }
 
-fn native_media_options(options: &Bound<'_, PyDict>) -> PyResult<NativeMediaOptions> {
+fn native_media_options(
+    options: &Bound<'_, PyDict>,
+    served_model_name: &str,
+) -> PyResult<NativeMediaOptions> {
     let item = |key: &str| -> PyResult<Option<Bound<'_, PyAny>>> {
         Ok(options.get_item(key)?.filter(|value| !value.is_none()))
     };
@@ -458,24 +502,67 @@ fn native_media_options(options: &Bound<'_, PyDict>) -> PyResult<NativeMediaOpti
         .unwrap_or(false);
     let allowed_domains: Option<Vec<String>> =
         item("allowed_domains")?.map(|v| v.extract()).transpose()?;
+    let processor_kwargs = match string("processor_kwargs_json")? {
+        Some(json) => serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json)
+            .map_err(|error| {
+                PyValueError::new_err(format!(
+                    "smg_media_processor processor_kwargs_json is not a JSON object: {error}"
+                ))
+            })?,
+        None => serde_json::Map::new(),
+    };
+    // The engine's own video frame budget (`0`: every frame); absent when
+    // the launcher could not tell, which leaves each spec to its constant.
+    // `video_loader_rule` names a loader rule the pipeline cannot follow; the
+    // pipeline refuses it for a spec that samples the way the loader does.
+    let video_frame_budget = count("video_frame_budget")?;
     let fetch_timeout_ms: u64 = item("fetch_timeout_ms")?
         .map(|v| v.extract())
         .transpose()?
         .unwrap_or(10_000);
+    // A video gets the budget the engine's own loader gives one (30 s, against
+    // 5 s for an image): a clip is many times an image's size.
+    let video_fetch_timeout_ms: u64 = item("video_fetch_timeout_ms")?
+        .map(|v| v.extract())
+        .transpose()?
+        .unwrap_or(30_000);
+    // The engine's per-prompt limits by modality name; one the pipeline does
+    // not fetch is of no consequence here.
+    let engine_item_limits = item("engine_item_limits")?
+        .map(|v| v.extract::<HashMap<String, usize>>())
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(modality, limit)| {
+            let modality = match modality.as_str() {
+                "image" => Modality::Image,
+                "video" => Modality::Video,
+                "audio" => Modality::Audio,
+                _ => return None,
+            };
+            Some((modality, limit))
+        })
+        .collect();
     Ok(NativeMediaOptions {
         settings: WorkerMediaSettings {
             model_dir: required("model_dir")?,
             model_id: required("model_id")?,
+            served_model_name: Some(served_model_name.to_string()),
             pixel_format: if raw_pixels {
                 PixelFormat::RawU8
             } else {
                 PixelFormat::Normalized
             },
             encoder_dtype: string("encoder_dtype")?.unwrap_or_else(|| "float32".to_string()),
+            processor_kwargs,
             max_items: count("max_items")?,
+            engine_item_limits,
             max_item_bytes: count("max_item_bytes")?,
             allowed_domains,
             fetch_timeout: Duration::from_millis(fetch_timeout_ms),
+            video_fetch_timeout: Duration::from_millis(video_fetch_timeout_ms),
+            video_frame_budget,
+            video_loader_rule: string("video_loader_rule")?,
         },
         source: string("source")?.unwrap_or_else(|| "default".to_string()),
         max_inflight: count("max_inflight")?.unwrap_or(4).max(1),
@@ -528,8 +615,15 @@ impl PyVllmGrpcServer {
         shm_namespace_id = String::new(),
         pooler_use_activation = None,
         pooler_dimensions = None,
+        mm_device_do_normalize = false,
+        mm_item_limits = String::new(),
+        max_num_seqs = 0,
+        engine_reasoning_parser = String::new(),
+        structured_outputs_start = String::new(),
         media_processor = None,
         smg_media_processor = None,
+        engine_startup_timeout_secs = None,
+        engine_startup_ceiling_secs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -568,8 +662,15 @@ impl PyVllmGrpcServer {
         shm_namespace_id: String,
         pooler_use_activation: Option<bool>,
         pooler_dimensions: Option<u32>,
+        mm_device_do_normalize: bool,
+        mm_item_limits: String,
+        max_num_seqs: i32,
+        engine_reasoning_parser: String,
+        structured_outputs_start: String,
         media_processor: Option<Bound<'_, PyAny>>,
         smg_media_processor: Option<Bound<'_, PyDict>>,
+        engine_startup_timeout_secs: Option<f64>,
+        engine_startup_ceiling_secs: Option<f64>,
     ) -> PyResult<Self> {
         if media_processor.is_some() && smg_media_processor.is_some() {
             return Err(PyValueError::new_err(
@@ -581,11 +682,12 @@ impl PyVllmGrpcServer {
             .map(|bridge| PythonMediaProcessor::new(&bridge))
             .transpose()?
             .map(|processor| Arc::new(processor) as Arc<dyn MediaProcessor>);
+        let served_model_name = served_model_name.unwrap_or_else(|| model_path.clone());
         let native = smg_media_processor
-            .map(|options| native_media_options(&options))
+            .map(|options| native_media_options(&options, &served_model_name))
             .transpose()?;
         let model = VllmModelInfo {
-            served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
+            served_model_name,
             tokenizer_path: tokenizer_path.unwrap_or_else(|| model_path.clone()),
             model_path,
             is_generation,
@@ -614,6 +716,11 @@ impl PyVllmGrpcServer {
             shm_namespace_id,
             pooler_use_activation,
             pooler_dimensions,
+            mm_device_do_normalize,
+            mm_item_limits,
+            max_num_seqs,
+            engine_reasoning_parser,
+            structured_outputs_start,
         };
         let mut config = VllmServicerConfig {
             bind_address,
@@ -623,6 +730,8 @@ impl PyVllmGrpcServer {
             tokenizer_dir,
             model,
             media_processor,
+            engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
+            engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
         };
         let inner = py.detach(|| -> PyResult<VllmServicerServer> {
             let Some(native) = native else {
@@ -658,6 +767,8 @@ impl PyVllmGrpcServer {
                 spec = pipeline.spec_name(),
                 pixel_format = ?pipeline.pixel_format(),
                 max_inflight = native.max_inflight,
+                item_limits = %pipeline.item_limits_summary(),
+                video_frame_budget = ?pipeline.video_frame_budget(),
                 "smg media processor ready"
             );
             config.media_processor = Some(Arc::new(SmgMediaProcessor {
@@ -687,7 +798,381 @@ impl PyVllmGrpcServer {
         self.inner.engine_ready()
     }
 
+    /// Report that the engine process is alive while the handshake runs: the
+    /// launcher calls this each time it polls the process it spawned and
+    /// finds it running. Each report resets the handshake's silence bound
+    /// (`engine_startup_timeout_secs`); the ceiling
+    /// (`engine_startup_ceiling_secs`) still holds. A no-op once the engine
+    /// is connected.
+    fn note_engine_alive(&self) {
+        self.inner.note_engine_alive();
+    }
+
     /// The last fatal error (engine connect or server exit), if any.
+    #[getter]
+    fn last_error(&self) -> PyResult<Option<String>> {
+        self.inner.last_error().map_err(to_py_err)
+    }
+
+    /// Announce SERVING (`True`) or drain (`False`); health flips at once.
+    fn set_serving(&self, serving: bool) {
+        self.inner.set_serving(serving);
+    }
+
+    /// Stop the server: open streams are cancelled, connections get most of
+    /// `timeout_secs` to close, then the listener thread is joined.
+    #[pyo3(signature = (timeout_secs = 5.0))]
+    fn stop(&self, py: Python<'_>, timeout_secs: f64) -> PyResult<()> {
+        if !timeout_secs.is_finite() || timeout_secs <= 0.0 {
+            return Err(PyValueError::new_err(
+                "timeout_secs must be finite and positive",
+            ));
+        }
+        let timeout = Duration::from_secs_f64(timeout_secs);
+        py.detach(|| self.inner.stop(timeout)).map_err(to_py_err)
+    }
+}
+
+/// Rust-owned `tokenspeed.grpc.scheduler.TokenSpeedScheduler` server over
+/// same-host headless TokenSpeed scheduler(s) on the msgpack ZMQ wire. The
+/// Python launcher keeps the lifecycle: it starts the scheduler(s) dialing
+/// `handshake_address`, polls this object, and stops it.
+#[pyclass(name = "TokenSpeedGrpcServer")]
+pub struct PyTokenSpeedGrpcServer {
+    inner: TokenSpeedServicerServer,
+}
+
+#[pymethods]
+impl PyTokenSpeedGrpcServer {
+    #[new]
+    #[pyo3(signature = (
+        bind_address,
+        ipc_base_url,
+        handshake_address,
+        model_path,
+        *,
+        engine_count = 1,
+        tokenizer_dir = None,
+        served_model_name = None,
+        tokenizer_path = None,
+        model_type = String::new(),
+        architectures = None,
+        max_context_length = 0,
+        max_req_input_len = 0,
+        vocab_size = 0,
+        eos_token_ids = None,
+        pad_token_id = 0,
+        bos_token_id = 0,
+        weight_version = String::new(),
+        default_sampling_params_json = String::new(),
+        supports_vision = false,
+        supports_multimodal = false,
+        supported_modalities = None,
+        model_dtype = String::new(),
+        multimodal_encoder_dtype = String::new(),
+        server_args_json = String::new(),
+        scheduler_info_json = String::new(),
+        tokenspeed_version = String::new(),
+        max_running_requests = 0,
+        data_parallel_size = 1,
+        kv_events_endpoint = String::new(),
+        kv_events_replay_endpoint = String::new(),
+        kv_events_topic = String::new(),
+        engine_startup_timeout_secs = None,
+        engine_startup_ceiling_secs = None,
+    ))]
+    #[expect(clippy::too_many_arguments)]
+    fn new(
+        py: Python<'_>,
+        bind_address: String,
+        ipc_base_url: String,
+        handshake_address: String,
+        model_path: String,
+        engine_count: usize,
+        tokenizer_dir: Option<String>,
+        served_model_name: Option<String>,
+        tokenizer_path: Option<String>,
+        model_type: String,
+        architectures: Option<Vec<String>>,
+        max_context_length: i32,
+        max_req_input_len: i32,
+        vocab_size: i32,
+        eos_token_ids: Option<Vec<u32>>,
+        pad_token_id: i32,
+        bos_token_id: i32,
+        weight_version: String,
+        default_sampling_params_json: String,
+        supports_vision: bool,
+        supports_multimodal: bool,
+        supported_modalities: Option<Vec<i32>>,
+        model_dtype: String,
+        multimodal_encoder_dtype: String,
+        server_args_json: String,
+        scheduler_info_json: String,
+        tokenspeed_version: String,
+        max_running_requests: i32,
+        data_parallel_size: i32,
+        kv_events_endpoint: String,
+        kv_events_replay_endpoint: String,
+        kv_events_topic: String,
+        engine_startup_timeout_secs: Option<f64>,
+        engine_startup_ceiling_secs: Option<f64>,
+    ) -> PyResult<Self> {
+        let model = TokenSpeedModelInfo {
+            served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
+            tokenizer_path: tokenizer_path.unwrap_or_else(|| model_path.clone()),
+            model_path,
+            model_type,
+            architectures: architectures.unwrap_or_default(),
+            max_context_length,
+            max_req_input_len,
+            vocab_size,
+            eos_token_ids: eos_token_ids.unwrap_or_default(),
+            pad_token_id,
+            bos_token_id,
+            weight_version,
+            default_sampling_params_json,
+            supports_vision,
+            supports_multimodal,
+            supported_modalities: supported_modalities.unwrap_or_default(),
+            model_dtype,
+            multimodal_encoder_dtype,
+            server_args_json,
+            scheduler_info_json,
+            tokenspeed_version,
+            max_running_requests,
+            data_parallel_size,
+            kv_events_endpoint,
+            kv_events_replay_endpoint,
+            kv_events_topic,
+        };
+        let config = TokenSpeedServicerConfig {
+            bind_address,
+            ipc_base_url,
+            handshake_address,
+            engine_count,
+            tokenizer_dir,
+            model,
+            engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
+            engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
+        };
+        let inner = py
+            .detach(|| TokenSpeedServicerServer::start(config))
+            .map_err(to_py_err)?;
+        Ok(Self { inner })
+    }
+
+    /// The bound `ip:port`.
+    #[getter]
+    fn address(&self) -> String {
+        self.inner.address()
+    }
+
+    #[getter]
+    fn running(&self) -> bool {
+        self.inner.running()
+    }
+
+    /// Whether the scheduler handshake completed; health is NOT_SERVING
+    /// until it has.
+    #[getter]
+    fn engine_ready(&self) -> bool {
+        self.inner.engine_ready()
+    }
+
+    /// Report that the scheduler process is alive while the handshake runs:
+    /// the launcher calls this each time it polls the process it spawned and
+    /// finds it running. Each report resets the handshake's silence bound
+    /// (`engine_startup_timeout_secs`); the ceiling
+    /// (`engine_startup_ceiling_secs`) still holds. A no-op once the
+    /// scheduler is connected.
+    fn note_engine_alive(&self) {
+        self.inner.note_engine_alive();
+    }
+
+    /// The last fatal error (scheduler connect or server exit), if any.
+    #[getter]
+    fn last_error(&self) -> PyResult<Option<String>> {
+        self.inner.last_error().map_err(to_py_err)
+    }
+
+    /// Announce SERVING (`True`) or drain (`False`); health flips at once.
+    fn set_serving(&self, serving: bool) {
+        self.inner.set_serving(serving);
+    }
+
+    /// Stop the server: open streams are cancelled, connections get most of
+    /// `timeout_secs` to close, then the listener thread is joined.
+    #[pyo3(signature = (timeout_secs = 5.0))]
+    fn stop(&self, py: Python<'_>, timeout_secs: f64) -> PyResult<()> {
+        if !timeout_secs.is_finite() || timeout_secs <= 0.0 {
+            return Err(PyValueError::new_err(
+                "timeout_secs must be finite and positive",
+            ));
+        }
+        let timeout = Duration::from_secs_f64(timeout_secs);
+        py.detach(|| self.inner.stop(timeout)).map_err(to_py_err)
+    }
+}
+
+/// Rust-owned `sglang.grpc.scheduler.SglangScheduler` server over a same-host
+/// headless SGLang scheduler on the msgpack ZMQ wire (the SMG plugin inside
+/// the scheduler dials in). The Python launcher keeps the lifecycle: it starts
+/// the scheduler dialing `handshake_address`, polls this object, and stops it.
+#[pyclass(name = "SglangGrpcServer")]
+pub struct PySglangGrpcServer {
+    inner: SglangServicerServer,
+}
+
+#[pymethods]
+impl PySglangGrpcServer {
+    #[new]
+    #[pyo3(signature = (
+        bind_address,
+        ipc_base_url,
+        handshake_address,
+        model_path,
+        *,
+        engine_count = 1,
+        tokenizer_dir = None,
+        served_model_name = None,
+        tokenizer_path = None,
+        is_generation = true,
+        model_type = String::new(),
+        architectures = None,
+        max_context_length = 0,
+        max_req_input_len = 0,
+        vocab_size = 0,
+        eos_token_ids = None,
+        pad_token_id = 0,
+        bos_token_id = 0,
+        weight_version = String::new(),
+        preferred_sampling_params = String::new(),
+        default_sampling_params_json = String::new(),
+        supports_vision = false,
+        id2label_json = String::new(),
+        num_labels = 0,
+        server_args_json = String::new(),
+        scheduler_info_json = String::new(),
+        sglang_version = String::new(),
+        max_running_requests = 0,
+        data_parallel_size = 1,
+        kv_events_endpoint = String::new(),
+        kv_events_replay_endpoint = String::new(),
+        kv_events_topic = String::new(),
+        engine_startup_timeout_secs = None,
+        engine_startup_ceiling_secs = None,
+    ))]
+    #[expect(clippy::too_many_arguments)]
+    fn new(
+        py: Python<'_>,
+        bind_address: String,
+        ipc_base_url: String,
+        handshake_address: String,
+        model_path: String,
+        engine_count: usize,
+        tokenizer_dir: Option<String>,
+        served_model_name: Option<String>,
+        tokenizer_path: Option<String>,
+        is_generation: bool,
+        model_type: String,
+        architectures: Option<Vec<String>>,
+        max_context_length: i32,
+        max_req_input_len: i32,
+        vocab_size: i32,
+        eos_token_ids: Option<Vec<u32>>,
+        pad_token_id: i32,
+        bos_token_id: i32,
+        weight_version: String,
+        preferred_sampling_params: String,
+        default_sampling_params_json: String,
+        supports_vision: bool,
+        id2label_json: String,
+        num_labels: i32,
+        server_args_json: String,
+        scheduler_info_json: String,
+        sglang_version: String,
+        max_running_requests: i32,
+        data_parallel_size: i32,
+        kv_events_endpoint: String,
+        kv_events_replay_endpoint: String,
+        kv_events_topic: String,
+        engine_startup_timeout_secs: Option<f64>,
+        engine_startup_ceiling_secs: Option<f64>,
+    ) -> PyResult<Self> {
+        let model = SglangModelInfo {
+            served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
+            tokenizer_path: tokenizer_path.unwrap_or_else(|| model_path.clone()),
+            model_path,
+            is_generation,
+            model_type,
+            architectures: architectures.unwrap_or_default(),
+            max_context_length,
+            max_req_input_len,
+            vocab_size,
+            eos_token_ids: eos_token_ids.unwrap_or_default(),
+            pad_token_id,
+            bos_token_id,
+            weight_version,
+            preferred_sampling_params,
+            default_sampling_params_json,
+            supports_vision,
+            id2label_json,
+            num_labels,
+            server_args_json,
+            scheduler_info_json,
+            sglang_version,
+            max_running_requests,
+            data_parallel_size,
+            kv_events_endpoint,
+            kv_events_replay_endpoint,
+            kv_events_topic,
+        };
+        let config = SglangServicerConfig {
+            bind_address,
+            ipc_base_url,
+            handshake_address,
+            engine_count,
+            tokenizer_dir,
+            model,
+            engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
+            engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
+        };
+        let inner = py
+            .detach(|| SglangServicerServer::start(config))
+            .map_err(to_py_err)?;
+        Ok(Self { inner })
+    }
+
+    /// The bound `ip:port`.
+    #[getter]
+    fn address(&self) -> String {
+        self.inner.address()
+    }
+
+    #[getter]
+    fn running(&self) -> bool {
+        self.inner.running()
+    }
+
+    /// Whether the scheduler handshake completed; health is NOT_SERVING
+    /// until it has.
+    #[getter]
+    fn engine_ready(&self) -> bool {
+        self.inner.engine_ready()
+    }
+
+    /// Report that the scheduler process is alive while the handshake runs:
+    /// the launcher calls this each time it polls the process it spawned and
+    /// finds it running. Each report resets the handshake's silence bound
+    /// (`engine_startup_timeout_secs`); the ceiling
+    /// (`engine_startup_ceiling_secs`) still holds. A no-op once the
+    /// scheduler is connected.
+    fn note_engine_alive(&self) {
+        self.inner.note_engine_alive();
+    }
+
+    /// The last fatal error (scheduler connect or server exit), if any.
     #[getter]
     fn last_error(&self) -> PyResult<Option<String>> {
         self.inner.last_error().map_err(to_py_err)

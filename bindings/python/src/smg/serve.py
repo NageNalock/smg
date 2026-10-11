@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import errno
 import logging
 import os
 import random
@@ -30,6 +31,16 @@ logger = logging.getLogger("smg.serve")
 # created 0700 (single-owner) so a shared /tmp cannot leak another user's
 # sockets into this router. Override with SMG_ZMQ_SOCKET_DIR.
 _ZMQ_SOCKET_DIR = os.environ.get("SMG_ZMQ_SOCKET_DIR", f"/tmp/smg-zmq-{os.getuid()}")
+
+
+def _bracket_if_ipv6(host: str) -> str:
+    """Return ``host`` ready for a ``host:port`` join or a URL authority: an IPv6
+    literal in brackets; IPv4 addresses, hostnames and already-bracketed literals
+    as they are. ``--worker-host ::1`` otherwise yields ``grpc://::1:<port>`` (which
+    the router rejects) and ``::1:<port>`` (which grpc cannot dial)."""
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
 
 
 def _zmq_ipc_url(port: int) -> str:
@@ -129,16 +140,16 @@ class WorkerLauncher(ABC):
             # host:port to probe. The router's own health checker gates
             # readiness, so the launcher just proceeds to start the router.
             return True
-        return _http_health_check(f"http://{host}:{port}/health", timeout)
+        return _http_health_check(f"http://{_bracket_if_ipv6(host)}:{port}/health", timeout)
 
     def worker_url(self, args: argparse.Namespace, host: str, port: int) -> str:
         """Return the URL used by the router to reach this worker."""
         mode = getattr(args, "connection_mode", "grpc")
         if mode == "grpc":
-            return f"grpc://{host}:{port}"
+            return f"grpc://{_bracket_if_ipv6(host)}:{port}"
         if mode == "zmq":
             return _zmq_ipc_url(port)
-        return f"http://{host}:{port}"
+        return f"http://{_bracket_if_ipv6(host)}:{port}"
 
     def _get_tp_size(self, args: argparse.Namespace) -> int:
         """Return tensor-parallel size for GPU assignment. Default 1."""
@@ -250,6 +261,8 @@ class SglangWorkerLauncher(WorkerLauncher):
             "--port",
             str(port),
         ]
+        if getattr(args, "connection_mode", "grpc") == "zmq":
+            return self._build_zmq_command(args, backend_args, port)
         if getattr(args, "connection_mode", "grpc") == "grpc":
             cmd.append("--grpc-mode")
 
@@ -259,6 +272,57 @@ class SglangWorkerLauncher(WorkerLauncher):
             cmd.append("--enable-cache-report")
 
         cmd.extend(self._filter_backend_args(backend_args, ["--model-path", "--host", "--port"]))
+        return cmd
+
+    def _build_zmq_command(
+        self, args: argparse.Namespace, backend_args: list[str], port: int
+    ) -> list[str]:
+        """Launch SGLang's scheduler headless behind SMG's ZMQ handshake.
+
+        SMG binds the tcp handshake + ipc data-plane sockets it derives from
+        the ipc:// worker URL; the scheduler dials in. The launcher is
+        ``smg_grpc_servicer.sglang.headless`` (this package's SGLang plugin
+        does the dialing inside the scheduler; SGLang itself is unchanged).
+        ``--port`` seeds SGLang's derived control-plane ports, so co-located
+        workers get distinct clusters.
+        """
+        # SGLang accepts both spellings of its DP flag.
+        engine_dp = max(
+            _backend_arg_int(backend_args, "--dp-size", 1),
+            _backend_arg_int(backend_args, "--data-parallel-size", 1),
+        )
+        if engine_dp > 1:
+            raise ValueError(
+                "--dp-size > 1 is not supported over the SGLang ZMQ wire yet; "
+                "use --connection-mode grpc for data parallelism"
+            )
+        rpc_port = _zmq_handshake_port(_zmq_ipc_url(port))
+        cmd = [
+            sys.executable,
+            "-m",
+            "smg_grpc_servicer.sglang.headless",
+            "--zmq-handshake-address",
+            f"tcp://127.0.0.1:{rpc_port}",
+            "--zmq-engine-index",
+            "0",
+            "--model-path",
+            getattr(args, "model_path", ""),
+            "--port",
+            str(port),
+        ]
+        cmd.extend(
+            self._filter_backend_args(
+                backend_args,
+                [
+                    "--model-path",
+                    "--host",
+                    "--port",
+                    "--zmq-handshake-address",
+                    "--zmq-engine-index",
+                    "--grpc-mode",
+                ],
+            )
+        )
         return cmd
 
 
@@ -582,7 +646,7 @@ def _grpc_health_check(host: str, port: int, timeout: float) -> bool:
         return False
 
     try:
-        channel = grpc.insecure_channel(f"{host}:{port}")
+        channel = grpc.insecure_channel(f"{_bracket_if_ipv6(host)}:{port}")
         try:
             stub = health_pb2_grpc.HealthStub(channel)
             request = health_pb2.HealthCheckRequest(service="")
@@ -594,7 +658,7 @@ def _grpc_health_check(host: str, port: int, timeout: float) -> bool:
         # vLLM doesn't implement gRPC health service — fall back to channel ready
         if hasattr(e, "code") and e.code() == grpc.StatusCode.UNIMPLEMENTED:
             try:
-                channel = grpc.insecure_channel(f"{host}:{port}")
+                channel = grpc.insecure_channel(f"{_bracket_if_ipv6(host)}:{port}")
                 try:
                     grpc.channel_ready_future(channel).result(timeout=timeout)
                     return True
@@ -640,13 +704,22 @@ def _find_available_ports(base_port: int, count: int) -> list[int]:
 
 
 def _is_port_available(port: int) -> bool:
-    """Return True if *port* is free on localhost."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    """Return True if *port* is free on localhost for both address families a
+    worker may bind: a port busy on ``[::1]`` is not free. A family without a
+    loopback address (IPv6 disabled) is skipped, not treated as busy."""
+    for family, address in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
         try:
-            s.bind(("127.0.0.1", port))
-            return True
+            s = socket.socket(family, socket.SOCK_STREAM)
         except OSError:
-            return False
+            continue
+        with s:
+            try:
+                s.bind((address, port))
+            except OSError as e:
+                if e.errno == errno.EADDRNOTAVAIL:
+                    continue
+                return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -767,7 +840,7 @@ def add_serve_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "Connection mode for workers (default: grpc). Note: trtllm only "
             "supports grpc, tokenspeed only supports zmq, and zmq is otherwise "
-            "only supported for the vllm backend"
+            "supported for the vllm and sglang backends"
         ),
     )
     group.add_argument(
@@ -870,11 +943,15 @@ def parse_serve_args(
     serve_router_args, backend_args = pre_parser.parse_known_args(argv)
     backend = serve_router_args.backend
 
-    # ZMQ direct-backend is a same-host engine connection; only vLLM EngineCore
-    # and TokenSpeed speak a supported ZMQ wire protocol.
-    if serve_router_args.connection_mode == "zmq" and backend not in ("vllm", "tokenspeed"):
+    # ZMQ direct-backend is a same-host engine connection; vLLM EngineCore,
+    # TokenSpeed and SGLang speak a supported ZMQ wire protocol.
+    if serve_router_args.connection_mode == "zmq" and backend not in (
+        "vllm",
+        "tokenspeed",
+        "sglang",
+    ):
         pre_parser.error(
-            "connection-mode zmq is only supported for the vllm and tokenspeed "
+            "connection-mode zmq is only supported for the vllm, tokenspeed and sglang "
             f"backends, not {backend}"
         )
     if getattr(serve_router_args, "servicer_impl", "python") == "rust":

@@ -11,6 +11,8 @@ import time
 
 import requests
 
+from .constants import DEFAULT_HOST
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -22,7 +24,7 @@ logger = logging.getLogger(__name__)
 _reserved_ports: set[int] = set()
 
 
-def get_open_port(max_attempts: int = 10) -> int:
+def get_open_port(max_attempts: int = 10, host: str = DEFAULT_HOST) -> int:
     """Get an available port with reservation tracking.
 
     Finds an available port from the kernel and reserves it in our tracking set
@@ -30,6 +32,9 @@ def get_open_port(max_attempts: int = 10) -> int:
 
     Args:
         max_attempts: Maximum attempts to find an unreserved port.
+        host: The address the port will be bound on; the probe uses its address
+            family (an IPv6 literal probes an IPv6 socket), so the port is free
+            where the gateway or worker binds it.
 
     Returns:
         An available port number that is reserved until release_port() is called.
@@ -37,10 +42,11 @@ def get_open_port(max_attempts: int = 10) -> int:
     Raises:
         RuntimeError: If unable to find an available port after max_attempts.
     """
+    family, unspecified = (socket.AF_INET6, "::") if ":" in host else (socket.AF_INET, "")
     for attempt in range(max_attempts):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        with socket.socket(family, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("", 0))
+            s.bind((unspecified, 0))
             s.listen(1)
             port = s.getsockname()[1]
 
@@ -57,6 +63,24 @@ def get_open_port(max_attempts: int = 10) -> int:
         )
 
     raise RuntimeError(f"Failed to find available port after {max_attempts} attempts")
+
+
+def port_is_free(port: int, host: str = DEFAULT_HOST) -> bool:
+    """Whether ``port`` can still be bound on ``host``.
+
+    A reservation from :func:`get_open_port` is a number in a set, not a
+    socket: between the reservation and the launch that binds it, any process
+    that picks its own ports can take it. Callers re-check right before the
+    launch and re-allocate when it is gone.
+    """
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((host, port))
+        except OSError:
+            return False
+    return True
 
 
 def release_port(port: int) -> None:
@@ -194,6 +218,47 @@ def gpu_memory_used_mib(gpu_ids: list[int]) -> dict[int, int] | None:
     return used
 
 
+def gpu_compute_apps(gpu_ids: list[int]) -> dict[int, list[tuple[int, int | None]]] | None:
+    """Compute processes ``nvidia-smi`` lists on each GPU: ``(pid, used MiB)``.
+
+    Only a non-empty list says anything. Inside a job container ``nvidia-smi``
+    can list nothing while workers hold contexts, or list the host's PIDs, so
+    an empty list does not show that the memory belongs to an exited process.
+    ``used`` is ``None`` when the driver withholds the figure. ``None`` overall
+    when ``nvidia-smi`` is unavailable.
+    """
+    apps: dict[int, list[tuple[int, int | None]]] = {}
+    for gpu in gpu_ids:
+        try:
+            out = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-compute-apps=pid,used_memory",
+                    "--format=csv,noheader,nounits",
+                    "-i",
+                    str(gpu),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=True,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+        rows: list[tuple[int, int | None]] = []
+        for line in out.splitlines():
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) != 2:
+                continue
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+            rows.append((pid, int(parts[1]) if parts[1].isdigit() else None))
+        apps[gpu] = rows
+    return apps
+
+
 def wait_for_gpu_memory_release(
     gpu_ids: list[int],
     baseline: dict[int, int],
@@ -249,11 +314,45 @@ def terminate_process(proc: subprocess.Popen, timeout: float = 30) -> None:
         time.sleep(1)
 
 
+class ProcessExitedError(RuntimeError):
+    """The process a readiness wait was gating on exited before it became ready.
+
+    Raised instead of running the wait down to its deadline: a server that is
+    gone cannot come up, and its exit is the finding.
+    """
+
+
+def _raise_if_exited(process: subprocess.Popen | None, what: str, url: str, started: float) -> None:
+    if process is None:
+        return
+    code = process.poll()
+    if code is None:
+        return
+    raise ProcessExitedError(
+        f"{what} at {url} exited with code {code} "
+        f"{time.perf_counter() - started:.1f}s after launch, before becoming ready"
+    )
+
+
+def _sleep_watching(
+    process: subprocess.Popen | None, seconds: float, what: str, url: str, started: float
+) -> None:
+    """Sleep ``seconds``, waking early when ``process`` exits."""
+    deadline = time.perf_counter() + seconds
+    while True:
+        _raise_if_exited(process, what, url, started)
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.25, remaining))
+
+
 def wait_for_health(
     url: str,
     timeout: float = 60,
     api_key: str | None = None,
     check_interval: float = 1.0,
+    process: subprocess.Popen | None = None,
 ) -> None:
     """Wait for a server's /health endpoint to return 200.
 
@@ -262,12 +361,15 @@ def wait_for_health(
         timeout: Seconds to wait before timing out
         api_key: Optional API key for auth header
         check_interval: Seconds between health checks
+        process: The server's process, when the caller launched it; its exit
+            ends the wait at once with :class:`ProcessExitedError`.
     """
     start = time.perf_counter()
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
     with requests.Session() as session:
         while time.perf_counter() - start < timeout:
+            _raise_if_exited(process, "Server", url, start)
             try:
                 resp = session.get(f"{url}/health", headers=headers, timeout=5)
                 if resp.status_code == 200:
@@ -275,7 +377,7 @@ def wait_for_health(
                     return
             except requests.RequestException:
                 pass
-            time.sleep(check_interval)
+            _sleep_watching(process, check_interval, "Server", url, start)
 
     raise TimeoutError(f"Server at {url} did not become healthy within {timeout}s")
 
@@ -285,6 +387,8 @@ def wait_for_workers_ready(
     expected_workers: int,
     timeout: float = 300,
     api_key: str | None = None,
+    process: subprocess.Popen | None = None,
+    expected_urls: list[str] | None = None,
 ) -> None:
     """Wait for all workers to connect and for the router to become ready.
 
@@ -293,19 +397,35 @@ def wait_for_workers_ready(
         expected_workers: Number of workers to wait for
         timeout: Seconds to wait before timing out
         api_key: Optional API key for auth header
+        process: The router's process, when the caller launched it; its exit
+            ends the wait at once with :class:`ProcessExitedError`.
+        expected_urls: The worker URLs the router was started with; the ones
+            still missing at the deadline are named in the error (a
+            data-parallel worker counts as registered once any of its ranks
+            is).
     """
     start = time.perf_counter()
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     connected_workers = 0
+    registered_urls: list[str] = []
     readiness_reason = "not checked"
 
     with requests.Session() as session:
         while time.perf_counter() - start < timeout:
+            _raise_if_exited(process, "Router", router_url, start)
             try:
                 resp = session.get(f"{router_url}/workers", headers=headers, timeout=5)
                 if resp.status_code == 200:
                     data = resp.json()
-                    connected_workers = data.get("total", len(data.get("workers", [])))
+                    workers = data.get("workers", [])
+                    connected_workers = data.get("total", len(workers))
+                    # A data-parallel worker registers each rank as
+                    # "<base>@<rank>" with the base URL in dp_base_url.
+                    registered_urls = [
+                        w.get("dp_base_url") or w["url"]
+                        for w in workers
+                        if isinstance(w, dict) and "url" in w
+                    ]
                     if connected_workers >= expected_workers:
                         readiness_resp = session.get(
                             f"{router_url}/readiness", headers=headers, timeout=5
@@ -346,11 +466,18 @@ def wait_for_workers_ready(
                         readiness_reason = "waiting for workers"
             except (requests.RequestException, ValueError):
                 pass
-            time.sleep(2)
+            _sleep_watching(process, 2, "Router", router_url, start)
 
+    missing = ""
+    if expected_urls:
+        registered = {url.rstrip("/") for url in registered_urls}
+        absent = [url for url in expected_urls if url.rstrip("/") not in registered]
+        if absent:
+            missing = f", missing: {', '.join(absent)}"
     raise TimeoutError(
         f"Router at {router_url} did not become ready within {timeout}s "
-        f"(workers: {connected_workers}/{expected_workers}, readiness: {readiness_reason})"
+        f"(workers: {connected_workers}/{expected_workers}{missing}, "
+        f"readiness: {readiness_reason})"
     )
 
 

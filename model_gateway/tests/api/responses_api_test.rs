@@ -5,8 +5,8 @@ use openai_protocol::{
     common::{GenerationRequest, UsageInfo},
     responses::{
         CodeInterpreterTool, McpTool, ReasoningEffort, RequireApproval, RequireApprovalMode,
-        ResponseInput, ResponseReasoningParam, ResponseTool, ResponsesRequest, ResponsesToolChoice,
-        ServiceTier, ToolChoiceOptions, Truncation, WebSearchPreviewTool,
+        ResponseContentPart, ResponseInput, ResponseReasoningParam, ResponseTool, ResponsesRequest,
+        ResponsesToolChoice, ServiceTier, ToolChoiceOptions, Truncation, WebSearchPreviewTool,
     },
 };
 use smg::{
@@ -76,6 +76,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
     // Build a simple ResponsesRequest that will trigger the tool call
     let req = ResponsesRequest {
         include: None,
+        background: None,
         input: ResponseInput::Text("search something".to_string()),
         instructions: Some("Be brief".to_string()),
         max_output_tokens: Some(64),
@@ -278,6 +279,7 @@ async fn test_non_streaming_mcp_e2e_accepts_forwardable_request_headers() {
 
     let req = ResponsesRequest {
         include: None,
+        background: None,
         input: ResponseInput::Text("search something".to_string()),
         instructions: Some("Be brief".to_string()),
         max_output_tokens: Some(64),
@@ -426,6 +428,7 @@ async fn test_non_streaming_mcp_returns_approval_request_when_required() {
 
     let req = ResponsesRequest {
         include: None,
+        background: None,
         input: ResponseInput::Text("search something".to_string()),
         instructions: Some("Be brief".to_string()),
         max_output_tokens: Some(64),
@@ -560,6 +563,7 @@ async fn test_final_response_hides_internal_mcp_trace_items() {
 
     let req = ResponsesRequest {
         include: None,
+        background: None,
         input: ResponseInput::Text("search something private".to_string()),
         instructions: Some("Use tools when relevant.".to_string()),
         max_output_tokens: Some(64),
@@ -704,6 +708,7 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
     });
 
     let req1 = ResponsesRequest {
+        background: None,
         include: None,
         input: ResponseInput::Text("search something".to_string()),
         instructions: Some("Be brief".to_string()),
@@ -759,6 +764,7 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
         .to_string();
 
     let req2 = ResponsesRequest {
+        background: None,
         include: None,
         input: ResponseInput::Text("Summarize that in five words".to_string()),
         instructions: Some("Be brief".to_string()),
@@ -874,6 +880,7 @@ async fn test_final_response_hides_internal_mcp_error_details() {
 
     let req = ResponsesRequest {
         include: None,
+        background: None,
         input: ResponseInput::Text("search something private".to_string()),
         instructions: Some("Use tools when relevant.".to_string()),
         max_output_tokens: Some(64),
@@ -1018,9 +1025,232 @@ async fn test_conversations_crud_basic() {
     assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
 }
 
+/// The router configuration of the conversation tests: OpenAI mode, no
+/// upstream calls, the memory storage backends.
+fn conversation_router_config() -> RouterConfig {
+    RouterConfig::builder()
+        .openai_mode(vec!["http://localhost".to_string()])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(1)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(8)
+        .queue_timeout_secs(5)
+        .build_unchecked()
+}
+
+/// The JSON body of a response that must be a 200.
+async fn ok_json(
+    response: axum::response::Response,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// The public API answers a conversation created without metadata with
+/// `"metadata": {}` on creation and on retrieval; the field is never omitted.
+#[tokio::test]
+async fn a_conversation_without_metadata_answers_an_empty_metadata_object(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = crate::common::create_test_context(conversation_router_config()).await;
+
+    let created = ok_json(
+        conversations::create_conversation(&ctx.conversation_storage, serde_json::json!({})).await,
+    )
+    .await?;
+    assert_eq!(created["metadata"], serde_json::json!({}), "{created}");
+
+    let conv_id = created["id"].as_str().expect("id missing");
+    let fetched =
+        ok_json(conversations::get_conversation(&ctx.conversation_storage, conv_id).await).await?;
+    assert_eq!(fetched["metadata"], serde_json::json!({}), "{fetched}");
+    Ok(())
+}
+
+/// A message added with a plain string content is stored, answered and
+/// listed with the typed `input_text` part the public API makes of it, the
+/// same shape a message added with typed parts has; the list carries the item
+/// objects alone, without a gateway-only `created_at` on them.
+#[tokio::test]
+async fn items_added_with_string_content_are_listed_as_typed_parts(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = crate::common::create_test_context(conversation_router_config()).await;
+
+    let created = ok_json(
+        conversations::create_conversation(&ctx.conversation_storage, serde_json::json!({})).await,
+    )
+    .await?;
+    let conv_id = created["id"].as_str().expect("id missing");
+    let typed_first = serde_json::json!([{"type": "input_text", "text": "first"}]);
+    let typed_second = serde_json::json!([{"type": "input_text", "text": "second"}]);
+
+    let added = ok_json(
+        conversations::create_conversation_items(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            conv_id,
+            serde_json::json!({"items": [
+                {"type": "message", "role": "user", "content": "first"},
+                {"type": "message", "role": "user", "content": typed_second},
+            ]}),
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(added["data"][0]["content"], typed_first, "{added}");
+    assert_eq!(added["data"][1]["content"], typed_second, "{added}");
+
+    let first_id = added["data"][0]["id"].as_str().expect("item id missing");
+    let second_id = added["data"][1]["id"].as_str().expect("item id missing");
+
+    let listed = ok_json(
+        conversations::list_conversation_items(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            conv_id,
+            None,
+            Some("asc"),
+            None,
+        )
+        .await,
+    )
+    .await?;
+    let listed_items = listed["data"].as_array().expect("data");
+    assert_eq!(listed_items.len(), 2, "{listed}");
+    // The two items of one add call share their `added_at`, and the stores
+    // order such ties by the item id, so the list may answer them in either
+    // order: each item is looked up by its id.
+    let listed_content = |id: &str| {
+        listed_items
+            .iter()
+            .find(|item| item["id"] == id)
+            .map(|item| item["content"].clone())
+    };
+    assert_eq!(
+        listed_content(first_id).as_ref(),
+        Some(&typed_first),
+        "{listed}"
+    );
+    assert_eq!(
+        listed_content(second_id).as_ref(),
+        Some(&typed_second),
+        "{listed}"
+    );
+    for item in listed_items {
+        assert!(
+            item.get("created_at").is_none(),
+            "a listed item carries a field the public API's items do not: {item}"
+        );
+        assert_eq!(item["status"], "completed", "{item}");
+    }
+
+    let fetched = ok_json(
+        conversations::get_conversation_item(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            conv_id,
+            first_id,
+            None,
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(fetched["content"], typed_first, "{fetched}");
+    Ok(())
+}
+
+/// An assistant message added with a plain string content becomes the one
+/// `output_text` part (empty `annotations`) the public API makes of it, not
+/// an `input_text` part, which the public API refuses on an assistant message
+/// when the conversation's history is replayed; the add, the item GET and the
+/// list answer that part, and it deserializes as the typed content parts the
+/// history loaders replay upstream.
+#[tokio::test]
+async fn an_assistant_message_added_as_a_string_is_stored_as_an_output_text_part(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = crate::common::create_test_context(conversation_router_config()).await;
+
+    let created = ok_json(
+        conversations::create_conversation(&ctx.conversation_storage, serde_json::json!({})).await,
+    )
+    .await?;
+    let conv_id = created["id"].as_str().expect("id missing");
+    let output_part =
+        serde_json::json!([{"type": "output_text", "text": "Hi there!", "annotations": []}]);
+
+    let added = ok_json(
+        conversations::create_conversation_items(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            conv_id,
+            serde_json::json!({"items": [
+                {"type": "message", "role": "assistant", "content": "Hi there!"},
+            ]}),
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(added["data"][0]["role"], "assistant", "{added}");
+    assert_eq!(added["data"][0]["content"], output_part, "{added}");
+    let item_id = added["data"][0]["id"].as_str().expect("item id missing");
+
+    let fetched = ok_json(
+        conversations::get_conversation_item(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            conv_id,
+            item_id,
+            None,
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(fetched["content"], output_part, "{fetched}");
+
+    let listed = ok_json(
+        conversations::list_conversation_items(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            conv_id,
+            None,
+            Some("asc"),
+            None,
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(listed["data"].as_array().map(Vec::len), Some(1), "{listed}");
+    assert_eq!(listed["data"][0]["content"], output_part, "{listed}");
+
+    // The parse both history loaders apply to a stored message before they
+    // replay it upstream: the typed parts, an `output_text` one here.
+    let parts: Vec<ResponseContentPart> = serde_json::from_value(fetched["content"].clone())?;
+    assert!(
+        matches!(
+            parts.as_slice(),
+            [ResponseContentPart::OutputText { text, annotations, .. }]
+                if text == "Hi there!" && annotations.is_empty()
+        ),
+        "{parts:?}"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_responses_request_creation() {
     let request = ResponsesRequest {
+        background: None,
         include: None,
         input: ResponseInput::Text("Hello, world!".to_string()),
         instructions: Some("Be helpful".to_string()),
@@ -1074,6 +1304,7 @@ fn test_responses_request_creation() {
 fn test_responses_request_sglang_extensions() {
     // Test that SGLang-specific sampling parameters are present and serializable
     let request = ResponsesRequest {
+        background: None,
         include: None,
         input: ResponseInput::Text("Test".to_string()),
         instructions: None,
@@ -1138,6 +1369,7 @@ fn test_usage_conversion() {
         reasoning_tokens: Some(8),
         prompt_tokens_details: Some(openai_protocol::common::PromptTokenUsageInfo {
             cached_tokens: 3,
+            audio_tokens: None,
         }),
     };
     let response_usage = usage_info.to_response_usage();
@@ -1146,26 +1378,9 @@ fn test_usage_conversion() {
     assert_eq!(response_usage.output_tokens, 25);
     assert_eq!(response_usage.total_tokens, 40);
 
-    // Check details are converted correctly
-    assert!(response_usage.input_tokens_details.is_some());
-    assert_eq!(
-        response_usage
-            .input_tokens_details
-            .as_ref()
-            .unwrap()
-            .cached_tokens,
-        3
-    );
-
-    assert!(response_usage.output_tokens_details.is_some());
-    assert_eq!(
-        response_usage
-            .output_tokens_details
-            .as_ref()
-            .unwrap()
-            .reasoning_tokens,
-        8
-    );
+    // Check details are converted correctly (both blocks are always present)
+    assert_eq!(response_usage.input_tokens_details.cached_tokens, 3);
+    assert_eq!(response_usage.output_tokens_details.reasoning_tokens, 8);
 
     let back_to_usage = response_usage.to_usage_info();
     assert_eq!(back_to_usage.prompt_tokens, 15);
@@ -1230,6 +1445,7 @@ fn test_reasoning_effort_accepts_every_openai_tier() {
 #[test]
 fn test_json_serialization() {
     let request = ResponsesRequest {
+        background: None,
         include: None,
         input: ResponseInput::Text("Test input".to_string()),
         instructions: Some("Test instructions".to_string()),
@@ -1340,6 +1556,7 @@ async fn test_multi_turn_loop_with_mcp() {
     // Build request with MCP tools
     let req = ResponsesRequest {
         include: None,
+        background: None,
         input: ResponseInput::Text("search for SGLang".to_string()),
         instructions: Some("Be helpful".to_string()),
         max_output_tokens: Some(128),
@@ -1503,6 +1720,7 @@ async fn test_max_tool_calls_limit() {
 
     let req = ResponsesRequest {
         include: None,
+        background: None,
         input: ResponseInput::Text("test max calls".to_string()),
         instructions: None,
         max_output_tokens: Some(128),
@@ -1693,6 +1911,7 @@ async fn test_streaming_with_mcp_tool_calls() {
     // Build streaming request with MCP tools
     let req = ResponsesRequest {
         include: None,
+        background: None,
         input: ResponseInput::Text("search for something interesting".to_string()),
         instructions: Some("Use tools when needed".to_string()),
         max_output_tokens: Some(256),
@@ -1981,6 +2200,7 @@ async fn test_streaming_multi_turn_with_mcp() {
 
     let req = ResponsesRequest {
         include: None,
+        background: None,
         input: ResponseInput::Text("complex query requiring multiple tool calls".to_string()),
         instructions: Some("Be thorough".to_string()),
         max_output_tokens: Some(512),
@@ -2141,6 +2361,156 @@ async fn test_conversation_items_create_and_get() {
     assert_eq!(get_json["id"], item_id);
     assert_eq!(get_json["type"], "message");
     assert_eq!(get_json["role"], "user");
+}
+
+/// The JSON body of a handler's 200 response.
+async fn conversation_json(
+    resp: axum::response::Response,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// The ids of a list response's `data[]`, in the order answered.
+fn conversation_item_ids(list: &serde_json::Value) -> Vec<String> {
+    list["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["id"].as_str().map(String::from))
+        .collect()
+}
+
+fn user_message(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": text}]
+    })
+}
+
+#[tokio::test]
+async fn items_of_one_add_call_are_listed_in_request_order(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Items that share a stamp are listed by their random ids, which is request order about
+    // half of the time: twenty rounds, each with two items in one call and a third in the next.
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec!["http://localhost".to_string()])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(1)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(8)
+        .queue_timeout_secs(5)
+        .build_unchecked();
+    let ctx = crate::common::create_test_context(router_cfg).await;
+    let _router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    for round in 0..20 {
+        let conv = conversation_json(
+            conversations::create_conversation(&ctx.conversation_storage, serde_json::json!({}))
+                .await,
+        )
+        .await?;
+        let conv_id = conv["id"].as_str().ok_or("conversation id")?;
+
+        let added = conversation_json(
+            conversations::create_conversation_items(
+                &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
+                conv_id,
+                serde_json::json!({"items": [user_message("first"), user_message("second")]}),
+            )
+            .await,
+        )
+        .await?;
+        let mut expected = conversation_item_ids(&added);
+        assert_eq!(
+            expected.len(),
+            2,
+            "round {round}: the add answers both items"
+        );
+
+        // A second call right after the first: its item follows the first call's items.
+        let third = conversation_json(
+            conversations::create_conversation_items(
+                &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
+                conv_id,
+                serde_json::json!({"items": [user_message("third")]}),
+            )
+            .await,
+        )
+        .await?;
+        expected.extend(conversation_item_ids(&third));
+        assert_eq!(
+            expected.len(),
+            3,
+            "round {round}: the second add answers its item"
+        );
+
+        let asc = conversation_json(
+            conversations::list_conversation_items(
+                &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
+                conv_id,
+                None,
+                Some("asc"),
+                None,
+            )
+            .await,
+        )
+        .await?;
+        assert_eq!(
+            conversation_item_ids(&asc),
+            expected,
+            "round {round}: order=asc lists the items as they were added"
+        );
+
+        let desc = conversation_json(
+            conversations::list_conversation_items(
+                &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
+                conv_id,
+                None,
+                Some("desc"),
+                None,
+            )
+            .await,
+        )
+        .await?;
+        let mut reversed = expected.clone();
+        reversed.reverse();
+        assert_eq!(
+            conversation_item_ids(&desc),
+            reversed,
+            "round {round}: order=desc is the reverse"
+        );
+
+        let after_first = conversation_json(
+            conversations::list_conversation_items(
+                &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
+                conv_id,
+                None,
+                Some("asc"),
+                Some(&expected[0]),
+            )
+            .await,
+        )
+        .await?;
+        assert_eq!(
+            conversation_item_ids(&after_first),
+            expected[1..],
+            "round {round}: after the first item come the others, in order"
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test]

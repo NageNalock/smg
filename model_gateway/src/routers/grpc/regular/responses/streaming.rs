@@ -62,7 +62,7 @@ use crate::{
                 utils::{
                     function_call_status, generation_failure_error, resolve_function_identity,
                 },
-                ResponsesContext,
+                BackgroundStream, ResponsesContext,
             },
             utils,
         },
@@ -86,8 +86,10 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     chat_request: Arc<ChatCompletionRequest>,
     params: ResponsesCallContext,
     original_request: &ResponsesRequest,
+    background: Option<BackgroundStream>,
 ) -> Response {
     debug!("Converting chat SSE stream to responses SSE format");
+    let response_id = params.response_id;
 
     // Get chat streaming response
     let chat_response = ctx
@@ -126,15 +128,20 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     let conversation_storage = ctx.conversation_storage.clone();
     let conversation_item_storage = ctx.conversation_item_storage.clone();
     let request_context = ctx.request_context.clone();
+    // A background stream's events go through a relay, so the work and its
+    // terminal record outlive a client that leaves.
+    let tx = match &background {
+        Some(_) => BackgroundStream::detach(tx),
+        None => tx,
+    };
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "streaming task is fire-and-forget; client disconnect terminates it"
-    )]
-    tokio::spawn(async move {
-        if let Err(e) = process_and_transform_sse_stream(
+    // The transform answers the error it ended with (after the error frame
+    // went to the client), so the runner of a background stream can store it.
+    let transform = async move {
+        match process_and_transform_sse_stream(
             body,
             original_request_clone,
+            response_id,
             response_storage,
             conversation_storage,
             conversation_item_storage,
@@ -143,19 +150,55 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
         )
         .await
         {
-            warn!("Error transforming SSE stream: {}", e);
-            utils::send_error_sse(&tx, &e, "stream_error").await;
+            Ok(()) => Ok(()),
+            Err(e) => {
+                warn!("Error transforming SSE stream: {}", e);
+                utils::send_error_sse(&tx, &e, "stream_error").await;
+                Err(json!({ "code": "stream_error", "message": e }))
+            }
         }
-    });
+    };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "streaming task is fire-and-forget; client disconnect terminates it unless it runs a background response, whose slot bounds it"
+    )]
+    match background {
+        Some(run) => {
+            let storage = ctx.response_storage.clone();
+            let request_context = ctx.request_context.clone();
+            tokio::spawn(run.run(storage, request_context, transform));
+        }
+        None => {
+            tokio::spawn(transform);
+        }
+    }
 
     // Build SSE response with transformed stream
     build_sse_response(rx)
 }
 
+/// The SSE events of one frame of the chat stream's body.
+///
+/// The chat pipeline writes whole events to the body, but not one per frame:
+/// a frame carries every chunk the engine had ready when the stream loop ran,
+/// and a re-sliced stream every slice cut from one chunk. Read as one event,
+/// such a frame parses as nothing and everything after its first event is lost.
+fn sse_events(frame: &str) -> impl Iterator<Item = &str> {
+    frame
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|event| !event.is_empty())
+}
+
 /// Process chat SSE stream and transform to responses format
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the stream transform takes the storage handles and the pre-stored id of a background response"
+)]
 async fn process_and_transform_sse_stream(
     body: Body,
     original_request: ResponsesRequest,
+    response_id: Option<String>,
     response_storage: Arc<dyn ResponseStorage>,
     conversation_storage: Arc<dyn ConversationStorage>,
     conversation_item_storage: Arc<dyn ConversationItemStorage>,
@@ -165,19 +208,29 @@ async fn process_and_transform_sse_stream(
     // Create accumulator for final response
     let mut accumulator = StreamingResponseAccumulator::new(&original_request);
 
-    // Create event emitter for OpenAI-compatible streaming
-    let response_id = format!("resp_{}", Uuid::now_v7());
+    // Create event emitter for OpenAI-compatible streaming; a background
+    // response streams under the id its queued record was stored under.
+    let response_id = response_id.unwrap_or_else(|| format!("resp_{}", Uuid::now_v7()));
     let model = original_request.model.clone();
     let created_at = chrono::Utc::now().timestamp() as u64;
     let mut event_emitter = ResponseStreamEventEmitter::new(response_id.clone(), model, created_at);
     event_emitter.set_original_request(original_request.clone());
 
-    // Emit initial response.created and response.in_progress events
+    // Emit initial response.created and response.in_progress events (a
+    // background stream reports response.queued between the two)
     let event = event_emitter.emit_created();
     event_emitter
         .send_event(&event, &tx)
         .await
         .map_err(|_| "Failed to send response.created event".to_string())?;
+
+    if original_request.background.unwrap_or(false) {
+        let event = event_emitter.emit_queued();
+        event_emitter
+            .send_event(&event, &tx)
+            .await
+            .map_err(|_| "Failed to send response.queued event".to_string())?;
+    }
 
     let event = event_emitter.emit_in_progress();
     event_emitter
@@ -189,8 +242,8 @@ async fn process_and_transform_sse_stream(
     let mut stream = body.into_data_stream();
 
     let mut terminal_error = None;
-    // Process stream chunks (each chunk is a complete SSE event)
-    while let Some(chunk_result) = stream.next().await {
+    // Process the stream frame by frame; a frame holds one or more SSE events.
+    'frames: while let Some(chunk_result) = stream.next().await {
         let chunk = match chunk_result {
             Ok(chunk) => chunk,
             Err(error) => {
@@ -201,17 +254,17 @@ async fn process_and_transform_sse_stream(
             }
         };
 
-        // Convert chunk to string
-        let event_str = String::from_utf8_lossy(&chunk);
-        let event = event_str.trim();
+        let frame = String::from_utf8_lossy(&chunk);
+        for event in sse_events(&frame) {
+            // Check for end of stream
+            if event == "data: [DONE]" {
+                break 'frames;
+            }
 
-        // Check for end of stream
-        if event == "data: [DONE]" {
-            break;
-        }
-
-        // Parse SSE event (format: "data: {...}\n\n" or "data: {...}")
-        if let Some(json_str) = event.strip_prefix("data: ") {
+            // Parse SSE event (format: "data: {...}")
+            let Some(json_str) = event.strip_prefix("data: ") else {
+                continue;
+            };
             let json_str = json_str.trim();
 
             // Try to parse as ChatCompletionStreamResponse
@@ -230,7 +283,7 @@ async fn process_and_transform_sse_stream(
                                 "code": error.get("code").and_then(Value::as_str).or_else(|| error.get("type").and_then(Value::as_str)).unwrap_or("server_error"),
                                 "message": error.get("message").and_then(Value::as_str).unwrap_or("Upstream generation failed"),
                             }));
-                            break;
+                            break 'frames;
                         }
                     }
                     // Pass through unrecognized non-error events.
@@ -247,39 +300,20 @@ async fn process_and_transform_sse_stream(
         }
     }
 
-    // Emit final response.completed event with accumulated usage
-    let usage_json = accumulator.usage.as_ref().map(|u| {
-        let mut usage_obj = json!({
-            "input_tokens": u.prompt_tokens,
-            "output_tokens": u.completion_tokens,
-            "total_tokens": u.total_tokens
-        });
-
-        // Include reasoning_tokens if present
-        if let Some(details) = &u.completion_tokens_details {
-            if let Some(reasoning_tokens) = details.reasoning_tokens {
-                usage_obj["output_tokens_details"] =
-                    json!({ "reasoning_tokens": reasoning_tokens });
-            }
-        }
-
-        usage_obj
-    });
-
-    event_emitter
-        .emit_terminal(usage_json.as_ref(), terminal_error.as_ref(), &tx)
-        .await?;
-
-    // Finalize and persist accumulated response
+    // Use the same complete usage representation for the terminal event and storage.
     if terminal_error.is_some() {
         accumulator.finish_reason = Some("failed".into());
     }
     let mut final_response = accumulator.finalize();
     // Persist under the public Responses ID, not the upstream Chat ID.
     final_response.id = response_id;
-    if let Some(error) = terminal_error {
-        final_response.error = Some(error);
+    if let Some(error) = terminal_error.as_ref() {
+        final_response.error = Some(error.clone());
     }
+    let usage_json = final_response.usage.as_ref().map(|usage| json!(usage));
+    event_emitter
+        .emit_terminal(usage_json.as_ref(), terminal_error.as_ref(), &tx)
+        .await?;
     persist_response_if_needed(
         conversation_storage,
         conversation_item_storage,
@@ -520,6 +554,7 @@ pub(super) async fn execute_tool_loop_streaming(
     original_request: &ResponsesRequest,
     params: ResponsesCallContext,
     mcp_servers: Vec<McpServerBinding>,
+    background: Option<BackgroundStream>,
 ) -> Response {
     // Create SSE channel for client
     let (tx, rx) = sse_channel();
@@ -528,14 +563,17 @@ pub(super) async fn execute_tool_loop_streaming(
     // Clone data for background task
     let ctx_clone = ctx.clone();
     let original_request_clone = original_request.clone();
+    // A background stream's events go through a relay, so the work and its
+    // terminal record outlive a client that leaves.
+    let tx = match &background {
+        Some(_) => BackgroundStream::detach(tx),
+        None => tx,
+    };
 
-    // Spawn background task for tool loop
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "streaming task is fire-and-forget; client disconnect terminates it"
-    )]
-    tokio::spawn(async move {
-        let result = execute_tool_loop_streaming_internal(
+    // The loop answers the error it ended with (after the error frame went
+    // to the client), so the runner of a background stream can store it.
+    let tool_loop = async move {
+        match execute_tool_loop_streaming_internal(
             &ctx_clone,
             current_request,
             &original_request_clone,
@@ -544,13 +582,31 @@ pub(super) async fn execute_tool_loop_streaming(
             tx.clone(),
             Some(startup_tx),
         )
-        .await;
-
-        if let Err(e) = result {
-            warn!("Streaming tool loop error: {}", e);
-            utils::send_error_sse(&tx, &e, "tool_loop_error").await;
+        .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                warn!("Streaming tool loop error: {}", e);
+                utils::send_error_sse(&tx, &e, "tool_loop_error").await;
+                Err(json!({ "code": "tool_loop_error", "message": e }))
+            }
         }
-    });
+    };
+    // Spawn background task for tool loop
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "streaming task is fire-and-forget; client disconnect terminates it unless it runs a background response, whose slot bounds it"
+    )]
+    match background {
+        Some(run) => {
+            let storage = ctx.response_storage.clone();
+            let request_context = ctx.request_context.clone();
+            tokio::spawn(run.run(storage, request_context, tool_loop));
+        }
+        None => {
+            tokio::spawn(tool_loop);
+        }
+    }
 
     await_stream_startup(startup_rx, rx).await
 }
@@ -569,7 +625,11 @@ async fn execute_tool_loop_streaming_internal(
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
     // Generate response ID first so we can use it for both emitter and session
-    let response_id = format!("resp_{}", Uuid::now_v7());
+    // (a background response streams under the id its queued record holds)
+    let response_id = params
+        .response_id
+        .clone()
+        .unwrap_or_else(|| format!("resp_{}", Uuid::now_v7()));
 
     // Create session once — bundles orchestrator, request_ctx, server_keys, mcp_tools
     let session = McpToolSession::new(&ctx.mcp_orchestrator, mcp_servers, &response_id);
@@ -583,9 +643,14 @@ async fn execute_tool_loop_streaming_internal(
         ResponseStreamEventEmitter::new(response_id, current_request.model.clone(), created_at);
     emitter.set_original_request(original_request.clone());
 
-    // Emit initial response.created and response.in_progress events
+    // Emit initial response.created and response.in_progress events (a
+    // background stream reports response.queued between the two)
     let event = emitter.emit_created();
     emitter.send_event(&event, &tx).await?;
+    if original_request.background.unwrap_or(false) {
+        let event = emitter.emit_queued();
+        emitter.send_event(&event, &tx).await?;
+    }
     let event = emitter.emit_in_progress();
     emitter.send_event(&event, &tx).await?;
 
@@ -953,7 +1018,25 @@ async fn execute_tool_loop_streaming_internal(
     let terminal_usage = state.usage.as_ref().map(|usage| json!(usage));
     emitter
         .emit_terminal(terminal_usage.as_ref(), terminal_error.as_ref(), &tx)
-        .await
+        .await?;
+
+    // Store the final object, as the other streaming paths do; a background
+    // response needs its terminal record under the id the client polls.
+    let mut final_response = emitter.finalize(None);
+    final_response.usage = state.usage.clone().map(ResponsesUsage::Modern);
+    if let Some(error) = terminal_error {
+        final_response.error = Some(error);
+    }
+    persist_response_if_needed(
+        ctx.conversation_storage.clone(),
+        ctx.conversation_item_storage.clone(),
+        ctx.response_storage.clone(),
+        &final_response,
+        original_request,
+        ctx.request_context.clone(),
+    )
+    .await;
+    Ok(())
 }
 
 /// Convert chat stream to Responses API events while accumulating for tool call detection
@@ -970,18 +1053,21 @@ async fn convert_and_accumulate_stream(
     let mut mcp_indices: HashMap<u32, bool> = HashMap::new();
     let mut pending: HashMap<u32, Vec<ToolCallDelta>> = HashMap::new();
 
-    while let Some(chunk_result) = stream.next().await {
+    // A frame holds one or more SSE events; every one of them counts.
+    'frames: while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|error| {
             json!({
                 "code": "stream_error", "message": format!("Stream read error: {error}"),
             })
         })?;
-        let event_str = String::from_utf8_lossy(&chunk);
-        let event = event_str.trim();
-        if event == "data: [DONE]" {
-            break;
-        }
-        if let Some(json_str) = event.strip_prefix("data: ") {
+        let frame = String::from_utf8_lossy(&chunk);
+        for event in sse_events(&frame) {
+            if event == "data: [DONE]" {
+                break 'frames;
+            }
+            let Some(json_str) = event.strip_prefix("data: ") else {
+                continue;
+            };
             let json_str = json_str.trim();
             if let Ok(mut chat_chunk) =
                 serde_json::from_str::<ChatCompletionStreamResponse>(json_str)
@@ -1139,6 +1225,7 @@ impl ChatResponseAccumulator {
                     } else {
                         Some(self.content)
                     },
+                    refusal: None,
                     tool_calls: if tool_calls.is_empty() {
                         None
                     } else {
@@ -1190,6 +1277,64 @@ mod tests {
         );
         assert!(usage.get("prompt_tokens").is_none());
         assert!(usage.get("completion_tokens").is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_stream_preserves_cache_and_reasoning_usage() {
+        for cached in [Some(0), Some(6), None] {
+            let mut usage = Usage::from_counts(12, 7).with_reasoning_tokens(2);
+            if let Some(cached) = cached {
+                usage = usage.with_cached_tokens(cached);
+            }
+            let chunk = ChatCompletionStreamResponse::builder("chat_test", "test-model")
+                .usage(usage)
+                .build();
+            let frames = vec![
+                format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap()),
+                "data: [DONE]\n\n".into(),
+            ];
+            let body = Body::from_stream(futures_util::stream::iter(
+                frames.into_iter().map(Ok::<_, std::convert::Infallible>),
+            ));
+            let (tx, mut rx) = mpsc::channel(64);
+            process_and_transform_sse_stream(
+                body,
+                ResponsesRequest {
+                    store: Some(false),
+                    ..Default::default()
+                },
+                None,
+                Arc::new(smg_data_connector::MemoryResponseStorage::new()),
+                Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+                Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+            let mut terminal = None;
+            while let Some(Ok(bytes)) = rx.recv().await {
+                let text = std::str::from_utf8(&bytes).unwrap();
+                let data = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .unwrap();
+                let event: Value = serde_json::from_str(data).unwrap();
+                if event["type"] == "response.completed" {
+                    terminal = Some(event);
+                }
+            }
+            let terminal = terminal.expect("completed event must be emitted");
+            let usage = &terminal["response"]["usage"];
+            assert_eq!(usage["input_tokens"], 12);
+            assert_eq!(usage["output_tokens"], 7);
+            assert_eq!(usage["total_tokens"], 19);
+            assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 2);
+            assert_eq!(
+                usage["input_tokens_details"]["cached_tokens"],
+                cached.unwrap_or(0)
+            );
+        }
     }
 
     #[test]
@@ -1338,6 +1483,7 @@ mod tests {
                 store: Some(false),
                 ..Default::default()
             },
+            None,
             Arc::new(smg_data_connector::MemoryResponseStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
@@ -1600,5 +1746,140 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("connection reset"));
+    }
+
+    /// One chat chunk as the SSE event the chat stream writes for it.
+    fn chat_event(delta: Value, finish_reason: Option<&str>) -> String {
+        format!(
+            "data: {}\n\n",
+            json!({
+                "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
+                "choices":[{"index":0,"delta":delta,"finish_reason":finish_reason}]
+            })
+        )
+    }
+
+    /// The chat stream hands the body every chunk the engine had ready as one
+    /// frame. Each event of such a frame is converted, and a `[DONE]` that
+    /// shares its frame with the finish chunk still ends the stream.
+    #[tokio::test]
+    async fn drained_frame_feeds_every_chat_chunk_to_the_responses_stream() {
+        let frames = vec![
+            [
+                chat_event(json!({"role":"assistant","content":""}), None),
+                chat_event(json!({"content":"Hel"}), None),
+                chat_event(json!({"content":"lo"}), None),
+            ]
+            .concat(),
+            [
+                chat_event(json!({}), Some("stop")),
+                "data: [DONE]\n\n".to_string(),
+            ]
+            .concat(),
+        ];
+        let body = Body::from_stream(futures_util::stream::iter(
+            frames.into_iter().map(Ok::<_, std::convert::Infallible>),
+        ));
+        let (tx, mut rx) = mpsc::channel(64);
+        process_and_transform_sse_stream(
+            body,
+            ResponsesRequest {
+                store: Some(false),
+                ..Default::default()
+            },
+            None,
+            Arc::new(smg_data_connector::MemoryResponseStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
+            tx,
+        )
+        .await
+        .unwrap();
+        let mut events: Vec<Value> = Vec::new();
+        while let Some(Ok(bytes)) = rx.recv().await {
+            let text = std::str::from_utf8(&bytes).unwrap();
+            for data in text.lines().filter_map(|line| line.strip_prefix("data: ")) {
+                // Only the chat stream's `[DONE]` is not JSON; keep it visible.
+                events.push(serde_json::from_str(data).unwrap_or(Value::String(data.to_string())));
+            }
+        }
+        assert!(
+            events.iter().all(|e| e["sequence_number"].is_u64()),
+            "a chat frame reached the client unconverted: {events:?}"
+        );
+        let text: String = events
+            .iter()
+            .filter(|e| e["type"] == "response.output_text.delta")
+            .map(|e| e["delta"].as_str().unwrap())
+            .collect();
+        assert_eq!(text, "Hello");
+        let terminal = events.last().unwrap();
+        assert_eq!(terminal["type"], "response.completed");
+        assert_eq!(
+            terminal["response"]["output"][0]["content"][0]["text"],
+            "Hello"
+        );
+    }
+
+    /// The MCP converter reads every event of a frame as well: a server call
+    /// whose name, arguments and finish arrive in one frame is accumulated
+    /// for execution.
+    #[tokio::test]
+    async fn drained_frame_feeds_every_chat_chunk_to_the_mcp_converter() {
+        let frame = [
+            chat_event(
+                json!({"tool_calls":[{"index":0,"id":"call_server","type":"function",
+                    "function":{"name":"server_tool","arguments":""}}]}),
+                None,
+            ),
+            chat_event(
+                json!({"tool_calls":[{"index":0,"function":{"arguments":"{\"q\":1}"}}]}),
+                None,
+            ),
+            chat_event(json!({}), Some("tool_calls")),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        let (tx, _rx) = mpsc::channel(64);
+        let response =
+            convert_and_accumulate_stream(Body::from(frame), &mut emitter, &tx, |name| {
+                name == "server_tool"
+            })
+            .await
+            .unwrap();
+        let choice = &response.choices[0];
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+        let calls = choice
+            .message
+            .tool_calls
+            .as_ref()
+            .expect("the server call of the frame is accumulated");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_server");
+        assert_eq!(calls[0].function.name, "server_tool");
+        assert_eq!(calls[0].function.arguments.as_deref(), Some("{\"q\":1}"));
+    }
+
+    /// An upstream error that shares a frame with the chunks before it fails
+    /// the response instead of completing it.
+    #[tokio::test]
+    async fn drained_frame_error_fails_the_mcp_stream() {
+        let frame = [
+            chat_event(json!({"role":"assistant","content":"Part"}), None),
+            "data: {\"error\":{\"message\":\"engine unavailable\",\"type\":\"internal_error\"}}\n\n"
+                .to_string(),
+        ]
+        .concat();
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        let (tx, _rx) = mpsc::channel(64);
+        let error = convert_and_accumulate_stream(Body::from(frame), &mut emitter, &tx, |_| false)
+            .await
+            .unwrap_err();
+        assert_eq!(error["code"], "internal_error");
+        assert_eq!(error["message"], "engine unavailable");
     }
 }

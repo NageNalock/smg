@@ -22,7 +22,7 @@ use openai_protocol::{
 };
 use serde_json::Value;
 
-use crate::routers::grpc::utils;
+use crate::routers::grpc::{regular::stages::decisions::scoring::DecisionScoring, utils};
 
 /// Response-phase contract for one request, produced by request building.
 #[derive(Clone)]
@@ -34,8 +34,23 @@ pub(crate) enum ResponseSpec {
     /// Embedding/classify response processing needs only dispatch metadata.
     Embedding,
     Classify,
+    Decisions(DecisionsResponseSpec),
     Harmony(HarmonyResponseSpec),
     Transcription(TranscriptionResponseSpec),
+}
+
+#[derive(Clone)]
+pub(crate) struct DecisionsResponseSpec {
+    pub scoring: DecisionScoring,
+    pub questions: Vec<DecisionQuestionSpec>,
+    pub max_input_tokens: usize,
+}
+
+/// The candidate tokens and exact prompt size expected for one scoring RPC.
+#[derive(Clone)]
+pub(crate) struct DecisionQuestionSpec {
+    pub label_ids: Vec<u32>,
+    pub input_tokens: usize,
 }
 
 /// Wire format of a `/v1/audio/transcriptions` response body.
@@ -75,6 +90,8 @@ pub(crate) struct ChatResponseSpec {
     /// `n`, normalized.
     pub expected_choices: u32,
     pub logprobs: bool,
+    /// Alternatives per token the client asked for; none when absent.
+    pub top_logprobs: Option<u32>,
     pub stop: Option<StringOrArray>,
     pub stop_token_ids: Option<Vec<u32>>,
     pub no_stop_trim: bool,
@@ -110,6 +127,7 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             continues_final_assistant: utils::continues_final_assistant(request),
             expected_choices: request.n.unwrap_or(1).max(1),
             logprobs: request.logprobs,
+            top_logprobs: request.top_logprobs,
             stop: request.stop.clone(),
             stop_token_ids: request.stop_token_ids.clone(),
             no_stop_trim: request.no_stop_trim,

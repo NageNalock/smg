@@ -192,3 +192,123 @@ class TestConvertBatchAttnDpRank:
         proto, _ = shared.convert_batch(batch, seq_num=1, event_id_start=0)
         assert proto.HasField("dp_rank")
         assert proto.dp_rank == 0
+
+
+class TestResolvedReplayEndpoint:
+    def test_replay_endpoint_is_carried_when_configured(self):
+        cfg = ts_kv_events.resolve_kv_events_config(
+            _Args(
+                _cfg(
+                    enable_kv_cache_events=True,
+                    publisher="zmq",
+                    endpoint="tcp://*:5600",
+                    replay_endpoint="tcp://*:5601",
+                )
+            )
+        )
+        assert (cfg.endpoint, cfg.replay_endpoint) == ("tcp://*:5600", "tcp://*:5601")
+
+    def test_replay_endpoint_is_empty_when_absent_or_not_a_string(self):
+        absent = ts_kv_events.resolve_kv_events_config(
+            _Args(_cfg(enable_kv_cache_events=True, publisher="zmq"))
+        )
+        assert absent.replay_endpoint == ""
+        odd = ts_kv_events.resolve_kv_events_config(
+            _Args(_cfg(enable_kv_cache_events=True, publisher="zmq", replay_endpoint=5601))
+        )
+        assert odd is not None and odd.replay_endpoint == ""
+
+
+# --- The servicer hands its load record to the stream loop (no TokenSpeed import) ---
+
+
+def _subscribe_method(namespace):
+    """The real ``SubscribeKvEvents`` method of the TokenSpeed servicer,
+    compiled on its own (the servicer module imports the engine)."""
+    import ast
+    import asyncio
+    import logging
+    from collections.abc import AsyncIterator
+
+    import grpc
+    from smg_grpc_proto.generated import common_pb2
+
+    source_path = _SERVICER_ROOT / "tokenspeed" / "servicer.py"
+    tree = ast.parse(source_path.read_text())
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "SubscribeKvEvents"
+    )
+    namespace.update(
+        {
+            "AsyncIterator": AsyncIterator,
+            "asyncio": asyncio,
+            "common_pb2": common_pb2,
+            "grpc": grpc,
+            "logger": logging.getLogger("test"),
+        }
+    )
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(source_path), "exec"), namespace)
+    return namespace["SubscribeKvEvents"]
+
+
+@pytest.mark.asyncio
+async def test_servicer_hands_its_load_record_to_the_stream_loop():
+    from types import SimpleNamespace
+
+    from smg_grpc_proto.generated import common_pb2
+
+    calls = []
+
+    async def fake_stream(sub_socket, decode, send_initial_metadata, is_cancelled, **options):
+        calls.append((decode, options))
+        yield common_pb2.KvEventBatch(sequence_number=3)
+
+    class Socket:
+        def subscribe(self, topic):
+            pass
+
+        def connect(self, endpoint):
+            self.endpoint = endpoint
+
+        def close(self, linger=0):
+            pass
+
+    class Context:
+        def socket(self, kind):
+            return Socket()
+
+    decoder = SimpleNamespace(decode=lambda payload: payload)
+    method = _subscribe_method(
+        {
+            "stream_kv_events": fake_stream,
+            "endpoint_for_rank": lambda endpoint, rank: endpoint,
+            "zmq": SimpleNamespace(
+                asyncio=SimpleNamespace(Context=SimpleNamespace(instance=Context)), SUB=2
+            ),
+            "msgspec": SimpleNamespace(msgpack=SimpleNamespace(Decoder=lambda kind: decoder)),
+            "KVEventBatch": object,
+        }
+    )
+    config = SimpleNamespace(endpoint="tcp://127.0.0.1:5557", topic="kv")
+
+    def load_record(dp_rank):
+        return None
+
+    servicer = SimpleNamespace(_kv_events_config=config, _load_record=load_record)
+
+    class RpcContext:
+        def cancelled(self):
+            return False
+
+        async def send_initial_metadata(self, metadata):
+            pass
+
+    batches = [
+        batch
+        async for batch in method(servicer, common_pb2.SubscribeKvEventsRequest(), RpcContext())
+    ]
+    assert [b.sequence_number for b in batches] == [3]
+    ((decode, options),) = calls
+    assert decode is decoder.decode and options["load_source"] is load_record

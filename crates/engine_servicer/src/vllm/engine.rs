@@ -1,39 +1,37 @@
 //! The link to the engine: `None` while the ZMQ handshake runs, then the
 //! client or the reason it failed. Health is gated on it.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::{sync::Arc, time::Duration};
 
 use engine_zmq_adapter::{
-    connect_with_eos, structured_outputs_backend_from_config, EosTokenIds, ZmqEngineClient,
+    connect_with_eos, structured_outputs_backend_from_config, EosTokenIds, Handshake,
 };
+use engine_zmq_client::StartupBudget;
 use openai_protocol::worker::RuntimeType;
 use tracing::{error, info, warn};
 
 use super::State;
 use crate::{record_error, SharedError};
 
-/// The engine link: unset while the handshake runs, then the client or the
-/// reason it failed. Health is gated on it.
-#[derive(Default)]
-pub(crate) struct EngineLink {
-    pub(crate) client: OnceLock<ZmqEngineClient>,
-    pub(crate) error: Mutex<Option<String>>,
-}
-
-impl EngineLink {
-    pub(super) fn error(&self) -> Option<String> {
-        self.error.lock().ok().and_then(|slot| slot.clone())
-    }
-}
-
 /// Load the tokenizer and connect the engine, in the background of a server
 /// that is already listening. Failures gate health and surface as the last
 /// error; nothing here retries, the lifecycle owner restarts the pair.
+///
+/// The handshake's silence bound (`startup_timeout`) counts from the latest
+/// sign of life: a handshake message, or the lifecycle owner's report that
+/// the engine process is alive (`State::engine::liveness`); the ceiling
+/// bounds the whole start regardless.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the link's inputs: endpoints, engine count, the two startup bounds, the tokenizer and the error slot"
+)]
 pub(super) async fn connect_engine(
     state: Arc<State>,
     ipc_base_url: String,
     handshake_address: String,
     engine_count: usize,
+    startup_timeout: Duration,
+    startup_ceiling: Option<Duration>,
     tokenizer_dir: Option<String>,
     last_error: SharedError,
 ) {
@@ -67,9 +65,14 @@ pub(super) async fn connect_engine(
         &ipc_base_url,
         state.model.model_path.clone(),
         RuntimeType::Vllm,
-        Some(&handshake_address),
+        Handshake::TcpOrIpc(&handshake_address),
         engine_count,
         eos,
+        StartupBudget {
+            silence: startup_timeout,
+            ceiling: startup_ceiling,
+            liveness: Some(state.engine.liveness.clone()),
+        },
     )
     .await
     {
@@ -86,11 +89,14 @@ pub(super) async fn connect_engine(
             let _ = state.engine.client.set(client);
         }
         Err(connect_error) => {
-            let message = format!("vLLM engine connection failed: {connect_error}");
+            let ceiling = startup_ceiling
+                .map_or_else(|| "none".to_string(), |ceiling| format!("{ceiling:?}"));
+            let message = format!(
+                "vLLM engine connection failed: {connect_error} (startup bounds: \
+                 {startup_timeout:?} without a sign of life from the engine, ceiling {ceiling})"
+            );
             error!(%message);
-            if let Ok(mut slot) = state.engine.error.lock() {
-                *slot = Some(message.clone());
-            }
+            state.engine.fail(message.clone());
             record_error(&last_error, message);
         }
     }

@@ -13,6 +13,8 @@ use llm_multimodal::{
     TrackedMedia,
 };
 
+mod common;
+
 fn fixtures() -> Vec<String> {
     (0..70)
         .map(|index| {
@@ -37,7 +39,7 @@ fn fixtures() -> Vec<String> {
 async fn image_data_url_tracker() {
     let urls = fixtures();
     let connector = Arc::new(
-        MediaConnector::new(reqwest::Client::new(), MediaConnectorConfig::default())
+        MediaConnector::new(common::http_client(), MediaConnectorConfig::default())
             .expect("connector"),
     );
     for (count, unique) in [(1, 1), (8, 8), (32, 32), (70, 70), (70, 1)] {
@@ -66,8 +68,8 @@ async fn image_data_url_tracker() {
                 let TrackedMedia::Image(frame) = image else {
                     panic!("expected an image");
                 };
-                assert_eq!((frame.image.width(), frame.image.height()), (512, 512));
-                hasher.update(frame.image.to_rgb8().as_raw());
+                assert_eq!((frame.size().width, frame.size().height), (512, 512));
+                hasher.update(frame.image().expect("decoded image").to_rgb8().as_raw());
             }
             let digest = hasher.finalize().to_hex().to_string();
             assert_eq!(

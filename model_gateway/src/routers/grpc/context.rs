@@ -4,7 +4,7 @@
 //! request building is its last reader and [`RequestContext::into_dispatch`]
 //! yields the request-free [`DispatchContext`] the dispatch phase runs on.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use axum::http::HeaderMap;
 use llm_multimodal::registry::transcription::TranscriptionFamily;
@@ -13,6 +13,7 @@ use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
     classify::{ClassifyRequest, ClassifyResponse},
     completion::{CompletionRequest, CompletionResponse},
+    decisions::{DecisionResponse, DecisionsRequest},
     embedding::{EmbeddingRequest, EmbeddingResponse},
     generate::{GenerateRequest, GenerateResponse},
     messages::{CreateMessageRequest, Message},
@@ -27,21 +28,26 @@ use super::{
     backend_client::BackendClient,
     common::stages::{
         encode::EncodeDispatchPlan,
-        helpers::{IdStamp, SamplingBaseline, SamplingDefaultsMask},
+        helpers::{IdStamp, SamplingBaseline, SamplingDefaultsMask, ToolConstraintStamp},
         RateLimitCell,
     },
     multimodal::{InflightPermit, MediaPlan, MultimodalComponents, MultimodalIntermediate},
     proto_wrapper::{
         EncodeItemBootstrapInfo, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
-        ProtoRequest, ProtoStream,
+        ProtoInputLogProbs, ProtoRequest, ProtoStream,
     },
+    regular::stages::decisions::scoring::{DecisionPrompt, DecisionScoring},
     spec::ResponseSpec,
     utils::ParserResolver,
 };
 use crate::{
     middleware::TenantRequestMeta,
+    observability::{cache_trace, metrics::Metrics},
     policies::CacheNamespace,
-    routers::{common::pd_admission::PdAdmissionGuard, error::internal_error},
+    routers::{
+        common::{attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard},
+        error::internal_error,
+    },
     worker::{
         ConnectionMode, PrefillLoadGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
     },
@@ -83,6 +89,7 @@ pub(crate) enum RequestType {
     Responses(Arc<ResponsesRequest>),
     Embedding(Arc<EmbeddingRequest>),
     Classify(Arc<ClassifyRequest>),
+    Decisions(Arc<DecisionsRequest>),
     Messages(Arc<CreateMessageRequest>),
     /// Audio transcription: the request plus its uploaded audio. The
     /// preparation stage turns these into a chat-shaped backend request
@@ -113,6 +120,7 @@ impl RequestType {
             Self::Responses(request) => replace(&mut Arc::make_mut(request).model, model_id),
             Self::Embedding(request) => replace(&mut Arc::make_mut(request).model, model_id),
             Self::Classify(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Decisions(request) => replace(&mut Arc::make_mut(request).model, model_id),
             Self::Messages(request) => replace(&mut Arc::make_mut(request).model, model_id),
             Self::Transcription { request, .. } => {
                 replace(&mut Arc::make_mut(request).model, model_id);
@@ -130,7 +138,7 @@ impl RequestType {
             Self::Embedding(r) => r.rid.as_deref(),
             Self::Classify(r) => r.rid.as_deref(),
             Self::Messages(r) => r.rid.as_deref(),
-            Self::Responses(_) | Self::Transcription { .. } => None,
+            Self::Responses(_) | Self::Decisions(_) | Self::Transcription { .. } => None,
         }
     }
 }
@@ -144,6 +152,7 @@ impl std::fmt::Display for RequestType {
             Self::Responses(_) => write!(f, "Responses"),
             Self::Embedding(_) => write!(f, "Embedding"),
             Self::Classify(_) => write!(f, "Classify"),
+            Self::Decisions(_) => write!(f, "Decisions"),
             Self::Messages(_) => write!(f, "Messages"),
             Self::Transcription { .. } => write!(f, "Transcription"),
         }
@@ -158,6 +167,7 @@ impl std::fmt::Display for FinalResponse {
             Self::Completion(_) => write!(f, "Completion"),
             Self::Embedding(_) => write!(f, "Embedding"),
             Self::Classify(_) => write!(f, "Classify"),
+            Self::Decisions(_) => write!(f, "Decisions"),
             Self::Messages(_) => write!(f, "Messages"),
             Self::Transcription { .. } => write!(f, "Transcription"),
         }
@@ -274,6 +284,16 @@ impl WireConstraint {
 /// [`RequestContext::into_dispatch`]. `ResponseSpec` is the only
 /// request-derived input past this point.
 pub(crate) struct DispatchContext {
+    pub root_request_id: Option<String>,
+    pub cache_trace: Option<String>,
+    pub attempt: u32,
+    /// The request's bookkeeping across attempts: circuit-breaker charges
+    /// and the workers whose answer was definitive.
+    pub ledger: AttemptLedger,
+    /// Engines (base URLs) a failed attempt of this request dispatched to;
+    /// a retry's re-selection skips them while another available worker is
+    /// left (see `placement::PlacementInputs::tried`).
+    pub tried: Vec<String>,
     /// Canonical model ID (routing, registries).
     pub model_id: String,
     /// Model the response reports, captured from the request at the build
@@ -324,6 +344,10 @@ pub(crate) struct AttemptStamp {
     /// Pre-default values of the masked fields, so re-application never
     /// carries a previous attempt's worker defaults forward.
     pub sampling_baseline: Option<SamplingBaseline>,
+    /// A forced tool call's constraint before any worker shaped it, with
+    /// the tool parser that shapes it; retry attempts re-shape it for the
+    /// newly selected worker's engine, as the build did for the first.
+    pub tool_constraint: Option<ToolConstraintStamp>,
     /// Mode::PrefillDecode only (mirrors the build stage's flag).
     pub inject_pd_metadata: bool,
 }
@@ -480,6 +504,10 @@ impl ExecutionPlan {
 /// Each request type produces its own variant, eliminating optional fields
 /// that are always None for certain pipelines.
 pub(crate) enum PreparationOutput {
+    Decisions {
+        items: Vec<DecisionPrompt>,
+        scoring: DecisionScoring,
+    },
     Chat {
         token_ids: Vec<u32>,
         processed_messages: super::ProcessedMessages,
@@ -540,6 +568,9 @@ impl PreparationOutput {
     /// first prompt's tokens as the routing-affinity proxy.
     pub fn token_ids(&self) -> &[u32] {
         match self {
+            Self::Decisions { items, .. } => {
+                items.first().map_or(&[], |item| item.token_ids.as_slice())
+            }
             Self::Chat { token_ids, .. }
             | Self::Messages { token_ids, .. }
             | Self::Transcription { token_ids, .. }
@@ -558,6 +589,7 @@ impl PreparationOutput {
     /// request's real input cost is the sum of every prompt in the batch.
     pub fn total_input_token_count(&self) -> usize {
         match self {
+            Self::Decisions { items, .. } => items.iter().map(|item| item.token_ids.len()).sum(),
             Self::Completion { items, .. } => items.iter().map(|item| item.token_ids.len()).sum(),
             other => other.token_ids().len(),
         }
@@ -568,6 +600,11 @@ impl PreparationOutput {
     /// engine request, so the window applies per item, not to their sum.
     pub fn max_input_token_count(&self) -> usize {
         match self {
+            Self::Decisions { items, .. } => items
+                .iter()
+                .map(|item| item.token_ids.len())
+                .max()
+                .unwrap_or(0),
             Self::Completion { items, .. } => items
                 .iter()
                 .map(|item| item.token_ids.len())
@@ -581,6 +618,7 @@ impl PreparationOutput {
     /// Chat/Messages borrow from processed_messages.text to avoid a redundant clone.
     pub fn routing_text(&self) -> Option<&str> {
         match self {
+            Self::Decisions { items, .. } => items.first().map(|item| item.text.as_str()),
             Self::Chat {
                 processed_messages, ..
             }
@@ -671,6 +709,24 @@ pub(crate) enum LoadGuards {
         _admission: PdAdmissionGuard,
         _guards: Box<LoadGuards>,
     },
+    /// The dispatch's upstream span rides with the guards, so it ends when
+    /// they are released: at the response stream's last frame, the client's
+    /// disconnect, an upstream error or a retry, not at dispatch.
+    Traced {
+        _span: StreamSpan,
+        _guards: Box<LoadGuards>,
+    },
+}
+
+/// A span held open across a response stream. Released, it is entered once
+/// more: the OpenTelemetry layer stamps a span's end at its last exit, not
+/// at its close, so a span merely held would still end at dispatch.
+pub(crate) struct StreamSpan(tracing::Span);
+
+impl Drop for StreamSpan {
+    fn drop(&mut self) {
+        let _last_exit = self.0.enter();
+    }
 }
 
 impl LoadGuards {
@@ -695,6 +751,14 @@ impl LoadGuards {
                 _guards: Box::new(guards),
             },
             None => guards,
+        }
+    }
+
+    /// Keep `span` open for as long as the guards are held.
+    pub fn traced(span: tracing::Span, guards: Self) -> Self {
+        Self::Traced {
+            _span: StreamSpan(span),
+            _guards: Box::new(guards),
         }
     }
 
@@ -776,7 +840,9 @@ impl RequestContext {
             // preparation by capability check, never handed off here.
             RequestType::Transcription { .. } => false,
             // Embeddings and classification never stream.
-            RequestType::Embedding(_) | RequestType::Classify(_) => false,
+            RequestType::Embedding(_) | RequestType::Classify(_) | RequestType::Decisions(_) => {
+                false
+            }
         };
         Self {
             input: RequestInput {
@@ -810,7 +876,7 @@ impl RequestContext {
             headers,
             model_id,
             streaming,
-            tenant_request_meta: _,
+            tenant_request_meta,
             rate_limit_cell,
         } = input;
         // The model the response reports. `RequestContext::new` already
@@ -825,6 +891,7 @@ impl RequestContext {
             RequestType::Responses(req) => req.model.clone(),
             RequestType::Embedding(req) => req.model.clone(),
             RequestType::Classify(req) => req.model.clone(),
+            RequestType::Decisions(req) => req.model.clone(),
             RequestType::Messages(req) => req.model.clone(),
             RequestType::Transcription { request, .. } => request.model.clone(),
         };
@@ -855,6 +922,16 @@ impl RequestContext {
                 )
             })?;
         Ok(DispatchContext {
+            root_request_id: if cache_trace::enabled() {
+                super::common::stages::helpers::middleware_request_id(tenant_request_meta.as_ref())
+                    .map(str::to_owned)
+            } else {
+                None
+            },
+            cache_trace: None,
+            attempt: 0,
+            ledger: AttemptLedger::default(),
+            tried: Vec::new(),
             model_id,
             dispatch_model,
             streaming,
@@ -940,6 +1017,21 @@ impl RequestContext {
     ) -> Self {
         Self::new(
             RequestType::Responses(request),
+            headers,
+            model_id,
+            components,
+        )
+    }
+
+    /// Create context for a Decisions scoring request.
+    pub fn for_decisions(
+        request: Arc<DecisionsRequest>,
+        headers: Option<HeaderMap>,
+        model_id: String,
+        components: Arc<SharedComponents>,
+    ) -> Self {
+        Self::new(
+            RequestType::Decisions(request),
             headers,
             model_id,
             components,
@@ -1094,37 +1186,65 @@ impl WorkerSelection {
         }
     }
 
-    /// Record circuit breaker outcome for all workers based on HTTP status code.
-    pub fn record_outcome(&self, status_code: u16) {
+    /// The workers this selection dispatches to: the one worker, or the
+    /// prefill and decode legs.
+    pub fn workers(&self) -> impl Iterator<Item = &Arc<dyn Worker>> {
+        let (first, second) = match self {
+            Self::Single { worker } => (worker, None),
+            Self::Disaggregated {
+                prefill, decode, ..
+            } => (prefill, Some(decode)),
+        };
+        std::iter::once(first).chain(second)
+    }
+
+    /// The engines (base URLs) this selection dispatches to: the one worker,
+    /// or the prefill and decode legs.
+    pub fn engines(&self) -> impl Iterator<Item = &str> {
+        self.workers().map(|worker| worker.base_url())
+    }
+
+    /// Record an attempt's circuit-breaker outcome on every worker, through
+    /// the request's ledger (one failure charge per request per worker).
+    pub fn record_outcome(&self, ledger: &AttemptLedger, status_code: u16) {
         match self {
-            Self::Single { worker } => worker.record_outcome(status_code),
+            Self::Single { worker } => ledger.record_outcome(worker.as_ref(), status_code),
             Self::Disaggregated {
                 prefill, decode, ..
             } => {
                 // EPD encode dispatch is asynchronous and supervised by
                 // RequestExecution; this records only the prefill/decode leg.
-                prefill.record_outcome(status_code);
-                decode.record_outcome(status_code);
+                ledger.record_outcome(prefill.as_ref(), status_code);
+                ledger.record_outcome(decode.as_ref(), status_code);
             }
         }
     }
 
     /// Record circuit breaker outcomes for disaggregated dispatch (individual tracking)
-    pub fn record_prefill_decode_outcomes(&self, prefill_status: u16, decode_status: u16) {
+    pub fn record_prefill_decode_outcomes(
+        &self,
+        ledger: &AttemptLedger,
+        prefill_status: Option<u16>,
+        decode_status: Option<u16>,
+    ) {
         if let Self::Disaggregated {
             prefill, decode, ..
         } = self
         {
-            prefill.record_outcome(prefill_status);
-            decode.record_outcome(decode_status);
+            if let Some(status) = prefill_status {
+                ledger.record_outcome(prefill.as_ref(), status);
+            }
+            if let Some(status) = decode_status {
+                ledger.record_outcome(decode.as_ref(), status);
+            }
         }
     }
 
     /// Record circuit breaker outcome for prefill worker only (sequential PD)
-    pub fn record_outcome_prefill(&self, status_code: u16) {
+    pub fn record_outcome_prefill(&self, ledger: &AttemptLedger, status_code: u16) {
         match self {
             Self::Disaggregated { prefill, .. } => {
-                prefill.record_outcome(status_code);
+                ledger.record_outcome(prefill.as_ref(), status_code);
             }
             Self::Single { .. } => {
                 debug!("record_outcome_prefill called on Single worker selection, ignoring");
@@ -1133,10 +1253,10 @@ impl WorkerSelection {
     }
 
     /// Record circuit breaker outcome for decode worker only (sequential PD)
-    pub fn record_outcome_decode(&self, status_code: u16) {
+    pub fn record_outcome_decode(&self, ledger: &AttemptLedger, status_code: u16) {
         match self {
             Self::Disaggregated { decode, .. } => {
-                decode.record_outcome(status_code);
+                ledger.record_outcome(decode.as_ref(), status_code);
             }
             Self::Single { .. } => {
                 debug!("record_outcome_decode called on Single worker selection, ignoring");
@@ -1249,10 +1369,17 @@ pub(crate) enum ExecutionResult {
         prefill: ProtoStream,
         decode: Box<ProtoStream>,
         /// Guards indexed by fan-out sample. Each starts as `Some` and is taken
-        /// when that sample completes; siblings retain their guards.
+        /// when that sample completes; siblings retain their guards. A leg
+        /// whose prefill already ran to completion in the execution stage
+        /// (sequential PD) carries `None` — there is no live guard to release.
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         /// PD timing context, for honest PD TTFT (prefill start to first decode token).
         pd_timing: PdTiming,
+        /// Input (prompt) logprobs harvested from the prefill `Complete` frame.
+        /// `Some` only for sequential PD, where the execution stage drains the
+        /// prefill stream before the streaming layer runs; parallel/fan-out PD
+        /// leaves this `None` and the streaming layer drains the stream itself.
+        prefill_input_logprobs: Option<ProtoInputLogProbs>,
     },
     /// Embedding requests return a single response, not a stream
     Embedding {
@@ -1265,18 +1392,47 @@ pub(crate) enum ExecutionResult {
 }
 
 /// Timing context threaded from PD execution into the streaming layer so the
-/// first decode token can be measured against prefill start.
+/// first decode token can be measured against the prefill and decode dispatch
+/// instants.
 #[derive(Clone)]
 pub(crate) struct PdTiming {
     /// Monotonic instant the prefill RPC was dispatched.
-    pub prefill_start: std::time::Instant,
+    pub prefill_start: Instant,
+    /// Monotonic instant the decode RPC was dispatched. Sequential dispatch
+    /// sends decode once prefill is drained and relayed; parallel dispatch
+    /// sends both legs together, so this is the prefill instant.
+    pub decode_sent: Instant,
     /// Backend runtime label (e.g. "sglang", "vllm") for the PD metric set.
     pub runtime: &'static str,
+}
+
+impl PdTiming {
+    /// Record the PD time-to-first-token pair at the first decode token: the
+    /// end-to-end value from the prefill dispatch (`smg_pd_ttft_seconds`) and
+    /// the decode phase from the decode dispatch (`smg_pd_decode_ttft_seconds`),
+    /// off one clock reading so that the prefill, relay and decode phases add
+    /// up to the end-to-end value exactly.
+    pub(crate) fn record_first_decode_token(&self, backend_type: &'static str, model: &str) {
+        let now = Instant::now();
+        Metrics::record_pd_ttft(
+            backend_type,
+            model,
+            self.runtime,
+            now.duration_since(self.prefill_start),
+        );
+        Metrics::record_pd_decode_ttft(
+            backend_type,
+            model,
+            self.runtime,
+            now.duration_since(self.decode_sent),
+        );
+    }
 }
 
 /// Final processed response
 #[derive(Debug)]
 pub(crate) enum FinalResponse {
+    Decisions(DecisionResponse),
     Chat(ChatCompletionResponse),
     /// Generate response is a Vec of GenerateResponse (n=1 returns single item, n>1 returns multiple)
     Generate(Vec<GenerateResponse>),
@@ -1286,8 +1442,8 @@ pub(crate) enum FinalResponse {
     Embedding(EmbeddingResponse),
     /// Classification response
     Classify(ClassifyResponse),
-    /// Messages API response
-    Messages(Message),
+    /// Messages API response (boxed: the object outgrew the other variants)
+    Messages(Box<Message>),
     /// Transcription: the decoded transcript plus its wire format.
     Transcription {
         text: String,
@@ -1525,5 +1681,75 @@ mod tests {
         assert_eq!(plan.request_id(), "cmpl_shared");
         assert_eq!(plan.request_type(), "generate");
         assert_eq!(plan.mode_label(), "prefill_decode");
+    }
+
+    #[test]
+    fn load_guards_report_completion_for_each_leg_they_hold() {
+        use crate::worker::{BasicWorkerBuilder, RequestCompletionSink, WorkerType};
+        #[derive(Debug, Default)]
+        struct CompletionSpy(std::sync::Mutex<Vec<String>>);
+        impl RequestCompletionSink for CompletionSpy {
+            fn request_completed(&self, worker: &dyn Worker) {
+                self.0.lock().unwrap().push(worker.url().to_string());
+            }
+        }
+
+        let spy = Arc::new(CompletionSpy::default());
+        let sink: Arc<dyn RequestCompletionSink> = spy.clone();
+        let single: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://single")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+        for worker in [&single, &prefill, &decode] {
+            worker.set_completion_sink(Some(Arc::clone(&sink)));
+        }
+
+        // The regular gRPC path: one guard, one completion when the stream ends.
+        drop(LoadGuards::new(
+            &WorkerSelection::Single {
+                worker: Arc::clone(&single),
+            },
+            None,
+        ));
+        assert_eq!(spy.0.lock().unwrap().as_slice(), ["grpc://single"]);
+
+        // The disaggregated path: the decode leg completes with the guards,
+        // the prefill leg with its own guard when the prefill phase ends.
+        let guards = LoadGuards::new(&pd_selection(&prefill, &decode), None);
+        let prefill_guard = PrefillLoadGuard::Unbounded {
+            _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
+        };
+        drop(prefill_guard);
+        assert_eq!(
+            spy.0.lock().unwrap().last().map(String::as_str),
+            Some("grpc://prefill")
+        );
+        drop(guards);
+        assert_eq!(
+            spy.0.lock().unwrap().last().map(String::as_str),
+            Some("grpc://decode")
+        );
+
+        // A batched fan-out reports once per sub-request.
+        let before = spy.0.lock().unwrap().len();
+        drop(LoadGuards::scaled(
+            &WorkerSelection::Single {
+                worker: Arc::clone(&single),
+            },
+            None,
+            3,
+        ));
+        assert_eq!(spy.0.lock().unwrap().len(), before + 3);
     }
 }

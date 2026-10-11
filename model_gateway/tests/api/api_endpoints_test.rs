@@ -1487,11 +1487,9 @@ mod cache_tests {
                 .map(|entry| entry["worker"].as_str().expect("worker"))
                 .collect();
             reporters.sort_unstable();
-            assert_eq!(
-                reporters,
-                vec!["http://127.0.0.1:18502", "http://127.0.0.1:18503"],
-                "{uri}"
-            );
+            let mut expected: Vec<&str> = ctx.worker_urls.iter().map(String::as_str).collect();
+            expected.sort_unstable();
+            assert_eq!(reporters, expected, "{uri}");
             for entry in loads {
                 assert_eq!(entry["worker_type"], "regular", "{uri}");
                 assert_eq!(entry["num_running_reqs"], 2, "{uri}");
@@ -2194,6 +2192,64 @@ mod rerank_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        ctx.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod single_model_tests {
+    use super::*;
+
+    /// `GET /v1/models/{id}` takes the whole rest of the path: a served model
+    /// answers 200, and an unknown id with a slash in it (the usual shape of
+    /// a self-hosted id) answers the model_not_found envelope, not the
+    /// unknown-route 404 a one-segment route would fall through to.
+    #[tokio::test]
+    async fn test_single_model_route_takes_a_slashed_id() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18209,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let app = ctx.create_app();
+
+        let served = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/models/mock-model")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+
+        for uri in ["/v1/models/org/model", "/v1/models/org%2Fmodel"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body)
+                .unwrap_or_else(|_| json!({"error": {"code": "unknown_url"}}));
+            assert_eq!(body["error"]["code"], "model_not_found", "{uri}: {body}");
+        }
 
         ctx.shutdown().await;
     }

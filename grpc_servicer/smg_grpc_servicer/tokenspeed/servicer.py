@@ -19,7 +19,7 @@ import logging
 import os
 import re
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -47,9 +47,16 @@ from smg_grpc_servicer.mm_rdma import RdmaPixelPuller
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
-from smg_grpc_servicer.tokenspeed.loads import convert_load_to_protobuf, running_window
+from smg_grpc_servicer.tokenspeed.loads import (
+    convert_load_to_protobuf,
+    convert_snapshot_to_protobuf,
+    load_record,
+    running_window,
+)
+from smg_grpc_servicer.tokenspeed.redact import redact_secrets
 
 from ..pd_pairing import pairing_protocol_from_env
+from ..structured_outputs import grammar_start_labels, tokenspeed_structured_outputs_start
 
 if TYPE_CHECKING:
     # Type-only — keeps these out of the cold-path graph when the servicer is
@@ -60,6 +67,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 HEALTH_CHECK_TIMEOUT = int(os.getenv("TOKENSPEED_HEALTH_CHECK_TIMEOUT", "20"))
+# GetServerInfo's pause query must stay well under the gateway's 10 s metadata
+# step: a silent scheduler costs the `is_paused` field, not the registration.
+PAUSE_PROBE_TIMEOUT = float(os.getenv("TOKENSPEED_PAUSE_PROBE_TIMEOUT", "2"))
 # Profile round-trips include trace serialization, which can take minutes.
 PROFILE_TIMEOUT = 600.0
 LOG_MM_TENSOR_DATA = os.getenv("TOKENSPEED_LOG_MM_TENSOR_DATA", "").lower() in (
@@ -218,6 +228,19 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         # n>1 emits a *list* of final dicts (non-streaming) or per-choice
         # streamed dicts tagged with ``index`` — both handled below.
         expanded_rid = getattr(req_obj, "rid", None)
+        if os.environ.get("SMG_CACHE_TRACE") == "1":
+            logger.info(
+                "cache_request_mapping %s",
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "parent_id": rid,
+                        "child_ids": expanded_rid
+                        if isinstance(expanded_rid, list)
+                        else [expanded_rid],
+                    }
+                ),
+            )
 
         # Threaded through the response builders so the matched stop token
         # stays in ``output_ids`` when the client asked to keep it.
@@ -478,7 +501,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             model_path=model_path,
             tokenizer_path=tokenizer_path or "",
             default_sampling_params_json=self.server_args.preferred_sampling_params or "",
-            weight_version="",
+            weight_version=str(getattr(self.server_args, "weight_version", "") or ""),
             served_model_name=(self.server_args.served_model_name or model_path),
             max_context_length=int(self.async_llm.context_len),
             vocab_size=int(model_config.vocab_size),
@@ -588,8 +611,27 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         pairing_protocol = pairing_protocol_from_env()
         if pairing_protocol:
             server_args_dict["pairing_protocol"] = pairing_protocol
+        # The engine's reasoning parser and where it starts a grammar on a
+        # thinking prompt (the first token: this engine has no reasoning gate
+        # in front of a grammar), for the gateway to shape a forced tool
+        # call's grammar by.
+        server_args_dict.update(
+            grammar_start_labels(self.server_args, tokenspeed_structured_outputs_start())
+        )
+
+        # Control endpoint and capabilities for a fronting gateway (SMG reads
+        # the `rl.*` keys straight into worker labels). Older engines have no
+        # advertisement; they simply stay label-free.
+        advertise = getattr(self.async_llm, "rl_advertisement", None)
+        if callable(advertise):
+            try:
+                server_args_dict.update(advertise())
+            except Exception:  # noqa: BLE001 — a failed probe must not break discovery
+                logger.warning(
+                    "rl_advertisement failed; serving without rl.* labels", exc_info=True
+                )
         server_args_struct = Struct()
-        server_args_struct.update(_make_json_serializable(server_args_dict))
+        server_args_struct.update(redact_secrets(_make_json_serializable(server_args_dict)))
 
         scheduler_info_struct = Struct()
         scheduler_info_struct.update(_make_json_serializable(dict(self.scheduler_info)))
@@ -613,12 +655,57 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             server_args=server_args_struct,
             scheduler_info=scheduler_info_struct,
             active_requests=len(self.async_llm.rid_to_state),
-            is_paused=False,
+            is_paused=await self._is_paused(),
             uptime_seconds=float(uptime),
             tokenspeed_version=version,
             start_time=start_timestamp,
             max_total_num_tokens=int(self.scheduler_info.get("max_total_num_tokens", 0)),
         )
+
+    # The in-flight pause probe, kept across calls. TokenSpeed answers the query
+    # through a queueing communicator that resets its result state only after a
+    # normal completion: cancelling the await mid-wait (our deadline, or a gRPC
+    # client giving up) leaves that state set and wedges every later query. So
+    # the probe is never cancelled; a timed-out one keeps running and the next
+    # call waits on it instead of queueing another behind it.
+    _pause_probe: asyncio.Future | None = None
+
+    async def _bounded_probe(self, slot: str, start: Callable[[], Awaitable[Any]]) -> Any:
+        """Await an engine query with a deadline, without ever cancelling it."""
+        probe = getattr(self, slot, None)
+        if probe is None or probe.done():
+            probe = asyncio.ensure_future(start())
+            # A late failure on an orphaned probe is reported by the caller that
+            # was waiting then; retrieve it so asyncio does not log it as lost.
+            probe.add_done_callback(lambda f: f.cancelled() or f.exception())
+            setattr(self, slot, probe)
+        return await asyncio.wait_for(asyncio.shield(probe), timeout=PAUSE_PROBE_TIMEOUT)
+
+    async def _is_paused(self) -> bool:
+        """Live scheduler pause state; False when the engine cannot be asked.
+
+        An EPD encode worker is never asked: its encode loop has no pause
+        controller, so the query would take its scheduler down. The deadline
+        is well under the gateway's 10 s metadata step, so a silent scheduler
+        costs this one field, not the worker's registration.
+        """
+        if getattr(self.server_args, "disaggregation_mode", "null") == "encode":
+            return False
+        query = getattr(self.async_llm, "is_scheduler_paused", None)
+        if not callable(query):
+            return False
+        try:
+            return bool(await self._bounded_probe("_pause_probe", query))
+        # asyncio.TimeoutError is a separate exception on Python 3.10.
+        except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
+            logger.warning(
+                "is_scheduler_paused did not answer within %ss; reporting not paused",
+                PAUSE_PROBE_TIMEOUT,
+            )
+            return False
+        except Exception:  # noqa: BLE001 — a failed probe must not break discovery
+            logger.warning("is_scheduler_paused failed; reporting not paused", exc_info=True)
+            return False
 
     # ------------------------------------------------------------------
     # GetLoads (unary) — bridges to TokenSpeed's scheduler-side load metrics
@@ -631,9 +718,9 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
     ) -> tokenspeed_scheduler_pb2.GetLoadsResponse:
         """Return per-DP-rank scheduler load (optionally filtered to one rank).
 
-        ``AsyncLLM.get_load()`` round-trips a ``GetLoadReqInput`` over the
-        scheduler zmq channel; each reply carries ``num_reqs`` (running +
-        waiting), ``num_waiting_reqs``, and ``num_pages`` (KV pages in use).
+        New engines maintain a complete, fresh replica of scheduler snapshots.
+        Preserve its allocator capacity and active/resident page distinction;
+        older engines return only request counts and resident pages.
         """
         # The EPD encode loop has no control-message dispatch: a GetLoadReqInput
         # forwarded over the scheduler channel is submitted to the encode worker
@@ -659,7 +746,20 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             load_outputs = await asyncio.wait_for(
                 self.async_llm.get_load(), timeout=HEALTH_CHECK_TIMEOUT
             )
-        except TimeoutError:
+            store = getattr(self.async_llm, "load_snapshot_store", None)
+            snapshots = (
+                {int(snapshot.dp_rank): snapshot for snapshot in store.fresh_snapshots()}
+                if store is not None
+                else None
+            )
+            # A snapshot can expire between projection and conversion. A
+            # partial replica is unavailable load, never a zero-filled rank.
+            if snapshots is not None and any(
+                int(lo.dp_rank) not in snapshots for lo in load_outputs
+            ):
+                load_outputs = []
+        # asyncio.TimeoutError is a separate exception on Python 3.10.
+        except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
             await context.abort(
                 grpc.StatusCode.DEADLINE_EXCEEDED,
                 f"tokenspeed scheduler did not respond to GetLoad within {HEALTH_CHECK_TIMEOUT}s",
@@ -675,17 +775,23 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             wanted = int(request.dp_rank)
             load_outputs = [lo for lo in load_outputs if int(lo.dp_rank) == wanted]
 
-        page_size = int(getattr(self.async_llm.server_args, "page_size", 1) or 1)
-        # Fall back to ``server_args.max_total_num_tokens`` for SimpleNamespace test stubs.
-        max_total_num_tokens = int(
-            (self.scheduler_info.get("max_total_num_tokens") if self.scheduler_info else None)
-            or getattr(self.async_llm.server_args, "max_total_num_tokens", 0)
-            or 0
-        )
+        # Only legacy token pages have a page size. Native snapshots count
+        # LCM allocator blocks, whose packing is independent of launch grain.
+        page_size = int(getattr(self.async_llm.server_args, "page_size", 0) or 0)
+        if load_outputs and snapshots is None and page_size <= 0:
+            await context.abort(grpc.StatusCode.UNAVAILABLE, "KV page geometry is unavailable")
+            return
+        max_total_num_tokens = self._max_total_num_tokens()
         max_running_requests = running_window(self.async_llm.server_args)
 
         scheduler_loads = [
-            convert_load_to_protobuf(
+            convert_snapshot_to_protobuf(
+                snapshots[int(lo.dp_rank)],
+                max_total_num_tokens=max_total_num_tokens,
+                max_running_requests=max_running_requests,
+            )
+            if snapshots is not None
+            else convert_load_to_protobuf(
                 lo,
                 page_size=page_size,
                 max_total_num_tokens=max_total_num_tokens,
@@ -716,6 +822,37 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
     # SubscribeKvEvents (server-streaming) — feeds the gateway's
     # cache-aware router the scheduler's actual KV-cache state.
     # ------------------------------------------------------------------
+
+    def _max_total_num_tokens(self) -> int:
+        # Fall back to ``server_args.max_total_num_tokens`` for SimpleNamespace test stubs.
+        return int(
+            (self.scheduler_info.get("max_total_num_tokens") if self.scheduler_info else None)
+            or getattr(self.async_llm.server_args, "max_total_num_tokens", 0)
+            or 0
+        )
+
+    def _load_record(self, dp_rank: int | None) -> common_pb2.EngineLoad | None:
+        """The load record the KV-event stream carries for ``dp_rank``: the
+        scheduler's fresh snapshot from the engine's replica, converted as
+        ``GetLoads`` converts it, read for every batch and heartbeat. An
+        encode worker has no scheduler load, and an older engine without the
+        replica would need a scheduler round trip per record: both push none
+        and stay polled."""
+        if getattr(self.server_args, "disaggregation_mode", "null") == "encode":
+            return None
+        store = getattr(self.async_llm, "load_snapshot_store", None)
+        if store is None:
+            return None
+        try:
+            return load_record(
+                store.fresh_snapshots(),
+                dp_rank,
+                max_total_num_tokens=self._max_total_num_tokens(),
+                max_running_requests=running_window(self.async_llm.server_args),
+            )
+        except Exception:  # noqa: BLE001 - a record that cannot be read leaves the batch without one
+            logger.debug("load record unavailable", exc_info=True)
+            return None
 
     async def SubscribeKvEvents(
         self,
@@ -764,6 +901,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 decoder.decode,
                 lambda: context.send_initial_metadata(()),
                 context.cancelled,
+                load_source=self._load_record,
             ):
                 yield proto_batch
         except asyncio.CancelledError:
@@ -792,7 +930,8 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         comm_timeout = max(30.0, request.timeout_s + 10.0)
         try:
             result = await asyncio.wait_for(self.async_llm.flush_cache(), timeout=comm_timeout)
-        except TimeoutError:
+        # asyncio.TimeoutError is a separate exception on Python 3.10.
+        except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
             await context.abort(
                 grpc.StatusCode.DEADLINE_EXCEEDED,
                 f"Flush cache timed out after {comm_timeout}s",
@@ -836,7 +975,8 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 ),
                 timeout=PROFILE_TIMEOUT,
             )
-        except TimeoutError:
+        # asyncio.TimeoutError is a separate exception on Python 3.10.
+        except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
             await context.abort(
                 grpc.StatusCode.DEADLINE_EXCEEDED,
                 f"Start profiling timed out after {PROFILE_TIMEOUT}s",
@@ -858,7 +998,8 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         logger.debug("Receive stop profile request")
         try:
             await asyncio.wait_for(self.async_llm.stop_profile(), timeout=PROFILE_TIMEOUT)
-        except TimeoutError:
+        # asyncio.TimeoutError is a separate exception on Python 3.10.
+        except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
             await context.abort(
                 grpc.StatusCode.DEADLINE_EXCEEDED,
                 f"Stop profiling timed out after {PROFILE_TIMEOUT}s",
@@ -1553,6 +1694,8 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 cached_tokens=int(meta.get("cached_tokens", 0)),
                 output_logprobs=self._convert_output_logprobs_to_proto(output, len(token_ids)),
                 index=choice_index,
+                # protobuf treats None as unset for an optional field.
+                weight_version=_version_str(meta.get("weight_version")),
             ),
         )
 
@@ -1594,6 +1737,8 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 spec_draft_tokens=int(meta.get("spec_draft_tokens", 0)),
                 output_logprobs=self._convert_output_logprobs_to_proto(output, len(token_ids)),
                 index=choice_index,
+                # protobuf treats None as unset for an optional field.
+                weight_version=_version_str(meta.get("weight_version")),
                 **matched_kwargs,
             ),
         )
@@ -1675,6 +1820,11 @@ def _abort_status_code(reason: dict) -> grpc.StatusCode:
     if status_code == 429:
         return grpc.StatusCode.RESOURCE_EXHAUSTED
     return grpc.StatusCode.INTERNAL
+
+
+def _version_str(version: Any) -> str | None:
+    """``meta_info["weight_version"]`` as the proto's string, ``None`` when absent."""
+    return None if version is None else str(version)
 
 
 def _make_json_serializable(obj: Any) -> Any:

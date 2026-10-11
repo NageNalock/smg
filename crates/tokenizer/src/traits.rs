@@ -1,5 +1,5 @@
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{hash_map::DefaultHasher, HashMap},
     hash::{Hash, Hasher},
 };
 
@@ -82,6 +82,20 @@ pub trait Encoder: Send + Sync {
     fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>>;
 }
 
+/// Per-stream state that turns generated token ids into text one at a time.
+///
+/// Implementations own whatever they need (pending bytes, a decode window)
+/// and must produce, over a whole stream, the text [`Decoder::decode`] gives
+/// for all of its ids.
+pub trait IncrementalDecoder: Send + Sync {
+    /// Feed one token; returns the text that became final with it (empty when
+    /// the token only extends a multi-byte character or is skipped).
+    fn step(&mut self, token_id: TokenIdType) -> Result<String>;
+
+    /// Forget all state, as for a new stream.
+    fn reset(&mut self);
+}
+
 /// Core decoding trait - can be implemented independently
 pub trait Decoder: Send + Sync {
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String>;
@@ -134,6 +148,17 @@ pub trait Decoder: Send + Sync {
         } else {
             Ok(None)
         }
+    }
+
+    /// A dedicated per-stream decoder, when the backend has a cheaper
+    /// algorithm than [`decode_step`](Self::decode_step) (byte-level BPE
+    /// vocabularies do). `None`, the default, means callers use `decode_step`.
+    fn incremental_decoder(
+        &self,
+        skip_special_tokens: bool,
+    ) -> Option<Box<dyn IncrementalDecoder>> {
+        let _ = skip_special_tokens;
+        None
     }
 }
 
@@ -215,9 +240,35 @@ pub trait Tokenizer: Encoder + Decoder {
         false
     }
 
+    /// Whether the generation prompt opens a `<think>` block it does not
+    /// close, so a completion starts inside reasoning. Stricter than
+    /// `think_in_prefill`: a template that writes an empty, closed
+    /// `<think></think>` (a non-thinking template) injects the tag but opens
+    /// nothing. Arms the reasoning parser of a template without a thinking
+    /// switch.
+    fn prefill_opens_think_block(&self) -> bool {
+        self.think_in_prefill()
+    }
+
     /// Renderer behaviours the gateway mirrors when it prepares a request.
     fn renderer_capabilities(&self) -> RendererCapabilities {
         RendererCapabilities::default()
+    }
+
+    /// The thinking mode this tokenizer's renderer renders for the template
+    /// kwargs and the request-level toggle it is handed
+    /// ([`ChatTemplateParams::template_kwargs`] and
+    /// [`ChatTemplateParams::thinking`]), for a renderer that resolves the
+    /// mode by its own rule rather than through the template's toggle key.
+    /// The gateway arms its reasoning parser from the same answer, so the
+    /// prompt and the parser never disagree. `None`: the renderer has no
+    /// rule of its own and the gateway's generic resolution applies.
+    fn native_thinking_mode(
+        &self,
+        _template_kwargs: Option<&HashMap<String, serde_json::Value>>,
+        _thinking: Option<bool>,
+    ) -> Option<bool> {
+        None
     }
 
     /// Set or override the chat template.
