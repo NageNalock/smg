@@ -142,16 +142,16 @@ construct named (`to_symphony::Unsupported`):
   arguments.
 
 `stops` names the stop texts the stop decoder hides; a close of the tool calls
-among them closes the open call at the stop. Where the table reads output
-differently from transformers, by design for a stream: text outside every
-field is content; a second region of a field is added to the first; text
-fields keep their edges; whitespace a pattern allows before a marker stays
-where the model wrote it; a key written twice keeps its first value; with no
-tools declared, a value is read as the JSON its text is; text the prompt wrote
-after the turn opener is the prompt's; and the close of the field with no open
-adds no row, so one that is no stop text stays content. `tests/to_symphony.rs`
-checks each against transformers' recordings and pins every recorded
-template's outcome in `tests/to_symphony.tsv`.
+among them closes the open call at the stop. The table reads tool-call values
+as transformers' `_coerce` types them (`Format::reads_as_transformers`). Where
+the table reads output differently from transformers, by design for a stream:
+text outside every field is content; a second region of a field is added to
+the first; text fields keep their edges; whitespace a pattern allows before a
+marker stays where the model wrote it; a key written twice keeps its first
+value; text the prompt wrote after the turn opener is the prompt's; and the
+close of the field with no open adds no row, so one that is no stop text stays
+content. `tests/to_symphony.rs` checks each against transformers' recordings
+and pins every recorded template's outcome in `tests/to_symphony.tsv`.
 
 ## Regular expressions
 

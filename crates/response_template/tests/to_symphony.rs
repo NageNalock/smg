@@ -42,7 +42,7 @@ const ADDRESSED_STOPS: [&str; 2] = ["<|done|>", "<|invoke|>"];
 const FEEDS: [&str; 4] = ["whole", "chars", "step:3", "step:7"];
 
 /// Sessions whose message differs from transformers', and why.
-const DIFFERS: [(&str, &str); 13] = [
+const DIFFERS: [(&str, &str); 11] = [
     (
         "serve/qwen2#eot",
         "a close of the field with no open that is no stop text stays content",
@@ -80,16 +80,8 @@ const DIFFERS: [(&str, &str); 13] = [
         "the prompt's text is not the output's",
     ),
     (
-        "extra/addressed-lookahead#no-tools",
-        "with no tools declared, a value is read as the JSON its text is",
-    ),
-    (
         "extra/addressed-lookahead#repeated-key",
         "a key keeps its first value",
-    ),
-    (
-        "extra/addressed#no-tools",
-        "with no tools declared, a value is read as the JSON its text is",
     ),
     (
         "extra/addressed#repeated-key",
@@ -175,7 +167,8 @@ fn run(
     out.drain()
 }
 
-/// Every session in every chunking reads the same events through both tables.
+/// Every session in every chunking reads the same events through both tables, the family's
+/// reading as transformers does, as a compiled table does ([`Format::reads_as_transformers`]).
 fn same_events(dir: &Path, id: &str, stops: &[&str], family: &dyn Fn() -> Format) {
     let table = compiled(dir, id, stops);
     let sessions = sessions(dir, id);
@@ -193,7 +186,7 @@ fn same_events(dir: &Path, id: &str, stops: &[&str], family: &dyn Fn() -> Format
                 end.clone(),
             );
             let theirs = run(
-                family(),
+                family().reads_as_transformers(),
                 declared(dir, session),
                 prompt,
                 &pieces,
@@ -228,6 +221,7 @@ fn addressed_by_hand(next_key_closes: bool) -> Format {
         next_key_closes,
     };
     Format::new("addressed")
+        .reads_as_transformers()
         .terminal("start", "<|head|>assistant")
         .terminal("notes", "<|via|>notes<|body|>")
         .terminal("reply", "<|via|>reply<|body|>")
@@ -439,6 +433,76 @@ fn compiled_tables_read_the_messages_transformers_parses() {
     seen.sort();
     listed.sort();
     assert_eq!(seen, listed, "a listed difference is gone");
+}
+
+/// A call region whose opener leads to no call shows the opener with the text after it, as
+/// transformers keeps an open pattern that did not match in the content: at a stop inside the
+/// header, `<tool_call>` and ` to=` stay with the cut name. transformers gives the Qwen 3.5 output
+/// `<tool_call>\n<function=get_wea` as content; it drops the addressed one, which falls outside
+/// every field, where the table keeps outside text as content. A cut drops the header as the
+/// template's, the opener with it, and a call that starts drops the opener as before. Where the
+/// call syntax shows a header as text at any end (a header closed with no name in it; Qwen's
+/// function tag, which its assembler reports at a cut too), the opener goes with it.
+#[test]
+fn an_opener_whose_call_never_starts_stays_with_its_text() {
+    let hf = fixtures_dir();
+    let addressed = addressed_dir();
+    // (template, stops, output, content at a stop, whether a cut drops it all)
+    let cases = [
+        (
+            &hf,
+            "serve/qwen3_5",
+            &QWEN_STOPS,
+            "<think>\nx\n</think>\n\n<tool_call>\n<function=get_wea",
+            "<tool_call>\n<function=get_wea",
+            false,
+        ),
+        (
+            &addressed,
+            "extra/addressed",
+            &ADDRESSED_STOPS,
+            "<|via|>notes<|body|>T<|stop|><|head|>assistant to=get_wea",
+            "to=get_wea",
+            true,
+        ),
+        (
+            &addressed,
+            "extra/addressed",
+            &ADDRESSED_STOPS,
+            "<|via|>notes<|body|>T<|stop|><|head|>assistant to=a b<|via|>notes <|as|>xml<|body|>",
+            "to=a b<|via|>notes <|as|>xml<|body|>",
+            false,
+        ),
+    ];
+    for (dir, id, stops, text, content, cut_drops) in cases {
+        let table = compiled(dir, id, stops);
+        let pieces: Vec<&str> = text
+            .char_indices()
+            .map(|(at, c)| &text[at..at + c.len_utf8()])
+            .collect();
+        for feed in [vec![text], pieces] {
+            let read = |end| ours(&run(table.clone(), Declared::default(), "", &feed, end));
+            let stopped = read(EngineFinish::Stop);
+            assert_eq!(stopped.content.trim(), content, "{id} {text:?}");
+            assert!(stopped.calls.is_empty());
+            // A header the model closed wrong is its text however the stream ends.
+            let cut = read(EngineFinish::Length).content;
+            let expected = if cut_drops { "" } else { content };
+            assert_eq!(cut.trim(), expected, "{id} {text:?} cut");
+        }
+    }
+    // A call that starts keeps its opener out of the content.
+    let table = compiled(&addressed, "extra/addressed", &ADDRESSED_STOPS);
+    let text = "<|via|>notes<|body|>T<|stop|><|head|>assistant to=f<|via|>notes <|as|>xml<|body|>";
+    let read = ours(&run(
+        table,
+        Declared::default(),
+        "",
+        &[text],
+        EngineFinish::Stop,
+    ));
+    assert_eq!(read.content, "");
+    assert_eq!(read.calls.len(), 1);
 }
 
 /// Every recorded template that loads, compiled: `table`, or the reason it is refused.

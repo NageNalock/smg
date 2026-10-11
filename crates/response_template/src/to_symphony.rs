@@ -25,16 +25,20 @@
 //!   marker and before a literal header close, with tagged parameters
 //!   (`CallSyntax::Addressed`, its spelling taken from the template). A close of the tool calls
 //!   that is a stop text closes the open call when the stream stops.
+//! - The table reads as transformers' reader does where the engine's own tables read otherwise
+//!   ([`Format::reads_as_transformers`]): a tagged value is typed as `_coerce` types it, cast to
+//!   its schema's types in their order and the model's text when no cast takes it or the request
+//!   declares nothing; and the marker that opens the tool calls is shown with the text after it
+//!   when no call starts there (a header a stop ended, ` to=get_wea`).
 //!
 //! Where the table reads differently from transformers, by design, since a stream cannot take
 //! back what it already sent: text outside every field is content, not dropped; a second region
 //! of a field that does not repeat is added to the first, not put in its place; the edges of a
 //! text field are not stripped; whitespace a pattern allows before a marker (`\s*<tool_call>`) or
 //! around a tagged value stays where the model wrote it, or is the assembler's to drop; a key
-//! written twice in one call keeps its first value; with no tools declared, a value is read as
-//! the JSON its text is; text the prompt wrote after the turn opener is the prompt's, not the
-//! output's; a close of the field with no open that is no stop text stays content; and a call the
-//! stream cut stays cut.
+//! written twice in one call keeps its first value; text the prompt wrote after the turn opener
+//! is the prompt's, not the output's; a close of the field with no open that is no stop text stays
+//! content; and a call the stream cut stays cut.
 
 use std::{borrow::Cow, fmt};
 
@@ -165,7 +169,7 @@ pub fn compile(template: &ResponseTemplate, stops: &[&str]) -> Result<Format, Un
     }
     table.derive_rows()?;
 
-    let mut format = Format::new("response_template");
+    let mut format = Format::new("response_template").reads_as_transformers();
     for text in &table.terminals {
         format = format.terminal(text, text);
     }
