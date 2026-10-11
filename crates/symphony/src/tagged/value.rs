@@ -334,11 +334,12 @@ impl Declared {
     /// infers 1, 0 and the string. Nothing otherwise, the parameter's [`Kind`] alone then saying
     /// how its text reads. For [`typed_first`].
     ///
-    /// The order is transformers' `_schema_types`: the schema's `type`, one name or a list in
-    /// its order, then each `anyOf` member and each `oneOf` member in turn, depth first. A `$ref`
-    /// is followed where it stands, and a one-member `allOf` is read as its member, as
-    /// [`Kind`] reads them; the types a several-member `allOf` admits come last, in the order
-    /// integer, number, boolean, array, object, since its members agree on a set and not an order.
+    /// The order follows transformers' `_schema_types`, which reads the schema's `type`, one name
+    /// or a list in its order, then each `anyOf` member and each `oneOf` member in turn, depth
+    /// first. That reader neither follows a `$ref` nor reads an `allOf`; here, as [`Kind`] reads
+    /// them, a `$ref` is followed where it stands and a one-member `allOf` is read as its member,
+    /// and the types a several-member `allOf` admits come last, in the order integer, number,
+    /// boolean, array, object, since its members agree on a set and not an order.
     pub(crate) fn casts(&self, function: &str, parameter: &str) -> Option<Casts> {
         let root = self.schemas.get(function)?;
         let schema = root.get("properties")?.get(parameter)?;
@@ -394,7 +395,8 @@ impl Casts {
 }
 
 /// The cast types `schema` names, appended to `into` in the order transformers' `_schema_types`
-/// reads them ([`Declared::casts`]), each node read once.
+/// reads them, with `$ref` and a one-member `allOf` read as [`Declared::casts`] says, each node
+/// read once.
 fn declared_order<'a>(
     root: &'a Value,
     schema: &'a Value,
@@ -552,11 +554,13 @@ pub fn json(text: &str, kind: Option<Kind>) -> String {
 /// stands; a template of this kind writes `5` and `"5"` alike for a parameter that admits both,
 /// and its reader gives `5`, for `{"type": ["string", "boolean", "integer"]}` it reads `1` as
 /// `true`, and for a parameter declared `boolean` it reads `1` and `TRUE` as `true` where
-/// inference reads 1 and the string. A number keeps the model's digits when they are JSON's
-/// spelling, a boolean is `true` or
-/// `false` for `true`, `false`, `1` or `0` in any case, and an array or an object keeps the model's
-/// bytes; whitespace around the text is ignored for these casts. A text no cast takes is read by
-/// [`json`] under `kind`, so `null` is null for a schema that admits null too.
+/// inference reads 1 and the string. A number is what Python's `float` reads, written in JSON's
+/// spelling with the model's digits, a boolean is `true` or `false` for `true`, `false`, `1` or
+/// `0` in any case, and an array or an object keeps the model's bytes; whitespace around the text
+/// is ignored for these casts. A text no cast takes is read by [`json`] under `kind`, so `null` is
+/// null for a schema that admits null too, and inference reads `None` and `null` as null for a
+/// boolean declared alone, where `_coerce` keeps the string: null is the value a template writes
+/// `None` for.
 pub(crate) fn typed_first(text: &str, kind: Option<Kind>, casts: Casts) -> String {
     let trimmed = text.trim();
     casts
@@ -566,11 +570,14 @@ pub(crate) fn typed_first(text: &str, kind: Option<Kind>, casts: Casts) -> Strin
 }
 
 /// `trimmed` cast to `cast`, one of the cast types, if it fits: an integer as a sign and digits, a
-/// number in JSON's spelling, a boolean as `true`, `false`, `1` or `0` in any case, an array or an
-/// object as JSON of that shape; each as an argument reads it back.
+/// number as Python's `float` spells one ([`number`]), a boolean as `true`, `false`, `1` or `0` in
+/// any case, an array or an object as JSON of that shape; each as an argument reads it back.
 fn cast_to(trimmed: &str, cast: Types) -> Option<String> {
     if cast == Types::INTEGER {
         return integer(trimmed).filter(|integer| reads_back_as_an_argument(integer));
+    }
+    if cast == Types::NUMBER {
+        return number(trimmed).filter(|number| reads_back_as_an_argument(number));
     }
     if cast == Types::BOOLEAN {
         return match trimmed.to_ascii_lowercase().as_str() {
@@ -583,7 +590,6 @@ fn cast_to(trimmed: &str, cast: Types) -> Option<String> {
         return None;
     }
     let fits = match serde_json::from_str::<Value>(trimmed) {
-        Ok(Value::Number(_)) => cast == Types::NUMBER,
         Ok(Value::Array(_)) => cast == Types::ARRAY,
         Ok(Value::Object(_)) => cast == Types::OBJECT,
         _ => false,
@@ -608,6 +614,60 @@ fn integer(text: &str) -> Option<String> {
     } else {
         format!("{minus}{significant}")
     })
+}
+
+/// `text` as a JSON number when Python's `float` reads it as a finite one, as transformers'
+/// `_coerce` casts a `number`: an optional sign, digits with an optional point, digits on at least
+/// one side of it, and an optional exponent. JSON's own spelling is kept as the model wrote it;
+/// any other is written in JSON's spelling with the model's digits, so `+5`, `007`, `.5` and `5.`
+/// are `5`, `7`, `0.5` and `5.0`. `inf` and `nan` are not numbers, and a number past what a float
+/// holds is refused by the caller's read-back check, as `_coerce` refuses it. `_` between digits,
+/// which `float` takes, is not taken, as [`integer`] does not take it.
+fn number(text: &str) -> Option<String> {
+    if matches!(serde_json::from_str::<Value>(text), Ok(Value::Number(_))) {
+        return Some(text.to_string());
+    }
+    let (minus, unsigned) = match text.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, Some(exponent)),
+        None => (unsigned, None),
+    };
+    let (whole, fraction) = match mantissa.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (mantissa, None),
+    };
+    let digits = |part: &str| part.bytes().all(|byte| byte.is_ascii_digit());
+    if !digits(whole) || !fraction.is_none_or(digits) {
+        return None;
+    }
+    if whole.is_empty() && fraction.is_none_or(str::is_empty) {
+        return None;
+    }
+    let significant = whole.trim_start_matches('0');
+    let mut json = format!(
+        "{minus}{}",
+        if significant.is_empty() {
+            "0"
+        } else {
+            significant
+        }
+    );
+    if let Some(fraction) = fraction {
+        json.push('.');
+        json.push_str(if fraction.is_empty() { "0" } else { fraction });
+    }
+    if let Some(exponent) = exponent {
+        let power = exponent.strip_prefix(['-', '+']).unwrap_or(exponent);
+        if power.is_empty() || !digits(power) {
+            return None;
+        }
+        json.push('e');
+        json.push_str(exponent);
+    }
+    Some(json)
 }
 
 /// What the text is when no declared type decided it.
@@ -2015,6 +2075,36 @@ mod tests {
         let numbers = casts_of(&[Types::NUMBER, Types::INTEGER]);
         assert_eq!(typed_first("5", None, numbers), "5");
         assert_eq!(typed_first("5.5", None, numbers), "5.5");
+        // A number as Python's `float` reads it, as `_coerce` casts one: JSON's spelling is kept,
+        // and any other is written in JSON's spelling with the model's digits.
+        let number = casts_of(&[Types::NUMBER]);
+        for (text, expected) in [
+            ("1.5E3", "1.5E3"),
+            ("-0", "-0"),
+            ("007", "7"),
+            ("+5", "5"),
+            (".5", "0.5"),
+            ("-.5", "-0.5"),
+            ("5.", "5.0"),
+            ("007.50", "7.50"),
+            ("+1e+05", "1e+05"),
+            (".5e-3", "0.5e-3"),
+            ("1e400", "\"1e400\""),
+            ("inf", "\"inf\""),
+            ("nan", "\"nan\""),
+            (".", "\".\""),
+            ("+", "\"+\""),
+            ("1e", "\"1e\""),
+            ("1_000", "\"1_000\""),
+            ("--5", "\"--5\""),
+            ("5 5", "\"5 5\""),
+        ] {
+            assert_eq!(
+                typed_first(text, Some(Kind::String), number),
+                expected,
+                "{text:?}"
+            );
+        }
         // A boolean alone, as `_coerce` reads one: `true`, `false`, `1` and `0` in any case, the
         // whitespace around them ignored; any other text as `json` reads it with no kind, so
         // Python's `False` is false, `None` is null and the rest is the string.

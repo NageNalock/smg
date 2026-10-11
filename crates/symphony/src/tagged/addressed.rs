@@ -46,7 +46,10 @@
 //!   this syntax reads it (`typed_first` in the value module): the template writes `5` and `"5"`
 //!   alike for such a parameter, and `1` for `{"type": ["string", "boolean", "integer"]}` reads
 //!   as `true`. A boolean declared alone, with `null` beside it or not, is cast the same way, so
-//!   `1`, `0` and `TRUE` are booleans for it, as they are for that reader.
+//!   `1`, `0` and `TRUE` are booleans for it, as they are for that reader. A number is cast as
+//!   Python's `float` reads it, so `+5`, `007` and `.5` are 5, 7 and 0.5. Text no cast takes is
+//!   inferred, so `None` and `null` are null even for a boolean declared alone, where that
+//!   reader keeps the string: null is the value the template wrote `None` for.
 //! - **The template writes one newline after the key's tag and one before the value's closing
 //!   tag**; neither is the value's, and the assembler takes exactly those two away, as the Qwen
 //!   assembler does. A newline at the end of a streamed piece is held back until the next piece
@@ -71,9 +74,10 @@
 //!   the cut stopped keeps what arrived, a string's fragment open and any other value written as
 //!   its text reads so far, with the object left open. Either way the arguments keep every value
 //!   that arrived, whatever its type, and no tag reaches the content: a tag the end cut short (a
-//!   key with no value yet, the start of a closing tag) is the template's and goes with the bytes
+//!   key with no value yet, the start of a closing tag, or, where the next key closes a value,
+//!   the start of the next key's tag after a newline) is the template's and goes with the bytes
 //!   around it, into the object's close, or, at a cut, `Dropped { Wrapper }`. Bytes the end left
-//!   held inside a value that cannot be its closing tag are the value's text.
+//!   held inside a value that cannot be such a tag are the value's text.
 //! - **Every byte of the call lands in exactly one event**, with the Qwen assembler's accounting:
 //!   the name's and the header's bytes in `ToolCallStart`, each tag's and value's bytes in the
 //!   fragments they produce. Text where the syntax has tags, and a tag out of its place, are
@@ -332,9 +336,12 @@ impl Assembler {
     }
 
     /// Bytes the end of the call left held inside a value: the start of the value's closing tag,
-    /// returned to go with the value's close, or, when they cannot be that, the value's text.
+    /// or, where the next key would close the value there, the start of the key's opening tag,
+    /// returned to go with the value's close; when they cannot be either, the value's text.
     fn end_value(&mut self, held: &str, out: &mut Events) -> String {
-        if self.spelling.value_close.starts_with(held) {
+        if self.spelling.value_close.starts_with(held)
+            || self.spelling.key_open.starts_with(held) && self.closed_by_next_key()
+        {
             return held.to_string();
         }
         self.value_text(held, out);
@@ -1321,6 +1328,15 @@ mod tests {
                 "<parameter name=\"city\">\nParis\n<parameter name=\"days\">\n3",
                 r#"{"city": "Paris", "days": 3}"#,
             ),
+            // An end inside the next key's tag: the tag is the template's, cut short.
+            (
+                "<parameter name=\"days\">\n3\n<parameter na",
+                r#"{"days": 3}"#,
+            ),
+            (
+                "<parameter name=\"city\">\nParis\n<parameter na",
+                r#"{"city": "Paris"}"#,
+            ),
         ] {
             let call = format!("{HEADER}{body}");
             for events in every_split_spelled(NEXT_KEY_CLOSES, &call, false) {
@@ -1362,6 +1378,32 @@ mod tests {
             );
             assert_eq!(bytes(&events), format!("{call}{END}"));
             nothing_empty(&events);
+        }
+        // A cut inside the next key's tag keeps the value as it is and drops the tag's start.
+        for (body, expected) in [
+            (
+                "<parameter name=\"days\">\n3\n<parameter na",
+                r#"{"days": 3"#,
+            ),
+            (
+                "<parameter name=\"city\">\nParis\n<parameter na",
+                r#"{"city": "Paris"#,
+            ),
+        ] {
+            let call = format!("{HEADER}{body}");
+            for events in every_split_spelled(NEXT_KEY_CLOSES, &call, true) {
+                assert_eq!(arguments(&events), expected, "{body:?}");
+                let (shown, _) = shown_and_hidden(&events);
+                assert!(shown.is_empty(), "{body:?}: {shown:?}");
+                assert_eq!(bytes(&events), call, "{body:?}");
+                nothing_empty(&events);
+            }
+        }
+        // Without a newline of the value's before it, the start of a key's tag at the end is the
+        // value's text, as the whole tag would be.
+        let call = format!("{HEADER}<parameter name=\"city\">\nParis<parameter na");
+        for events in every_split_spelled(NEXT_KEY_CLOSES, &call, false) {
+            assert_eq!(arguments(&events), r#"{"city": "Paris<parameter na"}"#);
         }
         // Without the spelling's say, the next key's tag is the value's text, as before.
         let call = format!(
@@ -1591,6 +1633,13 @@ mod tests {
             ("x", "Paris", r#""Paris""#),
             ("x", "null", r#""null""#),
             ("z", "5.5", "5.5"),
+            // A number as Python's `float` reads it, in JSON's spelling with the model's digits.
+            ("z", "007", "7"),
+            ("z", "+5", "5"),
+            ("z", ".5", "0.5"),
+            ("z", "5.", "5.0"),
+            ("z", "1e2", "1e2"),
+            ("z", "inf", r#""inf""#),
             ("z", "null", "null"),
             ("z", "None", "null"),
             ("z", "five", r#""five""#),
@@ -1662,16 +1711,19 @@ mod tests {
     #[test]
     fn a_boolean_declared_alone_is_cast_as_the_reader_casts_it() {
         // transformers' `_coerce` casts a parameter's one type too: `1`, `0` and `TRUE` are
-        // booleans for a `boolean`, with null beside it or not, and `None` is null where null is
-        // admitted. Text that fits no cast reads as before: `yes` stays the string, `False` is
-        // false. An integer declared alone reads as before: `7.0` and `1e2` are the numbers the
-        // model wrote, where that reader keeps them as text.
+        // booleans for a `boolean`, with null beside it or not. Text that fits no cast reads as
+        // before: `yes` stays the string, `False` is false, and `None` and `null` are null, as
+        // that reader reads them where null is admitted, and for a boolean alone too, where it
+        // keeps the string. An integer declared alone reads as before: `7.0` and `1e2` are the
+        // numbers the model wrote, where that reader keeps them as text.
         for (key, text, expected) in [
             ("flag", "1", "true"),
             ("flag", "0", "false"),
             ("flag", "TRUE", "true"),
             ("flag", "False", "false"),
             ("flag", "yes", r#""yes""#),
+            ("flag", "None", "null"),
+            ("flag", "null", "null"),
             ("maybe", "1", "true"),
             ("maybe", "None", "null"),
             ("count", "7", "7"),
