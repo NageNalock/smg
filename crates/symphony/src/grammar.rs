@@ -47,18 +47,25 @@
 //! other state, its own row into the block. So the model closes whatever the prompt left open on
 //! its way to the calls, whichever that was.
 //!
+//! Calls addressed to a tool are messages of their own after the thought, so their tags start the
+//! turn (the `addressed` module, [`AddressedTags`]): [`Format::grammar`] gives the forced one,
+//! and the single-call and JSON-answer tags and the tags' lengths come from
+//! [`Format::addressed_tags`].
+//!
 //! A table without calls gives `None`, as do Inkling's named JSON (a forced call's tag would start
-//! inside the first message, before any opener), Gemma 4's syntax and calls addressed to a tool
-//! until their tags are derived; the gateway takes the JSON-schema path for them.
+//! inside the first message, before any opener) and Gemma 4's syntax; the gateway takes the
+//! JSON-schema path for them.
 
 use openai_protocol::common::Tool;
 use serde_json::{json, Value};
 
+pub use self::addressed::AddressedTags;
 use crate::{
     format::{CallSyntax, Emits, Format},
     tagged::{assembler::TAGS as TAGGED_TAGS, dsml, keyed::Tags as KeyedTags},
 };
 
+mod addressed;
 mod attributed;
 mod keyed;
 mod pythonic;
@@ -72,6 +79,9 @@ mod xtml;
 pub enum Grammar {
     /// Exactly this text.
     ConstString(String),
+    /// Exactly this one token of the model's vocabulary; the same text in ordinary tokens does not
+    /// match.
+    Token(String),
     /// Any text that contains none of `excludes`.
     AnyText { excludes: Vec<String> },
     /// Text the regular expression accepts.
@@ -111,13 +121,42 @@ pub enum Grammar {
 /// A tagged region: `begin`, what the content may be, `end`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tag {
-    pub begin: String,
+    pub begin: Bound,
     pub content: Box<Grammar>,
-    pub end: String,
+    pub end: Bound,
+}
+
+/// Where a tag begins or ends: a text, or one token of the model's vocabulary, which the same
+/// text in ordinary tokens does not match.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Bound {
+    Text(String),
+    Token(String),
+}
+
+impl From<String> for Bound {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
+}
+
+impl From<&str> for Bound {
+    fn from(text: &str) -> Self {
+        Self::Text(text.to_string())
+    }
+}
+
+impl Bound {
+    fn to_json(&self) -> Value {
+        match self {
+            Self::Text(text) => Value::String(text.clone()),
+            Self::Token(token) => json!({"type": "token", "token": token}),
+        }
+    }
 }
 
 impl Tag {
-    fn new(begin: impl Into<String>, content: Grammar, end: impl Into<String>) -> Self {
+    fn new(begin: impl Into<Bound>, content: Grammar, end: impl Into<Bound>) -> Self {
         Self {
             begin: begin.into(),
             content: Box::new(content),
@@ -128,9 +167,9 @@ impl Tag {
     fn to_json(&self) -> Value {
         json!({
             "type": "tag",
-            "begin": self.begin,
+            "begin": self.begin.to_json(),
             "content": self.content.to_json(),
-            "end": self.end,
+            "end": self.end.to_json(),
         })
     }
 }
@@ -140,6 +179,7 @@ impl Grammar {
     pub fn to_json(&self) -> Value {
         match self {
             Self::ConstString(value) => json!({"type": "const_string", "value": value}),
+            Self::Token(token) => json!({"type": "token", "token": token}),
             Self::AnyText { excludes } => json!({"type": "any_text", "excludes": excludes}),
             Self::Regex(pattern) => json!({"type": "regex", "pattern": pattern}),
             Self::JsonSchema { schema, style } => {
@@ -271,6 +311,9 @@ impl Format {
     /// either way; so is MiniMax M3's, whose block is entered the same way from every state and
     /// whose thought closes in the free text before the trigger; so is xLAM's list, whose table
     /// has no thought.
+    /// Calls addressed to a tool give [`AddressedTags::calls`], which starts the turn with the
+    /// thought, for `at_least_one` only, and `None` with `reasoning_open` or when
+    /// [`Format::addressed_tags`] refuses the table.
     pub fn grammar(
         &self,
         tools: &[Tool],
@@ -318,7 +361,13 @@ impl Format {
             CallSyntax::Xml => {
                 return xml::calls(markers?, self.separator(), &named, at_least_one);
             }
-            CallSyntax::NamedJson(_) | CallSyntax::Gemma | CallSyntax::Addressed(_) => return None,
+            CallSyntax::Addressed(_) => {
+                if !at_least_one || reasoning_open {
+                    return None;
+                }
+                return Some(self.addressed_tags().ok()?.calls_of(&named));
+            }
+            CallSyntax::NamedJson(_) | CallSyntax::Gemma => return None,
         };
         if !reasoning_open {
             return Some(calls);
@@ -1237,8 +1286,9 @@ mod tests {
         assert!(formats::glm()
             .grammar(&[tool("", None, value!({}))], true, false)
             .is_none());
-        // Calls addressed to a tool have no derivation yet either: a table of Harmony's channels
-        // whose calls are messages addressed to the tool, with tagged parameters.
+        // Calls addressed to a tool take a stop token to end the last call on, which this table
+        // of Harmony's channels, whose calls are messages addressed to the tool with tagged
+        // parameters, does not name (see `tests/addressed_grammar.rs` for one that does).
         let addressed = Format::new("addressed")
             .terminal("start", "<|start|>assistant")
             .terminal("analysis", "<|channel|>analysis<|message|>")

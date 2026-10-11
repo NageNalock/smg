@@ -1,0 +1,3095 @@
+{
+  "tokens": [
+    "<|start|>",
+    "<|end|>",
+    "<|message|>",
+    "<|channel|>",
+    "<|constrain|>",
+    "<|return|>",
+    "<|call|>"
+  ],
+  "eos": "<|return|>",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Weather for a city.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            },
+            "days": {
+              "type": "integer"
+            },
+            "unit": {
+              "type": "string",
+              "enum": [
+                "c",
+                "f"
+              ]
+            },
+            "options": {
+              "type": "object",
+              "properties": {
+                "hourly": {
+                  "type": "boolean"
+                },
+                "hours": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer"
+                  }
+                }
+              }
+            },
+            "note": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "city",
+            "days"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_time",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "tz": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "tz"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "ping",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string"
+            },
+            "limit": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "filter": {
+              "$ref": "#/$defs/Filter"
+            },
+            "order": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/Order"
+                }
+              ],
+              "description": "Sort order."
+            }
+          },
+          "$defs": {
+            "Filter": {
+              "type": "object",
+              "properties": {
+                "lang": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "lang"
+              ]
+            },
+            "Order": {
+              "type": "string",
+              "enum": [
+                "new",
+                "top"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ],
+  "renders": [
+    {
+      "name": "single",
+      "message": {
+        "role": "assistant",
+        "thinking": "Need the weather.",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": {
+                "city": "Paris",
+                "days": 3
+              }
+            }
+          }
+        ]
+      },
+      "text": "<|channel|>analysis<|message|>Need the weather.<|end|><|start|>assistant to=get_weather<|channel|>commentary <|constrain|>xml<|message|><parameter name=\"city\">\nParis\n</parameter>\n<parameter name=\"days\">\n3\n</parameter><|call|>"
+    },
+    {
+      "name": "parallel",
+      "message": {
+        "role": "assistant",
+        "thinking": "Both.",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": {
+                "city": "New York",
+                "days": 2,
+                "unit": "f",
+                "options": {
+                  "hourly": true,
+                  "hours": [
+                    9,
+                    12
+                  ]
+                },
+                "note": null
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "get_time",
+              "arguments": {
+                "tz": "UTC"
+              }
+            }
+          }
+        ]
+      },
+      "text": "<|channel|>analysis<|message|>Both.<|end|><|start|>assistant to=get_weather<|channel|>commentary <|constrain|>xml<|message|><parameter name=\"city\">\nNew York\n</parameter>\n<parameter name=\"days\">\n2\n</parameter>\n<parameter name=\"unit\">\nf\n</parameter>\n<parameter name=\"options\">\n{\"hourly\": true, \"hours\": [9, 12]}\n</parameter>\n<parameter name=\"note\">\nnull\n</parameter><|end|><|start|>assistant to=get_time<|channel|>commentary <|constrain|>xml<|message|><parameter name=\"tz\">\nUTC\n</parameter><|call|>"
+    },
+    {
+      "name": "no_parameters",
+      "message": {
+        "role": "assistant",
+        "thinking": "",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "ping",
+              "arguments": {}
+            }
+          }
+        ]
+      },
+      "text": "<|channel|>analysis<|message|><|end|><|start|>assistant to=ping<|channel|>commentary <|constrain|>xml<|message|><|call|>"
+    },
+    {
+      "name": "optional_only",
+      "message": {
+        "role": "assistant",
+        "thinking": "Search.",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "search",
+              "arguments": {
+                "limit": 5,
+                "filter": {
+                  "lang": "en"
+                },
+                "order": "top"
+              }
+            }
+          }
+        ]
+      },
+      "text": "<|channel|>analysis<|message|>Search.<|end|><|start|>assistant to=search<|channel|>commentary <|constrain|>xml<|message|><parameter name=\"limit\">\n5\n</parameter>\n<parameter name=\"filter\">\n{\"lang\": \"en\"}\n</parameter>\n<parameter name=\"order\">\ntop\n</parameter><|call|>"
+    },
+    {
+      "name": "multi_line",
+      "message": {
+        "role": "assistant",
+        "thinking": "Lines.",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": {
+                "city": "line one\nline two\n",
+                "days": 1
+              }
+            }
+          }
+        ]
+      },
+      "text": "<|channel|>analysis<|message|>Lines.<|end|><|start|>assistant to=get_weather<|channel|>commentary <|constrain|>xml<|message|><parameter name=\"city\">\nline one\nline two\n\n</parameter>\n<parameter name=\"days\">\n1\n</parameter><|call|>"
+    },
+    {
+      "name": "final_json",
+      "message": {
+        "role": "assistant",
+        "thinking": "Answer as JSON.",
+        "content": "{\"answer\": \"yes\", \"score\": 2}"
+      },
+      "text": "<|channel|>analysis<|message|>Answer as JSON.<|end|><|start|>assistant<|channel|>final<|message|>{\"answer\": \"yes\", \"score\": 2}<|return|>"
+    },
+    {
+      "name": "final_object",
+      "message": {
+        "role": "assistant",
+        "thinking": "",
+        "content": "{\"a\": [1, 2]}"
+      },
+      "text": "<|channel|>analysis<|message|><|end|><|start|>assistant<|channel|>final<|message|>{\"a\": [1, 2]}<|return|>"
+    }
+  ],
+  "tags": [
+    {
+      "name": "required",
+      "kind": "tool",
+      "tools": [
+        "get_weather",
+        "get_time",
+        "ping",
+        "search"
+      ],
+      "accepts": [
+        "single",
+        "parallel",
+        "no_parameters",
+        "optional_only",
+        "multi_line"
+      ],
+      "rejects": [
+        "final_json",
+        "final_object"
+      ],
+      "tag": {
+        "format": {
+          "type": "sequence",
+          "elements": [
+            {
+              "type": "sequence",
+              "elements": [
+                {
+                  "type": "token",
+                  "token": "<|channel|>"
+                },
+                {
+                  "type": "const_string",
+                  "value": "analysis"
+                },
+                {
+                  "type": "token",
+                  "token": "<|message|>"
+                },
+                {
+                  "type": "tag",
+                  "begin": "",
+                  "content": {
+                    "type": "any_text",
+                    "excludes": [
+                      "<|start|>",
+                      "<|end|>",
+                      "<|message|>",
+                      "<|channel|>",
+                      "<|constrain|>",
+                      "<|return|>",
+                      "<|call|>"
+                    ]
+                  },
+                  "end": {
+                    "type": "token",
+                    "token": "<|end|>"
+                  }
+                }
+              ]
+            },
+            {
+              "type": "or",
+              "elements": [
+                {
+                  "type": "sequence",
+                  "elements": [
+                    {
+                      "type": "token",
+                      "token": "<|start|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "assistant to=get_weather"
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|channel|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "commentary "
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|constrain|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "xml"
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|message|>"
+                    },
+                    {
+                      "type": "sequence",
+                      "elements": [
+                        {
+                          "type": "tag",
+                          "begin": "<parameter name=\"city\">\n",
+                          "content": {
+                            "type": "any_text",
+                            "excludes": [
+                              "</parameter>",
+                              "<|start|>",
+                              "<|end|>",
+                              "<|message|>",
+                              "<|channel|>",
+                              "<|constrain|>",
+                              "<|return|>",
+                              "<|call|>"
+                            ]
+                          },
+                          "end": "\n</parameter>"
+                        },
+                        {
+                          "type": "tag",
+                          "begin": "\n<parameter name=\"days\">\n",
+                          "content": {
+                            "type": "json_schema",
+                            "json_schema": {
+                              "type": "integer"
+                            }
+                          },
+                          "end": "\n</parameter>"
+                        },
+                        {
+                          "type": "optional",
+                          "content": {
+                            "type": "tag",
+                            "begin": "\n<parameter name=\"unit\">\n",
+                            "content": {
+                              "type": "or",
+                              "elements": [
+                                {
+                                  "type": "const_string",
+                                  "value": "c"
+                                },
+                                {
+                                  "type": "const_string",
+                                  "value": "f"
+                                }
+                              ]
+                            },
+                            "end": "\n</parameter>"
+                          }
+                        },
+                        {
+                          "type": "optional",
+                          "content": {
+                            "type": "tag",
+                            "begin": "\n<parameter name=\"options\">\n",
+                            "content": {
+                              "type": "json_schema",
+                              "json_schema": {
+                                "type": "object",
+                                "properties": {
+                                  "hourly": {
+                                    "type": "boolean"
+                                  },
+                                  "hours": {
+                                    "type": "array",
+                                    "items": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                }
+                              }
+                            },
+                            "end": "\n</parameter>"
+                          }
+                        },
+                        {
+                          "type": "optional",
+                          "content": {
+                            "type": "tag",
+                            "begin": "\n<parameter name=\"note\">\n",
+                            "content": {
+                              "type": "any_text",
+                              "excludes": [
+                                "</parameter>",
+                                "<|start|>",
+                                "<|end|>",
+                                "<|message|>",
+                                "<|channel|>",
+                                "<|constrain|>",
+                                "<|return|>",
+                                "<|call|>"
+                              ]
+                            },
+                            "end": "\n</parameter>"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "sequence",
+                  "elements": [
+                    {
+                      "type": "token",
+                      "token": "<|start|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "assistant to=get_time"
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|channel|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "commentary "
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|constrain|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "xml"
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|message|>"
+                    },
+                    {
+                      "type": "tag",
+                      "begin": "<parameter name=\"tz\">\n",
+                      "content": {
+                        "type": "any_text",
+                        "excludes": [
+                          "</parameter>",
+                          "<|start|>",
+                          "<|end|>",
+                          "<|message|>",
+                          "<|channel|>",
+                          "<|constrain|>",
+                          "<|return|>",
+                          "<|call|>"
+                        ]
+                      },
+                      "end": "\n</parameter>"
+                    }
+                  ]
+                },
+                {
+                  "type": "sequence",
+                  "elements": [
+                    {
+                      "type": "token",
+                      "token": "<|start|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "assistant to=ping"
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|channel|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "commentary "
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|constrain|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "xml"
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|message|>"
+                    }
+                  ]
+                },
+                {
+                  "type": "sequence",
+                  "elements": [
+                    {
+                      "type": "token",
+                      "token": "<|start|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "assistant to=search"
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|channel|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "commentary "
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|constrain|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "xml"
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|message|>"
+                    },
+                    {
+                      "type": "optional",
+                      "content": {
+                        "type": "or",
+                        "elements": [
+                          {
+                            "type": "sequence",
+                            "elements": [
+                              {
+                                "type": "or",
+                                "elements": [
+                                  {
+                                    "type": "sequence",
+                                    "elements": [
+                                      {
+                                        "type": "tag",
+                                        "begin": "<parameter name=\"query\">\n",
+                                        "content": {
+                                          "type": "any_text",
+                                          "excludes": [
+                                            "</parameter>",
+                                            "<|start|>",
+                                            "<|end|>",
+                                            "<|message|>",
+                                            "<|channel|>",
+                                            "<|constrain|>",
+                                            "<|return|>",
+                                            "<|call|>"
+                                          ]
+                                        },
+                                        "end": "\n</parameter>"
+                                      },
+                                      {
+                                        "type": "optional",
+                                        "content": {
+                                          "type": "tag",
+                                          "begin": "\n<parameter name=\"limit\">\n",
+                                          "content": {
+                                            "type": "json_schema",
+                                            "json_schema": {
+                                              "anyOf": [
+                                                {
+                                                  "type": "integer"
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
+                                            }
+                                          },
+                                          "end": "\n</parameter>"
+                                        }
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "type": "tag",
+                                    "begin": "<parameter name=\"limit\">\n",
+                                    "content": {
+                                      "type": "json_schema",
+                                      "json_schema": {
+                                        "anyOf": [
+                                          {
+                                            "type": "integer"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      }
+                                    },
+                                    "end": "\n</parameter>"
+                                  }
+                                ]
+                              },
+                              {
+                                "type": "optional",
+                                "content": {
+                                  "type": "tag",
+                                  "begin": "\n<parameter name=\"filter\">\n",
+                                  "content": {
+                                    "type": "json_schema",
+                                    "json_schema": {
+                                      "$ref": "#/$defs/Filter",
+                                      "$defs": {
+                                        "Filter": {
+                                          "type": "object",
+                                          "properties": {
+                                            "lang": {
+                                              "$ref": "#/$defs/symphony_string"
+                                            }
+                                          },
+                                          "required": [
+                                            "lang"
+                                          ]
+                                        },
+                                        "Order": {
+                                          "type": "string",
+                                          "enum": [
+                                            "new",
+                                            "top"
+                                          ]
+                                        },
+                                        "symphony_string": {
+                                          "type": "string",
+                                          "pattern": "([^\"\\\\\\x00-\\x1f<]|\\\\([\"\\\\/bfnrt]|u[0-9a-fA-F]{4})|(<(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?)*<((/(p(a(r(a(m(e(t(e(r([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<t])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<m])|[^\"\\\\\\x00-\\x1f<a])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<a])|[^\"\\\\\\x00-\\x1f<p])|\\|(c(a(l(l(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<l])|[^\"\\\\\\x00-\\x1f<l])|[^\"\\\\\\x00-\\x1f<a])|e(n(d(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<d])|[^\"\\\\\\x00-\\x1f<n])|r(e(t(u(r(n(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<n])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<u])|[^\"\\\\\\x00-\\x1f<t])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<cer])|[^\"\\\\\\x00-\\x1f</|])|(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?\\\\([\"\\\\/bfnrt]|u[0-9a-fA-F]{4})))*(<(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?)*"
+                                        }
+                                      }
+                                    }
+                                  },
+                                  "end": "\n</parameter>"
+                                }
+                              },
+                              {
+                                "type": "optional",
+                                "content": {
+                                  "type": "tag",
+                                  "begin": "\n<parameter name=\"order\">\n",
+                                  "content": {
+                                    "type": "any_text",
+                                    "excludes": [
+                                      "</parameter>",
+                                      "<|start|>",
+                                      "<|end|>",
+                                      "<|message|>",
+                                      "<|channel|>",
+                                      "<|constrain|>",
+                                      "<|return|>",
+                                      "<|call|>"
+                                    ]
+                                  },
+                                  "end": "\n</parameter>"
+                                }
+                              }
+                            ]
+                          },
+                          {
+                            "type": "or",
+                            "elements": [
+                              {
+                                "type": "sequence",
+                                "elements": [
+                                  {
+                                    "type": "tag",
+                                    "begin": "<parameter name=\"filter\">\n",
+                                    "content": {
+                                      "type": "json_schema",
+                                      "json_schema": {
+                                        "$ref": "#/$defs/Filter",
+                                        "$defs": {
+                                          "Filter": {
+                                            "type": "object",
+                                            "properties": {
+                                              "lang": {
+                                                "$ref": "#/$defs/symphony_string"
+                                              }
+                                            },
+                                            "required": [
+                                              "lang"
+                                            ]
+                                          },
+                                          "Order": {
+                                            "type": "string",
+                                            "enum": [
+                                              "new",
+                                              "top"
+                                            ]
+                                          },
+                                          "symphony_string": {
+                                            "type": "string",
+                                            "pattern": "([^\"\\\\\\x00-\\x1f<]|\\\\([\"\\\\/bfnrt]|u[0-9a-fA-F]{4})|(<(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?)*<((/(p(a(r(a(m(e(t(e(r([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<t])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<m])|[^\"\\\\\\x00-\\x1f<a])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<a])|[^\"\\\\\\x00-\\x1f<p])|\\|(c(a(l(l(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<l])|[^\"\\\\\\x00-\\x1f<l])|[^\"\\\\\\x00-\\x1f<a])|e(n(d(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<d])|[^\"\\\\\\x00-\\x1f<n])|r(e(t(u(r(n(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<n])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<u])|[^\"\\\\\\x00-\\x1f<t])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<cer])|[^\"\\\\\\x00-\\x1f</|])|(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?\\\\([\"\\\\/bfnrt]|u[0-9a-fA-F]{4})))*(<(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?)*"
+                                          }
+                                        }
+                                      }
+                                    },
+                                    "end": "\n</parameter>"
+                                  },
+                                  {
+                                    "type": "optional",
+                                    "content": {
+                                      "type": "tag",
+                                      "begin": "\n<parameter name=\"order\">\n",
+                                      "content": {
+                                        "type": "any_text",
+                                        "excludes": [
+                                          "</parameter>",
+                                          "<|start|>",
+                                          "<|end|>",
+                                          "<|message|>",
+                                          "<|channel|>",
+                                          "<|constrain|>",
+                                          "<|return|>",
+                                          "<|call|>"
+                                        ]
+                                      },
+                                      "end": "\n</parameter>"
+                                    }
+                                  }
+                                ]
+                              },
+                              {
+                                "type": "tag",
+                                "begin": "<parameter name=\"order\">\n",
+                                "content": {
+                                  "type": "any_text",
+                                  "excludes": [
+                                    "</parameter>",
+                                    "<|start|>",
+                                    "<|end|>",
+                                    "<|message|>",
+                                    "<|channel|>",
+                                    "<|constrain|>",
+                                    "<|return|>",
+                                    "<|call|>"
+                                  ]
+                                },
+                                "end": "\n</parameter>"
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "star",
+              "content": {
+                "type": "sequence",
+                "elements": [
+                  {
+                    "type": "token",
+                    "token": "<|end|>"
+                  },
+                  {
+                    "type": "or",
+                    "elements": [
+                      {
+                        "type": "sequence",
+                        "elements": [
+                          {
+                            "type": "token",
+                            "token": "<|start|>"
+                          },
+                          {
+                            "type": "const_string",
+                            "value": "assistant to=get_weather"
+                          },
+                          {
+                            "type": "token",
+                            "token": "<|channel|>"
+                          },
+                          {
+                            "type": "const_string",
+                            "value": "commentary "
+                          },
+                          {
+                            "type": "token",
+                            "token": "<|constrain|>"
+                          },
+                          {
+                            "type": "const_string",
+                            "value": "xml"
+                          },
+                          {
+                            "type": "token",
+                            "token": "<|message|>"
+                          },
+                          {
+                            "type": "sequence",
+                            "elements": [
+                              {
+                                "type": "tag",
+                                "begin": "<parameter name=\"city\">\n",
+                                "content": {
+                                  "type": "any_text",
+                                  "excludes": [
+                                    "</parameter>",
+                                    "<|start|>",
+                                    "<|end|>",
+                                    "<|message|>",
+                                    "<|channel|>",
+                                    "<|constrain|>",
+                                    "<|return|>",
+                                    "<|call|>"
+                                  ]
+                                },
+                                "end": "\n</parameter>"
+                              },
+                              {
+                                "type": "tag",
+                                "begin": "\n<parameter name=\"days\">\n",
+                                "content": {
+                                  "type": "json_schema",
+                                  "json_schema": {
+                                    "type": "integer"
+                                  }
+                                },
+                                "end": "\n</parameter>"
+                              },
+                              {
+                                "type": "optional",
+                                "content": {
+                                  "type": "tag",
+                                  "begin": "\n<parameter name=\"unit\">\n",
+                                  "content": {
+                                    "type": "or",
+                                    "elements": [
+                                      {
+                                        "type": "const_string",
+                                        "value": "c"
+                                      },
+                                      {
+                                        "type": "const_string",
+                                        "value": "f"
+                                      }
+                                    ]
+                                  },
+                                  "end": "\n</parameter>"
+                                }
+                              },
+                              {
+                                "type": "optional",
+                                "content": {
+                                  "type": "tag",
+                                  "begin": "\n<parameter name=\"options\">\n",
+                                  "content": {
+                                    "type": "json_schema",
+                                    "json_schema": {
+                                      "type": "object",
+                                      "properties": {
+                                        "hourly": {
+                                          "type": "boolean"
+                                        },
+                                        "hours": {
+                                          "type": "array",
+                                          "items": {
+                                            "type": "integer"
+                                          }
+                                        }
+                                      }
+                                    }
+                                  },
+                                  "end": "\n</parameter>"
+                                }
+                              },
+                              {
+                                "type": "optional",
+                                "content": {
+                                  "type": "tag",
+                                  "begin": "\n<parameter name=\"note\">\n",
+                                  "content": {
+                                    "type": "any_text",
+                                    "excludes": [
+                                      "</parameter>",
+                                      "<|start|>",
+                                      "<|end|>",
+                                      "<|message|>",
+                                      "<|channel|>",
+                                      "<|constrain|>",
+                                      "<|return|>",
+                                      "<|call|>"
+                                    ]
+                                  },
+                                  "end": "\n</parameter>"
+                                }
+                              }
+                            ]
+                          }
+                        ]
+                      },
+                      {
+                        "type": "sequence",
+                        "elements": [
+                          {
+                            "type": "token",
+                            "token": "<|start|>"
+                          },
+                          {
+                            "type": "const_string",
+                            "value": "assistant to=get_time"
+                          },
+                          {
+                            "type": "token",
+                            "token": "<|channel|>"
+                          },
+                          {
+                            "type": "const_string",
+                            "value": "commentary "
+                          },
+                          {
+                            "type": "token",
+                            "token": "<|constrain|>"
+                          },
+                          {
+                            "type": "const_string",
+                            "value": "xml"
+                          },
+                          {
+                            "type": "token",
+                            "token": "<|message|>"
+                          },
+                          {
+                            "type": "tag",
+                            "begin": "<parameter name=\"tz\">\n",
+                            "content": {
+                              "type": "any_text",
+                              "excludes": [
+                                "</parameter>",
+                                "<|start|>",
+                                "<|end|>",
+                                "<|message|>",
+                                "<|channel|>",
+                                "<|constrain|>",
+                                "<|return|>",
+                                "<|call|>"
+                              ]
+                            },
+                            "end": "\n</parameter>"
+                          }
+                        ]
+                      },
+                      {
+                        "type": "sequence",
+                        "elements": [
+                          {
+                            "type": "token",
+                            "token": "<|start|>"
+                          },
+                          {
+                            "type": "const_string",
+                            "value": "assistant to=ping"
+                          },
+                          {
+                            "type": "token",
+                            "token": "<|channel|>"
+                          },
+                          {
+                            "type": "const_string",
+                            "value": "commentary "
+                          },
+                          {
+                            "type": "token",
+                            "token": "<|constrain|>"
+                          },
+                          {
+                            "type": "const_string",
+                            "value": "xml"
+                          },
+                          {
+                            "type": "token",
+                            "token": "<|message|>"
+                          }
+                        ]
+                      },
+                      {
+                        "type": "sequence",
+                        "elements": [
+                          {
+                            "type": "token",
+                            "token": "<|start|>"
+                          },
+                          {
+                            "type": "const_string",
+                            "value": "assistant to=search"
+                          },
+                          {
+                            "type": "token",
+                            "token": "<|channel|>"
+                          },
+                          {
+                            "type": "const_string",
+                            "value": "commentary "
+                          },
+                          {
+                            "type": "token",
+                            "token": "<|constrain|>"
+                          },
+                          {
+                            "type": "const_string",
+                            "value": "xml"
+                          },
+                          {
+                            "type": "token",
+                            "token": "<|message|>"
+                          },
+                          {
+                            "type": "optional",
+                            "content": {
+                              "type": "or",
+                              "elements": [
+                                {
+                                  "type": "sequence",
+                                  "elements": [
+                                    {
+                                      "type": "or",
+                                      "elements": [
+                                        {
+                                          "type": "sequence",
+                                          "elements": [
+                                            {
+                                              "type": "tag",
+                                              "begin": "<parameter name=\"query\">\n",
+                                              "content": {
+                                                "type": "any_text",
+                                                "excludes": [
+                                                  "</parameter>",
+                                                  "<|start|>",
+                                                  "<|end|>",
+                                                  "<|message|>",
+                                                  "<|channel|>",
+                                                  "<|constrain|>",
+                                                  "<|return|>",
+                                                  "<|call|>"
+                                                ]
+                                              },
+                                              "end": "\n</parameter>"
+                                            },
+                                            {
+                                              "type": "optional",
+                                              "content": {
+                                                "type": "tag",
+                                                "begin": "\n<parameter name=\"limit\">\n",
+                                                "content": {
+                                                  "type": "json_schema",
+                                                  "json_schema": {
+                                                    "anyOf": [
+                                                      {
+                                                        "type": "integer"
+                                                      },
+                                                      {
+                                                        "type": "null"
+                                                      }
+                                                    ]
+                                                  }
+                                                },
+                                                "end": "\n</parameter>"
+                                              }
+                                            }
+                                          ]
+                                        },
+                                        {
+                                          "type": "tag",
+                                          "begin": "<parameter name=\"limit\">\n",
+                                          "content": {
+                                            "type": "json_schema",
+                                            "json_schema": {
+                                              "anyOf": [
+                                                {
+                                                  "type": "integer"
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
+                                            }
+                                          },
+                                          "end": "\n</parameter>"
+                                        }
+                                      ]
+                                    },
+                                    {
+                                      "type": "optional",
+                                      "content": {
+                                        "type": "tag",
+                                        "begin": "\n<parameter name=\"filter\">\n",
+                                        "content": {
+                                          "type": "json_schema",
+                                          "json_schema": {
+                                            "$ref": "#/$defs/Filter",
+                                            "$defs": {
+                                              "Filter": {
+                                                "type": "object",
+                                                "properties": {
+                                                  "lang": {
+                                                    "$ref": "#/$defs/symphony_string"
+                                                  }
+                                                },
+                                                "required": [
+                                                  "lang"
+                                                ]
+                                              },
+                                              "Order": {
+                                                "type": "string",
+                                                "enum": [
+                                                  "new",
+                                                  "top"
+                                                ]
+                                              },
+                                              "symphony_string": {
+                                                "type": "string",
+                                                "pattern": "([^\"\\\\\\x00-\\x1f<]|\\\\([\"\\\\/bfnrt]|u[0-9a-fA-F]{4})|(<(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?)*<((/(p(a(r(a(m(e(t(e(r([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<t])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<m])|[^\"\\\\\\x00-\\x1f<a])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<a])|[^\"\\\\\\x00-\\x1f<p])|\\|(c(a(l(l(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<l])|[^\"\\\\\\x00-\\x1f<l])|[^\"\\\\\\x00-\\x1f<a])|e(n(d(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<d])|[^\"\\\\\\x00-\\x1f<n])|r(e(t(u(r(n(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<n])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<u])|[^\"\\\\\\x00-\\x1f<t])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<cer])|[^\"\\\\\\x00-\\x1f</|])|(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?\\\\([\"\\\\/bfnrt]|u[0-9a-fA-F]{4})))*(<(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?)*"
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "end": "\n</parameter>"
+                                      }
+                                    },
+                                    {
+                                      "type": "optional",
+                                      "content": {
+                                        "type": "tag",
+                                        "begin": "\n<parameter name=\"order\">\n",
+                                        "content": {
+                                          "type": "any_text",
+                                          "excludes": [
+                                            "</parameter>",
+                                            "<|start|>",
+                                            "<|end|>",
+                                            "<|message|>",
+                                            "<|channel|>",
+                                            "<|constrain|>",
+                                            "<|return|>",
+                                            "<|call|>"
+                                          ]
+                                        },
+                                        "end": "\n</parameter>"
+                                      }
+                                    }
+                                  ]
+                                },
+                                {
+                                  "type": "or",
+                                  "elements": [
+                                    {
+                                      "type": "sequence",
+                                      "elements": [
+                                        {
+                                          "type": "tag",
+                                          "begin": "<parameter name=\"filter\">\n",
+                                          "content": {
+                                            "type": "json_schema",
+                                            "json_schema": {
+                                              "$ref": "#/$defs/Filter",
+                                              "$defs": {
+                                                "Filter": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "lang": {
+                                                      "$ref": "#/$defs/symphony_string"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "lang"
+                                                  ]
+                                                },
+                                                "Order": {
+                                                  "type": "string",
+                                                  "enum": [
+                                                    "new",
+                                                    "top"
+                                                  ]
+                                                },
+                                                "symphony_string": {
+                                                  "type": "string",
+                                                  "pattern": "([^\"\\\\\\x00-\\x1f<]|\\\\([\"\\\\/bfnrt]|u[0-9a-fA-F]{4})|(<(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?)*<((/(p(a(r(a(m(e(t(e(r([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<t])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<m])|[^\"\\\\\\x00-\\x1f<a])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<a])|[^\"\\\\\\x00-\\x1f<p])|\\|(c(a(l(l(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<l])|[^\"\\\\\\x00-\\x1f<l])|[^\"\\\\\\x00-\\x1f<a])|e(n(d(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<d])|[^\"\\\\\\x00-\\x1f<n])|r(e(t(u(r(n(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<n])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<u])|[^\"\\\\\\x00-\\x1f<t])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<cer])|[^\"\\\\\\x00-\\x1f</|])|(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?\\\\([\"\\\\/bfnrt]|u[0-9a-fA-F]{4})))*(<(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?)*"
+                                                }
+                                              }
+                                            }
+                                          },
+                                          "end": "\n</parameter>"
+                                        },
+                                        {
+                                          "type": "optional",
+                                          "content": {
+                                            "type": "tag",
+                                            "begin": "\n<parameter name=\"order\">\n",
+                                            "content": {
+                                              "type": "any_text",
+                                              "excludes": [
+                                                "</parameter>",
+                                                "<|start|>",
+                                                "<|end|>",
+                                                "<|message|>",
+                                                "<|channel|>",
+                                                "<|constrain|>",
+                                                "<|return|>",
+                                                "<|call|>"
+                                              ]
+                                            },
+                                            "end": "\n</parameter>"
+                                          }
+                                        }
+                                      ]
+                                    },
+                                    {
+                                      "type": "tag",
+                                      "begin": "<parameter name=\"order\">\n",
+                                      "content": {
+                                        "type": "any_text",
+                                        "excludes": [
+                                          "</parameter>",
+                                          "<|start|>",
+                                          "<|end|>",
+                                          "<|message|>",
+                                          "<|channel|>",
+                                          "<|constrain|>",
+                                          "<|return|>",
+                                          "<|call|>"
+                                        ]
+                                      },
+                                      "end": "\n</parameter>"
+                                    }
+                                  ]
+                                }
+                              ]
+                            }
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "type": "token",
+              "token": "<|call|>"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "named",
+      "kind": "tool",
+      "tools": [
+        "get_weather"
+      ],
+      "accepts": [
+        "single",
+        "multi_line"
+      ],
+      "rejects": [
+        "parallel",
+        "no_parameters",
+        "final_json"
+      ],
+      "tag": {
+        "format": {
+          "type": "sequence",
+          "elements": [
+            {
+              "type": "sequence",
+              "elements": [
+                {
+                  "type": "token",
+                  "token": "<|channel|>"
+                },
+                {
+                  "type": "const_string",
+                  "value": "analysis"
+                },
+                {
+                  "type": "token",
+                  "token": "<|message|>"
+                },
+                {
+                  "type": "tag",
+                  "begin": "",
+                  "content": {
+                    "type": "any_text",
+                    "excludes": [
+                      "<|start|>",
+                      "<|end|>",
+                      "<|message|>",
+                      "<|channel|>",
+                      "<|constrain|>",
+                      "<|return|>",
+                      "<|call|>"
+                    ]
+                  },
+                  "end": {
+                    "type": "token",
+                    "token": "<|end|>"
+                  }
+                }
+              ]
+            },
+            {
+              "type": "sequence",
+              "elements": [
+                {
+                  "type": "token",
+                  "token": "<|start|>"
+                },
+                {
+                  "type": "const_string",
+                  "value": "assistant to=get_weather"
+                },
+                {
+                  "type": "token",
+                  "token": "<|channel|>"
+                },
+                {
+                  "type": "const_string",
+                  "value": "commentary "
+                },
+                {
+                  "type": "token",
+                  "token": "<|constrain|>"
+                },
+                {
+                  "type": "const_string",
+                  "value": "xml"
+                },
+                {
+                  "type": "token",
+                  "token": "<|message|>"
+                },
+                {
+                  "type": "sequence",
+                  "elements": [
+                    {
+                      "type": "tag",
+                      "begin": "<parameter name=\"city\">\n",
+                      "content": {
+                        "type": "any_text",
+                        "excludes": [
+                          "</parameter>",
+                          "<|start|>",
+                          "<|end|>",
+                          "<|message|>",
+                          "<|channel|>",
+                          "<|constrain|>",
+                          "<|return|>",
+                          "<|call|>"
+                        ]
+                      },
+                      "end": "\n</parameter>"
+                    },
+                    {
+                      "type": "tag",
+                      "begin": "\n<parameter name=\"days\">\n",
+                      "content": {
+                        "type": "json_schema",
+                        "json_schema": {
+                          "type": "integer"
+                        }
+                      },
+                      "end": "\n</parameter>"
+                    },
+                    {
+                      "type": "optional",
+                      "content": {
+                        "type": "tag",
+                        "begin": "\n<parameter name=\"unit\">\n",
+                        "content": {
+                          "type": "or",
+                          "elements": [
+                            {
+                              "type": "const_string",
+                              "value": "c"
+                            },
+                            {
+                              "type": "const_string",
+                              "value": "f"
+                            }
+                          ]
+                        },
+                        "end": "\n</parameter>"
+                      }
+                    },
+                    {
+                      "type": "optional",
+                      "content": {
+                        "type": "tag",
+                        "begin": "\n<parameter name=\"options\">\n",
+                        "content": {
+                          "type": "json_schema",
+                          "json_schema": {
+                            "type": "object",
+                            "properties": {
+                              "hourly": {
+                                "type": "boolean"
+                              },
+                              "hours": {
+                                "type": "array",
+                                "items": {
+                                  "type": "integer"
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "end": "\n</parameter>"
+                      }
+                    },
+                    {
+                      "type": "optional",
+                      "content": {
+                        "type": "tag",
+                        "begin": "\n<parameter name=\"note\">\n",
+                        "content": {
+                          "type": "any_text",
+                          "excludes": [
+                            "</parameter>",
+                            "<|start|>",
+                            "<|end|>",
+                            "<|message|>",
+                            "<|channel|>",
+                            "<|constrain|>",
+                            "<|return|>",
+                            "<|call|>"
+                          ]
+                        },
+                        "end": "\n</parameter>"
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "star",
+              "content": {
+                "type": "sequence",
+                "elements": [
+                  {
+                    "type": "token",
+                    "token": "<|end|>"
+                  },
+                  {
+                    "type": "sequence",
+                    "elements": [
+                      {
+                        "type": "token",
+                        "token": "<|start|>"
+                      },
+                      {
+                        "type": "const_string",
+                        "value": "assistant to=get_weather"
+                      },
+                      {
+                        "type": "token",
+                        "token": "<|channel|>"
+                      },
+                      {
+                        "type": "const_string",
+                        "value": "commentary "
+                      },
+                      {
+                        "type": "token",
+                        "token": "<|constrain|>"
+                      },
+                      {
+                        "type": "const_string",
+                        "value": "xml"
+                      },
+                      {
+                        "type": "token",
+                        "token": "<|message|>"
+                      },
+                      {
+                        "type": "sequence",
+                        "elements": [
+                          {
+                            "type": "tag",
+                            "begin": "<parameter name=\"city\">\n",
+                            "content": {
+                              "type": "any_text",
+                              "excludes": [
+                                "</parameter>",
+                                "<|start|>",
+                                "<|end|>",
+                                "<|message|>",
+                                "<|channel|>",
+                                "<|constrain|>",
+                                "<|return|>",
+                                "<|call|>"
+                              ]
+                            },
+                            "end": "\n</parameter>"
+                          },
+                          {
+                            "type": "tag",
+                            "begin": "\n<parameter name=\"days\">\n",
+                            "content": {
+                              "type": "json_schema",
+                              "json_schema": {
+                                "type": "integer"
+                              }
+                            },
+                            "end": "\n</parameter>"
+                          },
+                          {
+                            "type": "optional",
+                            "content": {
+                              "type": "tag",
+                              "begin": "\n<parameter name=\"unit\">\n",
+                              "content": {
+                                "type": "or",
+                                "elements": [
+                                  {
+                                    "type": "const_string",
+                                    "value": "c"
+                                  },
+                                  {
+                                    "type": "const_string",
+                                    "value": "f"
+                                  }
+                                ]
+                              },
+                              "end": "\n</parameter>"
+                            }
+                          },
+                          {
+                            "type": "optional",
+                            "content": {
+                              "type": "tag",
+                              "begin": "\n<parameter name=\"options\">\n",
+                              "content": {
+                                "type": "json_schema",
+                                "json_schema": {
+                                  "type": "object",
+                                  "properties": {
+                                    "hourly": {
+                                      "type": "boolean"
+                                    },
+                                    "hours": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "integer"
+                                      }
+                                    }
+                                  }
+                                }
+                              },
+                              "end": "\n</parameter>"
+                            }
+                          },
+                          {
+                            "type": "optional",
+                            "content": {
+                              "type": "tag",
+                              "begin": "\n<parameter name=\"note\">\n",
+                              "content": {
+                                "type": "any_text",
+                                "excludes": [
+                                  "</parameter>",
+                                  "<|start|>",
+                                  "<|end|>",
+                                  "<|message|>",
+                                  "<|channel|>",
+                                  "<|constrain|>",
+                                  "<|return|>",
+                                  "<|call|>"
+                                ]
+                              },
+                              "end": "\n</parameter>"
+                            }
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "type": "token",
+              "token": "<|call|>"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "single_call",
+      "kind": "single_call",
+      "tools": [
+        "get_weather",
+        "get_time",
+        "ping",
+        "search"
+      ],
+      "accepts": [
+        "single",
+        "no_parameters",
+        "optional_only",
+        "multi_line"
+      ],
+      "rejects": [
+        "parallel",
+        "final_json",
+        "final_object"
+      ],
+      "tag": {
+        "format": {
+          "type": "sequence",
+          "elements": [
+            {
+              "type": "sequence",
+              "elements": [
+                {
+                  "type": "token",
+                  "token": "<|channel|>"
+                },
+                {
+                  "type": "const_string",
+                  "value": "analysis"
+                },
+                {
+                  "type": "token",
+                  "token": "<|message|>"
+                },
+                {
+                  "type": "tag",
+                  "begin": "",
+                  "content": {
+                    "type": "any_text",
+                    "excludes": [
+                      "<|start|>",
+                      "<|end|>",
+                      "<|message|>",
+                      "<|channel|>",
+                      "<|constrain|>",
+                      "<|return|>",
+                      "<|call|>"
+                    ]
+                  },
+                  "end": {
+                    "type": "token",
+                    "token": "<|end|>"
+                  }
+                }
+              ]
+            },
+            {
+              "type": "or",
+              "elements": [
+                {
+                  "type": "sequence",
+                  "elements": [
+                    {
+                      "type": "token",
+                      "token": "<|start|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "assistant to=get_weather"
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|channel|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "commentary "
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|constrain|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "xml"
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|message|>"
+                    },
+                    {
+                      "type": "sequence",
+                      "elements": [
+                        {
+                          "type": "tag",
+                          "begin": "<parameter name=\"city\">\n",
+                          "content": {
+                            "type": "any_text",
+                            "excludes": [
+                              "</parameter>",
+                              "<|start|>",
+                              "<|end|>",
+                              "<|message|>",
+                              "<|channel|>",
+                              "<|constrain|>",
+                              "<|return|>",
+                              "<|call|>"
+                            ]
+                          },
+                          "end": "\n</parameter>"
+                        },
+                        {
+                          "type": "tag",
+                          "begin": "\n<parameter name=\"days\">\n",
+                          "content": {
+                            "type": "json_schema",
+                            "json_schema": {
+                              "type": "integer"
+                            }
+                          },
+                          "end": "\n</parameter>"
+                        },
+                        {
+                          "type": "optional",
+                          "content": {
+                            "type": "tag",
+                            "begin": "\n<parameter name=\"unit\">\n",
+                            "content": {
+                              "type": "or",
+                              "elements": [
+                                {
+                                  "type": "const_string",
+                                  "value": "c"
+                                },
+                                {
+                                  "type": "const_string",
+                                  "value": "f"
+                                }
+                              ]
+                            },
+                            "end": "\n</parameter>"
+                          }
+                        },
+                        {
+                          "type": "optional",
+                          "content": {
+                            "type": "tag",
+                            "begin": "\n<parameter name=\"options\">\n",
+                            "content": {
+                              "type": "json_schema",
+                              "json_schema": {
+                                "type": "object",
+                                "properties": {
+                                  "hourly": {
+                                    "type": "boolean"
+                                  },
+                                  "hours": {
+                                    "type": "array",
+                                    "items": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                }
+                              }
+                            },
+                            "end": "\n</parameter>"
+                          }
+                        },
+                        {
+                          "type": "optional",
+                          "content": {
+                            "type": "tag",
+                            "begin": "\n<parameter name=\"note\">\n",
+                            "content": {
+                              "type": "any_text",
+                              "excludes": [
+                                "</parameter>",
+                                "<|start|>",
+                                "<|end|>",
+                                "<|message|>",
+                                "<|channel|>",
+                                "<|constrain|>",
+                                "<|return|>",
+                                "<|call|>"
+                              ]
+                            },
+                            "end": "\n</parameter>"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "sequence",
+                  "elements": [
+                    {
+                      "type": "token",
+                      "token": "<|start|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "assistant to=get_time"
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|channel|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "commentary "
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|constrain|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "xml"
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|message|>"
+                    },
+                    {
+                      "type": "tag",
+                      "begin": "<parameter name=\"tz\">\n",
+                      "content": {
+                        "type": "any_text",
+                        "excludes": [
+                          "</parameter>",
+                          "<|start|>",
+                          "<|end|>",
+                          "<|message|>",
+                          "<|channel|>",
+                          "<|constrain|>",
+                          "<|return|>",
+                          "<|call|>"
+                        ]
+                      },
+                      "end": "\n</parameter>"
+                    }
+                  ]
+                },
+                {
+                  "type": "sequence",
+                  "elements": [
+                    {
+                      "type": "token",
+                      "token": "<|start|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "assistant to=ping"
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|channel|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "commentary "
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|constrain|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "xml"
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|message|>"
+                    }
+                  ]
+                },
+                {
+                  "type": "sequence",
+                  "elements": [
+                    {
+                      "type": "token",
+                      "token": "<|start|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "assistant to=search"
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|channel|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "commentary "
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|constrain|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "xml"
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|message|>"
+                    },
+                    {
+                      "type": "optional",
+                      "content": {
+                        "type": "or",
+                        "elements": [
+                          {
+                            "type": "sequence",
+                            "elements": [
+                              {
+                                "type": "or",
+                                "elements": [
+                                  {
+                                    "type": "sequence",
+                                    "elements": [
+                                      {
+                                        "type": "tag",
+                                        "begin": "<parameter name=\"query\">\n",
+                                        "content": {
+                                          "type": "any_text",
+                                          "excludes": [
+                                            "</parameter>",
+                                            "<|start|>",
+                                            "<|end|>",
+                                            "<|message|>",
+                                            "<|channel|>",
+                                            "<|constrain|>",
+                                            "<|return|>",
+                                            "<|call|>"
+                                          ]
+                                        },
+                                        "end": "\n</parameter>"
+                                      },
+                                      {
+                                        "type": "optional",
+                                        "content": {
+                                          "type": "tag",
+                                          "begin": "\n<parameter name=\"limit\">\n",
+                                          "content": {
+                                            "type": "json_schema",
+                                            "json_schema": {
+                                              "anyOf": [
+                                                {
+                                                  "type": "integer"
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
+                                            }
+                                          },
+                                          "end": "\n</parameter>"
+                                        }
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "type": "tag",
+                                    "begin": "<parameter name=\"limit\">\n",
+                                    "content": {
+                                      "type": "json_schema",
+                                      "json_schema": {
+                                        "anyOf": [
+                                          {
+                                            "type": "integer"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      }
+                                    },
+                                    "end": "\n</parameter>"
+                                  }
+                                ]
+                              },
+                              {
+                                "type": "optional",
+                                "content": {
+                                  "type": "tag",
+                                  "begin": "\n<parameter name=\"filter\">\n",
+                                  "content": {
+                                    "type": "json_schema",
+                                    "json_schema": {
+                                      "$ref": "#/$defs/Filter",
+                                      "$defs": {
+                                        "Filter": {
+                                          "type": "object",
+                                          "properties": {
+                                            "lang": {
+                                              "$ref": "#/$defs/symphony_string"
+                                            }
+                                          },
+                                          "required": [
+                                            "lang"
+                                          ]
+                                        },
+                                        "Order": {
+                                          "type": "string",
+                                          "enum": [
+                                            "new",
+                                            "top"
+                                          ]
+                                        },
+                                        "symphony_string": {
+                                          "type": "string",
+                                          "pattern": "([^\"\\\\\\x00-\\x1f<]|\\\\([\"\\\\/bfnrt]|u[0-9a-fA-F]{4})|(<(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?)*<((/(p(a(r(a(m(e(t(e(r([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<t])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<m])|[^\"\\\\\\x00-\\x1f<a])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<a])|[^\"\\\\\\x00-\\x1f<p])|\\|(c(a(l(l(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<l])|[^\"\\\\\\x00-\\x1f<l])|[^\"\\\\\\x00-\\x1f<a])|e(n(d(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<d])|[^\"\\\\\\x00-\\x1f<n])|r(e(t(u(r(n(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<n])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<u])|[^\"\\\\\\x00-\\x1f<t])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<cer])|[^\"\\\\\\x00-\\x1f</|])|(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?\\\\([\"\\\\/bfnrt]|u[0-9a-fA-F]{4})))*(<(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?)*"
+                                        }
+                                      }
+                                    }
+                                  },
+                                  "end": "\n</parameter>"
+                                }
+                              },
+                              {
+                                "type": "optional",
+                                "content": {
+                                  "type": "tag",
+                                  "begin": "\n<parameter name=\"order\">\n",
+                                  "content": {
+                                    "type": "any_text",
+                                    "excludes": [
+                                      "</parameter>",
+                                      "<|start|>",
+                                      "<|end|>",
+                                      "<|message|>",
+                                      "<|channel|>",
+                                      "<|constrain|>",
+                                      "<|return|>",
+                                      "<|call|>"
+                                    ]
+                                  },
+                                  "end": "\n</parameter>"
+                                }
+                              }
+                            ]
+                          },
+                          {
+                            "type": "or",
+                            "elements": [
+                              {
+                                "type": "sequence",
+                                "elements": [
+                                  {
+                                    "type": "tag",
+                                    "begin": "<parameter name=\"filter\">\n",
+                                    "content": {
+                                      "type": "json_schema",
+                                      "json_schema": {
+                                        "$ref": "#/$defs/Filter",
+                                        "$defs": {
+                                          "Filter": {
+                                            "type": "object",
+                                            "properties": {
+                                              "lang": {
+                                                "$ref": "#/$defs/symphony_string"
+                                              }
+                                            },
+                                            "required": [
+                                              "lang"
+                                            ]
+                                          },
+                                          "Order": {
+                                            "type": "string",
+                                            "enum": [
+                                              "new",
+                                              "top"
+                                            ]
+                                          },
+                                          "symphony_string": {
+                                            "type": "string",
+                                            "pattern": "([^\"\\\\\\x00-\\x1f<]|\\\\([\"\\\\/bfnrt]|u[0-9a-fA-F]{4})|(<(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?)*<((/(p(a(r(a(m(e(t(e(r([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<t])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<m])|[^\"\\\\\\x00-\\x1f<a])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<a])|[^\"\\\\\\x00-\\x1f<p])|\\|(c(a(l(l(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<l])|[^\"\\\\\\x00-\\x1f<l])|[^\"\\\\\\x00-\\x1f<a])|e(n(d(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<d])|[^\"\\\\\\x00-\\x1f<n])|r(e(t(u(r(n(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<n])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<u])|[^\"\\\\\\x00-\\x1f<t])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<cer])|[^\"\\\\\\x00-\\x1f</|])|(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?\\\\([\"\\\\/bfnrt]|u[0-9a-fA-F]{4})))*(<(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?)*"
+                                          }
+                                        }
+                                      }
+                                    },
+                                    "end": "\n</parameter>"
+                                  },
+                                  {
+                                    "type": "optional",
+                                    "content": {
+                                      "type": "tag",
+                                      "begin": "\n<parameter name=\"order\">\n",
+                                      "content": {
+                                        "type": "any_text",
+                                        "excludes": [
+                                          "</parameter>",
+                                          "<|start|>",
+                                          "<|end|>",
+                                          "<|message|>",
+                                          "<|channel|>",
+                                          "<|constrain|>",
+                                          "<|return|>",
+                                          "<|call|>"
+                                        ]
+                                      },
+                                      "end": "\n</parameter>"
+                                    }
+                                  }
+                                ]
+                              },
+                              {
+                                "type": "tag",
+                                "begin": "<parameter name=\"order\">\n",
+                                "content": {
+                                  "type": "any_text",
+                                  "excludes": [
+                                    "</parameter>",
+                                    "<|start|>",
+                                    "<|end|>",
+                                    "<|message|>",
+                                    "<|channel|>",
+                                    "<|constrain|>",
+                                    "<|return|>",
+                                    "<|call|>"
+                                  ]
+                                },
+                                "end": "\n</parameter>"
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "token",
+              "token": "<|call|>"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "named_single_call",
+      "kind": "single_call",
+      "tools": [
+        "get_weather"
+      ],
+      "accepts": [
+        "single",
+        "multi_line"
+      ],
+      "rejects": [
+        "parallel",
+        "no_parameters",
+        "final_json"
+      ],
+      "tag": {
+        "format": {
+          "type": "sequence",
+          "elements": [
+            {
+              "type": "sequence",
+              "elements": [
+                {
+                  "type": "token",
+                  "token": "<|channel|>"
+                },
+                {
+                  "type": "const_string",
+                  "value": "analysis"
+                },
+                {
+                  "type": "token",
+                  "token": "<|message|>"
+                },
+                {
+                  "type": "tag",
+                  "begin": "",
+                  "content": {
+                    "type": "any_text",
+                    "excludes": [
+                      "<|start|>",
+                      "<|end|>",
+                      "<|message|>",
+                      "<|channel|>",
+                      "<|constrain|>",
+                      "<|return|>",
+                      "<|call|>"
+                    ]
+                  },
+                  "end": {
+                    "type": "token",
+                    "token": "<|end|>"
+                  }
+                }
+              ]
+            },
+            {
+              "type": "sequence",
+              "elements": [
+                {
+                  "type": "token",
+                  "token": "<|start|>"
+                },
+                {
+                  "type": "const_string",
+                  "value": "assistant to=get_weather"
+                },
+                {
+                  "type": "token",
+                  "token": "<|channel|>"
+                },
+                {
+                  "type": "const_string",
+                  "value": "commentary "
+                },
+                {
+                  "type": "token",
+                  "token": "<|constrain|>"
+                },
+                {
+                  "type": "const_string",
+                  "value": "xml"
+                },
+                {
+                  "type": "token",
+                  "token": "<|message|>"
+                },
+                {
+                  "type": "sequence",
+                  "elements": [
+                    {
+                      "type": "tag",
+                      "begin": "<parameter name=\"city\">\n",
+                      "content": {
+                        "type": "any_text",
+                        "excludes": [
+                          "</parameter>",
+                          "<|start|>",
+                          "<|end|>",
+                          "<|message|>",
+                          "<|channel|>",
+                          "<|constrain|>",
+                          "<|return|>",
+                          "<|call|>"
+                        ]
+                      },
+                      "end": "\n</parameter>"
+                    },
+                    {
+                      "type": "tag",
+                      "begin": "\n<parameter name=\"days\">\n",
+                      "content": {
+                        "type": "json_schema",
+                        "json_schema": {
+                          "type": "integer"
+                        }
+                      },
+                      "end": "\n</parameter>"
+                    },
+                    {
+                      "type": "optional",
+                      "content": {
+                        "type": "tag",
+                        "begin": "\n<parameter name=\"unit\">\n",
+                        "content": {
+                          "type": "or",
+                          "elements": [
+                            {
+                              "type": "const_string",
+                              "value": "c"
+                            },
+                            {
+                              "type": "const_string",
+                              "value": "f"
+                            }
+                          ]
+                        },
+                        "end": "\n</parameter>"
+                      }
+                    },
+                    {
+                      "type": "optional",
+                      "content": {
+                        "type": "tag",
+                        "begin": "\n<parameter name=\"options\">\n",
+                        "content": {
+                          "type": "json_schema",
+                          "json_schema": {
+                            "type": "object",
+                            "properties": {
+                              "hourly": {
+                                "type": "boolean"
+                              },
+                              "hours": {
+                                "type": "array",
+                                "items": {
+                                  "type": "integer"
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "end": "\n</parameter>"
+                      }
+                    },
+                    {
+                      "type": "optional",
+                      "content": {
+                        "type": "tag",
+                        "begin": "\n<parameter name=\"note\">\n",
+                        "content": {
+                          "type": "any_text",
+                          "excludes": [
+                            "</parameter>",
+                            "<|start|>",
+                            "<|end|>",
+                            "<|message|>",
+                            "<|channel|>",
+                            "<|constrain|>",
+                            "<|return|>",
+                            "<|call|>"
+                          ]
+                        },
+                        "end": "\n</parameter>"
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "token",
+              "token": "<|call|>"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "response_format",
+      "kind": "response_format",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          },
+          "score": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "answer",
+          "score"
+        ]
+      },
+      "tools": [],
+      "accepts": [
+        "final_json"
+      ],
+      "rejects": [
+        "single",
+        "final_object"
+      ],
+      "tag": {
+        "format": {
+          "type": "sequence",
+          "elements": [
+            {
+              "type": "sequence",
+              "elements": [
+                {
+                  "type": "token",
+                  "token": "<|channel|>"
+                },
+                {
+                  "type": "const_string",
+                  "value": "analysis"
+                },
+                {
+                  "type": "token",
+                  "token": "<|message|>"
+                },
+                {
+                  "type": "tag",
+                  "begin": "",
+                  "content": {
+                    "type": "any_text",
+                    "excludes": [
+                      "<|start|>",
+                      "<|end|>",
+                      "<|message|>",
+                      "<|channel|>",
+                      "<|constrain|>",
+                      "<|return|>",
+                      "<|call|>"
+                    ]
+                  },
+                  "end": {
+                    "type": "token",
+                    "token": "<|end|>"
+                  }
+                }
+              ]
+            },
+            {
+              "type": "sequence",
+              "elements": [
+                {
+                  "type": "token",
+                  "token": "<|start|>"
+                },
+                {
+                  "type": "const_string",
+                  "value": "assistant"
+                },
+                {
+                  "type": "token",
+                  "token": "<|channel|>"
+                },
+                {
+                  "type": "const_string",
+                  "value": "final"
+                },
+                {
+                  "type": "token",
+                  "token": "<|message|>"
+                },
+                {
+                  "type": "json_schema",
+                  "json_schema": {
+                    "type": "object",
+                    "properties": {
+                      "answer": {
+                        "$ref": "#/$defs/symphony_string"
+                      },
+                      "score": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "answer",
+                      "score"
+                    ],
+                    "$defs": {
+                      "symphony_string": {
+                        "type": "string",
+                        "pattern": "([^\"\\\\\\x00-\\x1f<]|\\\\([\"\\\\/bfnrt]|u[0-9a-fA-F]{4})|(<(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?)*<((/(p(a(r(a(m(e(t(e(r([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<t])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<m])|[^\"\\\\\\x00-\\x1f<a])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<a])|[^\"\\\\\\x00-\\x1f<p])|\\|(c(a(l(l(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<l])|[^\"\\\\\\x00-\\x1f<l])|[^\"\\\\\\x00-\\x1f<a])|e(n(d(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<d])|[^\"\\\\\\x00-\\x1f<n])|r(e(t(u(r(n(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<n])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<u])|[^\"\\\\\\x00-\\x1f<t])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<cer])|[^\"\\\\\\x00-\\x1f</|])|(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?\\\\([\"\\\\/bfnrt]|u[0-9a-fA-F]{4})))*(<(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?)*"
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "response_format_or_calls",
+      "kind": "response_format",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          },
+          "score": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "answer",
+          "score"
+        ]
+      },
+      "tools": [
+        "get_weather"
+      ],
+      "accepts": [
+        "final_json",
+        "single",
+        "multi_line"
+      ],
+      "rejects": [
+        "final_object",
+        "parallel"
+      ],
+      "tag": {
+        "format": {
+          "type": "sequence",
+          "elements": [
+            {
+              "type": "sequence",
+              "elements": [
+                {
+                  "type": "token",
+                  "token": "<|channel|>"
+                },
+                {
+                  "type": "const_string",
+                  "value": "analysis"
+                },
+                {
+                  "type": "token",
+                  "token": "<|message|>"
+                },
+                {
+                  "type": "tag",
+                  "begin": "",
+                  "content": {
+                    "type": "any_text",
+                    "excludes": [
+                      "<|start|>",
+                      "<|end|>",
+                      "<|message|>",
+                      "<|channel|>",
+                      "<|constrain|>",
+                      "<|return|>",
+                      "<|call|>"
+                    ]
+                  },
+                  "end": {
+                    "type": "token",
+                    "token": "<|end|>"
+                  }
+                }
+              ]
+            },
+            {
+              "type": "or",
+              "elements": [
+                {
+                  "type": "sequence",
+                  "elements": [
+                    {
+                      "type": "token",
+                      "token": "<|start|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "assistant"
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|channel|>"
+                    },
+                    {
+                      "type": "const_string",
+                      "value": "final"
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|message|>"
+                    },
+                    {
+                      "type": "json_schema",
+                      "json_schema": {
+                        "type": "object",
+                        "properties": {
+                          "answer": {
+                            "$ref": "#/$defs/symphony_string"
+                          },
+                          "score": {
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "answer",
+                          "score"
+                        ],
+                        "$defs": {
+                          "symphony_string": {
+                            "type": "string",
+                            "pattern": "([^\"\\\\\\x00-\\x1f<]|\\\\([\"\\\\/bfnrt]|u[0-9a-fA-F]{4})|(<(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?)*<((/(p(a(r(a(m(e(t(e(r([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<t])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<m])|[^\"\\\\\\x00-\\x1f<a])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<a])|[^\"\\\\\\x00-\\x1f<p])|\\|(c(a(l(l(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<l])|[^\"\\\\\\x00-\\x1f<l])|[^\"\\\\\\x00-\\x1f<a])|e(n(d(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<d])|[^\"\\\\\\x00-\\x1f<n])|r(e(t(u(r(n(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<n])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<u])|[^\"\\\\\\x00-\\x1f<t])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<cer])|[^\"\\\\\\x00-\\x1f</|])|(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?\\\\([\"\\\\/bfnrt]|u[0-9a-fA-F]{4})))*(<(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?)*"
+                          }
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "sequence",
+                  "elements": [
+                    {
+                      "type": "sequence",
+                      "elements": [
+                        {
+                          "type": "token",
+                          "token": "<|start|>"
+                        },
+                        {
+                          "type": "const_string",
+                          "value": "assistant to=get_weather"
+                        },
+                        {
+                          "type": "token",
+                          "token": "<|channel|>"
+                        },
+                        {
+                          "type": "const_string",
+                          "value": "commentary "
+                        },
+                        {
+                          "type": "token",
+                          "token": "<|constrain|>"
+                        },
+                        {
+                          "type": "const_string",
+                          "value": "xml"
+                        },
+                        {
+                          "type": "token",
+                          "token": "<|message|>"
+                        },
+                        {
+                          "type": "sequence",
+                          "elements": [
+                            {
+                              "type": "tag",
+                              "begin": "<parameter name=\"city\">\n",
+                              "content": {
+                                "type": "any_text",
+                                "excludes": [
+                                  "</parameter>",
+                                  "<|start|>",
+                                  "<|end|>",
+                                  "<|message|>",
+                                  "<|channel|>",
+                                  "<|constrain|>",
+                                  "<|return|>",
+                                  "<|call|>"
+                                ]
+                              },
+                              "end": "\n</parameter>"
+                            },
+                            {
+                              "type": "tag",
+                              "begin": "\n<parameter name=\"days\">\n",
+                              "content": {
+                                "type": "json_schema",
+                                "json_schema": {
+                                  "type": "integer"
+                                }
+                              },
+                              "end": "\n</parameter>"
+                            },
+                            {
+                              "type": "optional",
+                              "content": {
+                                "type": "tag",
+                                "begin": "\n<parameter name=\"unit\">\n",
+                                "content": {
+                                  "type": "or",
+                                  "elements": [
+                                    {
+                                      "type": "const_string",
+                                      "value": "c"
+                                    },
+                                    {
+                                      "type": "const_string",
+                                      "value": "f"
+                                    }
+                                  ]
+                                },
+                                "end": "\n</parameter>"
+                              }
+                            },
+                            {
+                              "type": "optional",
+                              "content": {
+                                "type": "tag",
+                                "begin": "\n<parameter name=\"options\">\n",
+                                "content": {
+                                  "type": "json_schema",
+                                  "json_schema": {
+                                    "type": "object",
+                                    "properties": {
+                                      "hourly": {
+                                        "type": "boolean"
+                                      },
+                                      "hours": {
+                                        "type": "array",
+                                        "items": {
+                                          "type": "integer"
+                                        }
+                                      }
+                                    }
+                                  }
+                                },
+                                "end": "\n</parameter>"
+                              }
+                            },
+                            {
+                              "type": "optional",
+                              "content": {
+                                "type": "tag",
+                                "begin": "\n<parameter name=\"note\">\n",
+                                "content": {
+                                  "type": "any_text",
+                                  "excludes": [
+                                    "</parameter>",
+                                    "<|start|>",
+                                    "<|end|>",
+                                    "<|message|>",
+                                    "<|channel|>",
+                                    "<|constrain|>",
+                                    "<|return|>",
+                                    "<|call|>"
+                                  ]
+                                },
+                                "end": "\n</parameter>"
+                              }
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "type": "star",
+                      "content": {
+                        "type": "sequence",
+                        "elements": [
+                          {
+                            "type": "token",
+                            "token": "<|end|>"
+                          },
+                          {
+                            "type": "sequence",
+                            "elements": [
+                              {
+                                "type": "token",
+                                "token": "<|start|>"
+                              },
+                              {
+                                "type": "const_string",
+                                "value": "assistant to=get_weather"
+                              },
+                              {
+                                "type": "token",
+                                "token": "<|channel|>"
+                              },
+                              {
+                                "type": "const_string",
+                                "value": "commentary "
+                              },
+                              {
+                                "type": "token",
+                                "token": "<|constrain|>"
+                              },
+                              {
+                                "type": "const_string",
+                                "value": "xml"
+                              },
+                              {
+                                "type": "token",
+                                "token": "<|message|>"
+                              },
+                              {
+                                "type": "sequence",
+                                "elements": [
+                                  {
+                                    "type": "tag",
+                                    "begin": "<parameter name=\"city\">\n",
+                                    "content": {
+                                      "type": "any_text",
+                                      "excludes": [
+                                        "</parameter>",
+                                        "<|start|>",
+                                        "<|end|>",
+                                        "<|message|>",
+                                        "<|channel|>",
+                                        "<|constrain|>",
+                                        "<|return|>",
+                                        "<|call|>"
+                                      ]
+                                    },
+                                    "end": "\n</parameter>"
+                                  },
+                                  {
+                                    "type": "tag",
+                                    "begin": "\n<parameter name=\"days\">\n",
+                                    "content": {
+                                      "type": "json_schema",
+                                      "json_schema": {
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "end": "\n</parameter>"
+                                  },
+                                  {
+                                    "type": "optional",
+                                    "content": {
+                                      "type": "tag",
+                                      "begin": "\n<parameter name=\"unit\">\n",
+                                      "content": {
+                                        "type": "or",
+                                        "elements": [
+                                          {
+                                            "type": "const_string",
+                                            "value": "c"
+                                          },
+                                          {
+                                            "type": "const_string",
+                                            "value": "f"
+                                          }
+                                        ]
+                                      },
+                                      "end": "\n</parameter>"
+                                    }
+                                  },
+                                  {
+                                    "type": "optional",
+                                    "content": {
+                                      "type": "tag",
+                                      "begin": "\n<parameter name=\"options\">\n",
+                                      "content": {
+                                        "type": "json_schema",
+                                        "json_schema": {
+                                          "type": "object",
+                                          "properties": {
+                                            "hourly": {
+                                              "type": "boolean"
+                                            },
+                                            "hours": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "integer"
+                                              }
+                                            }
+                                          }
+                                        }
+                                      },
+                                      "end": "\n</parameter>"
+                                    }
+                                  },
+                                  {
+                                    "type": "optional",
+                                    "content": {
+                                      "type": "tag",
+                                      "begin": "\n<parameter name=\"note\">\n",
+                                      "content": {
+                                        "type": "any_text",
+                                        "excludes": [
+                                          "</parameter>",
+                                          "<|start|>",
+                                          "<|end|>",
+                                          "<|message|>",
+                                          "<|channel|>",
+                                          "<|constrain|>",
+                                          "<|return|>",
+                                          "<|call|>"
+                                        ]
+                                      },
+                                      "end": "\n</parameter>"
+                                    }
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "type": "token",
+                      "token": "<|call|>"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "json_object",
+      "kind": "response_format",
+      "schema": {
+        "type": "object"
+      },
+      "tools": [],
+      "accepts": [
+        "final_json",
+        "final_object"
+      ],
+      "rejects": [
+        "single"
+      ],
+      "tag": {
+        "format": {
+          "type": "sequence",
+          "elements": [
+            {
+              "type": "sequence",
+              "elements": [
+                {
+                  "type": "token",
+                  "token": "<|channel|>"
+                },
+                {
+                  "type": "const_string",
+                  "value": "analysis"
+                },
+                {
+                  "type": "token",
+                  "token": "<|message|>"
+                },
+                {
+                  "type": "tag",
+                  "begin": "",
+                  "content": {
+                    "type": "any_text",
+                    "excludes": [
+                      "<|start|>",
+                      "<|end|>",
+                      "<|message|>",
+                      "<|channel|>",
+                      "<|constrain|>",
+                      "<|return|>",
+                      "<|call|>"
+                    ]
+                  },
+                  "end": {
+                    "type": "token",
+                    "token": "<|end|>"
+                  }
+                }
+              ]
+            },
+            {
+              "type": "sequence",
+              "elements": [
+                {
+                  "type": "token",
+                  "token": "<|start|>"
+                },
+                {
+                  "type": "const_string",
+                  "value": "assistant"
+                },
+                {
+                  "type": "token",
+                  "token": "<|channel|>"
+                },
+                {
+                  "type": "const_string",
+                  "value": "final"
+                },
+                {
+                  "type": "token",
+                  "token": "<|message|>"
+                },
+                {
+                  "type": "json_schema",
+                  "json_schema": {
+                    "type": "object",
+                    "properties": {
+                      "": {
+                        "$ref": "#/$defs/symphony_json"
+                      }
+                    },
+                    "additionalProperties": {
+                      "$ref": "#/$defs/symphony_json"
+                    },
+                    "propertyNames": {
+                      "$ref": "#/$defs/symphony_string"
+                    },
+                    "$defs": {
+                      "symphony_string": {
+                        "type": "string",
+                        "pattern": "([^\"\\\\\\x00-\\x1f<]|\\\\([\"\\\\/bfnrt]|u[0-9a-fA-F]{4})|(<(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?)*<((/(p(a(r(a(m(e(t(e(r([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<t])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<m])|[^\"\\\\\\x00-\\x1f<a])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<a])|[^\"\\\\\\x00-\\x1f<p])|\\|(c(a(l(l(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<l])|[^\"\\\\\\x00-\\x1f<l])|[^\"\\\\\\x00-\\x1f<a])|e(n(d(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<d])|[^\"\\\\\\x00-\\x1f<n])|r(e(t(u(r(n(\\|([^\"\\\\\\x00-\\x1f<>])|[^\"\\\\\\x00-\\x1f<|])|[^\"\\\\\\x00-\\x1f<n])|[^\"\\\\\\x00-\\x1f<r])|[^\"\\\\\\x00-\\x1f<u])|[^\"\\\\\\x00-\\x1f<t])|[^\"\\\\\\x00-\\x1f<e])|[^\"\\\\\\x00-\\x1f<cer])|[^\"\\\\\\x00-\\x1f</|])|(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?\\\\([\"\\\\/bfnrt]|u[0-9a-fA-F]{4})))*(<(/(p(a(r(a(m(e(t(e(r)?)?)?)?)?)?)?)?)?|\\|(c(a(l(l(\\|)?)?)?)?|e(n(d(\\|)?)?)?|r(e(t(u(r(n(\\|)?)?)?)?)?)?)?)?)*"
+                      },
+                      "symphony_json": {
+                        "anyOf": [
+                          {
+                            "$ref": "#/$defs/symphony_string"
+                          },
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "boolean"
+                          },
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "type": "array",
+                            "items": {
+                              "$ref": "#/$defs/symphony_json"
+                            }
+                          },
+                          {
+                            "type": "object",
+                            "properties": {
+                              "": {
+                                "$ref": "#/$defs/symphony_json"
+                              }
+                            },
+                            "additionalProperties": {
+                              "$ref": "#/$defs/symphony_json"
+                            },
+                            "propertyNames": {
+                              "$ref": "#/$defs/symphony_string"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

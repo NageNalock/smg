@@ -152,6 +152,11 @@ pub struct Format {
     stop_closes: Vec<usize>,
     /// The states where the template writes only markers.
     marker_only: Vec<usize>,
+    /// Tokens of the model's vocabulary that the markers hold, which a derived constraint writes
+    /// as tokens.
+    marker_tokens: Vec<String>,
+    /// Texts of the tokens the engine stops on that a terminal is.
+    stop_tokens: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -198,6 +203,8 @@ impl Format {
             structural_tokens: Vec::new(),
             stop_closes: Vec::new(),
             marker_only: Vec::new(),
+            marker_tokens: Vec::new(),
+            stop_tokens: Vec::new(),
         }
     }
 
@@ -296,6 +303,65 @@ impl Format {
     pub fn opens_turn(mut self, text: &str) -> Self {
         self.turn_opener = Some(text.to_string());
         self
+    }
+
+    /// The tokens of the model's vocabulary among `candidates` that the table's markers hold, in
+    /// the order given: a terminal's text or a text of the call syntax's spelling holds each. The
+    /// engine reads the markers as text, so parsing is the same; a constraint derived from the
+    /// table ([`crate::grammar`]) writes each as that one token, so its spelling in ordinary
+    /// tokens opens and closes nothing there, and an engine that stops on one stops where the
+    /// constraint writes it. A gateway passes the tokenizer's added tokens.
+    #[must_use]
+    pub fn marker_tokens<'t>(mut self, candidates: impl IntoIterator<Item = &'t str>) -> Self {
+        let texts = self.marker_texts();
+        for candidate in candidates {
+            let held = !candidate.is_empty()
+                && texts.iter().any(|text| text.contains(candidate))
+                && !self.marker_tokens.iter().any(|known| known == candidate);
+            if held {
+                self.marker_tokens.push(candidate.to_string());
+            }
+        }
+        self
+    }
+
+    /// The texts of the tokens the engine stops on (the model's end-of-sequence and stop tokens)
+    /// that a terminal of the table is: the stop decoder hides them, and a constraint derived from
+    /// the table ends a turn the stop ends with one. Other texts are not kept.
+    #[must_use]
+    pub fn stop_tokens<'t>(mut self, stops: impl IntoIterator<Item = &'t str>) -> Self {
+        for stop in stops {
+            let terminal = self.terminal_texts().any(|text| text == stop);
+            if terminal && !self.stop_tokens.iter().any(|known| known == stop) {
+                self.stop_tokens.push(stop.to_string());
+            }
+        }
+        self
+    }
+
+    /// The texts the table writes as markers: its terminals', then those of an addressed call's
+    /// spelling.
+    fn marker_texts(&self) -> Vec<String> {
+        let mut texts: Vec<String> = self.terminal_texts().map(str::to_string).collect();
+        if let Some(CallSyntax::Addressed(spelling)) = &self.calls {
+            texts.extend([
+                spelling.header_close.to_string(),
+                spelling.key_open.to_string(),
+                spelling.key_close.to_string(),
+                spelling.value_close.to_string(),
+            ]);
+        }
+        texts
+    }
+
+    /// The marker tokens the table keeps ([`Self::marker_tokens`]).
+    pub(crate) fn marker_token_texts(&self) -> &[String] {
+        &self.marker_tokens
+    }
+
+    /// Whether `text` is one of the stop tokens the table keeps ([`Self::stop_tokens`]).
+    pub(crate) fn is_stop_token(&self, text: &str) -> bool {
+        self.stop_tokens.iter().any(|stop| stop == text)
     }
 
     /// The turn opener, if the table names one.
