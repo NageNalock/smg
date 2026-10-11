@@ -286,6 +286,9 @@ pub struct Declared {
     functions: HashMap<String, HashMap<String, Kind>>,
     /// Each function's `parameters` schema, for a kind below the top level.
     schemas: HashMap<String, Value>,
+    /// Whether a value is read as transformers' `_coerce` reads it ([`Coerced`]): set by the
+    /// engine for a table built from a model's response template.
+    coerced: bool,
 }
 
 impl Declared {
@@ -302,7 +305,45 @@ impl Declared {
                 .entry(tool.function.name.clone())
                 .or_insert_with(|| tool.function.parameters.clone());
         }
-        Self { functions, schemas }
+        Self {
+            functions,
+            schemas,
+            coerced: false,
+        }
+    }
+
+    /// These types, read as transformers' `_coerce` reads a value ([`Coerced`]) when `coerced`
+    /// is set.
+    #[must_use]
+    pub(crate) fn coerced(mut self, coerced: bool) -> Self {
+        self.coerced = coerced;
+        self
+    }
+
+    /// How `function`'s `parameter` reads as transformers' `_coerce` reads it, when the table
+    /// reads values so; `None` for a table that reads them by [`json`] and [`typed_first`].
+    pub(crate) fn coercion(&self, function: &str, parameter: &str) -> Option<Coerced> {
+        if !self.coerced {
+            return None;
+        }
+        let mut coerced = Coerced::default();
+        let Some(root) = self.schemas.get(function) else {
+            return Some(coerced);
+        };
+        let Some(schema) = root.get("properties").and_then(|p| p.get(parameter)) else {
+            return Some(coerced);
+        };
+        let admitted = Types::admitted(root, schema);
+        let castable = admitted.meet(Types::CASTS);
+        declared_order(root, schema, &mut coerced.casts, &mut HashSet::new());
+        coerced.casts.keep(castable);
+        for cast in Types::CAST_ORDER {
+            if castable.has(cast) {
+                coerced.casts.push(cast);
+            }
+        }
+        coerced.nullable = admitted.has(Types::NULL);
+        Some(coerced)
     }
 
     /// The kind `function` declares for `parameter`, if it declares one.
@@ -670,6 +711,169 @@ fn number(text: &str) -> Option<String> {
     Some(json)
 }
 
+/// How a table built from a model's response template reads one value's text: as transformers'
+/// `_coerce` does, with the types the parameter's schema declares ([`Declared::casts`] reads them,
+/// in the same order, here for any schema). The text is cast to the first of its cast types it
+/// fits, then is null when the schema admits null and the text, less the whitespace around it, is
+/// `null` or `None`, and is otherwise the string, every byte of it. Nothing is inferred: a
+/// parameter with no declared type, a function the request did not declare, and a text no cast
+/// takes keep the model's text, so `3.0` for an integer, `[1]` for an object and `1` for an
+/// undeclared parameter are strings.
+///
+/// The casts are `_coerce`'s: an integer is what Python's `int` reads (a sign, ASCII digits, `_`
+/// between digits, whitespace around), a number what its `float` reads as a finite number, an
+/// integer when the text has no point (`1e2` is 100, as `int(float(text))` is) and a float
+/// otherwise, a boolean `true`, `false`, `1` or `0` in any case, and an array or an object JSON of
+/// that shape. An array or an object keeps the model's bytes; the other casts are written in
+/// JSON's spelling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Coerced {
+    casts: Casts,
+    nullable: bool,
+}
+
+impl Coerced {
+    /// Whether every text is the string: the schema declares no cast type and no null, so the
+    /// value can stream as it arrives.
+    pub(crate) fn is_text(&self) -> bool {
+        self.casts.iter().next().is_none() && !self.nullable
+    }
+
+    /// Whether the text is the string unless it is a null word: no cast type, and null.
+    pub(crate) fn is_nullable_text(&self) -> bool {
+        self.casts.iter().next().is_none() && self.nullable
+    }
+
+    /// Whether `so_far`, the start of a value's text, may still turn out a null word with
+    /// whitespace around it.
+    pub(crate) fn may_be_null(so_far: &str) -> bool {
+        let start = so_far.trim_start_matches(is_python_space);
+        let word = start.trim_end_matches(is_python_space);
+        let trailing = word.len() < start.len();
+        NULL_WORDS.iter().any(|null| {
+            if trailing {
+                *null == word
+            } else {
+                null.starts_with(word)
+            }
+        })
+    }
+
+    /// The JSON for `text`, the value's own text.
+    pub(crate) fn json(&self, text: &str) -> String {
+        let cast = self.casts.iter().find_map(|cast| coerce_to(text, cast));
+        if let Some(json) = cast {
+            return json;
+        }
+        let stripped = text.trim_matches(is_python_space);
+        if self.nullable && NULL_WORDS.contains(&stripped) {
+            return "null".to_string();
+        }
+        string(text)
+    }
+}
+
+/// What Python's `str.strip` takes away: Unicode whitespace and the four separators below space.
+fn is_python_space(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+/// `text` cast to `cast` as transformers' `_coerce` casts it ([`Coerced`]).
+fn coerce_to(text: &str, cast: Types) -> Option<String> {
+    // `int` and `float` take Unicode's whitespace around a number; `str.strip`, which the boolean
+    // cast uses, takes the four separators below space too.
+    let json = if cast == Types::INTEGER {
+        python_int(text.trim())?
+    } else if cast == Types::NUMBER {
+        python_float(text.trim(), text.contains('.'))?
+    } else if cast == Types::BOOLEAN {
+        match text.trim_matches(is_python_space).to_lowercase().as_str() {
+            "true" | "1" => "true".to_string(),
+            "false" | "0" => "false".to_string(),
+            _ => return None,
+        }
+    } else {
+        // `json.loads` takes JSON's whitespace around the value and nothing else.
+        let value = serde_json::from_str::<Value>(text).ok()?;
+        let shaped = match value {
+            Value::Array(_) => cast == Types::ARRAY,
+            Value::Object(_) => cast == Types::OBJECT,
+            _ => false,
+        };
+        if !shaped {
+            return None;
+        }
+        text.trim_matches([' ', '\t', '\n', '\r']).to_string()
+    };
+    reads_back_as_an_argument(&json).then_some(json)
+}
+
+/// Whether `text` is digits with single `_` between them, as Python's numbers take them.
+fn python_digits(text: &str) -> bool {
+    !text.is_empty()
+        && !text.starts_with('_')
+        && !text.ends_with('_')
+        && !text.contains("__")
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'_')
+}
+
+/// `text`, already stripped, as Python's `int` reads it, in JSON's spelling.
+fn python_int(text: &str) -> Option<String> {
+    let (minus, digits) = match text.strip_prefix('-') {
+        Some(digits) => ("-", digits),
+        None => ("", text.strip_prefix('+').unwrap_or(text)),
+    };
+    if !python_digits(digits) {
+        return None;
+    }
+    let digits = digits.replace('_', "");
+    let significant = digits.trim_start_matches('0');
+    Some(if significant.is_empty() {
+        "0".to_string()
+    } else {
+        format!("{minus}{significant}")
+    })
+}
+
+/// `text`, already stripped, as Python's `float` reads it when the result is finite, then as
+/// `_coerce` keeps it: the integer `int(number)` when the number is whole and the raw text has no
+/// point (`pointed` is false), the float otherwise.
+fn python_float(text: &str, pointed: bool) -> Option<String> {
+    let unsigned = text.strip_prefix(['-', '+']).unwrap_or(text);
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, Some(exponent)),
+        None => (unsigned, None),
+    };
+    let (whole, fraction) = match mantissa.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (mantissa, None),
+    };
+    let fraction_ok = fraction.is_none_or(|f| f.is_empty() || python_digits(f));
+    let whole_ok = whole.is_empty() || python_digits(whole);
+    let has_digits = !whole.is_empty() || fraction.is_some_and(|f| !f.is_empty());
+    if !(fraction_ok && whole_ok && has_digits) {
+        return None;
+    }
+    if let Some(exponent) = exponent {
+        if !python_digits(exponent.strip_prefix(['-', '+']).unwrap_or(exponent)) {
+            return None;
+        }
+    }
+    let number: f64 = text.replace('_', "").parse().ok()?;
+    if !number.is_finite() {
+        return None;
+    }
+    if number.fract() == 0.0 && !pointed {
+        if number == 0.0 {
+            return Some("0".to_string());
+        }
+        return Some(format!("{number:.0}"));
+    }
+    Some(format!("{number:?}"))
+}
+
 /// What the text is when no declared type decided it.
 fn inferred(text: &str) -> String {
     let trimmed = text.trim();
@@ -991,6 +1195,632 @@ mod tests {
                 strict: None,
                 extra: Default::default(),
             },
+        }
+    }
+
+    /// The texts and what transformers 5.17's `_coerce` makes of each, for the types each
+    /// schema's `_schema_types` lists, written as JSON (`json.dumps` of its result).
+    const COERCED: &[(&str, &str, &str)] = &[
+        ("int", "3", "3"),
+        ("int", " 5 ", "5"),
+        ("int", "3.0", "\"3.0\""),
+        ("int", "007", "7"),
+        ("int", "+5", "5"),
+        ("int", "-0", "0"),
+        ("int", "1_000", "1000"),
+        ("int", "1__0", "\"1__0\""),
+        ("int", "_1", "\"_1\""),
+        ("int", "1e2", "\"1e2\""),
+        ("int", "1E-2", "\"1E-2\""),
+        ("int", ".5", "\".5\""),
+        ("int", "5.", "\"5.\""),
+        ("int", "-.5e1", "\"-.5e1\""),
+        ("int", "1e400", "\"1e400\""),
+        ("int", "inf", "\"inf\""),
+        ("int", "nan", "\"nan\""),
+        ("int", "-Infinity", "\"-Infinity\""),
+        ("int", "1e", "\"1e\""),
+        ("int", "1.5", "\"1.5\""),
+        ("int", "12345678901234567890123", "12345678901234567890123"),
+        ("int", "0.1", "\"0.1\""),
+        ("int", "1e22", "\"1e22\""),
+        ("int", "true", "\"true\""),
+        ("int", " TRUE ", "\" TRUE \""),
+        ("int", "1", "1"),
+        ("int", "0", "0"),
+        ("int", "False", "\"False\""),
+        ("int", "yes", "\"yes\""),
+        ("int", "null", "\"null\""),
+        ("int", " null ", "\" null \""),
+        ("int", "None", "\"None\""),
+        ("int", "none", "\"none\""),
+        ("int", "NULL", "\"NULL\""),
+        ("int", "[1]", "\"[1]\""),
+        ("int", " [1, 2] ", "\" [1, 2] \""),
+        ("int", "{}", "\"{}\""),
+        ("int", "{\"a\": 1}", "\"{\\\"a\\\": 1}\""),
+        ("int", "[1", "\"[1\""),
+        ("int", "\"x\"", "\"\\\"x\\\"\""),
+        ("int", "abc", "\"abc\""),
+        ("int", "", "\"\""),
+        ("int", " ", "\" \""),
+        ("int", "\u{a0}5\u{a0}", "5"),
+        ("int", "\u{1c}5", "\"\\u001c5\""),
+        ("num", "3", "3"),
+        ("num", " 5 ", "5"),
+        ("num", "3.0", "3.0"),
+        ("num", "007", "7"),
+        ("num", "+5", "5"),
+        ("num", "-0", "0"),
+        ("num", "1_000", "1000"),
+        ("num", "1__0", "\"1__0\""),
+        ("num", "_1", "\"_1\""),
+        ("num", "1e2", "100"),
+        ("num", "1E-2", "0.01"),
+        ("num", ".5", "0.5"),
+        ("num", "5.", "5.0"),
+        ("num", "-.5e1", "-5.0"),
+        ("num", "1e400", "\"1e400\""),
+        ("num", "inf", "\"inf\""),
+        ("num", "nan", "\"nan\""),
+        ("num", "-Infinity", "\"-Infinity\""),
+        ("num", "1e", "\"1e\""),
+        ("num", "1.5", "1.5"),
+        ("num", "12345678901234567890123", "12345678901234567741440"),
+        ("num", "0.1", "0.1"),
+        ("num", "1e22", "10000000000000000000000"),
+        ("num", "true", "\"true\""),
+        ("num", " TRUE ", "\" TRUE \""),
+        ("num", "1", "1"),
+        ("num", "0", "0"),
+        ("num", "False", "\"False\""),
+        ("num", "yes", "\"yes\""),
+        ("num", "null", "\"null\""),
+        ("num", " null ", "\" null \""),
+        ("num", "None", "\"None\""),
+        ("num", "none", "\"none\""),
+        ("num", "NULL", "\"NULL\""),
+        ("num", "[1]", "\"[1]\""),
+        ("num", " [1, 2] ", "\" [1, 2] \""),
+        ("num", "{}", "\"{}\""),
+        ("num", "{\"a\": 1}", "\"{\\\"a\\\": 1}\""),
+        ("num", "[1", "\"[1\""),
+        ("num", "\"x\"", "\"\\\"x\\\"\""),
+        ("num", "abc", "\"abc\""),
+        ("num", "", "\"\""),
+        ("num", " ", "\" \""),
+        ("num", "\u{a0}5\u{a0}", "5"),
+        ("num", "\u{1c}5", "\"\\u001c5\""),
+        ("bool", "3", "\"3\""),
+        ("bool", " 5 ", "\" 5 \""),
+        ("bool", "3.0", "\"3.0\""),
+        ("bool", "007", "\"007\""),
+        ("bool", "+5", "\"+5\""),
+        ("bool", "-0", "\"-0\""),
+        ("bool", "1_000", "\"1_000\""),
+        ("bool", "1__0", "\"1__0\""),
+        ("bool", "_1", "\"_1\""),
+        ("bool", "1e2", "\"1e2\""),
+        ("bool", "1E-2", "\"1E-2\""),
+        ("bool", ".5", "\".5\""),
+        ("bool", "5.", "\"5.\""),
+        ("bool", "-.5e1", "\"-.5e1\""),
+        ("bool", "1e400", "\"1e400\""),
+        ("bool", "inf", "\"inf\""),
+        ("bool", "nan", "\"nan\""),
+        ("bool", "-Infinity", "\"-Infinity\""),
+        ("bool", "1e", "\"1e\""),
+        ("bool", "1.5", "\"1.5\""),
+        (
+            "bool",
+            "12345678901234567890123",
+            "\"12345678901234567890123\"",
+        ),
+        ("bool", "0.1", "\"0.1\""),
+        ("bool", "1e22", "\"1e22\""),
+        ("bool", "true", "true"),
+        ("bool", " TRUE ", "true"),
+        ("bool", "1", "true"),
+        ("bool", "0", "false"),
+        ("bool", "False", "false"),
+        ("bool", "yes", "\"yes\""),
+        ("bool", "null", "\"null\""),
+        ("bool", " null ", "\" null \""),
+        ("bool", "None", "\"None\""),
+        ("bool", "none", "\"none\""),
+        ("bool", "NULL", "\"NULL\""),
+        ("bool", "[1]", "\"[1]\""),
+        ("bool", " [1, 2] ", "\" [1, 2] \""),
+        ("bool", "{}", "\"{}\""),
+        ("bool", "{\"a\": 1}", "\"{\\\"a\\\": 1}\""),
+        ("bool", "[1", "\"[1\""),
+        ("bool", "\"x\"", "\"\\\"x\\\"\""),
+        ("bool", "abc", "\"abc\""),
+        ("bool", "", "\"\""),
+        ("bool", " ", "\" \""),
+        ("bool", "\u{a0}5\u{a0}", "\"\\u00a05\\u00a0\""),
+        ("bool", "\u{1c}5", "\"\\u001c5\""),
+        ("obj", "3", "\"3\""),
+        ("obj", " 5 ", "\" 5 \""),
+        ("obj", "3.0", "\"3.0\""),
+        ("obj", "007", "\"007\""),
+        ("obj", "+5", "\"+5\""),
+        ("obj", "-0", "\"-0\""),
+        ("obj", "1_000", "\"1_000\""),
+        ("obj", "1__0", "\"1__0\""),
+        ("obj", "_1", "\"_1\""),
+        ("obj", "1e2", "\"1e2\""),
+        ("obj", "1E-2", "\"1E-2\""),
+        ("obj", ".5", "\".5\""),
+        ("obj", "5.", "\"5.\""),
+        ("obj", "-.5e1", "\"-.5e1\""),
+        ("obj", "1e400", "\"1e400\""),
+        ("obj", "inf", "\"inf\""),
+        ("obj", "nan", "\"nan\""),
+        ("obj", "-Infinity", "\"-Infinity\""),
+        ("obj", "1e", "\"1e\""),
+        ("obj", "1.5", "\"1.5\""),
+        (
+            "obj",
+            "12345678901234567890123",
+            "\"12345678901234567890123\"",
+        ),
+        ("obj", "0.1", "\"0.1\""),
+        ("obj", "1e22", "\"1e22\""),
+        ("obj", "true", "\"true\""),
+        ("obj", " TRUE ", "\" TRUE \""),
+        ("obj", "1", "\"1\""),
+        ("obj", "0", "\"0\""),
+        ("obj", "False", "\"False\""),
+        ("obj", "yes", "\"yes\""),
+        ("obj", "null", "\"null\""),
+        ("obj", " null ", "\" null \""),
+        ("obj", "None", "\"None\""),
+        ("obj", "none", "\"none\""),
+        ("obj", "NULL", "\"NULL\""),
+        ("obj", "[1]", "\"[1]\""),
+        ("obj", " [1, 2] ", "\" [1, 2] \""),
+        ("obj", "{}", "{}"),
+        ("obj", "{\"a\": 1}", "{\"a\": 1}"),
+        ("obj", "[1", "\"[1\""),
+        ("obj", "\"x\"", "\"\\\"x\\\"\""),
+        ("obj", "abc", "\"abc\""),
+        ("obj", "", "\"\""),
+        ("obj", " ", "\" \""),
+        ("obj", "\u{a0}5\u{a0}", "\"\\u00a05\\u00a0\""),
+        ("obj", "\u{1c}5", "\"\\u001c5\""),
+        ("arr", "3", "\"3\""),
+        ("arr", " 5 ", "\" 5 \""),
+        ("arr", "3.0", "\"3.0\""),
+        ("arr", "007", "\"007\""),
+        ("arr", "+5", "\"+5\""),
+        ("arr", "-0", "\"-0\""),
+        ("arr", "1_000", "\"1_000\""),
+        ("arr", "1__0", "\"1__0\""),
+        ("arr", "_1", "\"_1\""),
+        ("arr", "1e2", "\"1e2\""),
+        ("arr", "1E-2", "\"1E-2\""),
+        ("arr", ".5", "\".5\""),
+        ("arr", "5.", "\"5.\""),
+        ("arr", "-.5e1", "\"-.5e1\""),
+        ("arr", "1e400", "\"1e400\""),
+        ("arr", "inf", "\"inf\""),
+        ("arr", "nan", "\"nan\""),
+        ("arr", "-Infinity", "\"-Infinity\""),
+        ("arr", "1e", "\"1e\""),
+        ("arr", "1.5", "\"1.5\""),
+        (
+            "arr",
+            "12345678901234567890123",
+            "\"12345678901234567890123\"",
+        ),
+        ("arr", "0.1", "\"0.1\""),
+        ("arr", "1e22", "\"1e22\""),
+        ("arr", "true", "\"true\""),
+        ("arr", " TRUE ", "\" TRUE \""),
+        ("arr", "1", "\"1\""),
+        ("arr", "0", "\"0\""),
+        ("arr", "False", "\"False\""),
+        ("arr", "yes", "\"yes\""),
+        ("arr", "null", "\"null\""),
+        ("arr", " null ", "\" null \""),
+        ("arr", "None", "\"None\""),
+        ("arr", "none", "\"none\""),
+        ("arr", "NULL", "\"NULL\""),
+        ("arr", "[1]", "[1]"),
+        ("arr", " [1, 2] ", "[1, 2]"),
+        ("arr", "{}", "\"{}\""),
+        ("arr", "{\"a\": 1}", "\"{\\\"a\\\": 1}\""),
+        ("arr", "[1", "\"[1\""),
+        ("arr", "\"x\"", "\"\\\"x\\\"\""),
+        ("arr", "abc", "\"abc\""),
+        ("arr", "", "\"\""),
+        ("arr", " ", "\" \""),
+        ("arr", "\u{a0}5\u{a0}", "\"\\u00a05\\u00a0\""),
+        ("arr", "\u{1c}5", "\"\\u001c5\""),
+        ("nstr", "3", "\"3\""),
+        ("nstr", " 5 ", "\" 5 \""),
+        ("nstr", "3.0", "\"3.0\""),
+        ("nstr", "007", "\"007\""),
+        ("nstr", "+5", "\"+5\""),
+        ("nstr", "-0", "\"-0\""),
+        ("nstr", "1_000", "\"1_000\""),
+        ("nstr", "1__0", "\"1__0\""),
+        ("nstr", "_1", "\"_1\""),
+        ("nstr", "1e2", "\"1e2\""),
+        ("nstr", "1E-2", "\"1E-2\""),
+        ("nstr", ".5", "\".5\""),
+        ("nstr", "5.", "\"5.\""),
+        ("nstr", "-.5e1", "\"-.5e1\""),
+        ("nstr", "1e400", "\"1e400\""),
+        ("nstr", "inf", "\"inf\""),
+        ("nstr", "nan", "\"nan\""),
+        ("nstr", "-Infinity", "\"-Infinity\""),
+        ("nstr", "1e", "\"1e\""),
+        ("nstr", "1.5", "\"1.5\""),
+        (
+            "nstr",
+            "12345678901234567890123",
+            "\"12345678901234567890123\"",
+        ),
+        ("nstr", "0.1", "\"0.1\""),
+        ("nstr", "1e22", "\"1e22\""),
+        ("nstr", "true", "\"true\""),
+        ("nstr", " TRUE ", "\" TRUE \""),
+        ("nstr", "1", "\"1\""),
+        ("nstr", "0", "\"0\""),
+        ("nstr", "False", "\"False\""),
+        ("nstr", "yes", "\"yes\""),
+        ("nstr", "null", "null"),
+        ("nstr", " null ", "null"),
+        ("nstr", "None", "null"),
+        ("nstr", "none", "\"none\""),
+        ("nstr", "NULL", "\"NULL\""),
+        ("nstr", "[1]", "\"[1]\""),
+        ("nstr", " [1, 2] ", "\" [1, 2] \""),
+        ("nstr", "{}", "\"{}\""),
+        ("nstr", "{\"a\": 1}", "\"{\\\"a\\\": 1}\""),
+        ("nstr", "[1", "\"[1\""),
+        ("nstr", "\"x\"", "\"\\\"x\\\"\""),
+        ("nstr", "abc", "\"abc\""),
+        ("nstr", "", "\"\""),
+        ("nstr", " ", "\" \""),
+        ("nstr", "\u{a0}5\u{a0}", "\"\\u00a05\\u00a0\""),
+        ("nstr", "\u{1c}5", "\"\\u001c5\""),
+        ("nint", "3", "3"),
+        ("nint", " 5 ", "5"),
+        ("nint", "3.0", "\"3.0\""),
+        ("nint", "007", "7"),
+        ("nint", "+5", "5"),
+        ("nint", "-0", "0"),
+        ("nint", "1_000", "1000"),
+        ("nint", "1__0", "\"1__0\""),
+        ("nint", "_1", "\"_1\""),
+        ("nint", "1e2", "\"1e2\""),
+        ("nint", "1E-2", "\"1E-2\""),
+        ("nint", ".5", "\".5\""),
+        ("nint", "5.", "\"5.\""),
+        ("nint", "-.5e1", "\"-.5e1\""),
+        ("nint", "1e400", "\"1e400\""),
+        ("nint", "inf", "\"inf\""),
+        ("nint", "nan", "\"nan\""),
+        ("nint", "-Infinity", "\"-Infinity\""),
+        ("nint", "1e", "\"1e\""),
+        ("nint", "1.5", "\"1.5\""),
+        ("nint", "12345678901234567890123", "12345678901234567890123"),
+        ("nint", "0.1", "\"0.1\""),
+        ("nint", "1e22", "\"1e22\""),
+        ("nint", "true", "\"true\""),
+        ("nint", " TRUE ", "\" TRUE \""),
+        ("nint", "1", "1"),
+        ("nint", "0", "0"),
+        ("nint", "False", "\"False\""),
+        ("nint", "yes", "\"yes\""),
+        ("nint", "null", "null"),
+        ("nint", " null ", "null"),
+        ("nint", "None", "null"),
+        ("nint", "none", "\"none\""),
+        ("nint", "NULL", "\"NULL\""),
+        ("nint", "[1]", "\"[1]\""),
+        ("nint", " [1, 2] ", "\" [1, 2] \""),
+        ("nint", "{}", "\"{}\""),
+        ("nint", "{\"a\": 1}", "\"{\\\"a\\\": 1}\""),
+        ("nint", "[1", "\"[1\""),
+        ("nint", "\"x\"", "\"\\\"x\\\"\""),
+        ("nint", "abc", "\"abc\""),
+        ("nint", "", "\"\""),
+        ("nint", " ", "\" \""),
+        ("nint", "\u{a0}5\u{a0}", "5"),
+        ("nint", "\u{1c}5", "\"\\u001c5\""),
+        ("union", "3", "3"),
+        ("union", " 5 ", "5"),
+        ("union", "3.0", "3.0"),
+        ("union", "007", "7"),
+        ("union", "+5", "5"),
+        ("union", "-0", "0"),
+        ("union", "1_000", "1000"),
+        ("union", "1__0", "\"1__0\""),
+        ("union", "_1", "\"_1\""),
+        ("union", "1e2", "100"),
+        ("union", "1E-2", "0.01"),
+        ("union", ".5", "0.5"),
+        ("union", "5.", "5.0"),
+        ("union", "-.5e1", "-5.0"),
+        ("union", "1e400", "\"1e400\""),
+        ("union", "inf", "\"inf\""),
+        ("union", "nan", "\"nan\""),
+        ("union", "-Infinity", "\"-Infinity\""),
+        ("union", "1e", "\"1e\""),
+        ("union", "1.5", "1.5"),
+        (
+            "union",
+            "12345678901234567890123",
+            "12345678901234567741440",
+        ),
+        ("union", "0.1", "0.1"),
+        ("union", "1e22", "10000000000000000000000"),
+        ("union", "true", "\"true\""),
+        ("union", " TRUE ", "\" TRUE \""),
+        ("union", "1", "1"),
+        ("union", "0", "0"),
+        ("union", "False", "\"False\""),
+        ("union", "yes", "\"yes\""),
+        ("union", "null", "null"),
+        ("union", " null ", "null"),
+        ("union", "None", "null"),
+        ("union", "none", "\"none\""),
+        ("union", "NULL", "\"NULL\""),
+        ("union", "[1]", "\"[1]\""),
+        ("union", " [1, 2] ", "\" [1, 2] \""),
+        ("union", "{}", "\"{}\""),
+        ("union", "{\"a\": 1}", "\"{\\\"a\\\": 1}\""),
+        ("union", "[1", "\"[1\""),
+        ("union", "\"x\"", "\"\\\"x\\\"\""),
+        ("union", "abc", "\"abc\""),
+        ("union", "", "\"\""),
+        ("union", " ", "\" \""),
+        ("union", "\u{a0}5\u{a0}", "5"),
+        ("union", "\u{1c}5", "\"\\u001c5\""),
+        ("sib", "3", "3"),
+        ("sib", " 5 ", "5"),
+        ("sib", "3.0", "\"3.0\""),
+        ("sib", "007", "7"),
+        ("sib", "+5", "5"),
+        ("sib", "-0", "0"),
+        ("sib", "1_000", "1000"),
+        ("sib", "1__0", "\"1__0\""),
+        ("sib", "_1", "\"_1\""),
+        ("sib", "1e2", "\"1e2\""),
+        ("sib", "1E-2", "\"1E-2\""),
+        ("sib", ".5", "\".5\""),
+        ("sib", "5.", "\"5.\""),
+        ("sib", "-.5e1", "\"-.5e1\""),
+        ("sib", "1e400", "\"1e400\""),
+        ("sib", "inf", "\"inf\""),
+        ("sib", "nan", "\"nan\""),
+        ("sib", "-Infinity", "\"-Infinity\""),
+        ("sib", "1e", "\"1e\""),
+        ("sib", "1.5", "\"1.5\""),
+        ("sib", "12345678901234567890123", "12345678901234567890123"),
+        ("sib", "0.1", "\"0.1\""),
+        ("sib", "1e22", "\"1e22\""),
+        ("sib", "true", "true"),
+        ("sib", " TRUE ", "true"),
+        ("sib", "1", "1"),
+        ("sib", "0", "0"),
+        ("sib", "False", "false"),
+        ("sib", "yes", "\"yes\""),
+        ("sib", "null", "\"null\""),
+        ("sib", " null ", "\" null \""),
+        ("sib", "None", "\"None\""),
+        ("sib", "none", "\"none\""),
+        ("sib", "NULL", "\"NULL\""),
+        ("sib", "[1]", "\"[1]\""),
+        ("sib", " [1, 2] ", "\" [1, 2] \""),
+        ("sib", "{}", "\"{}\""),
+        ("sib", "{\"a\": 1}", "\"{\\\"a\\\": 1}\""),
+        ("sib", "[1", "\"[1\""),
+        ("sib", "\"x\"", "\"\\\"x\\\"\""),
+        ("sib", "abc", "\"abc\""),
+        ("sib", "", "\"\""),
+        ("sib", " ", "\" \""),
+        ("sib", "\u{a0}5\u{a0}", "5"),
+        ("sib", "\u{1c}5", "\"\\u001c5\""),
+        ("anyof", "3", "3"),
+        ("anyof", " 5 ", "5"),
+        ("anyof", "3.0", "\"3.0\""),
+        ("anyof", "007", "7"),
+        ("anyof", "+5", "5"),
+        ("anyof", "-0", "0"),
+        ("anyof", "1_000", "1000"),
+        ("anyof", "1__0", "\"1__0\""),
+        ("anyof", "_1", "\"_1\""),
+        ("anyof", "1e2", "\"1e2\""),
+        ("anyof", "1E-2", "\"1E-2\""),
+        ("anyof", ".5", "\".5\""),
+        ("anyof", "5.", "\"5.\""),
+        ("anyof", "-.5e1", "\"-.5e1\""),
+        ("anyof", "1e400", "\"1e400\""),
+        ("anyof", "inf", "\"inf\""),
+        ("anyof", "nan", "\"nan\""),
+        ("anyof", "-Infinity", "\"-Infinity\""),
+        ("anyof", "1e", "\"1e\""),
+        ("anyof", "1.5", "\"1.5\""),
+        (
+            "anyof",
+            "12345678901234567890123",
+            "12345678901234567890123",
+        ),
+        ("anyof", "0.1", "\"0.1\""),
+        ("anyof", "1e22", "\"1e22\""),
+        ("anyof", "true", "\"true\""),
+        ("anyof", " TRUE ", "\" TRUE \""),
+        ("anyof", "1", "1"),
+        ("anyof", "0", "0"),
+        ("anyof", "False", "\"False\""),
+        ("anyof", "yes", "\"yes\""),
+        ("anyof", "null", "\"null\""),
+        ("anyof", " null ", "\" null \""),
+        ("anyof", "None", "\"None\""),
+        ("anyof", "none", "\"none\""),
+        ("anyof", "NULL", "\"NULL\""),
+        ("anyof", "[1]", "[1]"),
+        ("anyof", " [1, 2] ", "[1, 2]"),
+        ("anyof", "{}", "{}"),
+        ("anyof", "{\"a\": 1}", "{\"a\": 1}"),
+        ("anyof", "[1", "\"[1\""),
+        ("anyof", "\"x\"", "\"\\\"x\\\"\""),
+        ("anyof", "abc", "\"abc\""),
+        ("anyof", "", "\"\""),
+        ("anyof", " ", "\" \""),
+        ("anyof", "\u{a0}5\u{a0}", "5"),
+        ("anyof", "\u{1c}5", "\"\\u001c5\""),
+        ("opt", "3", "\"3\""),
+        ("opt", " 5 ", "\" 5 \""),
+        ("opt", "3.0", "\"3.0\""),
+        ("opt", "007", "\"007\""),
+        ("opt", "+5", "\"+5\""),
+        ("opt", "-0", "\"-0\""),
+        ("opt", "1_000", "\"1_000\""),
+        ("opt", "1__0", "\"1__0\""),
+        ("opt", "_1", "\"_1\""),
+        ("opt", "1e2", "\"1e2\""),
+        ("opt", "1E-2", "\"1E-2\""),
+        ("opt", ".5", "\".5\""),
+        ("opt", "5.", "\"5.\""),
+        ("opt", "-.5e1", "\"-.5e1\""),
+        ("opt", "1e400", "\"1e400\""),
+        ("opt", "inf", "\"inf\""),
+        ("opt", "nan", "\"nan\""),
+        ("opt", "-Infinity", "\"-Infinity\""),
+        ("opt", "1e", "\"1e\""),
+        ("opt", "1.5", "\"1.5\""),
+        (
+            "opt",
+            "12345678901234567890123",
+            "\"12345678901234567890123\"",
+        ),
+        ("opt", "0.1", "\"0.1\""),
+        ("opt", "1e22", "\"1e22\""),
+        ("opt", "true", "\"true\""),
+        ("opt", " TRUE ", "\" TRUE \""),
+        ("opt", "1", "\"1\""),
+        ("opt", "0", "\"0\""),
+        ("opt", "False", "\"False\""),
+        ("opt", "yes", "\"yes\""),
+        ("opt", "null", "null"),
+        ("opt", " null ", "null"),
+        ("opt", "None", "null"),
+        ("opt", "none", "\"none\""),
+        ("opt", "NULL", "\"NULL\""),
+        ("opt", "[1]", "\"[1]\""),
+        ("opt", " [1, 2] ", "\" [1, 2] \""),
+        ("opt", "{}", "\"{}\""),
+        ("opt", "{\"a\": 1}", "\"{\\\"a\\\": 1}\""),
+        ("opt", "[1", "\"[1\""),
+        ("opt", "\"x\"", "\"\\\"x\\\"\""),
+        ("opt", "abc", "\"abc\""),
+        ("opt", "", "\"\""),
+        ("opt", " ", "\" \""),
+        ("opt", "\u{a0}5\u{a0}", "\"\\u00a05\\u00a0\""),
+        ("opt", "\u{1c}5", "\"\\u001c5\""),
+        ("str", "3", "\"3\""),
+        ("str", " 5 ", "\" 5 \""),
+        ("str", "3.0", "\"3.0\""),
+        ("str", "007", "\"007\""),
+        ("str", "+5", "\"+5\""),
+        ("str", "-0", "\"-0\""),
+        ("str", "1_000", "\"1_000\""),
+        ("str", "1__0", "\"1__0\""),
+        ("str", "_1", "\"_1\""),
+        ("str", "1e2", "\"1e2\""),
+        ("str", "1E-2", "\"1E-2\""),
+        ("str", ".5", "\".5\""),
+        ("str", "5.", "\"5.\""),
+        ("str", "-.5e1", "\"-.5e1\""),
+        ("str", "1e400", "\"1e400\""),
+        ("str", "inf", "\"inf\""),
+        ("str", "nan", "\"nan\""),
+        ("str", "-Infinity", "\"-Infinity\""),
+        ("str", "1e", "\"1e\""),
+        ("str", "1.5", "\"1.5\""),
+        (
+            "str",
+            "12345678901234567890123",
+            "\"12345678901234567890123\"",
+        ),
+        ("str", "0.1", "\"0.1\""),
+        ("str", "1e22", "\"1e22\""),
+        ("str", "true", "\"true\""),
+        ("str", " TRUE ", "\" TRUE \""),
+        ("str", "1", "\"1\""),
+        ("str", "0", "\"0\""),
+        ("str", "False", "\"False\""),
+        ("str", "yes", "\"yes\""),
+        ("str", "null", "\"null\""),
+        ("str", " null ", "\" null \""),
+        ("str", "None", "\"None\""),
+        ("str", "none", "\"none\""),
+        ("str", "NULL", "\"NULL\""),
+        ("str", "[1]", "\"[1]\""),
+        ("str", " [1, 2] ", "\" [1, 2] \""),
+        ("str", "{}", "\"{}\""),
+        ("str", "{\"a\": 1}", "\"{\\\"a\\\": 1}\""),
+        ("str", "[1", "\"[1\""),
+        ("str", "\"x\"", "\"\\\"x\\\"\""),
+        ("str", "abc", "\"abc\""),
+        ("str", "", "\"\""),
+        ("str", " ", "\" \""),
+        ("str", "\u{a0}5\u{a0}", "\"\\u00a05\\u00a0\""),
+        ("str", "\u{1c}5", "\"\\u001c5\""),
+    ];
+
+    /// A table that reads values as `_coerce` does gives `_coerce`'s value for every text: a
+    /// cast in the schema's order, null for a null word with whitespace around it, and otherwise
+    /// the text itself, never a JSON value inferred from it.
+    #[test]
+    fn a_coerced_value_is_what_transformers_coerce_gives() {
+        let schemas = value!({
+            "int": {"type": "integer"},
+            "num": {"type": "number"},
+            "bool": {"type": "boolean"},
+            "obj": {"type": "object"},
+            "arr": {"type": "array"},
+            "nstr": {"type": ["string", "null"]},
+            "nint": {"type": ["integer", "null"]},
+            "union": {"type": ["string", "number", "null"]},
+            "sib": {"type": ["string", "integer", "boolean"]},
+            "anyof": {"anyOf": [{"type": "array"}, {"type": "object"}, {"type": "integer"}]},
+            "opt": {"type": "string", "nullable": true},
+            "str": {"type": "string"}
+        });
+        let declared = Declared::of(&[tool("f", schemas)]).coerced(true);
+        for (key, text, expected) in COERCED {
+            let coerced = declared.coercion("f", key).unwrap();
+            let written = coerced.json(text);
+            let got: Value = serde_json::from_str(&written).unwrap();
+            let want: Value = serde_json::from_str(expected).unwrap();
+            assert_eq!(got, want, "{key} {text:?}: {written}");
+        }
+        // No schema for the key, or no such function: the text, whatever it holds.
+        for (function, key) in [("f", "undeclared"), ("g", "x")] {
+            let coerced = declared.coercion(function, key).unwrap();
+            assert!(coerced.is_text());
+            for text in ["1", "True", "[1, 2]", " 5 ", "null"] {
+                assert_eq!(coerced.json(text), string(text));
+            }
+        }
+        // A table that reads values as the engine's parsers do has no coercion.
+        assert!(Declared::of(&[]).coercion("f", "int").is_none());
+    }
+
+    #[test]
+    fn a_null_word_may_have_whitespace_around_it_while_it_arrives() {
+        for so_far in ["", " ", "n", " nu", "null", "None ", " null	"] {
+            assert!(Coerced::may_be_null(so_far), "{so_far:?}");
+        }
+        for so_far in ["x", "nul l", "null x", "nulls", "Non e"] {
+            assert!(!Coerced::may_be_null(so_far), "{so_far:?}");
         }
     }
 

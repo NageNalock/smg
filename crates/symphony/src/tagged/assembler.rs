@@ -47,7 +47,7 @@
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
     markers::{Piece, Scanner},
-    tagged::value::{json, Declared, Kind, NULL_WORDS},
+    tagged::value::{json, Coerced, Declared, Kind, NULL_WORDS},
 };
 
 const FUNCTION_OPEN: usize = 0;
@@ -131,6 +131,9 @@ enum Stage {
 struct ValueState {
     key: String,
     kind: Option<Kind>,
+    /// How its text reads in a table that reads values as transformers' `_coerce` does
+    /// (`Declared::coercion`); `kind` is not read then.
+    coerced: Option<Coerced>,
     /// Whether the newline the template writes after the tag may still come: no value text yet,
     /// under a template that writes one.
     leading: bool,
@@ -475,7 +478,20 @@ impl Assembler {
         }
         let function = self.function.as_deref().unwrap_or_default();
         let kind = declared.kind(function, &key);
+        let coerced = declared.coercion(function, &key);
         let mode = match kind {
+            _ if coerced.is_some_and(|c| c.is_nullable_text()) => Mode::Undecided {
+                start: self.carried.len(),
+            },
+            _ if coerced.is_some_and(|c| !c.is_text()) => Mode::Whole {
+                start: self.carried.len(),
+            },
+            _ if coerced.is_some() => {
+                self.open_string_fragment(&key, out);
+                Mode::Streaming {
+                    held_newline: false,
+                }
+            }
             Some(Kind::String) => {
                 self.open_string_fragment(&key, out);
                 Mode::Streaming {
@@ -492,6 +508,7 @@ impl Assembler {
         self.stage = Stage::Value(ValueState {
             key,
             kind,
+            coerced,
             leading: self.placement == Placement::OwnLine,
             mode,
         });
@@ -530,13 +547,18 @@ impl Assembler {
             // The piece was the template's newline alone.
             return;
         }
+        let coerced = value.coerced;
         match value.mode {
             Mode::Streaming { .. } => self.stream(text, out),
             Mode::Whole { .. } => self.carried.push_str(text),
             Mode::Undecided { start } => {
                 self.carried.push_str(text);
                 let so_far = self.whole_text(start);
-                if !NULL_WORDS.iter().any(|word| word.starts_with(so_far)) {
+                let null = match coerced {
+                    Some(_) => Coerced::may_be_null(so_far),
+                    None => NULL_WORDS.iter().any(|word| word.starts_with(so_far)),
+                };
+                if !null {
                     self.open_string_late(start, out);
                 }
             }
@@ -604,7 +626,11 @@ impl Assembler {
         let fragment = match value.mode {
             Mode::Streaming { .. } => "\"".to_string(),
             Mode::Whole { start } | Mode::Undecided { start } => {
-                let written = json(self.whole_text(start), value.kind);
+                let text = self.whole_text(start);
+                let written = match value.coerced {
+                    Some(coerced) => coerced.json(text),
+                    None => json(text, value.kind),
+                };
                 let mut member = String::with_capacity(value.key.len() + written.len() + 8);
                 member.push_str(self.separator());
                 push_quoted(&mut member, &value.key);
@@ -990,6 +1016,55 @@ mod tests {
                 fragment("\"", "\n</parameter>"),
             ]
         );
+    }
+
+    /// Under a table that reads values as transformers' `_coerce` does, a value no cast takes and
+    /// one with no declared type are the model's text, a null word may have whitespace around it,
+    /// and every chunking gives the same arguments.
+    #[test]
+    fn values_read_as_coerce_reads_them_keep_the_text_no_cast_takes() {
+        let declared = declared().coerced(true);
+        for (body, expected) in [
+            (
+                "<parameter=limit>\n3.0\n</parameter>",
+                r#"{"limit": "3.0"}"#,
+            ),
+            ("<parameter=limit>\n 7 \n</parameter>", r#"{"limit": 7}"#),
+            (
+                "<parameter=note>\n null \n</parameter>",
+                r#"{"note": null}"#,
+            ),
+            ("<parameter=note>\nNone\n</parameter>", r#"{"note": null}"#),
+            (
+                "<parameter=note>\nnulls\n</parameter>",
+                r#"{"note": "nulls"}"#,
+            ),
+            (
+                "<parameter=other>\n[1, 2]\n</parameter>",
+                r#"{"other": "[1, 2]"}"#,
+            ),
+            (
+                "<parameter=other>\nTrue\n</parameter>",
+                r#"{"other": "True"}"#,
+            ),
+        ] {
+            let call = format!("<function=f>\n{body}\n</function>");
+            let characters: Vec<&str> = call
+                .char_indices()
+                .map(|(at, c)| &call[at..at + c.len_utf8()])
+                .collect();
+            for pieces in [vec![call.as_str()], characters] {
+                let mut assembler = Assembler::new(0, "call_0", Placement::OwnLine);
+                let mut out = Events::new();
+                for piece in &pieces {
+                    assembler.feed(piece, &declared, &mut out);
+                }
+                assembler.finish(&mut out);
+                let events = out.drain();
+                assert_eq!(arguments(&events), expected, "{body:?}");
+                assert_eq!(bytes(&events), call, "{body:?}");
+            }
+        }
     }
 
     #[test]

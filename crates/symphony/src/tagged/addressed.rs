@@ -93,7 +93,7 @@ use crate::{
     markers::{Piece, Scanner},
     tagged::{
         assembler::{push_escaped, push_quoted},
-        value::{json, typed_first, Casts, Declared, Kind, NULL_WORDS},
+        value::{json, typed_first, Casts, Coerced, Declared, Kind, NULL_WORDS},
     },
 };
 
@@ -184,6 +184,9 @@ struct ValueState {
     kind: Option<Kind>,
     /// The types its text is cast to, in the schema's order (`Declared::casts`).
     casts: Option<Casts>,
+    /// How its text reads in a table that reads values as transformers' `_coerce` does
+    /// (`Declared::coercion`); `kind` and `casts` are not read then.
+    coerced: Option<Coerced>,
     /// Whether the newline the template writes after the key's tag may still come: no value text
     /// yet.
     leading: bool,
@@ -444,6 +447,7 @@ impl Assembler {
             key,
             kind: None,
             casts: None,
+            coerced: None,
             leading: true,
             mode: Mode::Whole {
                 start: self.carried.len(),
@@ -545,9 +549,19 @@ impl Assembler {
         let function = self.function.as_deref().unwrap_or_default();
         let kind = declared.kind(function, &key);
         let casts = declared.casts(function, &key);
+        let coerced = declared.coercion(function, &key);
         let mode = match kind {
+            _ if coerced.is_some_and(|c| c.is_text()) => {
+                self.open_string_fragment(&key, out);
+                Mode::Streaming {
+                    held_newline: false,
+                }
+            }
+            _ if coerced.is_some_and(|c| c.is_nullable_text()) => Mode::Undecided {
+                start: self.carried.len(),
+            },
             // A value cast to its schema's types is cast at its close, so it is written whole.
-            _ if casts.is_some() => Mode::Whole {
+            _ if casts.is_some() || coerced.is_some() => Mode::Whole {
                 start: self.carried.len(),
             },
             Some(Kind::String) => {
@@ -567,6 +581,7 @@ impl Assembler {
             key,
             kind,
             casts,
+            coerced,
             leading: true,
             mode,
             repeated: false,
@@ -602,13 +617,18 @@ impl Assembler {
         if text.is_empty() {
             return;
         }
+        let coerced = value.coerced;
         match value.mode {
             Mode::Streaming { .. } => self.stream(text, out),
             Mode::Whole { .. } => self.carried.push_str(text),
             Mode::Undecided { start } => {
                 self.carried.push_str(text);
                 let so_far = self.whole_text(start);
-                if !NULL_WORDS.iter().any(|word| word.starts_with(so_far)) {
+                let null = match coerced {
+                    Some(_) => Coerced::may_be_null(so_far),
+                    None => NULL_WORDS.iter().any(|word| word.starts_with(so_far)),
+                };
+                if !null {
                     self.open_string_late(start, out);
                 }
             }
@@ -696,9 +716,10 @@ impl Assembler {
             return String::new();
         };
         let text = self.whole_text(start);
-        let written = match value.casts {
-            Some(casts) => typed_first(text, value.kind, casts),
-            None => json(text, value.kind),
+        let written = match (value.coerced, value.casts) {
+            (Some(coerced), _) => coerced.json(text),
+            (None, Some(casts)) => typed_first(text, value.kind, casts),
+            (None, None) => json(text, value.kind),
         };
         let mut member = String::with_capacity(value.key.len() + written.len() + 8);
         member.push_str(self.separator());

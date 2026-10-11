@@ -104,6 +104,10 @@ pub struct Engine {
     state: usize,
     /// The call being assembled while the engine is in an arguments state.
     call: Option<Call>,
+    /// For a table that reads as transformers does ([`Format::reads_as_transformers`]): the
+    /// terminal that opened the call region, and the events after it, held until the call
+    /// starts, or reports text, or the region ends.
+    opener: Option<Vec<Event>>,
     calls: u32,
     tokens: Ledger,
     reasoning_tokens: u32,
@@ -323,12 +327,14 @@ impl Engine {
         if let Err(why) = format.validate() {
             panic!("{why}");
         }
+        let declared = declared.coerced(format.is_read_as_transformers());
         let mut engine = Self {
             scanner: Scanner::new(format.terminal_texts()),
             format,
             declared,
             state: 0,
             call: None,
+            opener: None,
             calls: 0,
             tokens: Ledger::new(),
             reasoning_tokens: 0,
@@ -389,7 +395,7 @@ impl Engine {
                 .find(|(_, c)| c.is_whitespace() != space)
                 .map_or(rest.len(), |(at, _)| at);
             let run = self.tokens.text(&rest[..length]);
-            out.push(if space {
+            let event = if space {
                 Event::Dropped {
                     text: run,
                     why: DropReason::Wrapper,
@@ -399,7 +405,8 @@ impl Engine {
                     text: run,
                     why: MalformedReason::Other(why.to_string()),
                 }
-            });
+            };
+            self.pass(event, out);
             rest = &rest[length..];
         }
     }
@@ -435,10 +442,16 @@ impl Engine {
         let taken =
             self.emits() == Emits::Arguments && self.close_call(Closed::ByMarker, &terminal, out);
         if !taken {
-            out.push(Event::Dropped {
+            let opener = Event::Dropped {
                 text: self.tokens.text(&terminal),
                 why: DropReason::Wrapper,
-            });
+            };
+            if self.format.emits(next) == Emits::Arguments && self.format.is_read_as_transformers()
+            {
+                self.opener = Some(vec![opener]);
+            } else {
+                out.push(opener);
+            }
         }
         self.enter(next, out);
     }
@@ -491,6 +504,9 @@ impl Engine {
             finished = renamed;
         }
         self.push_call_events(finished, out);
+        for event in self.opener.take().into_iter().flatten() {
+            out.push(event);
+        }
         taken
     }
 
@@ -502,8 +518,41 @@ impl Engine {
             if matches!(event, Event::ToolCallStart { .. }) {
                 self.calls += 1;
             }
-            out.push(self.tokens.relabel(event));
+            let event = self.tokens.relabel(event);
+            self.pass(event, out);
         }
+    }
+
+    /// Pushes one event of the call region, or holds it behind the region's opener
+    /// ([`Self::opener`]) until the region shows what the opener was: the call's start keeps it
+    /// the template's wrapping, and text the region reports before any call starts makes it that
+    /// text's beginning, as transformers' reader keeps an opener whose call never matched in the
+    /// text around it (` to=get_wea` at a stop, not `get_wea`).
+    fn pass(&mut self, event: Event, out: &mut Events) {
+        let Some(held) = &mut self.opener else {
+            out.push(event);
+            return;
+        };
+        let why = match &event {
+            Event::ToolCallStart { .. } => None,
+            Event::Malformed { why, .. } => Some(why.clone()),
+            _ => {
+                held.push(event);
+                return;
+            }
+        };
+        let mut held = std::mem::take(held).into_iter();
+        self.opener = None;
+        if let Some(opener) = held.next() {
+            out.push(match (opener, why) {
+                (Event::Dropped { text, .. }, Some(why)) => Event::Malformed { text, why },
+                (opener, _) => opener,
+            });
+        }
+        for event in held {
+            out.push(event);
+        }
+        out.push(event);
     }
 
     /// Where the prompt leaves the engine: its terminals replayed over the table from the initial
@@ -988,6 +1037,91 @@ mod tests {
                 assert_eq!([content, reasoning], expected, "{output:?} {finish:?}");
                 assert_eq!(malformed, "", "{output:?} {finish:?}");
             }
+        }
+    }
+
+    /// [`run`] with the output fed one character at a time.
+    fn run_chars(format: Format, output: &str, finish: EngineFinish) -> Vec<Event> {
+        let mut engine = Engine::new(format, declared());
+        let mut out = Events::new();
+        for (at, c) in output.char_indices() {
+            let text = &output[at..at + c.len_utf8()];
+            let delta = Input::Delta {
+                token_ids: &[],
+                text,
+                spans: &[],
+            };
+            engine.feed(delta, &mut out).expect("in order");
+        }
+        engine
+            .feed(Input::End { finish }, &mut out)
+            .expect("in order");
+        out.drain()
+    }
+
+    /// The text of the events shown as content: content and malformed text.
+    fn shown(events: &[Event]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Content(text) | Event::Malformed { text, .. } => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_table_read_as_transformers_shows_an_opener_whose_call_never_starts() {
+        let table = || addressed().closes_at_stop("calls").reads_as_transformers();
+        for read in [run, run_chars] {
+            // A stop inside the header: the opener goes with the header's text.
+            let events = read(table(), " to=get_wea", EngineFinish::Stop);
+            assert_eq!(shown(&events), " to=get_wea");
+            assert_eq!(bytes(&events), " to=get_wea");
+            // The engine's own tables drop the opener as the template's wrapping.
+            let events = read(
+                addressed().closes_at_stop("calls"),
+                " to=get_wea",
+                EngineFinish::Stop,
+            );
+            assert_eq!(shown(&events), "get_wea");
+            // A cut drops the header, the opener with it.
+            for finish in [EngineFinish::Length, EngineFinish::Abort] {
+                let events = read(table(), " to=get_wea", finish);
+                assert_eq!(shown(&events), "");
+                assert_eq!(bytes(&events), " to=get_wea");
+            }
+            // A header with no name in it is text at any end.
+            let header = " to=a b<|channel|>commentary<|message|>";
+            let events = read(table(), header, EngineFinish::Length);
+            assert_eq!(shown(&events), header);
+            // A call that starts keeps the opener out of the content.
+            let events = read(table(), LAST_CALL, EngineFinish::Stop);
+            assert_eq!(shown(&events), "");
+            assert_eq!(calls(&events).len(), 1);
+            assert_eq!(bytes(&events), LAST_CALL);
+        }
+    }
+
+    #[test]
+    fn a_table_read_as_transformers_casts_values_as_coerce_does() {
+        let output = concat!(
+            " to=get_weather<|channel|>commentary<|message|><parameter name=\"days\">\n3.0\n",
+            "</parameter><parameter name=\"note\">\n[1]\n</parameter>",
+            "<parameter name=\"city\">\nParis\n</parameter>"
+        );
+        for read in [run, run_chars] {
+            let table = addressed().closes_at_stop("calls");
+            let events = read(table.reads_as_transformers(), output, EngineFinish::Stop);
+            let expected = r#"{"days": "3.0", "note": "[1]", "city": "Paris"}"#;
+            assert_eq!(calls(&events)[0].0, expected);
+            let events = read(
+                addressed().closes_at_stop("calls"),
+                output,
+                EngineFinish::Stop,
+            );
+            let inferred = r#"{"days": 3.0, "note": [1], "city": "Paris"}"#;
+            assert_eq!(calls(&events)[0].0, inferred);
         }
     }
 

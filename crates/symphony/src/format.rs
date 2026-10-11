@@ -157,6 +157,8 @@ pub struct Format {
     marker_tokens: Vec<String>,
     /// Texts of the tokens the engine stops on that a terminal is.
     stop_tokens: Vec<String>,
+    /// Whether the table reads as transformers' reader of a response template does.
+    reads_as_transformers: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -205,6 +207,7 @@ impl Format {
             marker_only: Vec::new(),
             marker_tokens: Vec::new(),
             stop_tokens: Vec::new(),
+            reads_as_transformers: false,
         }
     }
 
@@ -265,6 +268,28 @@ impl Format {
         };
         self.transitions.push(transition);
         self
+    }
+
+    /// The table reads as transformers' reader of a response template does where the engine's
+    /// parsers read otherwise: for a table built from a model's response template.
+    ///
+    /// - A tagged call's value is cast as transformers' `_coerce` casts a response template's
+    ///   arguments: to the types its schema declares, in their order, and the model's text when no
+    ///   cast takes it or nothing is declared, where the engine's parsers infer JSON.
+    /// - The terminal that opens a call region is shown with the text the region reports when no
+    ///   call starts before that text (a header the model wrote wrong, or one a stop ended), as
+    ///   transformers keeps an open pattern that did not match in the text; the engine's tables
+    ///   drop it as the template's wrapping. A call that starts, and a region a cut ended, still
+    ///   drop it.
+    #[must_use]
+    pub fn reads_as_transformers(mut self) -> Self {
+        self.reads_as_transformers = true;
+        self
+    }
+
+    /// Whether the table reads as [`Self::reads_as_transformers`] says.
+    pub(crate) fn is_read_as_transformers(&self) -> bool {
+        self.reads_as_transformers
     }
 
     /// The syntax of a call inside an arguments state.
