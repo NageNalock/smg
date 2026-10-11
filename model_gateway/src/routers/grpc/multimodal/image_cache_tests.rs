@@ -320,9 +320,9 @@ async fn invalid_cache_layout_falls_back_without_publishing_entries() {
         calls.batches.lock().unwrap().clear();
         let output = run(&components, &config, &[3, 4], "tok").await;
         assert_eq!(output.encoder_input_flat().as_ref(), &[3.0, 4.0]);
-        // First attempt discovers the invalid split; fallback returns the original
-        // batch. A second request must try both images again, not a poisoned hit.
-        assert_eq!(*calls.batches.lock().unwrap(), vec![vec![3, 4], vec![3, 4]]);
+        // The original cold batch remains usable even when it cannot be split.
+        // A later request must retry preprocessing, not consume a poisoned hit.
+        assert_eq!(*calls.batches.lock().unwrap(), vec![vec![3, 4]]);
     }
 }
 

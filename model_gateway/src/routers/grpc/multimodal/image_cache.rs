@@ -85,10 +85,18 @@ pub(super) async fn preprocess_images_cached_batch(
 
     let result = tokio::task::spawn_blocking(move || -> Result<PreprocessedEncoderInputs> {
         let (batch, items) = match miss_outputs {
-            ImageCacheMissOutputs::Batch(batch) => {
-                let items = batch.slice_items(&layouts)?;
-                (Some(batch), items)
-            }
+            ImageCacheMissOutputs::Batch(batch) => match batch.slice_items(&layouts) {
+                Ok(items) => (Some(batch), items),
+                Err(error) if misses.len() == image_count => {
+                    warn!(
+                        error = format!("{error:#}"),
+                        image_count,
+                        "Cannot split cold image batch for caching; returning it uncached"
+                    );
+                    return Ok(batch);
+                }
+                Err(error) => return Err(error),
+            },
             ImageCacheMissOutputs::Items(items) => (None, items),
         };
         anyhow::ensure!(
