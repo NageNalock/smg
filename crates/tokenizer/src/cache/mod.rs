@@ -383,6 +383,10 @@ impl Tokenizer for CachedTokenizer {
         self.inner.response_template()
     }
 
+    fn added_token_texts(&self) -> Vec<String> {
+        self.inner.added_token_texts()
+    }
+
     fn apply_chat_template(
         &self,
         messages: &[serde_json::Value],

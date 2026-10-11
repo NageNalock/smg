@@ -189,8 +189,28 @@ impl MessagePreparationStage {
 
         // Step 4: Build tool constraints if tools present. On a thinking
         // prompt a parser with a reasoning prefix gets its tag wrapped so a
-        // forced call follows the reasoning instead of preempting it.
-        let tool_call_constraint = if let (false, Some(tool_choice)) =
+        // forced call follows the reasoning instead of preempting it. A model
+        // whose compiled table derives tags has its forced choices take its
+        // own format, as long as the prompt starts a new assistant message; a
+        // tag too large to build is refused first.
+        let table_constraint = ctx
+            .components
+            .parser_resolver
+            .template_table(&request.model)
+            .and_then(|table| {
+                utils::table_constraint::for_messages(
+                    &table,
+                    request,
+                    &filtered_tools,
+                    chat_tool_choice.as_ref(),
+                    &processed_messages.text,
+                    // A Messages prompt always opens a new assistant turn.
+                    false,
+                )
+            });
+        let tool_call_constraint = if let Some(constraint) = table_constraint {
+            constraint?
+        } else if let (false, Some(tool_choice)) =
             (filtered_tools.is_empty(), chat_tool_choice.as_ref())
         {
             let reasoning =

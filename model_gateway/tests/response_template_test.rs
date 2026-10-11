@@ -66,6 +66,14 @@ fn qwen3_5() -> Value {
     })
 }
 
+/// `template` with a default the symphony compiler does not take, so that
+/// the parsers over the template read the output rather than the table it
+/// would compile into: these tests are the parsers'.
+fn uncompiled(mut template: Value) -> Value {
+    template["defaults"]["x-parsers"] = json!(true);
+    template
+}
+
 /// Model output as tokens: each `<|...|>` alone, other text four characters
 /// at a time.
 fn tokens(output: &str) -> Vec<String> {
@@ -165,7 +173,7 @@ async fn serve(setup: Setup) -> Gateway {
         .with_prompt_tail(setup.prompt_tail)
         .with_prompt_ids(setup.decoded_prompt_tail);
     let tokenizer: Arc<dyn Tokenizer> = match setup.template {
-        Some(template) => Arc::new(tokenizer.with_response_template(template)),
+        Some(template) => Arc::new(tokenizer.with_response_template(uncompiled(template))),
         None => Arc::new(tokenizer),
     };
     let tokenizers = Arc::new(TokenizerRegistry::new());

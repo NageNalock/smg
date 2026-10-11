@@ -300,7 +300,27 @@ pub(crate) async fn prepare_chat_like(
         // the choice lets the model call, dynamic tools declared on messages
         // included (see `ChatCompletionRequest::callable_tools`).
         let constraint_tools = request.callable_tools();
-        let tool_call_constraint = if let (false, Some(tool_choice)) =
+        // A model whose compiled table derives tags has its forced choices
+        // and JSON response_formats constrained to its own format, as long as
+        // the prompt starts a new assistant message; a tag too large to build
+        // is refused first, and so is a regex or ebnf constraint, which would
+        // apply outside the format.
+        let table_constraint = ctx
+            .components
+            .parser_resolver
+            .template_table(&request.model)
+            .and_then(|table| {
+                utils::table_constraint::for_chat(
+                    &table,
+                    request,
+                    &constraint_tools,
+                    &processed_messages.text,
+                    utils::continues_final_assistant(request),
+                )
+            });
+        let tool_call_constraint = if let Some(constraint) = table_constraint {
+            constraint?
+        } else if let (false, Some(tool_choice)) =
             (constraint_tools.is_empty(), request.tool_choice.as_ref())
         {
             let reasoning = utils::chat_reasoning_starts_in_prefill(request, tokenizer.as_ref());

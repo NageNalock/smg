@@ -888,6 +888,11 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         self.reverse_vocab.get(&id).cloned()
     }
 
+    fn added_token_texts(&self) -> Vec<String> {
+        let added = self.tokenizer.get_added_tokens_decoder();
+        added.into_values().map(|token| token.content).collect()
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

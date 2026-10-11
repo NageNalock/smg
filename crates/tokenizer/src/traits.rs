@@ -246,6 +246,13 @@ pub trait Tokenizer: Encoder + Decoder {
     /// Enable downcasting to concrete types
     fn as_any(&self) -> &dyn std::any::Any;
 
+    /// The texts of the tokens added to the vocabulary (`added_tokens` of
+    /// `tokenizer.json`), special or not. A template's markers are often added
+    /// tokens that are not special. Empty for a tokenizer that does not list them.
+    fn added_token_texts(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// The `response_template` object of `tokenizer_config.json`, if any.
     ///
     /// The value is kept verbatim. Parser selection decides whether it

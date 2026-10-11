@@ -14,15 +14,19 @@ use reasoning_parser::{ParserFactory as ReasoningParserFactory, TemplateReasonin
 use serde_json::Value;
 use smg_response_template::{
     adapter::{self, ResponseParserState},
-    load_response_template, ResponseTemplate,
+    load_response_template, to_symphony, ResponseTemplate,
 };
 use tool_parser::{ParserFactory as ToolParserFactory, TemplateToolParser};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::chat_utils::offload;
+use crate::routers::grpc::symphony::Table;
 
 /// The tokenizer an entry was computed for, and its parser name and template.
 type Entry = (Weak<dyn Tokenizer>, Option<(String, ResponseTemplate)>);
+
+/// The tokenizer a compiled table was computed for, and the table.
+type TableEntry = (Weak<dyn Tokenizer>, Option<Arc<Table>>);
 
 /// Loads the response template of each model's tokenizer once and registers
 /// the reasoning and tool parsers for it.
@@ -31,6 +35,7 @@ pub(crate) struct ResponseTemplateParsers {
     reasoning: ReasoningParserFactory,
     tools: ToolParserFactory,
     cache: RwLock<HashMap<String, Entry>>,
+    tables: RwLock<HashMap<String, TableEntry>>,
 }
 
 impl ResponseTemplateParsers {
@@ -44,7 +49,55 @@ impl ResponseTemplateParsers {
             reasoning,
             tools,
             cache: RwLock::default(),
+            tables: RwLock::default(),
         }
+    }
+
+    /// The symphony table `model`'s response template compiles into, or
+    /// `None` without a template or for one the compiler refuses (logged once
+    /// per tokenizer, naming the construct). Compiled once per tokenizer, with
+    /// the texts of the tokenizer's end-of-sequence tokens as the stops and
+    /// its special and added tokens as the tokens the markers may hold.
+    pub(crate) fn table(&self, model: &str) -> Option<Arc<Table>> {
+        let tokenizer = self.tokenizers.get(model)?;
+        let current = Arc::downgrade(&tokenizer);
+        if let Some((cached, table)) = self.tables.read().get(model) {
+            if cached.ptr_eq(&current) {
+                return table.clone();
+            }
+        }
+        let table = tokenizer.response_template().and_then(|raw| {
+            let template = if has_float(raw) {
+                Err("a float, which serde_json can read differently from Python".to_owned())
+            } else {
+                load_response_template(raw).map_err(|error| error.to_string())
+            };
+            let stops = stop_texts(tokenizer.as_ref());
+            let stops: Vec<&str> = stops.iter().map(String::as_str).collect();
+            template
+                .and_then(|t| to_symphony::compile(&t, &stops).map_err(|e| e.to_string()))
+                .map(|format| {
+                    let tokens = token_texts(tokenizer.as_ref());
+                    let format = format
+                        .stop_tokens(stops.iter().copied())
+                        .marker_tokens(tokens.iter().map(String::as_str));
+                    info!(
+                        model,
+                        "reading the output with the table the response_template compiles into"
+                    );
+                    Arc::new(Table::compiled(format))
+                })
+                .inspect_err(|reason| {
+                    info!(
+                        model,
+                        reason, "the response_template compiles into no table"
+                    );
+                })
+                .ok()
+        });
+        let cached = (current, table.clone());
+        self.tables.write().insert(model.to_string(), cached);
+        table
     }
 
     /// The parser name and the template of `model`'s response template, or
@@ -86,6 +139,43 @@ impl ResponseTemplateParsers {
         self.cache.write().insert(model.to_string(), cached);
         entry
     }
+}
+
+/// The texts of the tokens `tokenizer` ends a sequence with: its end-of-sequence
+/// ids and its `eos_token`, each once.
+fn stop_texts(tokenizer: &dyn Tokenizer) -> Vec<String> {
+    let mut texts: Vec<String> = Vec::new();
+    let ids = tokenizer.eos_token_ids().iter();
+    let named = tokenizer.get_special_tokens().eos_token.clone();
+    for text in ids.filter_map(|&id| tokenizer.id_to_token(id)).chain(named) {
+        if !texts.contains(&text) {
+            texts.push(text);
+        }
+    }
+    texts
+}
+
+/// The texts of `tokenizer`'s special and added tokens, longest first, each
+/// once: the tokens a table's markers may hold. A template's markers are often
+/// added tokens that are not special, and a marker that is one is still
+/// written as that token.
+fn token_texts(tokenizer: &dyn Tokenizer) -> Vec<String> {
+    let special = tokenizer.get_special_tokens();
+    let named = [
+        &special.bos_token,
+        &special.eos_token,
+        &special.unk_token,
+        &special.sep_token,
+        &special.pad_token,
+        &special.cls_token,
+        &special.mask_token,
+    ];
+    let mut texts: Vec<String> = named.into_iter().flatten().cloned().collect();
+    texts.extend(special.additional_special_tokens.iter().cloned());
+    texts.extend(tokenizer.added_token_texts());
+    texts.sort_unstable_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    texts.dedup();
+    texts
 }
 
 /// Whether a template read from `tokenizer_config.json` holds a float: serde_json
@@ -237,6 +327,14 @@ mod tests {
         })
     }
 
+    /// [`template`] with a default the symphony compiler does not take, so the
+    /// parsers over it read the output.
+    fn uncompiled(close: &str) -> Value {
+        let mut template = template(close);
+        template["defaults"] = json!({"name": "bot"});
+        template
+    }
+
     async fn load(registry: &TokenizerRegistry, model: &str, template: Option<Value>) {
         let tokenizer = match template {
             Some(template) => MockTokenizer::new().with_response_template(template),
@@ -306,8 +404,8 @@ mod tests {
     #[tokio::test]
     async fn a_template_needs_both_sides_free_of_explicit_choices() {
         let registry = Arc::new(TokenizerRegistry::new());
-        load(&registry, "m", Some(template("</think>"))).await;
-        load(&registry, "carded", Some(template("</think>"))).await;
+        load(&registry, "m", Some(uncompiled("</think>"))).await;
+        load(&registry, "carded", Some(uncompiled("</think>"))).await;
         let parsers = Arc::new(parsers(&registry));
         let name = parsers.get("m").map(|(name, _)| name);
 
@@ -400,5 +498,158 @@ mod tests {
                 .map_or("", |end| &rendered[end..]);
             assert_eq!(&*tail, expected);
         }
+    }
+
+    /// A model that names no parser reads its output with the table its
+    /// template compiles into, built once per tokenizer: no parser name, no
+    /// parsers over the template, and a call addressed to a tool derives
+    /// tags and drops a call the request did not ask for. A template the
+    /// compiler refuses keeps the parsers over it.
+    #[tokio::test]
+    async fn a_template_that_compiles_is_read_by_its_table() {
+        use crate::routers::grpc::{symphony, utils::table_constraint::tests::neutral_template};
+
+        let registry = Arc::new(TokenizerRegistry::new());
+        load(&registry, "addressed", Some(neutral_template())).await;
+        load(&registry, "plain", Some(template("</think>"))).await;
+        load(&registry, "refused", Some(uncompiled("</think>"))).await;
+        let parsers = Arc::new(parsers(&registry));
+        let workers = Arc::new(WorkerRegistry::new());
+        let resolver = ParserResolver::new(workers.clone(), None, None, Some(parsers.clone()));
+
+        let table = resolver.template_table("addressed").unwrap();
+        assert_eq!(table.name, symphony::COMPILED);
+        assert!(table.drops_unasked_calls && table.tagged && table.tags().is_some());
+        assert!(Arc::ptr_eq(
+            &table,
+            &resolver.symphony("addressed").unwrap()
+        ));
+        assert!(Arc::ptr_eq(&table, &parsers.table("addressed").unwrap()));
+        assert_eq!(resolver.tool_parser("addressed"), None);
+        assert_eq!(resolver.reasoning_parser("addressed"), None);
+        assert!(resolver.response_template("addressed").is_none());
+
+        let plain = resolver.template_table("plain").unwrap();
+        assert!(!plain.drops_unasked_calls && !plain.tagged && plain.tags().is_none());
+        assert!(resolver.response_template("plain").is_none());
+
+        assert!(resolver.template_table("refused").is_none());
+        assert!(resolver.response_template("refused").is_some());
+        assert!(resolver.template_table("unknown").is_none());
+
+        // A replaced tokenizer is compiled again.
+        load(&registry, "plain", Some(template("</thought>"))).await;
+        assert!(!Arc::ptr_eq(
+            &plain,
+            &resolver.template_table("plain").unwrap()
+        ));
+
+        // A configured or carded parser name turns the table off.
+        let resolver = ParserResolver::new(workers, Some("json".into()), None, Some(parsers));
+        assert!(resolver.template_table("addressed").is_none());
+        assert!(resolver.symphony("addressed").is_none());
+    }
+
+    /// A tokenizer whose markers are added tokens that are not special: the
+    /// compiled table's tags write each marker as its token all the same, so a
+    /// marker spelled in ordinary tokens opens and closes nothing there.
+    #[tokio::test]
+    async fn markers_that_are_added_but_not_special_are_tokens() {
+        use crate::routers::grpc::utils::table_constraint::tests::neutral_template;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let vocab: serde_json::Map<_, _> = (0..=255u32)
+            .map(|byte| (format!("<0x{byte:02X}>"), json!(byte)))
+            .collect();
+        let markers = [
+            "<|head|>", "<|via|>", "<|body|>", "<|as|>", "<|stop|>", "<|done|>",
+        ];
+        let added: Vec<_> = markers
+            .into_iter()
+            .map(|content| (content, false))
+            .chain([("<eos>", true)])
+            .zip(256..)
+            .map(|((content, special), id)| {
+                json!({"id": id, "content": content, "single_word": false, "lstrip": false,
+                       "rstrip": false, "normalized": false, "special": special})
+            })
+            .collect();
+        let tokenizer = json!({
+            "version": "1.0", "truncation": null, "padding": null,
+            "added_tokens": added,
+            "normalizer": null, "pre_tokenizer": null, "post_processor": null,
+            "decoder": {"type": "Sequence", "decoders": [{"type": "ByteFallback"}, {"type": "Fuse"}]},
+            "model": {"type": "BPE", "vocab": vocab, "merges": [], "byte_fallback": true}
+        });
+        let config = json!({"eos_token": "<eos>", "response_template": neutral_template()});
+        std::fs::write(dir.path().join("tokenizer.json"), tokenizer.to_string()).unwrap();
+        let config_path = dir.path().join("tokenizer_config.json");
+        std::fs::write(config_path, config.to_string()).unwrap();
+        let path = dir.path().join("tokenizer.json");
+        let tokenizer = llm_tokenizer::HuggingFaceTokenizer::from_file(path.to_str().unwrap());
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(tokenizer.unwrap());
+        let special = &tokenizer.get_special_tokens().additional_special_tokens;
+        assert!(!special.iter().any(|text| markers.contains(&text.as_str())));
+
+        let registry = Arc::new(TokenizerRegistry::new());
+        registry
+            .load("m", "m", "test", || async move { Ok(tokenizer) })
+            .await
+            .unwrap();
+        let table = parsers(&registry).table("m").unwrap();
+        let tool: Tool = serde_json::from_value(json!({"type": "function", "function": {
+            "name": "get_weather",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+        }}))
+        .unwrap();
+        let tag = table.tags().unwrap().calls(&[tool]).payload().to_string();
+        for marker in markers.into_iter().filter(|m| *m != "<|done|>") {
+            let token = json!({"type": "token", "token": marker}).to_string();
+            assert!(tag.contains(&token), "{marker} is not a token in {tag}");
+        }
+    }
+
+    /// The compiled table reads a call addressed to a tool, typed by the
+    /// request's tools, and drops one the request did not ask for.
+    #[test]
+    fn a_compiled_table_reads_calls_and_drops_unasked_ones() {
+        use crate::routers::grpc::{
+            symphony::{chat_message, Choice, Policy, SymphonySpec, Table},
+            utils::table_constraint::tests::{neutral_format, OPENER},
+        };
+
+        let table = Arc::new(Table::compiled(neutral_format()));
+        let tool: Tool = serde_json::from_value(json!({"type": "function", "function": {
+            "name": "get_weather",
+            "parameters": {"type": "object", "properties": {"days": {"type": "integer"}}}
+        }}))
+        .unwrap();
+        let output = "<|via|>notes<|body|>Look it up.<|stop|><|head|>assistant to=get_weather\
+                      <|via|>notes <|as|>xml<|body|><arg name=\"days\">\n3\n</arg>";
+        let policy = |calls: bool| Policy {
+            calls,
+            separate_reasoning: true,
+            first_call_only: false,
+            history_tool_calls_count: 0,
+        };
+        let read = |calls: bool| {
+            let spec = SymphonySpec::new(
+                table.clone(),
+                std::slice::from_ref(&tool),
+                OPENER,
+                policy(calls),
+            );
+            let events = Choice::whole(&spec, "m", output, "stop");
+            serde_json::to_value(chat_message(0, &events)).unwrap()
+        };
+        let asked = read(true);
+        let call = &asked["message"]["tool_calls"][0]["function"];
+        assert_eq!(call["name"], "get_weather");
+        assert_eq!(call["arguments"], r#"{"days": 3}"#);
+        assert_eq!(asked["message"]["reasoning_content"], "Look it up.");
+        assert_eq!(asked["finish_reason"], "tool_calls");
+        let unasked = read(false);
+        assert!(unasked["message"]["tool_calls"].is_null(), "{unasked}");
+        assert!(unasked["message"]["content"].is_null(), "{unasked}");
     }
 }

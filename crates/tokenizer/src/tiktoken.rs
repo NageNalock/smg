@@ -780,6 +780,11 @@ impl TokenizerTrait for TiktokenTokenizer {
         self.reverse_vocab.get(&id).cloned()
     }
 
+    fn added_token_texts(&self) -> Vec<String> {
+        let added = self.tokenizer.special_tokens();
+        added.into_iter().map(str::to_string).collect()
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

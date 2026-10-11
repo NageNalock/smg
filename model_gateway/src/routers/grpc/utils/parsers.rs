@@ -33,11 +33,12 @@ use crate::{
 /// Precedence: the model's `ModelCard` override (`tool_parser` /
 /// `reasoning_parser`, populated from worker labels or an explicit
 /// `WorkerSpec` card) → the process-wide configured name
-/// (`--tool-call-parser` / `--reasoning-parser`) → the parsers of the
-/// `response_template` in the model's tokenizer, for both sides and only
-/// when neither side has an override or a configured name → `None`, which
-/// lets the factory helpers fall back to their name-based auto-detection,
-/// unchanged. A name `symphony:<table>` on either side selects a symphony
+/// (`--tool-call-parser` / `--reasoning-parser`) → when neither side has an
+/// override or a configured name, the `response_template` in the model's
+/// tokenizer: the symphony table it compiles into ([`Self::template_table`]),
+/// which reads the output in place of any parser, or else the parsers over
+/// it → `None`, which lets the factory helpers fall back to their name-based
+/// auto-detection, unchanged. A name `symphony:<table>` on either side selects a symphony
 /// table, and both names then resolve to the parsers of the table's family.
 /// The card decides the table as a whole: a card that names either parser
 /// selects from its own names only, and the configured names select a table
@@ -98,10 +99,12 @@ impl ParserResolver {
         })
     }
 
-    /// The symphony table `model`'s parser names select (`symphony:<table>`),
-    /// the tool parser's name first: the card's names when it names either
-    /// parser, the configured names otherwise.
-    pub(crate) fn symphony(&self, model: &str) -> Option<&'static symphony::Table> {
+    /// The symphony table that reads `model`'s output: the one its parser
+    /// names select (`symphony:<table>`), the tool parser's name first, the
+    /// card's names when it names either parser, the configured names
+    /// otherwise; without any parser name, the table its response template
+    /// compiles into ([`Self::template_table`]).
+    pub(crate) fn symphony(&self, model: &str) -> Option<Arc<symphony::Table>> {
         let card_tool = self.card_parser(model, |card| card.tool_parser.as_ref());
         let card_reasoning = self.card_parser(model, |card| card.reasoning_parser.as_ref());
         let (tool, reasoning) = if card_tool.is_some() || card_reasoning.is_some() {
@@ -114,6 +117,20 @@ impl ParserResolver {
         };
         tool.and_then(symphony::table)
             .or_else(|| reasoning.and_then(symphony::table))
+            .or_else(|| self.template_table(model))
+    }
+
+    /// The table `model`'s response template compiles into, when no parser
+    /// is named for the model (by its card or the configuration, passthrough
+    /// included): built once per tokenizer
+    /// ([`ResponseTemplateParsers::table`]). A template that does not compile
+    /// gives none, and the parsers over it are taken as before.
+    pub(crate) fn template_table(&self, model: &str) -> Option<Arc<symphony::Table>> {
+        let templates = self.response_templates.as_ref()?;
+        if self.explicit(model) {
+            return None;
+        }
+        templates.table(model)
     }
 
     fn named_tool_parser(&self, model: &str) -> Option<String> {
@@ -128,25 +145,31 @@ impl ParserResolver {
             .or_else(|| Some(self.template_parsers(model)?.0))
     }
 
-    /// The response template that selects `model`'s parsers, if any.
+    /// The response template that selects `model`'s parsers, if any: one
+    /// that compiles into a table selects none ([`Self::template_table`]).
     pub(crate) fn response_template(&self, model: &str) -> Option<ResponseTemplate> {
         Some(self.template_parsers(model)?.1)
     }
 
     fn template_parsers(&self, model: &str) -> Option<(String, ResponseTemplate)> {
         let templates = self.response_templates.as_ref()?;
-        let explicit = self.configured_tool_parser.is_some()
+        if self.explicit(model) || templates.table(model).is_some() {
+            return None;
+        }
+        templates.get(model)
+    }
+
+    /// Whether a parser is named for `model`, by the configuration or by the
+    /// model's card.
+    fn explicit(&self, model: &str) -> bool {
+        self.configured_tool_parser.is_some()
             || self.configured_reasoning_parser.is_some()
             || self
                 .card_parser(model, |card| card.tool_parser.as_ref())
                 .is_some()
             || self
                 .card_parser(model, |card| card.reasoning_parser.as_ref())
-                .is_some();
-        if explicit {
-            return None;
-        }
-        templates.get(model)
+                .is_some()
     }
 
     fn card_parser(
@@ -193,12 +216,12 @@ impl ParserResolver {
 /// selects `table`, else the name as resolved, a table name standing for its
 /// family's parser (a card's names kept the configured one from selecting).
 fn family_or_named(
-    table: Option<&'static symphony::Table>,
+    table: Option<Arc<symphony::Table>>,
     named: Option<String>,
     family: impl Fn(&symphony::Table) -> Option<&'static str>,
 ) -> Option<String> {
     match table.or_else(|| named.as_deref().and_then(symphony::table)) {
-        Some(table) => family(table).map(str::to_string),
+        Some(table) => family(&table).map(str::to_string),
         None => named,
     }
 }

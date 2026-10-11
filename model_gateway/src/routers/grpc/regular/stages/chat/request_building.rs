@@ -1,5 +1,7 @@
 //! Chat request building stage: Build proto GenerateRequest for chat requests
 
+use std::borrow::Cow;
+
 use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
@@ -310,9 +312,24 @@ impl BuildStage for ChatRequestBuildingStage {
             }
             None => None,
         };
+        // A compiled table's tag (in `tool_constraints`) stands in for a JSON
+        // response_format, which the backend would otherwise apply.
+        let backend_request = if utils::table_constraint::frames_response_format(&chat_request)
+            && ctx
+                .components
+                .parser_resolver
+                .template_table(&chat_request.model)
+                .is_some_and(|table| table.tagged)
+        {
+            let mut request = chat_request.as_ref().clone();
+            request.response_format = None;
+            Cow::Owned(request)
+        } else {
+            Cow::Borrowed(chat_request.as_ref())
+        };
         let (plan, stamp, reasoning_in_prefill) = build_chat_backed_plan(
             ctx,
-            &chat_request,
+            &backend_request,
             processed_messages.text,
             token_ids,
             tool_constraints,

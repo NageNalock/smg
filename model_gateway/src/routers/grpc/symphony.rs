@@ -6,8 +6,9 @@
 //! the form `symphony:<table>`, from a model card (worker label or `WorkerSpec`) or from
 //! `--tool-call-parser` / `--reasoning-parser`, selects the row of that name in [`TABLES`]. The card
 //! comes first: a card that names either parser decides alone, and the flags select a table only
-//! for a model whose card names neither. Model-id detection never yields such a name, so a model
-//! selects a table only when its configuration says so. A row also names the parsers the gateway
+//! for a model whose card names neither. Model-id detection never yields such a name. A model that
+//! names no parser at all reads its output with the table its tokenizer's `response_template`
+//! compiles into ([`Table::compiled`], `ParserResolver::template_table`). A row also names the parsers the gateway
 //! takes for the table's family without symphony, and the resolver answers with them wherever a
 //! parser is looked up by name: preparation (tool constraints, `skip_special_tokens`, the stop
 //! decoder) stays what it is for the family, and only the reading of the output changes.
@@ -23,7 +24,10 @@
 //! JSON-schema constraint, which a family without a structural tag gets. The model then writes the
 //! bare arguments, which no table reads.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+};
 
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::{
@@ -33,8 +37,8 @@ use openai_protocol::{
 };
 use serde_json::Value;
 use symphony::{
-    adapt, CallSyntax, Declared, Engine, EngineFinish, Event, Events, FinishReason, Format, Input,
-    Parser, Text,
+    adapt, AddressedTags, CallSyntax, Declared, Engine, EngineFinish, Event, Events, FinishReason,
+    Format, Input, Parser, Text,
 };
 use tracing::warn;
 
@@ -46,53 +50,97 @@ use super::{
 /// The parser-name prefix that selects a symphony table.
 pub(crate) const PREFIX: &str = "symphony:";
 
-/// A table a parser setting can select.
+/// A table that reads a model's output: a row a parser setting selects, or the table a model's
+/// response template compiles into.
 #[derive(Debug)]
 pub(crate) struct Table {
-    /// The name after [`PREFIX`].
+    /// The name after [`PREFIX`]; [`COMPILED`] for a compiled table, which no name selects.
     pub name: &'static str,
-    /// Builds the table.
-    pub format: fn() -> Format,
+    /// The table. Each choice's engine reads with a copy of it.
+    pub format: Arc<Format>,
     /// The tool parser the gateway takes for the family without symphony. It builds the tool
-    /// constraints.
+    /// constraints. `None` for a compiled table.
     pub tool_parser: Option<&'static str>,
     /// The reasoning parser the gateway takes for the family without symphony. It decides
-    /// whether special tokens are kept.
+    /// whether special tokens are kept. `None` for a compiled table.
     pub reasoning_parser: Option<&'static str>,
+    /// A call the request did not ask for (no tools, or tool choice none) is dropped rather than
+    /// returned as content. The policy's "what the model wrote of it, without the markers"
+    /// strips only the table's terminals; a call addressed to a tool spells its header's close
+    /// and its parameter tags itself, and those would show. Without reasoning separation the
+    /// output is the raw text and nothing is dropped. True exactly for addressed calls.
+    pub drops_unasked_calls: bool,
+    /// The table derives the structural tags of its calls ([`Self::tags`]).
+    pub tagged: bool,
+}
+
+/// The name of a table compiled from a model's response template.
+pub(crate) const COMPILED: &str = "response_template";
+
+impl Table {
+    fn row(
+        name: &'static str,
+        format: Format,
+        tool_parser: &'static str,
+        reasoning_parser: &'static str,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            tool_parser: Some(tool_parser),
+            reasoning_parser: Some(reasoning_parser),
+            ..Self::new(name, format)
+        })
+    }
+
+    /// The table a model's response template compiles into: it names no legacy parser, and drops
+    /// a call the request did not ask for when its calls are addressed to a tool.
+    pub(crate) fn compiled(format: Format) -> Self {
+        Self::new(COMPILED, format)
+    }
+
+    fn new(name: &'static str, format: Format) -> Self {
+        let drops_unasked_calls = matches!(format.call_syntax(), Some(CallSyntax::Addressed(_)));
+        let tagged = drops_unasked_calls && format.addressed_tags().is_ok();
+        Self {
+            name,
+            format: Arc::new(format),
+            tool_parser: None,
+            reasoning_parser: None,
+            drops_unasked_calls,
+            tagged,
+        }
+    }
+
+    /// The structural tags the table's rows derive for its calls ([`Format::addressed_tags`]),
+    /// which constrain forced calls and JSON output, or `None` when they derive none.
+    pub(crate) fn tags(&self) -> Option<AddressedTags> {
+        if self.tagged {
+            self.format.addressed_tags().ok()
+        } else {
+            None
+        }
+    }
 }
 
 /// The selectable tables, each with the parser names in the crate's README "SMG today" column:
 /// groups the README marks ready that this driver is tested with (DeepSeek V4.1, Hy4, Qwen3 with
 /// JSON calls). Another ready table is one more row.
-pub(crate) static TABLES: &[Table] = &[
-    Table {
-        name: "deepseek_v4.1",
-        format: symphony::deepseek_v4_1,
-        tool_parser: Some("deepseek_v41"),
-        reasoning_parser: Some("deepseek_v41"),
-    },
-    Table {
-        name: "hy4",
-        format: symphony::hy4,
-        tool_parser: Some("hy_v4"),
-        reasoning_parser: Some("hy_v4"),
-    },
-    Table {
-        name: "qwen3",
-        format: qwen3_json,
-        tool_parser: Some("qwen"),
-        reasoning_parser: Some("qwen3"),
-    },
-];
-
-fn qwen3_json() -> Format {
-    symphony::qwen3(CallSyntax::Json)
-}
+pub(crate) static TABLES: LazyLock<Vec<Arc<Table>>> = LazyLock::new(|| {
+    vec![
+        Table::row(
+            "deepseek_v4.1",
+            symphony::deepseek_v4_1(),
+            "deepseek_v41",
+            "deepseek_v41",
+        ),
+        Table::row("hy4", symphony::hy4(), "hy_v4", "hy_v4"),
+        Table::row("qwen3", symphony::qwen3(CallSyntax::Json), "qwen", "qwen3"),
+    ]
+});
 
 /// The table a parser name selects, if it names one.
-pub(crate) fn table(name: &str) -> Option<&'static Table> {
+pub(crate) fn table(name: &str) -> Option<Arc<Table>> {
     let name = name.strip_prefix(PREFIX)?;
-    TABLES.iter().find(|table| table.name == name)
+    TABLES.iter().find(|table| table.name == name).cloned()
 }
 
 /// Whether a parser name selects a table, for the checks that refuse unknown parser names.
@@ -136,7 +184,7 @@ pub(crate) struct Policy {
 /// What request building hands the response paths for a request a table reads.
 #[derive(Debug)]
 pub(crate) struct SymphonySpec {
-    table: &'static Table,
+    table: Arc<Table>,
     declared: Declared,
     prompt: String,
     policy: Policy,
@@ -151,7 +199,7 @@ impl SymphonySpec {
     /// A spec for `table` over `prompt`, the rendered prompt the engine is given, with the
     /// request's `tools`, which type the arguments of a tagged call.
     pub(crate) fn new(
-        table: &'static Table,
+        table: Arc<Table>,
         tools: &[Tool],
         prompt: impl Into<String>,
         policy: Policy,
@@ -169,8 +217,7 @@ impl SymphonySpec {
     /// token each ([`Self::finish_of`]).
     fn with_call_stops(mut self, tokenizer: Option<&dyn Tokenizer>) -> Self {
         self.call_stops = tokenizer.map(|tokenizer| {
-            let format = (self.table.format)();
-            let (_, ends) = format.call_terminals();
+            let (_, ends) = self.table.format.call_terminals();
             ends.into_iter()
                 .filter_map(|text| tokenizer.token_to_id(text))
                 .collect()
@@ -205,7 +252,7 @@ impl SymphonySpec {
     /// The spec for a Chat request, or `None` when its tool constraint keeps it on the legacy
     /// parsers. `tokenizer` is the model's, which names the stop tokens that end a call.
     pub(crate) fn for_chat(
-        table: &'static Table,
+        table: Arc<Table>,
         spec: &ChatResponseSpec,
         parallel_tool_calls: Option<bool>,
         prompt: &str,
@@ -235,7 +282,7 @@ impl SymphonySpec {
     /// legacy parsers. Reasoning is always a thinking block. `tokenizer` is the model's, which
     /// names the stop tokens that end a call.
     pub(crate) fn for_messages(
-        table: &'static Table,
+        table: Arc<Table>,
         spec: &MessagesResponseSpec,
         prompt: &str,
         tool_constraint: Option<&(String, String)>,
@@ -299,6 +346,8 @@ pub(crate) struct Choice {
     /// A call ended without the marker that ended it among its own bytes: the whitespace and the
     /// first ending marker that follow it are its own.
     closing: bool,
+    /// The table drops a call the request did not ask for ([`Table::drops_unasked_calls`]).
+    drops_unasked_calls: bool,
     /// Without reasoning separation: the call open now is one that only the first call being
     /// returned drops, so its bytes are content as written.
     shown: bool,
@@ -314,12 +363,12 @@ pub(crate) struct Choice {
 impl Choice {
     /// A choice that has read the prompt and nothing else. `model` names the model in call ids.
     pub(crate) fn new(spec: &SymphonySpec, model: &str) -> Self {
-        let format = (spec.table.format)();
+        let format = &spec.table.format;
         let (opens, ends) = format.call_terminals();
         let owned = |texts: Vec<&str>| texts.into_iter().map(str::to_string).collect();
         let (opens, ends) = (owned(opens), owned(ends));
         let mut choice = Self {
-            engine: Engine::new(format, spec.declared.clone()),
+            engine: Engine::new(Format::clone(format), spec.declared.clone()),
             events: Events::new(),
             policy: spec.policy,
             model: model.to_string(),
@@ -331,6 +380,7 @@ impl Choice {
             markers: Vec::new(),
             inside: false,
             closing: false,
+            drops_unasked_calls: spec.table.drops_unasked_calls,
             shown: false,
             open_calls: 0,
             failed: false,
@@ -552,6 +602,11 @@ impl Choice {
                     }
                 }
                 Event::ReasoningStart | Event::ReasoningEnd if raw => {}
+                // A call the request did not ask for, under a table that drops it.
+                Event::ToolCallStart { .. }
+                | Event::ToolCallArguments { .. }
+                | Event::ToolCallEnd { .. }
+                    if self.drops_unasked_calls && !raw => {}
                 event => {
                     if raw {
                         self.closing = false;
@@ -793,7 +848,7 @@ mod tests {
     /// A call written without an arguments member.
     const BARE_CALL: &str = "<tool_call>\n{\"name\": \"get_weather\"}\n</tool_call>";
 
-    fn qwen3() -> &'static Table {
+    fn qwen3() -> Arc<Table> {
         table("symphony:qwen3").expect("the qwen3 row")
     }
 
@@ -820,7 +875,7 @@ mod tests {
         spec_with(qwen3(), policy)
     }
 
-    fn spec_with(table: &'static Table, policy: Policy) -> SymphonySpec {
+    fn spec_with(table: Arc<Table>, policy: Policy) -> SymphonySpec {
         SymphonySpec::new(table, &[tool("get_weather")], PROMPT, policy)
     }
 
@@ -842,7 +897,7 @@ mod tests {
     fn every_listed_parser_name_selects_its_table() {
         let names = parser_names();
         assert_eq!(names.len(), TABLES.len());
-        for (name, row) in names.iter().zip(TABLES) {
+        for (name, row) in names.iter().zip(TABLES.iter()) {
             assert_eq!(table(name).map(|t| t.name), Some(row.name));
         }
     }
@@ -874,9 +929,10 @@ mod tests {
         let tools = ToolParserFactory::new();
         let reasoning = ReasoningParserFactory::new();
         for (position, row) in TABLES.iter().enumerate() {
-            let format = (row.format)();
-            assert_eq!(format.validate(), Ok(()), "{}", row.name);
-            let mut choice = Choice::new(&SymphonySpec::new(row, &[], "", policy()), "m");
+            assert_eq!(row.format.validate(), Ok(()), "{}", row.name);
+            assert!(!row.drops_unasked_calls && !row.tagged, "{}", row.name);
+            let spec = SymphonySpec::new(row.clone(), &[], "", policy());
+            let mut choice = Choice::new(&spec, "m");
             let events = choice.end(Some("stop"));
             assert!(
                 matches!(events.last(), Some(Event::Finish { .. })),
@@ -1005,7 +1061,7 @@ mod tests {
         .into_iter()
         .map(|choice| serde_json::from_value(choice).expect("tool choice"))
         .collect();
-        for row in TABLES {
+        for row in TABLES.iter() {
             let name = format!("{PREFIX}{}", row.name);
             let selected = configured(Some(&name), None).tool_parser("m");
             assert_eq!(selected.as_deref(), row.tool_parser, "{}", row.name);
@@ -1058,7 +1114,8 @@ mod tests {
                 .to_tuple();
             assert_eq!(constraint.0, kind, "{}", row.name);
             assert_eq!(
-                SymphonySpec::for_chat(row, &spec, None, PROMPT, Some(&constraint), None).is_some(),
+                SymphonySpec::for_chat(row.clone(), &spec, None, PROMPT, Some(&constraint), None)
+                    .is_some(),
                 armed,
                 "{}",
                 row.name
@@ -1438,13 +1495,6 @@ mod tests {
             .calls(CallSyntax::Json)
     }
 
-    static ENDS_AT_IM_END: Table = Table {
-        name: "ends_at_im_end",
-        format: ends_at_im_end,
-        tool_parser: None,
-        reasoning_parser: None,
-    };
-
     #[test]
     fn a_stop_token_that_ends_no_call_is_a_finish_that_closes_none() {
         // The tokenizer names the table's call-ending markers that are one token each; a stop on
@@ -1452,8 +1502,13 @@ mod tests {
         // table as a finish it does not interpret, so the call it stopped in stays cut. The
         // client reads `stop` either way.
         let tokenizer = llm_tokenizer::MockTokenizer::new();
-        let spec = SymphonySpec::new(&ENDS_AT_IM_END, &[tool("get_weather")], "", policy())
-            .with_call_stops(Some(&tokenizer as &dyn Tokenizer));
+        let spec = SymphonySpec::new(
+            Arc::new(Table::compiled(ends_at_im_end())),
+            &[tool("get_weather")],
+            "",
+            policy(),
+        )
+        .with_call_stops(Some(&tokenizer as &dyn Tokenizer));
         assert_eq!(spec.call_stops, Some(vec![1002]));
         assert_eq!(spec.finish_of("stop", Some(&json!(1002))), "stop");
         assert_eq!(spec.finish_of("stop", Some(&json!(999))), STOP_TOKEN);

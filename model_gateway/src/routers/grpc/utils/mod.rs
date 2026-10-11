@@ -8,6 +8,7 @@ mod parsers;
 mod pd_bootstrap;
 mod response_template;
 pub(crate) mod stream_failure;
+pub(crate) mod table_constraint;
 pub(crate) mod tonic_ext;
 
 // Re-export all public items so consumer imports stay unchanged.
