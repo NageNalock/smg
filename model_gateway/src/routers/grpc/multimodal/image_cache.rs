@@ -13,6 +13,7 @@ use super::{
     config::{MultimodalComponents, MultimodalModelConfig},
     pixel_cache::{config_fingerprint, CachedPreprocessedItem, PixelCacheKey},
 };
+use crate::observability::metrics::Metrics;
 
 /// Cache entries own independent per-image buffers. Hits and duplicate positions
 /// share Arc handles; only final assembly copies their pixels. All unique misses
@@ -56,10 +57,7 @@ pub(super) async fn preprocess_images_cached_batch(
             continue;
         }
         parts.push(cache.get(&key));
-        crate::observability::metrics::Metrics::record_mm_pixel_cache_lookup(
-            model_id,
-            parts[index].is_some(),
-        );
+        Metrics::record_mm_pixel_cache_lookup(model_id, parts[index].is_some());
         if parts[index].is_none() {
             misses.push((index, key));
             miss_images.push(image.clone());
@@ -86,14 +84,14 @@ pub(super) async fn preprocess_images_cached_batch(
     let result = tokio::task::spawn_blocking(move || -> Result<PreprocessedEncoderInputs> {
         let (batch, items) = match miss_outputs {
             ImageCacheMissOutputs::Batch(batch) => match batch.slice_items(&layouts) {
-                Ok(items) => (Some(batch), items),
+                Ok(items) => (Some(*batch), items),
                 Err(error) if misses.len() == image_count => {
                     warn!(
                         error = format!("{error:#}"),
                         image_count,
                         "Cannot split cold image batch for caching; returning it uncached"
                     );
-                    return Ok(batch);
+                    return Ok(*batch);
                 }
                 Err(error) => return Err(error),
             },
@@ -155,7 +153,7 @@ pub(super) async fn preprocess_images_cached_batch(
 }
 
 enum ImageCacheMissOutputs {
-    Batch(PreprocessedEncoderInputs),
+    Batch(Box<PreprocessedEncoderInputs>),
     Items(Vec<PreprocessedEncoderInputs>),
 }
 
@@ -198,7 +196,7 @@ async fn preprocess_image_cache_misses(
             .collect::<Result<Vec<_>, _>>()?;
         processor
             .preprocess(&raw_images, &pp_config)
-            .map(ImageCacheMissOutputs::Batch)
+            .map(|batch| ImageCacheMissOutputs::Batch(Box::new(batch)))
             .map_err(|e| anyhow::anyhow!("Image preprocessing failed: {e}"))
     })
     .await
