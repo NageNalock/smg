@@ -1,0 +1,217 @@
+serve/qwen2	table
+serve/qwen3_5	table
+serve/gemma4	response_template: several start anchors
+shapes/literal-anchors-json-tools	response_template: several start anchors
+shapes/xml-invoke-word-boundary	Field 'tool_calls': an open with an anchor or a word boundary
+shapes/content-only-close-pattern	table
+shapes/recipient-name-class-escape	table
+synthetic/base	Field 'thinking': an open with an optional item
+synthetic/strip-true	Field 'thinking': an open with an optional item
+synthetic/strip-false	Field 'thinking': an open with an optional item
+synthetic/unwrapped	Field 'thinking': an open with an optional item
+synthetic/greedy-tag	Field 'thinking': an open with an optional item
+synthetic/overlap-close	Field 'thinking': an open with an optional item
+synthetic/dollar-open	Field 'thinking': an open with an optional item
+synthetic/defaults	response_template: a default for "content"
+synthetic/version	Field 'thinking': an open with an optional item
+synthetic/literal-anchor	Field 'thinking': an open with an optional item
+synthetic/literal-open	Field 'content': an open with an optional item
+synthetic/close-pattern	Field 'thinking': an open with an optional item
+synthetic/text-strip-false	Field 'thinking': an open with an optional item
+synthetic/content-repeats-join	Field 'thinking': an open with an optional item
+synthetic/value-parser-json	Field 'thinking': an open with an optional item
+synthetic/merge-duplicates	Field 'thinking': an open with an optional item
+synthetic/implicit-content	Field 'thinking': an open with an optional item
+synthetic/no-content-field	Field 'thinking': an open with an optional item
+synthetic/extra-field	Field 'thinking': an open with an optional item
+synthetic/optional-false	Field 'thinking': an open with an optional item
+synthetic/word-boundary-open	Field 'thinking': an open with an anchor or a word boundary
+synthetic/abs-end-tag	Field 'thinking': an open with an optional item
+synthetic/zero-width-open	Field 'thinking': an open with an anchor or a word boundary
+synthetic/transform-extra-key	Field 'thinking': an open with an optional item
+synthetic/json-body	Field 'thinking': an open with an optional item
+synthetic/kv-lines	Field 'thinking': an open with an optional item
+synthetic/unicode-delimiters	Field 'tool_calls': an open with the group "name" reads text of another shape
+behaviour/json-allow-non-json	Field 'x': a field named "x"
+behaviour/json-strict	Field 'x': a field named "x"
+behaviour/int	Field 'n': a field named "n"
+behaviour/int-no-strip	Field 'n': a field named "n"
+behaviour/float	Field 'f': a field named "f"
+behaviour/bool	Field 'b': a field named "b"
+behaviour/kv-lines-args	Field 'kv': a field named "kv"
+behaviour/xml-no-tag-pattern	Field 'x': a field named "x"
+behaviour/xml-no-key-group	Field 'x': a field named "x"
+behaviour/xml-merge-list-value	Field 'x': a field named "x"
+behaviour/xml-nested	Field 'x': a field named "x"
+behaviour/join-non-string	Field 'x': a field named "x"
+behaviour/join-default-list	response_template: a default for "x"
+behaviour/join-default-str	response_template: a default for "x"
+behaviour/repeats-default-str	response_template: a default for "x"
+behaviour/optional-required	Field 'x': a field named "x"
+behaviour/transform-each	Field 'calls': a field named "calls"
+behaviour/transform-scalar	Field 'x': a field named "x"
+behaviour/transform-missing	Field 'x': a field named "x"
+behaviour/transform-unknown-root	Field 'x': a field named "x"
+behaviour/capture-optional-group	Field 'x': a field named "x"
+behaviour/capture-named-content	Field 'x': a field named "x"
+behaviour/no-close-field	Field 'x': a field named "x"
+behaviour/implicit-no-close	Field 'body': a field with no open that is not the content
+behaviour/literal-prefix-overlap	Field 'x': a field named "x"
+behaviour/close-absolute-end	Field 'body': a field with no open that is not the content
+behaviour/close-dollar	Field 'body': a field with no open that is not the content
+behaviour/close-word-boundary	Field 'body': a field with no open that is not the content
+behaviour/greedy-open	Field 'x': a field named "x"
+behaviour/non-string-defaults	response_template: a default for "n"
+behaviour/version-float	Field 'x': a field named "x"
+behaviour/version-bool	Field 'x': a field named "x"
+behaviour/unrepresentable-dropped	Field 'x': a field named "x"
+behaviour/unrepresentable-overwritten	Field 'x': a field named "x"
+behaviour/unrepresentable-key-clash	Field 'x': a field named "x"
+behaviour/key-order-after-split	Field 'n': a field named "n"
+behaviour/string-delims-overlap	Field 'x': a field named "x"
+load/open-list-dedupe	Field 'x': a field named "x"
+load/join-repeats-truthy	Field 'x': a field named "x"
+load/transform-placeholder-only	Field 'x': a field named "x"
+load/optional-string	Field 'x': a field named "x"
+dialect/008	Field 'body': a field with no open that is not the content
+dialect/021	Field 'body': a field with no open that is not the content
+dialect/072	Field 'body': a field with no open that is not the content
+dialect/074	Field 'body': a field with no open that is not the content
+dialect/075	Field 'body': a field with no open that is not the content
+dialect/078	Field 'body': a field with no open that is not the content
+dialect/080	Field 'body': a field with no open that is not the content
+dialect/081	Field 'body': a field with no open that is not the content
+dialect/083	Field 'body': a field with no open that is not the content
+dialect/105	Field 'body': a field with no open that is not the content
+hf-tests/test_field_without_close_runs_to_end_of_stream/1	table
+hf-tests/test_int_content_parser/1	Field 'count': a field named "count"
+hf-tests/test_join_concatenates_repeated_matches/1	Field 'content': join
+hf-tests/test_join_requires_string_matches/1	Field 'x': a field named "x"
+hf-tests/test_kv_lines_parser/1	Field 'metadata': a field named "metadata"
+hf-tests/test_literal_list_defers_prefix_overlapping_literal/1	Field 'x': a field named "x"
+hf-tests/test_literal_list_open_and_close/1	Field 'x': a field named "x"
+hf-tests/test_literal_list_streams_without_64_byte_hold/1	table
+hf-tests/test_optional_false_raises_when_missing/1	Field 'content': optional: false
+hf-tests/test_transform_dotted_path_errors/1	Field 'x': a field named "x"
+hf-tests/test_transform_dotted_path_errors/2	Field 'x': a field named "x"
+hf-tests/test_transform_dotted_path_errors/3	Field 'x': a field named "x"
+hf-tests/test_transform_dotted_paths/1	Field 'tool_calls': a transform of a JSON call other than its function
+hf-tests/test_transform_dotted_paths_with_transform_each/1	Field 'tool_calls': transform_each
+hf-tests/test_history_bleed_is_guarded_by_prefix_not_by_response_anchor/1	table
+hf-tests/test_prefix_with_open_close_inside_truncated_region/1	Field 'body': a field with no open that is not the content
+hf-tests/test_dirty_flag_marks_structured_regions/1	Field 'score': a field named "score"
+hf-tests/test_merge_duplicates_arguments_are_cast_element_wise/1	Field 'tool_calls': an open with the group "name" reads text of another shape
+hf-tests/test_non_tool_call_regions_are_untouched/1	Field 'citation': a field named "citation"
+hf-tests/cohere_template	Field 'tool_calls': transform_each
+hf-tests/ernie_template	Field 'thinking': an open with an anchor or a word boundary
+hf-tests/gemma4_template	response_template: several start anchors
+hf-tests/gpt_oss_template	Field 'tool_calls': an open with the group "name" reads text of another shape
+hf-tests/inkling_template	Field 'thinking': join
+hf-tests/qwen3_template	Field 'tool_calls': an open with the group "name" reads text of another shape
+hf-tests/smollm_template	table
+hf-tests/_XML_STRING_ARGS_TEMPLATE	Field 'tool_calls': an open with the group "name" reads text of another shape
+hf-tests/_KV_LINES_TOOLS_TEMPLATE	Field 'tool_calls': an open with the group "name" reads text of another shape
+random/000	response_template: a start anchor with an optional item
+random/001	response_template: a default for "answer"
+random/002	table
+random/003	Field 'x': a field named "x"
+random/004	Field 'tool_calls': a field with no open that is not the content
+random/005	response_template: a start anchor with an optional item
+random/006	Field 'answer': a field named "answer"
+random/007	response_template: several start anchors
+random/008	response_template: a default for "reasoning_content"
+random/009	response_template: a start anchor with an optional item
+random/010	Field 'x': a field with no open that is not the content
+random/011	response_template: a start anchor with more than literal text
+random/012	response_template: a start anchor with more than literal text
+random/013	Field 'answer': a field with no open that is not the content
+random/014	Field 'reasoning_content': a text field that repeats
+random/015	response_template: a default for "x"
+random/016	response_template: a default for "thinking"
+random/017	response_template: a start anchor with an optional item
+random/018	response_template: several start anchors
+random/019	response_template: a default for "thinking"
+random/020	response_template: a default for "extra"
+random/021	response_template: a start anchor with more than literal text
+random/022	Field 'note': a field with no open that is not the content
+random/023	response_template: several start anchors
+random/024	Field 'reasoning_content': a field with no open that is not the content
+random/025	Field 'answer': a field named "answer"
+random/026	response_template: a default for "extra"
+random/027	Field 'answer': a field with no open that is not the content
+random/028	response_template: several start anchors
+random/029	response_template: several start anchors
+random/030	Field 'answer': a field with no open that is not the content
+random/031	response_template: a start anchor with more than literal text
+random/032	response_template: a start anchor with an optional item
+random/033	response_template: a default for "note"
+random/034	response_template: a start anchor with an optional item
+random/035	Field 'x': a field named "x"
+random/036	response_template: a start anchor with an optional item
+random/037	response_template: a default for "tool_calls"
+random/038	response_template: a default for "note"
+random/039	response_template: a default for "thinking"
+random/040	Field 'note': a field with no open that is not the content
+random/041	response_template: several start anchors
+random/042	Field 'reasoning_content': a field with no open that is not the content
+random/043	response_template: several start anchors
+random/044	Field 'note': a field with no open that is not the content
+random/045	Field 'note': a field with no open that is not the content
+random/046	Field 'thinking': content that is not text
+random/047	response_template: several start anchors
+random/048	response_template: several start anchors
+random/049	response_template: a default for "thinking"
+random/050	response_template: several start anchors
+random/051	response_template: several start anchors
+random/052	Field 'answer': a field named "answer"
+random/053	response_template: a start anchor with an optional item
+random/054	Field 'note': a field with no open that is not the content
+random/055	response_template: a default for "tool_calls"
+random/056	response_template: a default for "thinking"
+random/057	Field 'reasoning_content': a field with no open that is not the content
+random/058	response_template: a default for "extra"
+random/059	Field 'thinking': join
+random/060	Field 'thinking': content that is not text
+random/061	response_template: a start anchor with more than literal text
+random/062	response_template: a start anchor with an optional item
+random/063	response_template: a start anchor with an optional item
+random/064	Field 'tool_calls': a field with no open that is not the content
+random/065	Field 'answer': a field named "answer"
+random/066	Field 'reasoning_content': content that is not text
+random/067	Field 'note': a field named "note"
+random/068	response_template: a default for "note"
+random/069	Field 'tool_calls': tool calls that do not repeat
+random/070	Field 'thinking': content that is not text
+random/071	response_template: a default for "thinking"
+random/072	response_template: several start anchors
+random/073	response_template: a start anchor with more than literal text
+random/074	response_template: a default for "x"
+random/075	response_template: a start anchor with an optional item
+random/076	response_template: a start anchor with more than literal text
+random/077	response_template: a default for "thinking"
+random/078	Field 'thinking': content that is not text
+random/079	response_template: a start anchor with an optional item
+random/080	Field 'answer': a field with no open that is not the content
+random/081	response_template: a default for "answer"
+random/082	Field 'thinking': a field with no open that is not the content
+random/083	Field 'x': a field with no open that is not the content
+random/084	Field 'reasoning_content': a text field that repeats
+random/085	response_template: a start anchor with more than literal text
+random/086	response_template: several start anchors
+random/087	Field 'x': a field named "x"
+random/088	response_template: a start anchor with more than literal text
+random/089	response_template: a default for "content"
+random/090	response_template: a default for "extra"
+random/091	Field 'note': a field with no open that is not the content
+random/092	response_template: a default for "tool_calls"
+random/093	response_template: a default for "note"
+random/094	Field 'answer': a field with no open that is not the content
+random/095	response_template: a start anchor with more than literal text
+random/096	response_template: a start anchor with an optional item
+random/097	response_template: a start anchor with an optional item
+random/098	Field 'answer': a field named "answer"
+random/099	Field 'thinking': a text field that repeats
+synthetic/space-class-name	Field 'thinking': an open with an optional item
+synthetic/lookahead-tag	Field 'thinking': an open with an optional item
+extra/addressed-lookahead	table
+extra/addressed	table

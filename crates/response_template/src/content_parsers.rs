@@ -48,14 +48,14 @@ impl ContentParser {
 #[derive(Debug)]
 pub(crate) struct Content {
     pub(crate) parser: ContentParser,
-    strip: bool,
-    string_delims: Vec<(String, String)>,
-    unquoted_keys: bool,
-    allow_non_json: bool,
+    pub(crate) strip: bool,
+    pub(crate) string_delims: Vec<(String, String)>,
+    pub(crate) unquoted_keys: bool,
+    pub(crate) allow_non_json: bool,
     /// `None`: transformers raises `ValueError` on every close.
-    tag_pattern: Option<Pattern>,
-    value_parser: Option<Box<Content>>,
-    merge_duplicates: bool,
+    pub(crate) tag_pattern: Option<Pattern>,
+    pub(crate) value_parser: Option<Box<Content>>,
+    pub(crate) merge_duplicates: bool,
     line_sep: String,
     kv_sep: String,
 }

@@ -13,18 +13,26 @@ categories = ["parsing", "text-processing"]
 regex-syntax = "0.8"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+smg-symphony = { workspace = true, optional = true }
 thiserror.workspace = true
 
 [dev-dependencies]
+openai-protocol.workspace = true
 sha2 = "0.11"
 
 [features]
 # Glue for smg's reasoning and tool parsers (`adapter` module).
 adapter = []
+# The compiler of a template into a symphony table (`to_symphony` module).
+symphony = ["dep:smg-symphony"]
 
 [[test]]
 name = "adapter"
 required-features = ["adapter"]
+
+[[test]]
+name = "to_symphony"
+required-features = ["symphony"]
 
 [lints]
 workspace = true

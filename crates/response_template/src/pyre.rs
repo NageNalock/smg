@@ -210,7 +210,7 @@ enum Rep {
     LazyStar,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Node {
     One(Set),
     Look(Look),
@@ -321,6 +321,9 @@ pub(crate) enum Role {
 /// A compiled pattern, as `regex.compile(pattern, regex.DOTALL)`.
 #[derive(Debug)]
 pub(crate) struct Pattern {
+    /// The parsed pattern, which [`Pattern::shape`] reads.
+    #[cfg(feature = "symphony")]
+    tree: Node,
     prog: Vec<Inst>,
     /// Named groups: name and group number.
     names: Vec<(String, usize)>,
@@ -340,6 +343,32 @@ pub(crate) struct Pattern {
     /// back could only end where what follows fails at once, as in `\s*<` or
     /// `[^>]+>`, so the repeat gives none back.
     gives_back: Vec<bool>,
+}
+
+/// One item of a pattern's [`Pattern::shape`].
+#[cfg(feature = "symphony")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Atom {
+    /// Literal text.
+    Lit(String),
+    /// `\s*`.
+    Spaces,
+    /// A named group around a repeat.
+    Capture { name: String, body: Body },
+    /// Alternatives, each a sequence.
+    Alt(Vec<Vec<Atom>>),
+    /// `(?=...)`.
+    Ahead(Vec<Atom>),
+}
+
+/// What a named group of a [`Pattern::shape`] reads.
+#[cfg(feature = "symphony")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Body {
+    /// `.*?`.
+    LazyAny,
+    /// `[^...]+` of single characters, and `\s` when `space`.
+    NoneOf { chars: Vec<char>, space: bool },
 }
 
 /// A complete match with its group spans.
@@ -428,6 +457,8 @@ impl Pattern {
             })
             .collect();
         Self {
+            #[cfg(feature = "symphony")]
+            tree: node.clone(),
             prog,
             names,
             optional,
@@ -437,6 +468,77 @@ impl Pattern {
             memos,
             gives_back,
         }
+    }
+
+    /// The pattern as a sequence of [`Atom`]s, or the construct that is none of them. Literal
+    /// characters are joined, and non-capturing groups are opened.
+    #[cfg(feature = "symphony")]
+    pub(crate) fn shape(&self) -> Result<Vec<Atom>, String> {
+        let mut atoms = Vec::new();
+        self.atoms(&self.tree, &mut atoms)?;
+        Ok(atoms)
+    }
+
+    #[cfg(feature = "symphony")]
+    fn atoms(&self, node: &Node, out: &mut Vec<Atom>) -> Result<(), String> {
+        match node {
+            Node::One(Set::Char(c)) => match out.last_mut() {
+                Some(Atom::Lit(text)) => text.push(*c),
+                _ => out.push(Atom::Lit(c.to_string())),
+            },
+            Node::Cat(nodes) => {
+                for node in nodes {
+                    self.atoms(node, out)?;
+                }
+            }
+            Node::Group(None, inner) => self.atoms(inner, out)?,
+            Node::Alt(branches) => {
+                let branches = branches
+                    .iter()
+                    .map(|branch| {
+                        let mut atoms = Vec::new();
+                        self.atoms(branch, &mut atoms).map(|()| atoms)
+                    })
+                    .collect::<Result<_, _>>()?;
+                out.push(Atom::Alt(branches));
+            }
+            Node::Group(Some(group), inner) => {
+                let name = self
+                    .names
+                    .iter()
+                    .find(|(_, g)| g == group)
+                    .map(|(name, _)| name.clone())
+                    .ok_or("an unnamed group")?;
+                let body = match &**inner {
+                    Node::Repeat(Set::Any, Rep::LazyStar) => Body::LazyAny,
+                    Node::Repeat(
+                        Set::Class {
+                            negated: true,
+                            ranges,
+                            word: false,
+                            space,
+                        },
+                        Rep::Plus,
+                    ) if ranges.iter().all(|(lo, hi)| lo == hi) => Body::NoneOf {
+                        chars: ranges.iter().map(|(c, _)| *c).collect(),
+                        space: *space,
+                    },
+                    _ => return Err(format!("the group {name:?} reads text of another shape")),
+                };
+                out.push(Atom::Capture { name, body });
+            }
+            Node::Repeat(Set::Space, Rep::Star) => out.push(Atom::Spaces),
+            Node::Ahead(inner) => {
+                let mut atoms = Vec::new();
+                self.atoms(inner, &mut atoms)?;
+                out.push(Atom::Ahead(atoms));
+            }
+            Node::One(_) | Node::Repeat(..) => return Err("a class or a repeat".into()),
+            Node::Look(_) => return Err("an anchor or a word boundary".into()),
+            Node::Opt(_) => return Err("an optional item".into()),
+            Node::Backref(_) => return Err("a backreference".into()),
+        }
+        Ok(())
     }
 
     /// Whether the pattern can match the empty string.

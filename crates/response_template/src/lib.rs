@@ -22,6 +22,8 @@ mod response_templates;
 #[cfg(test)]
 #[path = "../tests/common/mod.rs"]
 mod test_fixtures;
+#[cfg(feature = "symphony")]
+pub mod to_symphony;
 #[cfg(test)]
 mod unit_tests;
 

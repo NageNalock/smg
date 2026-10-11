@@ -1,0 +1,1 @@
+{"tools-0": [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}, "metric": {"type": "boolean"}, "note": {"type": ["string", "null"]}, "either": {"type": ["integer", "string"]}}}}}]}

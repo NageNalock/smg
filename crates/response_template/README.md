@@ -119,6 +119,40 @@ Where smg's use differs from `transformers serve` by design:
   long whitespace run before an opener, can leave part of its text in the
   region.
 
+## A symphony table from a template
+
+The `symphony` feature adds `to_symphony::compile`, which turns a template into
+a table for smg's symphony parser (`symphony::Format`), so that a model whose
+template is such a table needs no parser of its own. symphony reads output with
+literal markers and runs no regex while it streams, so `compile` accepts a
+template only where every pattern is literal markers around at most one capture
+of the shape a symphony call assembler reads, and refuses the rest with the
+construct named (`to_symphony::Unsupported`):
+
+- the start anchor is one literal, the turn opener;
+- a field is `thinking` or `reasoning_content` (reasoning), `content`, or
+  `tool_calls`, each as text between literal opens and closes, except that a
+  field with no open must be `content`, which is then the text outside the
+  others;
+- `tool_calls` repeats, and is one JSON object between literal markers, the
+  Qwen 3.5 tags in the spelling symphony's tagged assembler reads, or a call
+  addressed to the tool: `RECIPIENT(?P<name>[^\s<]+)HEADER` opens it and
+  `xml-inline` with the tag pattern `K1(?P<key>[^"]+)K2\n(?P<value>.*?)\nV`
+  (or `\n(?:V|(?=K1))`, where the next key's tag also ends a value) reads its
+  arguments.
+
+`stops` names the stop texts the stop decoder hides; a close of the tool calls
+among them closes the open call at the stop. Where the table reads output
+differently from transformers, by design for a stream: text outside every
+field is content; a second region of a field is added to the first; text
+fields keep their edges; whitespace a pattern allows before a marker stays
+where the model wrote it; a key written twice keeps its first value; with no
+tools declared, a value is read as the JSON its text is; text the prompt wrote
+after the turn opener is the prompt's; and the close of the field with no open
+adds no row, so one that is no stop text stays content. `tests/to_symphony.rs`
+checks each against transformers' recordings and pins every recorded
+template's outcome in `tests/to_symphony.tsv`.
+
 ## Regular expressions
 
 transformers compiles patterns with the `regex` module, and streaming depends on

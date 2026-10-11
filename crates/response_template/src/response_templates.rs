@@ -41,7 +41,7 @@ pub(crate) struct Template {
     pub(crate) defaults: Map<String, Value>,
     pub(crate) fields: Vec<ResponseTemplateField>,
     pub(crate) implicit: Option<usize>,
-    start_anchor: Pattern,
+    pub(crate) start_anchor: Pattern,
 }
 
 /// transformers: `ResponseTemplate`, a loaded template. Cheap to clone.
