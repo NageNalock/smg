@@ -35,6 +35,11 @@
 //!   no bytes. One cut for length, aborted, or ended with any finish but `Stop` is cut as before;
 //!   a driver hands a stop sequence of the request's that matched inside the call over as such a
 //!   finish, so that it never completes the call (the stop row in [`crate::format`]).
+//! - A table can say that the template writes only markers in a state ([`Format::marker_only`]):
+//!   at any end but `Stop`, the bytes the scanner held there as the start of a terminal are
+//!   `Dropped { Wrapper }`, a marker the end cut short, where they would otherwise be the state's
+//!   text (content, or `Malformed` wrapping). At `Stop`, and in every other state, they are the
+//!   state's text as before.
 //! - With the tagged syntax, a value's type comes from the request's tools ([`Declared`]): a
 //!   declared string streams, every other value is written at its close. A call to a function the
 //!   request did not declare has every value inferred.
@@ -539,13 +544,22 @@ impl Engine {
         // (`<|close|>message` with no `<|sep|>` after it), which the model cannot have written as
         // text and which is dropped as the whole tag would have been. Inside a call the
         // assembler still holds the call's bytes, which came before the tail: the call ends
-        // first, so every byte leaves in order.
+        // first, so every byte leaves in order. Where the table says the template writes only
+        // markers, an end the model did not choose cut the marker it was writing short, so the
+        // held tail is dropped there at any end but `Stop`, whatever it begins with.
+        let cut = !matches!(finish, EngineFinish::Stop);
         for piece in scanner.finish() {
             match piece {
                 Piece::Text(text) if self.format.is_cut_tag(self.state, &text) => {
                     if self.emits() == Emits::Arguments {
                         self.close_call(Closed::ByEnd, "", out);
                     }
+                    out.push(Event::Dropped {
+                        text: self.tokens.text(&text),
+                        why: DropReason::Wrapper,
+                    });
+                }
+                Piece::Text(text) if cut && self.format.holds_only_markers(self.state) => {
                     out.push(Event::Dropped {
                         text: self.tokens.text(&text),
                         why: DropReason::Wrapper,
@@ -848,6 +862,130 @@ mod tests {
                     Some(String::new())
                 )]
             );
+        }
+    }
+
+    /// Harmony's channels around the synthetic table's calls: a header, a thought, an answer, the
+    /// space between messages, and the calls; the header and the space between messages hold
+    /// only markers when `marked`.
+    fn channels(marked: bool) -> Format {
+        let format = Format::new("channels")
+            .terminal("start", "<|start|>assistant")
+            .terminal("analysis", "<|channel|>analysis<|message|>")
+            .terminal("final", "<|channel|>final<|message|>")
+            .terminal("recipient", " to=")
+            .terminal("end", "<|end|>")
+            .terminal("call", "<|call|>")
+            .state("header", Emits::Wrapper)
+            .state("reasoning", Emits::Reasoning)
+            .state("content", Emits::Content)
+            .state("between", Emits::Wrapper)
+            .state("calls", Emits::Arguments)
+            .transition("header", "analysis", "reasoning")
+            .transition("header", "final", "content")
+            .transition("header", "recipient", "calls")
+            .transition("reasoning", "end", "between")
+            .transition("content", "end", "between")
+            .transition("calls", "end", "between")
+            .transition("calls", "call", "between")
+            .transition("between", "start", "header")
+            .calls(CallSyntax::Addressed(Spelling {
+                header_close: "<|channel|>commentary<|message|>",
+                key_open: "<parameter name=\"",
+                key_close: "\">",
+                value_close: "</parameter>",
+                next_key_closes: false,
+            }));
+        if marked {
+            format.marker_only("header").marker_only("between")
+        } else {
+            format
+        }
+    }
+
+    /// The text of the events of one kind: content, reasoning, dropped and malformed.
+    fn kinds(events: &[Event]) -> [String; 4] {
+        let mut kinds: [String; 4] = Default::default();
+        for event in events {
+            let (kind, text) = match event {
+                Event::Content(text) => (0, text),
+                Event::Reasoning(text) => (1, text),
+                Event::Dropped { text, .. } => (2, text),
+                Event::Malformed { text, .. } => (3, text),
+                _ => continue,
+            };
+            kinds[kind].push_str(&text.text);
+        }
+        kinds
+    }
+
+    #[test]
+    fn a_marker_the_end_cut_short_where_the_template_writes_only_markers_is_dropped() {
+        // The header of a message and the space between two: the model was writing a marker
+        // when the stream was cut, and none of it reaches the client. Had the model stopped
+        // there, the bytes would be its own, read as the state reads text.
+        for (output, held, thought) in [
+            ("<|chan", "<|chan", ""),
+            (
+                "<|channel|>analysis<|message|>Plan.<|end|><|start|>assistant<|chan",
+                "<|chan",
+                "Plan.",
+            ),
+            (
+                "<|channel|>analysis<|message|>Plan.<|end|><|start|>assis",
+                "<|start|>assis",
+                "Plan.",
+            ),
+            (
+                "<|channel|>analysis<|message|>Plan.<|end|><|start|>assistant to",
+                " to",
+                "Plan.",
+            ),
+        ] {
+            for finish in [
+                EngineFinish::Length,
+                EngineFinish::Abort,
+                EngineFinish::Other("stop_sequence".to_string()),
+            ] {
+                let events = run(channels(true), output, finish.clone());
+                let [content, reasoning, dropped, malformed] = kinds(&events);
+                assert_eq!(content, "", "{output:?} {finish:?}");
+                assert_eq!(reasoning, thought, "{output:?} {finish:?}");
+                assert!(
+                    dropped.ends_with(held),
+                    "{output:?} {finish:?}: {dropped:?}"
+                );
+                assert_eq!(malformed, "", "{output:?} {finish:?}");
+                assert_eq!(bytes(&events), output);
+                // Without the row the held bytes are the wrapping's text, as before.
+                let [_, _, _, malformed] = kinds(&run(channels(false), output, finish.clone()));
+                assert_eq!(malformed, held.trim(), "{output:?} {finish:?}");
+            }
+            let [_, _, _, malformed] = kinds(&run(channels(true), output, EngineFinish::Stop));
+            assert_eq!(malformed, held.trim(), "{output:?} at stop");
+        }
+    }
+
+    #[test]
+    fn a_marker_cut_short_in_an_answer_or_a_thought_stays_their_text() {
+        for (output, expected) in [
+            (
+                "<|channel|>analysis<|message|><|end|><|start|>assistant<|channel|>final\
+                 <|message|>Hi.<|en",
+                ["Hi.<|en", ""],
+            ),
+            ("<|channel|>analysis<|message|>Plan <|en", ["", "Plan <|en"]),
+        ] {
+            for finish in [
+                EngineFinish::Length,
+                EngineFinish::Abort,
+                EngineFinish::Stop,
+            ] {
+                let [content, reasoning, _, malformed] =
+                    kinds(&run(channels(true), output, finish.clone()));
+                assert_eq!([content, reasoning], expected, "{output:?} {finish:?}");
+                assert_eq!(malformed, "", "{output:?} {finish:?}");
+            }
         }
     }
 

@@ -31,6 +31,14 @@
 //!   knows a stop sequence ended the stream hands the end over as another finish
 //!   (`EngineFinish::Other`), and the call stays cut, since a stop sequence never completes a
 //!   call.
+//! - A **marker-only row** names a content or wrapper state where the template writes nothing
+//!   but markers: a message's header, or the space between two messages. Bytes the scanner still
+//!   held there as the start of a terminal when the stream ended are a marker the end cut short,
+//!   unless the model stopped: at any end but `Stop` (a cut for length, an abort, any other
+//!   finish, such as a stop sequence a driver hands over as one) they are `Dropped { Wrapper }`,
+//!   so no part of the marker reaches the client; at `Stop` the model ended its output on them,
+//!   and they are read as the state reads text. Bytes the scanner released before the end, and
+//!   every state without the row, keep their reading.
 //!
 //! The first state in the table is where an output starts, unless the prompt moved the engine
 //! before the output began: the engine replays the prompt's terminals over the same table, from
@@ -142,6 +150,8 @@ pub struct Format {
     structural_tokens: Vec<String>,
     /// The arguments states whose call the stream's stop closes.
     stop_closes: Vec<usize>,
+    /// The states where the template writes only markers.
+    marker_only: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -187,6 +197,7 @@ impl Format {
             turn_opener: None,
             structural_tokens: Vec::new(),
             stop_closes: Vec::new(),
+            marker_only: Vec::new(),
         }
     }
 
@@ -265,6 +276,17 @@ impl Format {
     pub fn closes_at_stop(mut self, state: &str) -> Self {
         let state = self.state_named(state);
         self.stop_closes.push(state);
+        self
+    }
+
+    /// The template writes only markers in state `state`, a content or wrapper state: bytes the
+    /// stream's end leaves held there as the start of a terminal are `Dropped { Wrapper }` at any
+    /// end but `Stop` (see the marker-only row in [`crate::format`]). The state must already be in
+    /// the table.
+    #[must_use]
+    pub fn marker_only(mut self, state: &str) -> Self {
+        let state = self.state_named(state);
+        self.marker_only.push(state);
         self
     }
 
@@ -365,12 +387,18 @@ impl Format {
         self.stop_closes.contains(&index)
     }
 
+    /// Whether the template writes only markers in state `index`.
+    pub(crate) fn holds_only_markers(&self, index: usize) -> bool {
+        self.marker_only.contains(&index)
+    }
+
     /// What every table must hold before an engine runs it: a state to start in, which does not
     /// emit reasoning (a thought the output starts inside is entered by the prompt's replay, which
     /// pushes `ReasoningStart`; an arguments state at the start has its call opened by the
     /// engine), a call syntax when a state emits arguments, a text for every terminal, a turn
-    /// opener that is not empty, and a stop row only for an arguments state. The builder keeps a
-    /// row from naming what the table lacks; this checks the rest.
+    /// opener that is not empty, a stop row only for an arguments state, and a marker-only row
+    /// only for a state that holds content or wrapping. The builder keeps a row from naming what
+    /// the table lacks; this checks the rest.
     pub fn validate(&self) -> Result<(), String> {
         let Some(first) = self.states.first() else {
             return Err(format!("format {}: a table with no state", self.name));
@@ -415,6 +443,17 @@ impl Format {
             return Err(format!(
                 "format {}: a stop closes state {:?}, which holds no call",
                 self.name, state.name
+            ));
+        }
+        if let Some(state) = self
+            .marker_only
+            .iter()
+            .map(|&index| &self.states[index])
+            .find(|state| matches!(state.emits, Emits::Reasoning | Emits::Arguments))
+        {
+            return Err(format!(
+                "format {}: state {:?} holds only markers, but it emits {:?}",
+                self.name, state.name, state.emits
             ));
         }
         Ok(())
@@ -507,6 +546,45 @@ mod tests {
     #[should_panic(expected = "format t: no state named \"call\"")]
     fn a_stop_row_for_a_state_the_table_lacks_is_a_programming_error() {
         let _ = two_states().closes_at_stop("call");
+    }
+
+    #[test]
+    fn a_marker_only_row_names_a_state_of_content_or_wrapping() {
+        let format = Format::new("markers")
+            .terminal("open", "<call>")
+            .state("header", Emits::Wrapper)
+            .state("content", Emits::Content)
+            .state("thought", Emits::Reasoning)
+            .state("call", Emits::Arguments)
+            .transition("header", "open", "call")
+            .calls(CallSyntax::Json)
+            .marker_only("header")
+            .marker_only("content");
+        assert!(format.holds_only_markers(0));
+        assert!(format.holds_only_markers(1));
+        assert!(!format.holds_only_markers(2));
+        assert!(!format.holds_only_markers(3));
+        assert!(format.validate().is_ok());
+        assert_eq!(
+            format.clone().marker_only("thought").validate(),
+            Err(
+                "format markers: state \"thought\" holds only markers, but it emits Reasoning"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            format.marker_only("call").validate(),
+            Err(
+                "format markers: state \"call\" holds only markers, but it emits Arguments"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "format t: no state named \"header\"")]
+    fn a_marker_only_row_for_a_state_the_table_lacks_is_a_programming_error() {
+        let _ = two_states().marker_only("header");
     }
 
     #[test]

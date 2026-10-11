@@ -240,6 +240,18 @@ fn addressed_closed_at_stop() -> Box<dyn Parser> {
     ))
 }
 
+/// The table closed at stop, with the header of a message and the space between two marked as
+/// holding only markers.
+fn addressed_marker_only() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        addressed_table()
+            .closes_at_stop("calls")
+            .marker_only("header")
+            .marker_only("between"),
+        keyed_tools(),
+    ))
+}
+
 const FORMATS: &[Subject] = &[
     Subject {
         name: "qwen3",
@@ -947,6 +959,84 @@ fn calls_are_numbered_from_zero_in_order_with_ids_that_follow_the_index() {
         for (position, (index, id, _)) in Said::of(&events).calls.iter().enumerate() {
             assert_eq!(*index as usize, position, "{}: {text:?}", subject.name);
             assert_eq!(id, &format!("call_{index}"), "{}: {text:?}", subject.name);
+        }
+    }
+}
+
+/// Outputs the end stops inside a marker: in a message's header, at the output's start and after
+/// a call, and between two messages; and, for the states that read text, in an answer and in a
+/// thought.
+const MARKER_CUTS: &[&str] = &[
+    "<|chan",
+    "<|channel|>analy",
+    "<|channel|>analysis<|message|>Plan.<|end|><|start|>assistant<|channel|>",
+    "<|channel|>analysis<|message|>Plan.<|end|><|start|>assis",
+    "<|channel|>analysis<|message|>Plan.<|end|><|start|>assistant to",
+    "<|channel|>analysis<|message|>Plan.<|end|><|start|>assistant<|channel|>final<|message|>\
+     Hi.<|end|><|start|>assis",
+    "<|channel|>analysis<|message|><|end|><|start|>assistant to=get_weather\
+     <|channel|>commentary<|message|><parameter name=\"city\">\nParis\n</parameter><|end|>\
+     <|start|>assistant<|channel|>",
+    "<|channel|>analysis<|message|><|end|><|start|>assistant<|channel|>final<|message|>Hi.<|en",
+    "<|channel|>analysis<|message|>Plan <|en",
+];
+
+#[test]
+fn a_marker_cut_short_where_the_template_writes_only_markers_is_dropped_at_any_end_but_stop() {
+    let marked = Subject {
+        name: "addressed, marker-only header and between",
+        new: addressed_marker_only,
+        outputs: MARKER_CUTS,
+    };
+    let plain = Subject {
+        name: "addressed, closed at stop",
+        new: addressed_closed_at_stop,
+        outputs: MARKER_CUTS,
+    };
+    for text in MARKER_CUTS {
+        for finish in [
+            EngineFinish::Length,
+            EngineFinish::Abort,
+            EngineFinish::Other("stop_sequence".to_string()),
+            EngineFinish::Stop,
+        ] {
+            let place = format!("{text:?} {finish:?}");
+            let replay_with = |subject: &Subject, cuts: &[usize]| {
+                common::replay(&mut *(subject.new)(), text, cuts, &finish, false)
+                    .unwrap_or_else(|e| panic!("{place}: {e}"))
+            };
+            let whole = replay_with(&marked, &[]);
+            let said = Said::of(&whole);
+            // Every chunking, every two-way split among them, says the same, every byte lands in
+            // one event, and the stream is well formed.
+            for (_, cuts) in chunkings(text, usize::MAX) {
+                let events = replay_with(&marked, &cuts);
+                let conserved: String = events.iter().map(bytes_of).collect();
+                assert_eq!(conserved, *text, "{place} cut at {cuts:?}");
+                assert_eq!(Said::of(&events), said, "{place} cut at {cuts:?}");
+                check_well_formed(marked.name, text, &cuts, &events);
+            }
+            // Beside the same table without the rows: what the client reads is the same, and
+            // only the held start of a marker in the header or between two messages moves, from
+            // the wrapping's malformed text to the dropped, at any end but `Stop`.
+            let without = Said::of(&replay_with(&plain, &[]));
+            if finish == EngineFinish::Stop {
+                assert_eq!(said, without, "{place}");
+                continue;
+            }
+            assert!(said.malformed.is_empty(), "{place}: {:?}", said.malformed);
+            assert_eq!(
+                (&said.content, &said.reasoning, &said.calls, &said.arguments),
+                (
+                    &without.content,
+                    &without.reasoning,
+                    &without.calls,
+                    &without.arguments
+                ),
+                "{place}"
+            );
+            assert_eq!(said.ended, without.ended, "{place}");
+            assert_eq!(said.finish, without.finish, "{place}");
         }
     }
 }
