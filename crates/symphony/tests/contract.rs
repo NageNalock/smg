@@ -26,6 +26,8 @@
 
 mod common;
 
+use std::borrow::Cow;
+
 use common::{bytes_of, chunkings, delta, prompt};
 use openai_protocol::common::{Function, Tool};
 use serde_json::json as value;
@@ -176,10 +178,10 @@ fn plain() -> Box<dyn Parser> {
 /// The synthetic table's spelling: the commentary channel closes the header, and the arguments
 /// are named parameter tags.
 const ADDRESSED_SPELLING: addressed::Spelling = addressed::Spelling {
-    header_close: "<|channel|>commentary<|message|>",
-    key_open: "<parameter name=\"",
-    key_close: "\">",
-    value_close: "</parameter>",
+    header_close: Cow::Borrowed("<|channel|>commentary<|message|>"),
+    key_open: Cow::Borrowed("<parameter name=\""),
+    key_close: Cow::Borrowed("\">"),
+    value_close: Cow::Borrowed("</parameter>"),
     next_key_closes: false,
 };
 
@@ -226,6 +228,22 @@ fn addressed_next_key_closes() -> Box<dyn Parser> {
         addressed_table_spelled(addressed::Spelling {
             next_key_closes: true,
             ..ADDRESSED_SPELLING
+        }),
+        keyed_tools(),
+    ))
+}
+
+/// The same table where the next key closes a value, with every tag of the spelling built at run
+/// time, as a table read from a model's own files is.
+fn addressed_spelled_at_run_time() -> Box<dyn Parser> {
+    let owned = |tag: &str| Cow::Owned(tag.to_string());
+    Box::new(Engine::new(
+        addressed_table_spelled(addressed::Spelling {
+            header_close: owned(&ADDRESSED_SPELLING.header_close),
+            key_open: owned(&ADDRESSED_SPELLING.key_open),
+            key_close: owned(&ADDRESSED_SPELLING.key_close),
+            value_close: owned(&ADDRESSED_SPELLING.value_close),
+            next_key_closes: true,
         }),
         keyed_tools(),
     ))
@@ -336,6 +354,11 @@ const FORMATS: &[Subject] = &[
     Subject {
         name: "addressed, the next key closes a value",
         new: addressed_next_key_closes,
+        outputs: ADDRESSED_OUTPUTS,
+    },
+    Subject {
+        name: "addressed, spelled at run time",
+        new: addressed_spelled_at_run_time,
         outputs: ADDRESSED_OUTPUTS,
     },
     Subject {

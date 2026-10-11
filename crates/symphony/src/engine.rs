@@ -461,7 +461,7 @@ impl Engine {
     /// The next call takes the next free index; the index is spent only when a call starts, so a
     /// `<tool_call>` block that held no call does not count and does not leave a gap.
     fn open_call(&mut self) {
-        self.call = Some(Call::new(self.format.call_syntax().copied(), self.calls));
+        self.call = Some(Call::new(self.format.call_syntax().cloned(), self.calls));
     }
 
     /// Ends the call region: the assembler closes what arrived, and the result says whether it took
@@ -641,6 +641,8 @@ impl Parser for Engine {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use openai_protocol::common::{Function, Tool};
     use serde_json::json as value;
 
@@ -679,10 +681,10 @@ mod tests {
             .transition("calls", "call", "between")
             .transition("between", "start", "header")
             .calls(CallSyntax::Addressed(Spelling {
-                header_close: "<|channel|>commentary<|message|>",
-                key_open: "<parameter name=\"",
-                key_close: "\">",
-                value_close: "</parameter>",
+                header_close: Cow::Borrowed("<|channel|>commentary<|message|>"),
+                key_open: Cow::Borrowed("<parameter name=\""),
+                key_close: Cow::Borrowed("\">"),
+                value_close: Cow::Borrowed("</parameter>"),
                 next_key_closes: false,
             }))
     }
@@ -890,10 +892,10 @@ mod tests {
             .transition("calls", "call", "between")
             .transition("between", "start", "header")
             .calls(CallSyntax::Addressed(Spelling {
-                header_close: "<|channel|>commentary<|message|>",
-                key_open: "<parameter name=\"",
-                key_close: "\">",
-                value_close: "</parameter>",
+                header_close: Cow::Borrowed("<|channel|>commentary<|message|>"),
+                key_open: Cow::Borrowed("<parameter name=\""),
+                key_close: Cow::Borrowed("\">"),
+                value_close: Cow::Borrowed("</parameter>"),
                 next_key_closes: false,
             }));
         if marked {

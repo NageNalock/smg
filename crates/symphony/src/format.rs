@@ -58,7 +58,7 @@ use crate::{
 };
 
 /// How the model writes a call between the call markers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CallSyntax {
     /// One JSON object, `{"name": …, "arguments": {…}}`: Qwen3.
     Json,
@@ -378,7 +378,7 @@ impl Format {
     }
 
     /// The call syntax, for a format with an arguments state.
-    pub(crate) fn call_syntax(&self) -> Option<&CallSyntax> {
+    pub fn call_syntax(&self) -> Option<&CallSyntax> {
         self.calls.as_ref()
     }
 

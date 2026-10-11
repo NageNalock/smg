@@ -86,6 +86,8 @@
 //!   newline after a value's closing tag or before a key's opening one) is the template's: it
 //!   goes into the tag's event, or is `Dropped { Wrapper }` before a report that follows a tag.
 
+use std::borrow::Cow;
+
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
     markers::{Piece, Scanner},
@@ -110,18 +112,19 @@ const WITHOUT_A_CALL: &str = "a call message that named no call";
 const REPEATED_KEY: &str = "a parameter whose key the call already has";
 
 /// How a family spells an addressed call: what closes the header after the name, and the three
-/// tags around a parameter.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// tags around a parameter. A family written in the crate borrows its tags; a table built at run
+/// time, from a model's own files, owns them.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Spelling {
     /// What follows the name and closes the message's header: `<|channel|>commentary<|message|>`
     /// in the example above.
-    pub header_close: &'static str,
+    pub header_close: Cow<'static, str>,
     /// What opens a parameter's key: `<parameter name="`.
-    pub key_open: &'static str,
+    pub key_open: Cow<'static, str>,
     /// What closes the key and opens the value: `">`.
-    pub key_close: &'static str,
+    pub key_close: Cow<'static, str>,
     /// What closes the value: `</parameter>`.
-    pub value_close: &'static str,
+    pub value_close: Cow<'static, str>,
     /// Whether a newline and then [`Self::key_open`] close a value as a newline and
     /// [`Self::value_close`] do: a parameter the model left unclosed ends where the next one
     /// opens. Otherwise the key's opening tag inside a value is the value's text.
@@ -129,13 +132,15 @@ pub struct Spelling {
 }
 
 impl Spelling {
-    fn text(&self, tag: usize) -> &'static str {
+    /// The tag's text: free for borrowed tags, a copy of a few bytes for owned ones.
+    fn text(&self, tag: usize) -> Cow<'static, str> {
         [
-            self.header_close,
-            self.key_open,
-            self.key_close,
-            self.value_close,
+            &self.header_close,
+            &self.key_open,
+            &self.key_close,
+            &self.value_close,
         ][tag]
+            .clone()
     }
 }
 
@@ -208,10 +213,10 @@ impl Assembler {
             index,
             id: id.into(),
             scanner: Scanner::new([
-                spelling.header_close,
-                spelling.key_open,
-                spelling.key_close,
-                spelling.value_close,
+                &*spelling.header_close,
+                &spelling.key_open,
+                &spelling.key_close,
+                &spelling.value_close,
             ]),
             spelling,
             carried: String::new(),
@@ -351,7 +356,7 @@ impl Assembler {
     fn tag(&mut self, tag: usize, declared: &Declared, out: &mut Events) {
         let bytes = self.spelling.text(tag);
         match &self.stage {
-            Stage::Name if tag == HEADER_CLOSE => self.name_call(bytes, out),
+            Stage::Name if tag == HEADER_CLOSE => self.name_call(&bytes, out),
             Stage::Name => {
                 // A parameter tag before the header closed: the header is reported, no call
                 // starts, and the tag is read as between keys.
@@ -363,7 +368,7 @@ impl Assembler {
             Stage::Key { start } if tag == KEY_CLOSE => {
                 let start = *start;
                 let key = self.carried[start..].to_string();
-                self.carried.push_str(bytes);
+                self.carried.push_str(&bytes);
                 if key.is_empty() {
                     self.report(EMPTY_KEY, out);
                     self.stage = Stage::Between;
@@ -382,7 +387,7 @@ impl Assembler {
                 self.stage = Stage::Between;
                 self.tag_between(tag, out);
             }
-            Stage::Value(_) if tag == VALUE_CLOSE => self.close_value(bytes, out),
+            Stage::Value(_) if tag == VALUE_CLOSE => self.close_value(&bytes, out),
             // The next key closes the value where the spelling says so, after a newline that may
             // be the template's; the key's tag then opens the next parameter.
             Stage::Value(_) if tag == KEY_OPEN && self.closed_by_next_key() => {
@@ -390,7 +395,7 @@ impl Assembler {
                 self.tag_between(tag, out);
             }
             // Inside a value, the other tags are the value's text.
-            Stage::Value(_) => self.value_text(bytes, out),
+            Stage::Value(_) => self.value_text(&bytes, out),
         }
     }
 
@@ -453,13 +458,13 @@ impl Assembler {
     fn tag_between(&mut self, tag: usize, out: &mut Events) {
         let bytes = self.spelling.text(tag);
         if tag == KEY_OPEN && self.started() {
-            self.carried.push_str(bytes);
+            self.carried.push_str(&bytes);
             self.malformed = false;
             self.stage = Stage::Key {
                 start: self.carried.len(),
             };
         } else {
-            self.report_text(bytes, TAG_OUT_OF_PLACE, out);
+            self.report_text(&bytes, TAG_OUT_OF_PLACE, out);
         }
     }
 
@@ -778,10 +783,10 @@ mod tests {
     /// A synthetic spelling: Harmony's commentary channel closes the header, and each parameter
     /// is a named tag.
     const SPELLING: Spelling = Spelling {
-        header_close: "<|channel|>commentary<|message|>",
-        key_open: "<parameter name=\"",
-        key_close: "\">",
-        value_close: "</parameter>",
+        header_close: Cow::Borrowed("<|channel|>commentary<|message|>"),
+        key_open: Cow::Borrowed("<parameter name=\""),
+        key_close: Cow::Borrowed("\">"),
+        value_close: Cow::Borrowed("</parameter>"),
         next_key_closes: false,
     };
     /// The same spelling where the next key closes a value the model left unclosed.
@@ -1199,23 +1204,55 @@ mod tests {
 
     /// `call` whole and split in two at every character boundary.
     fn every_split(call: &str, cut: bool) -> Vec<Vec<Event>> {
-        every_split_spelled(SPELLING, call, cut)
+        every_split_spelled(&SPELLING, call, cut)
     }
 
     /// [`every_split`] in `spelling`, character by character too.
-    fn every_split_spelled(spelling: Spelling, call: &str, cut: bool) -> Vec<Vec<Event>> {
+    fn every_split_spelled(spelling: &Spelling, call: &str, cut: bool) -> Vec<Vec<Event>> {
         let characters: Vec<&str> = call
             .char_indices()
             .map(|(at, c)| &call[at..at + c.len_utf8()])
             .collect();
-        std::iter::once(run_spelled(spelling, &[call], cut))
+        std::iter::once(run_spelled(spelling.clone(), &[call], cut))
             .chain(
                 (1..call.len())
                     .filter(|at| call.is_char_boundary(*at))
-                    .map(|at| run_spelled(spelling, &[&call[..at], &call[at..]], cut)),
+                    .map(|at| run_spelled(spelling.clone(), &[&call[..at], &call[at..]], cut)),
             )
-            .chain(std::iter::once(run_spelled(spelling, &characters, cut)))
+            .chain(std::iter::once(run_spelled(
+                spelling.clone(),
+                &characters,
+                cut,
+            )))
             .collect()
+    }
+
+    /// A spelling whose tags were built at run time reads every call as the same spelling written
+    /// in the crate does, however the call is split.
+    #[test]
+    fn a_spelling_built_at_run_time_reads_as_the_written_one() {
+        let owned = |tag: &str| Cow::Owned(tag.to_string());
+        let built = Spelling {
+            header_close: owned(&NEXT_KEY_CLOSES.header_close),
+            key_open: owned(&NEXT_KEY_CLOSES.key_open),
+            key_close: owned(&NEXT_KEY_CLOSES.key_close),
+            value_close: owned(&NEXT_KEY_CLOSES.value_close),
+            next_key_closes: true,
+        };
+        assert_eq!(built, NEXT_KEY_CLOSES);
+        for call in [
+            "get_weather<|channel|>commentary<|message|><parameter name=\"city\">\nParis\n</parameter>\n<parameter name=\"days\">\n3\n</parameter>",
+            "get_weather<|channel|>commentary<|message|><parameter name=\"city\">\nParis\n<parameter name=\"days\">\n3",
+            "get_weather<|channel|>commentary<|message|><parameter name=\"\">\nx\n</parameter>",
+        ] {
+            for cut in [false, true] {
+                assert_eq!(
+                    every_split_spelled(&built, call, cut),
+                    every_split_spelled(&NEXT_KEY_CLOSES, call, cut),
+                    "{call:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1339,7 +1376,7 @@ mod tests {
             ),
         ] {
             let call = format!("{HEADER}{body}");
-            for events in every_split_spelled(NEXT_KEY_CLOSES, &call, false) {
+            for events in every_split_spelled(&NEXT_KEY_CLOSES, &call, false) {
                 assert_eq!(arguments(&events), expected, "{body:?}");
                 assert!(malformed(&events).is_empty(), "{body:?}");
                 assert_eq!(bytes(&events), format!("{call}{END}"), "{body:?}");
@@ -1359,7 +1396,7 @@ mod tests {
             ),
         ] {
             let call = format!("{HEADER}{body}");
-            for events in every_split_spelled(NEXT_KEY_CLOSES, &call, false) {
+            for events in every_split_spelled(&NEXT_KEY_CLOSES, &call, false) {
                 assert_eq!(arguments(&events), expected, "{body:?}");
                 assert_eq!(bytes(&events), format!("{call}{END}"), "{body:?}");
             }
@@ -1370,7 +1407,7 @@ mod tests {
             "{HEADER}<parameter name=\"city\">\nParis\n</parameter>\n<parameter name=\"city\">\n\
              Rome\n<parameter name=\"days\">\n2\n</parameter>"
         );
-        for events in every_split_spelled(NEXT_KEY_CLOSES, &call, false) {
+        for events in every_split_spelled(&NEXT_KEY_CLOSES, &call, false) {
             assert_eq!(arguments(&events), r#"{"city": "Paris", "days": 2}"#);
             assert_eq!(
                 malformed(&events),
@@ -1391,7 +1428,7 @@ mod tests {
             ),
         ] {
             let call = format!("{HEADER}{body}");
-            for events in every_split_spelled(NEXT_KEY_CLOSES, &call, true) {
+            for events in every_split_spelled(&NEXT_KEY_CLOSES, &call, true) {
                 assert_eq!(arguments(&events), expected, "{body:?}");
                 let (shown, _) = shown_and_hidden(&events);
                 assert!(shown.is_empty(), "{body:?}: {shown:?}");
@@ -1402,7 +1439,7 @@ mod tests {
         // Without a newline of the value's before it, the start of a key's tag at the end is the
         // value's text, as the whole tag would be.
         let call = format!("{HEADER}<parameter name=\"city\">\nParis<parameter na");
-        for events in every_split_spelled(NEXT_KEY_CLOSES, &call, false) {
+        for events in every_split_spelled(&NEXT_KEY_CLOSES, &call, false) {
             assert_eq!(arguments(&events), r#"{"city": "Paris<parameter na"}"#);
         }
         // Without the spelling's say, the next key's tag is the value's text, as before.

@@ -668,6 +668,8 @@ impl Format {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use openai_protocol::common::Function;
     use serde_json::json as value;
 
@@ -1254,10 +1256,10 @@ mod tests {
             .transition("calls", "call", "between")
             .transition("between", "start", "header")
             .calls(CallSyntax::Addressed(addressed::Spelling {
-                header_close: "<|channel|>commentary<|message|>",
-                key_open: "<parameter name=\"",
-                key_close: "\">",
-                value_close: "</parameter>",
+                header_close: Cow::Borrowed("<|channel|>commentary<|message|>"),
+                key_open: Cow::Borrowed("<parameter name=\""),
+                key_close: Cow::Borrowed("\">"),
+                value_close: Cow::Borrowed("</parameter>"),
                 next_key_closes: false,
             }));
         for format in [formats::plain(), addressed] {
