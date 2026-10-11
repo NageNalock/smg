@@ -14,12 +14,12 @@ use anyhow::Context;
 use llm_multimodal::{
     configure_parallelism, registry::modality_limit_override, vision::PreProcessorConfig,
     FrameSampling, MediaConnector, MediaConnectorConfig, MediaConnectorError, MediaContentPart,
-    Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism, VisionProcessorRegistry,
-    POOL_THREADS_ENV,
+    MediaFault, Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism,
+    VisionProcessorRegistry, POOL_THREADS_ENV,
 };
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
-use smg_grpc_client::vllm_proto as vllm;
+use smg_grpc_client::{vllm_proto as vllm, WorkerMediaFault};
 use tracing::warn;
 
 use super::{
@@ -81,7 +81,10 @@ pub struct WorkerMediaSettings {
     /// capped by the connector's own limits.
     pub max_item_bytes: Option<usize>,
     pub allowed_domains: Option<Vec<String>>,
+    /// Budget for one image or audio fetch by URL, connect to last byte.
     pub fetch_timeout: Duration,
+    /// Budget for one video fetch by URL, connect to last byte.
+    pub video_fetch_timeout: Duration,
     /// The engine's own video frame budget: its `--media-io-kwargs`
     /// `video.num_frames` when set (`0` for every frame), else its loader's
     /// default; `None` when unknown. A spec that samples the way the engine's
@@ -260,11 +263,19 @@ pub enum WorkerMediaError {
     /// media than the model takes.
     #[error("{0}")]
     Invalid(String),
-    /// Not this worker's fault right now: a fetch that timed out or could not
-    /// connect.
-    #[error("{0}")]
-    Unavailable(String),
-    /// A pipeline failure.
+    /// The media the request names failed, by whose fault (see
+    /// [`WorkerMediaFault`]): the request's own (a host that cannot be
+    /// resolved or refuses the connection, its 4xx, a payload that is not the
+    /// media it claims to be) or its host's for now (a fetch that ran out of
+    /// its budget, a 5xx, a broken transfer). Neither is this worker's.
+    #[error("{message}")]
+    Media {
+        fault: WorkerMediaFault,
+        message: String,
+    },
+    /// This worker's own: a pipeline failure, a decode task that died, a
+    /// scratch file or decoder process that failed on this side (see
+    /// [`MediaFault::Internal`]).
     #[error("{0}")]
     Internal(String),
 }
@@ -425,6 +436,7 @@ impl WorkerMediaPipeline {
                 allowed_domains: settings.allowed_domains.clone(),
                 allowed_local_media_path: None,
                 fetch_timeout: settings.fetch_timeout,
+                video_fetch_timeout: settings.video_fetch_timeout,
             },
         )
         .context("building the media connector")?;
@@ -668,8 +680,9 @@ fn apply_processor_kwargs(
 }
 
 /// Whose fault a pipeline failure is, from the typed error in its chain: a
-/// fetch that timed out or could not connect is the network's (retryable),
-/// a bad reference or undecodable media the caller's, anything else ours.
+/// fetch or decode failure is the media's, by the connector's own reading of
+/// it (the request's, or its host's for now); a bad part or a prompt the
+/// anchors do not fit the caller's; anything else ours.
 fn classify(error: anyhow::Error) -> WorkerMediaError {
     let message = format!("{error:#}");
     for cause in error.chain() {
@@ -690,14 +703,12 @@ fn classify(error: anyhow::Error) -> WorkerMediaError {
 }
 
 fn classify_fetch(error: &MediaConnectorError, message: String) -> WorkerMediaError {
-    match error {
-        MediaConnectorError::Timeout(_) => WorkerMediaError::Unavailable(message),
-        MediaConnectorError::Http(http) if http.is_timeout() || http.is_connect() => {
-            WorkerMediaError::Unavailable(message)
-        }
-        MediaConnectorError::Blocking(_) => WorkerMediaError::Internal(message),
-        _ => WorkerMediaError::Invalid(message),
-    }
+    let fault = match error.fault() {
+        MediaFault::Client => WorkerMediaFault::Client,
+        MediaFault::Transient => WorkerMediaFault::Transient,
+        MediaFault::Internal => return WorkerMediaError::Internal(message),
+    };
+    WorkerMediaError::Media { fault, message }
 }
 
 #[cfg(test)]
@@ -812,6 +823,7 @@ mod tests {
             max_item_bytes: None,
             allowed_domains: None,
             fetch_timeout: Duration::from_secs(1),
+            video_fetch_timeout: Duration::from_secs(1),
             video_frame_budget: None,
             video_loader_rule: None,
         };
@@ -860,18 +872,45 @@ mod tests {
         assert_eq!(data_url_payload_bytes("https://example.com/x.png"), None);
     }
 
+    /// A fetch that ran out of its budget is the media host's fault for now,
+    /// a reference the request got wrong the request's, neither the worker's;
+    /// a scratch file that failed on this side and a decoder this side cannot
+    /// start are the worker's own, as is a failure with no connector error in
+    /// its chain.
     #[test]
     fn fetch_failures_are_classified_by_fault() {
-        let timeout = anyhow::Error::new(MultiModalError::Media(MediaConnectorError::Timeout(
-            Duration::from_secs(1),
-        )))
+        let timeout = anyhow::Error::new(MultiModalError::Media(MediaConnectorError::Timeout {
+            url: "https://media.example/clip.mp4".to_string(),
+            budget: Duration::from_secs(1),
+        }))
         .context("Failed to finalize multimodal tracker");
         assert!(matches!(
             classify(timeout),
-            WorkerMediaError::Unavailable(_)
+            WorkerMediaError::Media {
+                fault: WorkerMediaFault::Transient,
+                ..
+            }
         ));
         let scheme = anyhow::Error::new(MediaConnectorError::UnsupportedScheme("ftp".to_string()));
-        assert!(matches!(classify(scheme), WorkerMediaError::Invalid(_)));
+        assert!(matches!(
+            classify(scheme),
+            WorkerMediaError::Media {
+                fault: WorkerMediaFault::Client,
+                ..
+            }
+        ));
+        let part = anyhow::Error::new(MultiModalError::UnsupportedContent("image_embeds"));
+        assert!(matches!(classify(part), WorkerMediaError::Invalid(_)));
+        let scratch = anyhow::Error::new(MultiModalError::Media(MediaConnectorError::DecodeIo(
+            std::io::Error::other("no space left on device"),
+        )))
+        .context("Failed to finalize multimodal tracker");
+        assert!(matches!(classify(scratch), WorkerMediaError::Internal(_)));
+        let decoder = anyhow::Error::new(MultiModalError::Media(
+            MediaConnectorError::decoder_unavailable("ffmpeg executable not found".to_string()),
+        ))
+        .context("Failed to finalize multimodal tracker");
+        assert!(matches!(classify(decoder), WorkerMediaError::Internal(_)));
         let other = anyhow::anyhow!("preprocess failed");
         assert!(matches!(classify(other), WorkerMediaError::Internal(_)));
     }
@@ -967,6 +1006,7 @@ mod unsupported_model_tests {
             max_item_bytes: None,
             allowed_domains: None,
             fetch_timeout: Duration::from_secs(1),
+            video_fetch_timeout: Duration::from_secs(1),
             video_frame_budget: None,
             video_loader_rule: None,
         };
@@ -1006,6 +1046,7 @@ mod unsupported_model_tests {
             max_item_bytes: None,
             allowed_domains: None,
             fetch_timeout: Duration::from_secs(1),
+            video_fetch_timeout: Duration::from_secs(1),
             video_frame_budget: None,
             video_loader_rule: None,
         };

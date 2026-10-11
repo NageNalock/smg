@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import inspect
 import json
 import os
 import subprocess
@@ -544,6 +545,27 @@ def test_model_info_advertises_the_engines_item_limits():
     assert rust.model_info_from_config(config)["mm_item_limits"] == "image=8,video=2"
 
 
+def test_model_info_carries_where_the_engine_starts_a_grammar():
+    # The Rust servicer advertises the engine's reasoning parser and where its
+    # grammar starts on a thinking prompt, as the Python servicer does; a
+    # config without the structured-outputs section advertises neither.
+    info = rust.model_info_from_config(_config())
+    assert info["engine_reasoning_parser"] == ""
+    assert info["structured_outputs_start"] == ""
+    config = _config()
+    config.structured_outputs_config = SimpleNamespace(
+        backend="xgrammar", reasoning_parser="glm45", enable_in_reasoning=False
+    )
+    info = rust.model_info_from_config(config)
+    assert info["structured_outputs_backend"] == "xgrammar"
+    assert info["engine_reasoning_parser"] == "glm45"
+    assert info["structured_outputs_start"] == "after_reasoning"
+    config.structured_outputs_config = SimpleNamespace(backend="auto", reasoning_parser="")
+    info = rust.model_info_from_config(config)
+    assert info["engine_reasoning_parser"] == ""
+    assert info["structured_outputs_start"] == "first_token"
+
+
 def test_model_info_carries_the_running_window():
     # The Rust servicer advertises the launcher's `--max-num-seqs` as the
     # Python servicer does; a config without one leaves the handshake's.
@@ -583,6 +605,15 @@ def test_model_info_mirrors_the_python_servicer(monkeypatch):
     assert isinstance(info["shm_namespace_id"], str)
     # No pooler config on a generation model.
     assert info["pooler_use_activation"] is None and info["pooler_dimensions"] is None
+
+
+def test_model_info_leaves_the_encoder_dtype_to_the_rust_servicer():
+    """`server_facts` carries the multimodal encoder dtype for the Python
+    servicer's GetServerInfo; the Rust servicer derives it from `model_dtype`
+    itself, by the same rule, and its binding takes no such keyword (smg-lab#169)."""
+    config = _config()
+    assert "multimodal_encoder_dtype" in rust.server_facts(config)
+    assert "multimodal_encoder_dtype" not in rust.model_info_from_config(config)
 
 
 def test_model_info_carries_the_pooler_config():
@@ -1025,6 +1056,41 @@ def test_serve_rust_starts_the_engine_cores_from_this_process(monkeypatch, tmp_p
     # Two configs in this process: the servicer's own, then the headless one.
     assert [(call[1], call[2]) for call in recorded["configs"]] == [(1, False), (1, True)]
     assert recorded["configs"][0][0] is args and recorded["configs"][1][0].headless is True
+
+
+def test_serve_rust_constructs_the_server_with_keywords_the_binding_takes(monkeypatch, tmp_path):
+    """The keyword set `serve_rust` hands the Rust server is bound against the
+    compiled binding's constructor: a fact the launcher gains without a
+    parameter on the binding fails here, not at the engine's start
+    (smg-lab#169). Skipped where the `smg` wheel is not installed."""
+    servicer = pytest.importorskip("smg.servicer")
+    signature = inspect.signature(servicer.VllmGrpcServer)
+    _stub_engine_core_launch(monkeypatch, _parallel())
+    _stub_engine_exceptions(monkeypatch)
+    _install(monkeypatch, "smg")
+    _install(
+        monkeypatch, "smg.servicer", VllmGrpcServer=FakeServer, init_servicer_tracing=lambda: None
+    )
+    monkeypatch.setattr(rust, "resolve_tokenizer_dir", lambda *a, **k: str(tmp_path))
+    monkeypatch.setattr(rust, "free_port", lambda: 24321)
+    monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
+    constructed: dict = {}
+
+    async def fake_supervise(server, engine, *, drain_secs, **_kwargs):
+        constructed["kwargs"] = server.kwargs
+        return 0
+
+    monkeypatch.setattr(rust, "supervise", fake_supervise)
+    args = argparse.Namespace(
+        model_tag="org/m", model="org/m", grpc=True, host=None, port=50051, max_model_len=4096
+    )
+    assert asyncio.run(rust.serve_rust(args)) == 0
+
+    kwargs = constructed["kwargs"]
+    unexpected = sorted(set(kwargs) - set(signature.parameters))
+    assert not unexpected, f"keywords the binding's constructor does not take: {unexpected}"
+    # The required parameters are all given too; pyo3 refuses the call otherwise.
+    signature.bind(**kwargs)
 
 
 # ---------------------------------------------------------------------------

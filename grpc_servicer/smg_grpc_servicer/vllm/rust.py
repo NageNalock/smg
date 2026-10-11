@@ -64,11 +64,13 @@ from smg_grpc_servicer.rust_lifecycle import (
 from smg_grpc_servicer.rust_lifecycle import env_float as _env_float
 from smg_grpc_servicer.vllm.media_refs import FETCHABLE_MODALITIES
 from smg_grpc_servicer.vllm.model_info import (
+    engine_reasoning_parser,
     eos_token_ids_with_generation_config,
     mm_device_do_normalize,
     mm_item_limits,
     model_facts,
     server_facts,
+    structured_outputs_start,
 )
 
 logger = logging.getLogger(__name__)
@@ -97,6 +99,10 @@ def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
     request path."""
     model_config = vllm_config.model_config
     facts = {**model_facts(model_config), **server_facts(vllm_config)}
+    # `server_facts` carries the multimodal encoder dtype for the Python
+    # servicer's GetServerInfo; the Rust servicer derives it from `model_dtype`
+    # itself, by the same rule, and its binding takes no such keyword.
+    facts.pop("multimodal_encoder_dtype", None)
     # KV-event publishing, as the Python servicer resolves it: only vLLM's ZMQ
     # publisher can be relayed; anything else leaves SubscribeKvEvents off.
     kv_events = getattr(vllm_config, "kv_events_config", None)
@@ -138,6 +144,8 @@ def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
         "pooler_dimensions": int(pooler_dimensions) if pooler_dimensions is not None else None,
         "mm_device_do_normalize": mm_device_do_normalize(vllm_config),
         "mm_item_limits": mm_item_limits(vllm_config),
+        "engine_reasoning_parser": engine_reasoning_parser(vllm_config),
+        "structured_outputs_start": structured_outputs_start(vllm_config),
     }
 
 

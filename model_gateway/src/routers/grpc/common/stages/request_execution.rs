@@ -872,7 +872,9 @@ async fn execute_single(
     }
     let call = dump.map(|dump| dump.begin(client, workers.single(), Leg::Single, &proto_request));
     let result = start_generate(client, proto_request, call).await;
-    workers.record_outcome(ledger, result.cb_status_code());
+    if let Some(status) = result.breaker_status() {
+        workers.record_outcome(ledger, status);
+    }
 
     let stream = result.map_err(|e| {
         start_failure_response(
@@ -904,6 +906,15 @@ fn start_failure_response(
     description: &str,
     code: &str,
 ) -> Response {
+    // The request's media failed, not the worker (see `TonicStatusExt::media_fault`):
+    // the answer is for the media, and another worker fetching the same URL
+    // would meet the same host, so the request is not replayed.
+    if let Some(fault) = e.media_fault() {
+        warn!(function = function, error = %e, ?fault, "{}: the request's media failed", description);
+        let mut response = e.to_http_error("media_fetch_failed", e.message().to_string());
+        mark_non_retryable(&mut response);
+        return response;
+    }
     if e.http_status().is_client_error() {
         warn!(function = function, error = %e, "{}: engine rejected the request", description);
     } else {
@@ -945,7 +956,9 @@ async fn execute_single_embed(
         Metrics::record_worker_request(worker.url(), worker.model_id());
     }
     let result = client.embed(proto_request).await;
-    workers.record_outcome(ledger, result.cb_status_code());
+    if let Some(status) = result.breaker_status() {
+        workers.record_outcome(ledger, status);
+    }
 
     let complete = result.map_err(|e| {
         start_failure_response(
@@ -1049,8 +1062,8 @@ async fn execute_parallel_pd(
             // Record circuit breaker outcomes (client errors don't count as failures)
             workers.record_prefill_decode_outcomes(
                 ledger,
-                prefill_result.cb_status_code(),
-                decode_result.cb_status_code(),
+                prefill_result.breaker_status(),
+                decode_result.breaker_status(),
             );
 
             // Both legs are translated before either is propagated: a
@@ -1093,17 +1106,21 @@ async fn execute_parallel_pd(
             error,
             partner,
         } => {
-            let status = error.http_status().as_u16();
+            let status = error.breaker_status();
             // Only the leg that answered is recorded: the abandoned one has
             // said nothing about its worker yet, and `retire_pd_leg` records
             // it when it finally does.
             let (label, partner_label, partner_worker) = match leg {
                 PdLeg::Prefill => {
-                    workers.record_outcome_prefill(ledger, status);
+                    if let Some(status) = status {
+                        workers.record_outcome_prefill(ledger, status);
+                    }
                     (prefill_label, decode_label, workers.decode_worker())
                 }
                 PdLeg::Decode => {
-                    workers.record_outcome_decode(ledger, status);
+                    if let Some(status) = status {
+                        workers.record_outcome_decode(ledger, status);
+                    }
                     (decode_label, prefill_label, workers.prefill_worker())
                 }
             };
@@ -1214,7 +1231,9 @@ fn retire_pd_leg(
 ) {
     tokio::spawn(async move {
         let result = dispatch.await;
-        worker.record_outcome(result.cb_status_code());
+        if let Some(status) = result.breaker_status() {
+            worker.record_outcome(status);
+        }
         match result {
             Ok(stream) => {
                 debug!(
@@ -1487,7 +1506,9 @@ async fn execute_sequential_pd(
     let mut prefill_stream = start_generate(prefill_client, prefill_request, prefill_call)
         .await
         .map_err(|e| {
-            workers.record_outcome_prefill(ledger, e.http_status().as_u16());
+            if let Some(status) = e.breaker_status() {
+                workers.record_outcome_prefill(ledger, status);
+            }
             Metrics::record_worker_error(
                 metrics_labels::WORKER_PREFILL,
                 prefill_label,
@@ -1522,7 +1543,9 @@ async fn execute_sequential_pd(
                 }
             }
             Err(e) => {
-                workers.record_outcome_prefill(ledger, e.http_status().as_u16());
+                if let Some(status) = e.breaker_status() {
+                    workers.record_outcome_prefill(ledger, status);
+                }
                 Metrics::record_worker_error(
                     metrics_labels::WORKER_PREFILL,
                     prefill_label,
@@ -1655,7 +1678,9 @@ async fn execute_sequential_pd(
     let decode_stream = start_generate(decode_client, decode_request, decode_call)
         .await
         .map_err(|e| {
-            workers.record_outcome_decode(ledger, e.http_status().as_u16());
+            if let Some(status) = e.breaker_status() {
+                workers.record_outcome_decode(ledger, status);
+            }
             Metrics::record_worker_error(
                 metrics_labels::WORKER_DECODE,
                 decode_label,

@@ -459,7 +459,9 @@ impl MediaProcessor for SmgMediaProcessor {
                 .await
                 .map_err(|error| match error {
                     WorkerMediaError::Invalid(message) => MediaError::Invalid(message),
-                    WorkerMediaError::Unavailable(message) => MediaError::Unavailable(message),
+                    WorkerMediaError::Media { fault, message } => {
+                        MediaError::Media { fault, message }
+                    }
                     WorkerMediaError::Internal(message) => MediaError::Internal(message),
                 })?;
             Ok(ProcessedMedia {
@@ -518,6 +520,12 @@ fn native_media_options(
         .map(|v| v.extract())
         .transpose()?
         .unwrap_or(10_000);
+    // A video gets the budget the engine's own loader gives one (30 s, against
+    // 5 s for an image): a clip is many times an image's size.
+    let video_fetch_timeout_ms: u64 = item("video_fetch_timeout_ms")?
+        .map(|v| v.extract())
+        .transpose()?
+        .unwrap_or(30_000);
     // The engine's per-prompt limits by modality name; one the pipeline does
     // not fetch is of no consequence here.
     let engine_item_limits = item("engine_item_limits")?
@@ -552,6 +560,7 @@ fn native_media_options(
             max_item_bytes: count("max_item_bytes")?,
             allowed_domains,
             fetch_timeout: Duration::from_millis(fetch_timeout_ms),
+            video_fetch_timeout: Duration::from_millis(video_fetch_timeout_ms),
             video_frame_budget,
             video_loader_rule: string("video_loader_rule")?,
         },
@@ -609,6 +618,8 @@ impl PyVllmGrpcServer {
         mm_device_do_normalize = false,
         mm_item_limits = String::new(),
         max_num_seqs = 0,
+        engine_reasoning_parser = String::new(),
+        structured_outputs_start = String::new(),
         media_processor = None,
         smg_media_processor = None,
         engine_startup_timeout_secs = None,
@@ -654,6 +665,8 @@ impl PyVllmGrpcServer {
         mm_device_do_normalize: bool,
         mm_item_limits: String,
         max_num_seqs: i32,
+        engine_reasoning_parser: String,
+        structured_outputs_start: String,
         media_processor: Option<Bound<'_, PyAny>>,
         smg_media_processor: Option<Bound<'_, PyDict>>,
         engine_startup_timeout_secs: Option<f64>,
@@ -706,6 +719,8 @@ impl PyVllmGrpcServer {
             mm_device_do_normalize,
             mm_item_limits,
             max_num_seqs,
+            engine_reasoning_parser,
+            structured_outputs_start,
         };
         let mut config = VllmServicerConfig {
             bind_address,
@@ -864,6 +879,7 @@ impl PyTokenSpeedGrpcServer {
         kv_events_replay_endpoint = String::new(),
         kv_events_topic = String::new(),
         engine_startup_timeout_secs = None,
+        engine_startup_ceiling_secs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -900,6 +916,7 @@ impl PyTokenSpeedGrpcServer {
         kv_events_replay_endpoint: String,
         kv_events_topic: String,
         engine_startup_timeout_secs: Option<f64>,
+        engine_startup_ceiling_secs: Option<f64>,
     ) -> PyResult<Self> {
         let model = TokenSpeedModelInfo {
             served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
@@ -937,6 +954,7 @@ impl PyTokenSpeedGrpcServer {
             tokenizer_dir,
             model,
             engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
+            engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
         };
         let inner = py
             .detach(|| TokenSpeedServicerServer::start(config))
@@ -960,6 +978,16 @@ impl PyTokenSpeedGrpcServer {
     #[getter]
     fn engine_ready(&self) -> bool {
         self.inner.engine_ready()
+    }
+
+    /// Report that the scheduler process is alive while the handshake runs:
+    /// the launcher calls this each time it polls the process it spawned and
+    /// finds it running. Each report resets the handshake's silence bound
+    /// (`engine_startup_timeout_secs`); the ceiling
+    /// (`engine_startup_ceiling_secs`) still holds. A no-op once the
+    /// scheduler is connected.
+    fn note_engine_alive(&self) {
+        self.inner.note_engine_alive();
     }
 
     /// The last fatal error (scheduler connect or server exit), if any.
@@ -1033,6 +1061,7 @@ impl PySglangGrpcServer {
         kv_events_replay_endpoint = String::new(),
         kv_events_topic = String::new(),
         engine_startup_timeout_secs = None,
+        engine_startup_ceiling_secs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -1069,6 +1098,7 @@ impl PySglangGrpcServer {
         kv_events_replay_endpoint: String,
         kv_events_topic: String,
         engine_startup_timeout_secs: Option<f64>,
+        engine_startup_ceiling_secs: Option<f64>,
     ) -> PyResult<Self> {
         let model = SglangModelInfo {
             served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
@@ -1106,6 +1136,7 @@ impl PySglangGrpcServer {
             tokenizer_dir,
             model,
             engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
+            engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
         };
         let inner = py
             .detach(|| SglangServicerServer::start(config))
@@ -1129,6 +1160,16 @@ impl PySglangGrpcServer {
     #[getter]
     fn engine_ready(&self) -> bool {
         self.inner.engine_ready()
+    }
+
+    /// Report that the scheduler process is alive while the handshake runs:
+    /// the launcher calls this each time it polls the process it spawned and
+    /// finds it running. Each report resets the handshake's silence bound
+    /// (`engine_startup_timeout_secs`); the ceiling
+    /// (`engine_startup_ceiling_secs`) still holds. A no-op once the
+    /// scheduler is connected.
+    fn note_engine_alive(&self) {
+        self.inner.note_engine_alive();
     }
 
     /// The last fatal error (scheduler connect or server exit), if any.
