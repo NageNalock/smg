@@ -3411,10 +3411,15 @@ impl ProtoStream {
                 if let Some(item) = tracked.replay.take() {
                     return item;
                 }
-                let item = if tracked.inner.is_wrapper() {
-                    Box::pin(tracked.inner.next()).await
-                } else {
-                    tracked.inner.next_untracked().await
+                // A disaggregated decode leg is a tracked layer over the
+                // bounded layer (`attribute_pd_legs` tracks the bounded
+                // stream): the bounded layer polls its own inner in place, so
+                // it is called directly rather than through a boxed future
+                // per message.
+                let item = match &mut tracked.inner {
+                    Self::Bounded(bounded) => bounded.next().await,
+                    inner if inner.is_wrapper() => Box::pin(inner.next()).await,
+                    inner => inner.next_untracked().await,
                 };
                 tracked.note(item.as_ref());
                 item

@@ -594,7 +594,20 @@ fn dispatch_within(
     request: ProtoGenerateRequest,
 ) -> PdLegDispatch {
     let request_id = request.request_id().to_owned();
-    let call: PdLegDispatch = Box::pin(async move { client.generate(request).await });
+    // A decode leg's stream is deferred-abort from the moment it opens: its
+    // engine may be taking the prefill's KV handoff, which an immediate
+    // abort can tear down mid-transfer, and a call that lands after the
+    // request's deadline is dropped by the retirement, not by the request
+    // path that defers the abort later.
+    let defer_abort = worker_type == metrics_labels::WORKER_DECODE;
+    let call: PdLegDispatch = Box::pin(async move {
+        let stream = client.generate(request).await?;
+        Ok(if defer_abort {
+            stream.defer_abort_until_first_item()
+        } else {
+            stream
+        })
+    });
     match worker {
         Some(worker) => Box::pin(call_within(
             deadline,
