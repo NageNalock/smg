@@ -1059,70 +1059,6 @@ def build_shape_corpus():
         add_case(f"{tid}#{name}", tid, text)
     add_case(f"{tid}#prefix", tid, "rest<|TURN_END|>", prefix="x<|BOT_TURN|>pre")
 
-    recipient = {
-        "defaults": {"role": "assistant"},
-        "start_anchor_pattern": r"<\|begin\|>bot",
-        "fields": {
-            "thinking": {
-                "open": "<|kind|>think<|body|>",
-                "close": "<|done|><|begin|>bot",
-                "content": "text",
-            },
-            "content": {
-                "open": "<|kind|>reply<|body|>",
-                "close": ["<|stop|>", "<|done|>", "<|invoke|>"],
-                "content": "text",
-            },
-            "tool_calls": {
-                "open_pattern": r" to=(?P<name>[^\s<]+)<\|kind\|>think <\|format\|>xml<\|body\|>",
-                "close": ["<|done|><|begin|>bot", "<|invoke|>"],
-                "repeats": True,
-                "content": "xml-inline",
-                "content_args": {
-                    "tag_pattern": r'<ns:param name="(?P<key>[^"]+)">\n(?P<value>.*?)\n</ns:param>',
-                    "value_parser": {"name": "text", "args": {"strip": False}},
-                },
-                "transform": WRAPPED,
-            },
-        },
-    }
-    tid = add_template(
-        "shapes/recipient-name-class-escape",
-        recipient,
-        "synthetic: start anchor pattern, a call name read up to whitespace (\\s in a negated"
-        " class), XML parameters with an unstripped text value",
-    )
-
-    def to(name: str, *params: tuple[str, str], close: str = "<|invoke|>") -> str:
-        body = "".join(f'<ns:param name="{k}">\n{v}\n</ns:param>' for k, v in params)
-        return f" to={name}<|kind|>think <|format|>xml<|body|>{body}{close}"
-
-    weather = to("get_weather", ("city", "Paris"), ("days", "3"))
-    for name, text in {
-        "think-call": "<|kind|>think<|body|>Let me check.<|done|><|begin|>bot" + weather,
-        "reply": "<|kind|>think<|body|>ok<|done|><|begin|>bot<|kind|>reply<|body|>Sunny.<|stop|>",
-        "two-calls": to("get_time", close="<|done|><|begin|>bot") + weather,
-        "dotted-name": to("ns.tool-x", ("q", " a b ")),
-        "unicode-name": to("天気", ("city", "東京")),
-        "space-in-name": to("get weather", ("city", "Paris")),
-        "nbsp-in-name": to("get\xa0weather", ("city", "Paris")),
-        "line-separator-in-name": to("get\u2028weather"),
-        "ideographic-space-in-name": to("get\u3000weather"),
-        "info-separator-in-name": to("get\x1cweather", ("city", "Paris")),
-        "next-line-in-name": to("get\x85weather"),
-        "lt-in-name": to("a<b") + weather,
-        "cut-name": "<|kind|>think<|body|>r<|done|><|begin|>bot to=get_we",
-        "cut-args": weather[:60],
-    }.items():
-        add_case(f"{tid}#{name}", tid, text, tools=TOOLS)
-    add_case(f"{tid}#prefix", tid, weather, prefix="u<|begin|>bot")
-    add_case(
-        f"{tid}#prefix-in-think",
-        tid,
-        "plan<|done|><|begin|>bot" + weather,
-        prefix="<|begin|>bot<|kind|>think<|body|>",
-    )
-
 
 # The templates of an earlier prototype harness: one shape with every field in
 # a common subset, and single-step variations of it.
@@ -1504,97 +1440,72 @@ def build_synthetic_corpus():
     )
 
 
-# A tool name read up to whitespace or the next marker, and a tag pattern whose
-# value also ends where the next key starts (`(?=...)`), the shape of templates
-# whose arguments may omit their closing tag.
-SPACE_CLASS_OPEN = r"(?:<\|turn\|>bot)? to=(?P<name>[^\s<]+)<\|args\|>"
-ARG_LOOKAHEAD = r'<arg name="(?P<key>[^"]+)">\n(?P<value>.*?)\n(?:</arg>|(?=<arg name="))'
+# The tool calls of the `transformers serve` template for Qwen 3.5 with a
+# parameter whose closing tag may be left out: its value also ends where the
+# next parameter starts or where the call ends (`(?=...)`).
+SERVE_PARAMETER = r"<parameter=(?P<key>[^>\n]+)>\s*(?P<value>.*?)\s*</parameter>"
+PARAMETER_LOOKAHEAD = (
+    r"<parameter=(?P<key>[^>\n]+)>\s*(?P<value>.*?)\s*(?:</parameter>|(?=<parameter=|$))"
+)
 # Templates whose patterns take their regex rows from a generator of their own,
 # so that adding them leaves the rows recorded before unchanged.
 LATE_TEMPLATES: list[str] = []
 
 
-def build_class_lookahead_corpus():
-    templates = {
-        "space-class-name": base_template(tool_open=SPACE_CLASS_OPEN),
-        "lookahead-tag": base_template(
-            tool_open=SPACE_CLASS_OPEN,
-            tag=ARG_LOOKAHEAD,
-            value_parser={"name": "text", "args": {"strip": False}},
-            tool_close=("<|ask|>", "<|eos|>"),
+def build_lookahead_corpus():
+    t = copy.deepcopy(serve_templates()["qwen3_5"])
+    args = t["fields"]["tool_calls"]["content_args"]
+    if args["tag_pattern"] != SERVE_PARAMETER:
+        raise ValueError(f"qwen3_5 tag pattern changed: {args['tag_pattern']!r}")
+    args["tag_pattern"] = PARAMETER_LOOKAHEAD
+    tid = add_template(
+        "synthetic/qwen3_5-unclosed-parameter",
+        t,
+        "synthetic: transformers serve qwen3_5 with a parameter whose closing tag may be left out",
+    )
+    LATE_TEMPLATES.append(tid)
+
+    def param(key: str, value: str, closed: bool = True) -> str:
+        return f"<parameter={key}>\n{value}\n" + ("</parameter>\n" if closed else "")
+
+    def fn(name: str, *params: str) -> str:
+        return f"<tool_call>\n<function={name}>\n" + "".join(params) + "</function>\n</tool_call>"
+
+    texts = {
+        "closed": fn("get_weather", param("city", "Paris")),
+        "next-key-closes": fn("get_weather", param("city", "Paris", False), param("days", "3")),
+        "all-open": fn(
+            "get_weather",
+            param("city", "New\nYork", False),
+            param("days", "3", False),
+            param("metric", "true", False),
         ),
+        "last-open": fn("get_weather", param("city", "Paris"), param("days", "3", False)),
+        "typed": fn(
+            "get_weather",
+            param("days", "3", False),
+            param("ratio", "0.5"),
+            param("either", "7", False),
+            param("filters", '{"a": 1}'),
+        ),
+        "key-in-value": fn("get_weather", param("city", "a\n<parameter=x", False)),
+        "repeated-key": fn("get_weather", param("city", "A", False), param("city", "B")),
+        "think-content-call": "<think>\nt\n</think>\n\nHello.\n\n" + fn("get_time"),
+        "two-calls": fn("get_weather", param("city", "Paris", False))
+        + "\n"
+        + fn("get_time")
+        + "<|im_end|>",
+        "cut-before-next": "<tool_call>\n<function=get_weather>\n"
+        + param("city", "Paris", False)
+        + "<parame",
     }
-    for name, t in templates.items():
-        LATE_TEMPLATES.append(add_template(f"synthetic/{name}", t, "synthetic"))
-
-    def la_arg(key: str, value: str, closed: bool = True) -> str:
-        return f'<arg name="{key}">\n{value}\n' + ("</arg>" if closed else "")
-
-    prefix = "<|turn|>user\nWhat is the weather?<|done|><|turn|>bot"
-    space = {
-        "one-call": " to=get_weather<|args|>" + arg("city", "Paris") + "<|done|>",
-        "think-then-call": "<|think|>look it up<|done|> to=get_weather<|args|>"
-        + arg("days", "2")
-        + "<|done|>",
-        "name-unicode": " to=wéather_Ω.v2<|args|>" + arg("city", "Zürich") + "<|done|>",
-        "name-cut-by-space": " to=get weather<|args|><|done|>",
-        "name-cut-by-marker": " to=get<|args|><|done|>",
-        "two-calls": " to=get_weather<|args|>"
-        + arg("city", "Paris")
-        + "<|done|> to=get_time<|args|><|done|>",
-        "cut-in-name": " to=get_wea",
-        "say-only": "<|say|>no tools to=use here<|done|>",
-    }
-    for k, text in space.items():
-        add_case(f"synthetic/space-class-name#{k}", "synthetic/space-class-name", text)
+    for k, text in texts.items():
+        add_case(f"{tid}#{k}", tid, text, tools=TOOLS)
         add_case(
-            f"synthetic/space-class-name#{k}-prefix",
-            "synthetic/space-class-name",
+            f"{tid}#{k}-prefix",
+            tid,
             text,
-            prefix=prefix,
-            tools=TOOLS,
-        )
-    look = {
-        "closed": " to=get_weather<|args|>" + la_arg("city", "Paris") + "<|ask|>",
-        "next-key-closes": " to=get_weather<|args|>"
-        + la_arg("city", "Paris", closed=False)
-        + la_arg("days", "3")
-        + "<|ask|>",
-        "all-open": " to=get_weather<|args|>"
-        + la_arg("city", "New\nYork", closed=False)
-        + la_arg("days", "3", closed=False)
-        + la_arg("metric", "true", closed=False)
-        + "<|ask|>",
-        "last-open": " to=get_weather<|args|>"
-        + la_arg("city", "Paris")
-        + la_arg("days", "3", closed=False)
-        + "<|ask|>",
-        "typed": " to=get_weather<|args|>"
-        + la_arg("days", "3", closed=False)
-        + la_arg("ratio", "0.5")
-        + la_arg("either", "7", closed=False)
-        + la_arg("filters", '{"a": 1}')
-        + "<|ask|>",
-        "key-in-value": " to=get_weather<|args|>"
-        + la_arg("city", 'a\n<arg name="x', closed=False)
-        + "<|ask|>",
-        "repeated-key": " to=get_weather<|args|>"
-        + la_arg("city", "A", closed=False)
-        + la_arg("city", "B")
-        + "<|ask|>",
-        "think-say-call": "<|think|>t<|done|><|say|>s<|done|> to=get_time<|args|><|ask|>",
-        "cut-before-next": " to=get_weather<|args|>"
-        + la_arg("city", "Paris", closed=False)
-        + "<arg na",
-        "eos-close": " to=get_weather<|args|>" + la_arg("city", "Paris") + "<|eos|>",
-    }
-    for k, text in look.items():
-        add_case(f"synthetic/lookahead-tag#{k}", "synthetic/lookahead-tag", text, tools=TOOLS)
-        add_case(
-            f"synthetic/lookahead-tag#{k}-prefix",
-            "synthetic/lookahead-tag",
-            text,
-            prefix=prefix,
+            prefix="<|im_start|>user\nWhat is the weather?<|im_end|>\n<|im_start|>assistant\n",
         )
 
 
@@ -2959,22 +2870,22 @@ OPTIONAL_BACKREF_ROWS = (
 # `regex` module's `\s` (Unicode White_Space) differs from Python's `re`
 # (U+001C to U+001F) and other Unicode spaces.
 CLASS_ESCAPE_ROWS = r"""
-[\s] [^\s] [\w] [^\w] [\w\s]+ [^\w\s]+ [^\s<]+ [a\s-]+ [\s-] [^\s\-.]+ [_\w.-]+
-x[^\s<]*?\b< (?P<n>[^\s<]+)< [^\s]|[^a] [^a\s]|[^b] x[^\s]|x[^a] (?:[^\w]|[^\s])
+[\s] [^\s] [\w] [^\w] [\w\s]+ [^\w\s]+ [^\s>]+ [a\s-]+ [\s-] [^\s\-.]+ [_\w.-]+
+x[^\s>]*?\b> (?P<n>[^\s>]+)> [^\s]|[^a] [^a\s]|[^b] x[^\s]|x[^a] (?:[^\w]|[^\s])
 [^\s]|[^a]|[^b] [\s-a] [a-\s] [\w--\d] [\w-\-] [\d\s] [^\S] [\W\s] [\s\b]
 """.split()
 CLASS_ESCAPE_HAYSTACKS = [
     "",
     "a b",
-    "to=get_weather<",
-    " to=ns.tool-x<",
-    " to=a\xa0b<",
-    " to=a\x1cb<",
-    " to=a\u2028b<",
-    " to=ab",
-    "\x1c\x1d\x1e\x1f<",
+    "get_weather>",
+    " ns.tool-x>",
+    " a\xa0b>",
+    " a\x1cb>",
+    " a\u2028b>",
+    " ab",
+    "\x1c\x1d\x1e\x1f>",
     "\t\n\x0b\x0c\r\x85\xa0\u1680\u2000\u200a\u2028\u2029\u202f\u205f\u3000",
-    "\u200b\ufeff\x08x<",
+    "\u200b\ufeff\x08x>",
     "é_1-." + NEWER_WORD,
     "xa xb- -a",
 ]
@@ -2984,11 +2895,11 @@ CLASS_ESCAPE_HAYSTACKS = [
 # recorded with a generator of their own.
 LOOKAHEAD_ROWS = (
     r"""
-a(?=b) (?=a)a a(?=b|c) x(?:y|(?=z)) a(?=b*) a(?=\b) a(?=.*?c) a(?=b(?=c)) a(?=[^\s<]+)
+a(?=b) (?=a)a a(?=b|c) x(?:y|(?=z)) a(?=b*) a(?=\b) a(?=.*?c) a(?=b(?=c)) a(?=[^\s>]+)
 a(?=\s)\s (?=a)|b a(?=(?P<x>b)) (?P<k>a)(?=\1) a(?!b) (?<=a)b a(?=b)? a(?=) (?=a)
 (?:a(?=b)|ab)c x(?=$) x(?=\Z) <k>(?P<v>.*?)(?:</k>|(?=<k>))
 """.split()
-    + [r'<arg name="(?P<key>[^"]+)">\n(?P<value>.*?)\n(?:</arg>|(?=<arg name="))']
+    + [PARAMETER_LOOKAHEAD]
 )
 LOOKAHEAD_HAYSTACKS = [
     "",
@@ -3001,8 +2912,8 @@ LOOKAHEAD_HAYSTACKS = [
     "xyz",
     " \t\n<",
     "<k>1</k><k>2<k>3",
-    'q<arg name="a">\n1\n<arg name="b">\n2\n</arg>',
-    '<arg name="a">\n1\n</arg><arg name="',
+    "q<parameter=a>\n1\n<parameter=b>\n2\n</parameter>",
+    "<parameter=a>\n1\n</parameter><parameter=",
 ]
 
 
@@ -3104,6 +3015,21 @@ def fragment_haystacks(pattern: str, rng: random.Random, n: int) -> list[str]:
     return ["".join(rng.choice(frags) for _ in range(rng.randint(1, 6))) for _ in range(n)]
 
 
+# Patterns since removed from the corpus still take their haystack draws (by
+# the number of fragments they had), so that the rows recorded after them stay
+# the same: before the pattern at this index of target + others, and before the
+# lookahead rows (late patterns draw from a generator of their own).
+RETIRED_DRAWS = {0: (97,), 24: (35,), 25: (88,)}
+RETIRED_LATE_DRAWS = (66, 80)
+
+
+def _burn_haystacks(rng: random.Random, n_frags: int, n: int) -> None:
+    """The draws `fragment_haystacks` takes for a pattern with `n_frags` fragments."""
+    for _ in range(n):
+        for _ in range(rng.randint(1, 6)):
+            rng.choice(range(n_frags))
+
+
 def build_regex_rows(
     target: list[tuple[str, str]],
     others: list[tuple[str, str]],
@@ -3111,7 +3037,9 @@ def build_regex_rows(
 ) -> list[dict]:
     rows = []
     rng = random.Random(0xFACE)
-    for role, pattern in target + others:
+    for i, (role, pattern) in enumerate(target + others):
+        for n_frags in RETIRED_DRAWS.get(i, ()):
+            _burn_haystacks(rng, n_frags, 12)
         hays = fragment_haystacks(pattern, rng, 12)
         corpus = (role, pattern) in target
         if role == "delimiter" and corpus:
@@ -3148,8 +3076,11 @@ def build_regex_rows(
         ]
         rows.append(regex_row(pattern, hays, rng.choice(["delimiter", "finditer"])))
     rng = random.Random(0xC1A5)
+    for n_frags in RETIRED_LATE_DRAWS:
+        _burn_haystacks(rng, n_frags, 12)
+    late_rng = random.Random(0x1A7E)
     for role, pattern in late:
-        rows.append(regex_row(pattern, fragment_haystacks(pattern, rng, 12), role))
+        rows.append(regex_row(pattern, fragment_haystacks(pattern, late_rng, 12), role))
     for pattern in LOOKAHEAD_ROWS:
         hays = LOOKAHEAD_HAYSTACKS + fragment_haystacks(pattern, rng, 4)
         for role in ("delimiter", "finditer"):
@@ -3687,7 +3618,7 @@ def generate(src: Path) -> dict[str, str]:
 
     build_tail_corpus()
     build_random_corpus(100, 10)
-    build_class_lookahead_corpus()
+    build_lookahead_corpus()
 
     templates_out = []
     for tid, entry in TEMPLATES.items():

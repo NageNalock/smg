@@ -157,14 +157,14 @@ fn empty_groups_do_not_hide_merged_negated_classes() {
 /// merged the way `[^a]|[^b]` is.
 #[test]
 fn class_escapes_match_the_regex_module() {
-    let hay = "a\u{1c}b\u{a0}c\u{2028}d\u{3000}e\u{85}f\tg<h é_1-";
+    let hay = "a\u{1c}b\u{a0}c\u{2028}d\u{3000}e\u{85}f\tg>h é_1-";
     let spaces: &[&str] = &["3:4", "5:6", "7:8", "9:10", "11:12", "15:16"];
     let every: Vec<String> = (0..20).map(|k| format!("{k}:{}", k + 1)).collect();
     let every: Vec<&str> = every.iter().map(String::as_str).collect();
     for (source, expected) in [
         (r"[\s]", spaces),
         (
-            r"[^\s<]+",
+            r"[^\s>]+",
             &[
                 "0:3", "4:5", "6:7", "8:9", "10:11", "12:13", "14:15", "16:20",
             ],
@@ -196,29 +196,25 @@ fn class_escapes_match_the_regex_module() {
     // An opener that names a call: `search` (span and name) and
     // `search(..., partial=True)` from 0; a partial match ending in "+" can
     // still grow.
-    let opener = Pattern::new(r" to=(?P<name>[^\s<]+)<\|x\|>", Role::Delimiter).unwrap();
+    let opener = Pattern::new(r"<call:(?P<name>[^\s>]+)>", Role::Delimiter).unwrap();
     for (hay, full, partial) in [
         (
-            " to=get_weather<|x|>",
-            Some(("0:20", "get_weather")),
-            Some("0:20"),
-        ),
-        (
-            " to=ns.tool-x<|x|>",
-            Some(("0:18", "ns.tool-x")),
+            "<call:get_weather>",
+            Some(("0:18", "get_weather")),
             Some("0:18"),
         ),
         (
-            " to=a\u{1c}b<|x|>",
-            Some(("0:12", "a\u{1c}b")),
-            Some("0:12"),
+            "<call:ns.tool-x>",
+            Some(("0:16", "ns.tool-x")),
+            Some("0:16"),
         ),
-        (" to=a\u{a0}b<|x|>", None, None),
-        (" to=a\u{2028}b<|x|>", None, None),
-        (" to=a b<|x|>", None, None),
-        (" to=a<b<|x|>", None, None),
-        (" to=get_we", None, Some("0:10+")),
-        (" to=a<|x", None, Some("0:8+")),
+        ("<call:a\u{1c}b>", Some(("0:10", "a\u{1c}b")), Some("0:10")),
+        ("<call:a<b>", Some(("0:10", "a<b")), Some("0:10")),
+        ("<call:a\u{a0}b>", None, None),
+        ("<call:a\u{2028}b>", None, None),
+        ("<call:a b>", None, None),
+        ("<call:get_we", None, Some("0:12+")),
+        ("<call:a", None, Some("0:7+")),
     ] {
         let got = opener
             .search(hay, 0, &mut Memo::default())
@@ -235,7 +231,7 @@ fn class_escapes_match_the_regex_module() {
 }
 
 /// Lookahead in a pattern used only with `finditer`, such as a tag pattern
-/// whose value also ends where the next key starts, with what the `regex`
+/// whose closing tag may be left out, with what the `regex`
 /// module returns (`regex` 2026.9.10, spans in characters). Lookahead in an
 /// open or close pattern, and a group, backreference or repeat in or of one,
 /// stay refused.
@@ -243,7 +239,7 @@ fn class_escapes_match_the_regex_module() {
 fn lookahead_in_finditer_patterns() {
     type Spans<'a> = (String, Vec<(&'a str, Option<&'a str>)>);
     let rows = read_jsonl(&fixtures_dir(), "regex");
-    let tag = r#"<arg name="(?P<key>[^"]+)">\n(?P<value>.*?)\n(?:</arg>|(?=<arg name="))"#;
+    let tag = r"<parameter=(?P<key>[^>\n]+)>\s*(?P<value>.*?)\s*(?:</parameter>|(?=<parameter=|$))";
     for source in [tag, r"a(?=b(?=c))"] {
         assert!(
             rows.iter()
@@ -254,16 +250,16 @@ fn lookahead_in_finditer_patterns() {
     let pattern = Pattern::new(tag, Role::Finditer).unwrap();
     for (hay, expected) in [
         (
-            "<arg name=\"a\">\n1\n<arg name=\"b\">\n2\n</arg>",
-            &[("0:17", "a", "1"), ("17:40", "b", "2")][..],
+            "<parameter=a>\n1\n<parameter=b>\n2\n</parameter>",
+            &[("0:16", "a", "1"), ("16:44", "b", "2")][..],
         ),
         (
-            "<arg name=\"a\">\nx\n<arg name=\"b\n</arg>",
-            &[("0:17", "a", "x")][..],
+            "<parameter=a>\nx\n<parameter=b\n</parameter>",
+            &[("0:16", "a", "x")][..],
         ),
         (
-            "<arg name=\"a\">\n1\n</arg><arg name=\"b\">\n2\n",
-            &[("0:23", "a", "1")][..],
+            "<parameter=a>\n1\n</parameter><parameter=b>\n2\n",
+            &[("0:28", "a", "1"), ("28:44", "b", "2")][..],
         ),
     ] {
         let got: Vec<Spans<'_>> = pattern

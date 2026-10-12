@@ -127,9 +127,9 @@ rather than from the pattern's language. `pyre.rs` parses the constructs used
 by the templates of transformers' tests and of `transformers serve` and by the
 public checkpoint shapes the parity fixtures record, plus positive classes,
 ranges in classes and `\w` and `\s` in classes (as in tool-name patterns like
-`[A-Za-z_][A-Za-z0-9_]*`, `[\w.-]+` or `[^\s<]+`) and lookahead in tag
-patterns (as in a value that also ends where the next key starts), and runs
-them on a backtracking matcher that reproduces those results.
+`[A-Za-z_][A-Za-z0-9_]*` or `[\w.-]+`) and lookahead in tag patterns (as in
+a parameter whose closing tag may be left out), and runs them on a
+backtracking matcher that reproduces those results.
 Supported:
 
 - literal characters other than `{`, `}` and `]`, `\` before ASCII
