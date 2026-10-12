@@ -366,6 +366,12 @@ class RouterArgs:
     # operation included); appended last for positional callers
     postgres_op_timeout_secs: int = 5
     redis_op_timeout_secs: int = 5
+    # How long the lease a gateway holds on a background response it runs
+    # stays valid without a renewal, in seconds; a response whose gateway
+    # stopped is closed as failed by any gateway sharing the response store.
+    # 0 = no lease, no reaper (1 to 5 are rejected); appended last for the
+    # same reason
+    background_lease_ttl_secs: int = 30
 
     @staticmethod
     def add_cli_args(
@@ -1656,6 +1662,21 @@ class RouterArgs:
                 "Most Responses API requests with background: true in flight"
                 " at once; one beyond answers 429. 0 switches background mode"
                 " off: such requests then run in the foreground."
+            ),
+        )
+        rate_limit_group.add_argument(
+            f"--{prefix}background-lease-ttl-secs",
+            type=int,
+            default=RouterArgs.background_lease_ttl_secs,
+            help=(
+                "How long the lease this gateway holds on a background"
+                " response it runs stays valid without a renewal, in seconds;"
+                " a response whose gateway stopped is closed as failed by any"
+                " gateway sharing the response store within one and a half"
+                " times this value. Keep the clocks of the gateways sharing a"
+                " store within a third of this value of each other. 0 writes"
+                " no lease and runs no reaper; 1 to 5 are rejected (too short"
+                " to be renewed)."
             ),
         )
 

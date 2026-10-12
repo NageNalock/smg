@@ -1819,6 +1819,7 @@ class TestRouterArgsFieldOrder:
         "sse_keepalive_secs",
         "postgres_op_timeout_secs",
         "redis_op_timeout_secs",
+        "background_lease_ttl_secs",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1886,6 +1887,7 @@ class TestRouterArgsFieldOrder:
             "sse_keepalive_secs",
             "postgres_op_timeout_secs",
             "redis_op_timeout_secs",
+            "background_lease_ttl_secs",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "

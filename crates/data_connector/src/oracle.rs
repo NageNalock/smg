@@ -9,11 +9,12 @@ use oracle::{sql_type::ToSql, Connection, Connector, Row};
 use serde_json::Value;
 
 use super::core::{
-    make_item_id, Conversation, ConversationId, ConversationItem, ConversationItemId,
-    ConversationItemStorage, ConversationItemStorageError, ConversationMetadata,
-    ConversationStorage, ConversationStorageError, ListParams, NewConversation,
-    NewConversationItem, ResponseId, ResponseStorage, ResponseStorageError, SortOrder,
-    StoredResponse,
+    make_item_id, sql_string_list, ConditionalStore, Conversation, ConversationId,
+    ConversationItem, ConversationItemId, ConversationItemStorage, ConversationItemStorageError,
+    ConversationMetadata, ConversationStorage, ConversationStorageError, ListParams,
+    NewConversation, NewConversationItem, ResponseId, ResponseStorage, ResponseStorageError,
+    SortOrder, StoredResponse, BACKGROUND_LEASE_KEY, OPEN_RESPONSE_STATUSES,
+    TERMINAL_RESPONSE_STATUSES,
 };
 use crate::{
     common::{
@@ -1160,6 +1161,31 @@ fn find_by_output_item_sql(schema: &SchemaConfig, select_base: &str) -> Option<S
     ))
 }
 
+/// The query behind `list_open_background_responses`: the rows whose
+/// `raw_response` carries `background: true`, a status the response still
+/// leaves and a lease (`JSON_VALUE` and `JSON_EXISTS` over the JSON text),
+/// oldest first, at most `limit` of them. `None` when the schema skips the
+/// column.
+fn open_background_sql(schema: &SchemaConfig, select_base: &str, limit: usize) -> Option<String> {
+    let s = &schema.responses;
+    if s.is_skipped("raw_response") {
+        return None;
+    }
+    let col_raw = s.col("raw_response");
+    let order = if s.is_skipped("created_at") {
+        String::new()
+    } else {
+        format!(" ORDER BY {} ASC", s.col("created_at"))
+    };
+    Some(format!(
+        "SELECT * FROM ({select_base} WHERE JSON_VALUE({col_raw}, '$.background') = 'true' \
+         AND JSON_VALUE({col_raw}, '$.status') IN ({}) \
+         AND JSON_EXISTS({col_raw}, '$.{BACKGROUND_LEASE_KEY}'){order}) \
+         WHERE ROWNUM <= {limit}",
+        sql_string_list(&OPEN_RESPONSE_STATUSES)
+    ))
+}
+
 impl OracleResponseStorage {
     pub fn new(store: OracleStore) -> Self {
         let select_base = build_response_select_base(&store.schema);
@@ -1379,6 +1405,38 @@ fn store_response_sql(table: &str, columns: &[&str]) -> (String, Vec<String>) {
     (sql, binds)
 }
 
+/// The statement of `store_response_if_open`, with the names of its binds
+/// in the columns' order: an UPDATE of every column but the id of the row
+/// under the id, applied only while the stored object's status is not
+/// terminal (`open`; none when the schema skips the column, so the update
+/// is plain). The values are bound by name as in `store_response_sql`.
+fn update_if_open_sql(table: &str, columns: &[&str], open: Option<&str>) -> (String, Vec<String>) {
+    let binds: Vec<String> = (1..=columns.len()).map(|i| format!("v{i}")).collect();
+    let id_col = columns.first().copied().unwrap_or("id");
+    let id_bind = binds.first().cloned().unwrap_or_else(|| "v1".to_string());
+    let updates: Vec<String> = columns
+        .iter()
+        .zip(&binds)
+        .skip(1)
+        .map(|(col, bind)| format!("{col} = :{bind}"))
+        .collect();
+    let condition = open.map(|open| format!(" AND {open}")).unwrap_or_default();
+    let sql = format!(
+        "UPDATE {table} SET {} WHERE {id_col} = :{id_bind}{condition}",
+        updates.join(", ")
+    );
+    (sql, binds)
+}
+
+/// The condition of `update_if_open_sql` over the stored object's JSON text
+/// (a record without a status counts as open).
+fn oracle_open_predicate(col_raw: &str) -> String {
+    format!(
+        "COALESCE(JSON_VALUE({col_raw}, '$.status'), ' ') NOT IN ({})",
+        sql_string_list(&TERMINAL_RESPONSE_STATUSES)
+    )
+}
+
 #[async_trait]
 impl ResponseStorage for OracleResponseStorage {
     async fn store_response(
@@ -1460,6 +1518,80 @@ impl ResponseStorage for OracleResponseStorage {
         Ok(return_id)
     }
 
+    async fn store_response_if_open(
+        &self,
+        response: StoredResponse,
+    ) -> Result<ConditionalStore, ResponseStorageError> {
+        let StoredResponse {
+            id,
+            previous_response_id,
+            input,
+            created_at,
+            safety_identifier,
+            model,
+            conversation_id,
+            raw_response,
+        } = response;
+        let read_back = id.clone();
+        let response_id_str = id.0;
+        let previous_id = previous_response_id.map(|r| r.0);
+        let json_input = serde_json::to_string(&input)?;
+        let json_raw_response = serde_json::to_string(&raw_response)?;
+        let schema = self.store.schema.clone();
+        let hook_extra = current_extra_columns().unwrap_or_default();
+
+        let updated = self
+            .store
+            .execute(move |conn| {
+                let s = &schema.responses;
+                let table = s.qualified_table(schema.owner.as_deref());
+                let logical_fields: &[(&str, &dyn ToSql)] = &[
+                    ("id", &response_id_str),
+                    ("previous_response_id", &previous_id),
+                    ("input", &json_input),
+                    ("created_at", &created_at),
+                    ("safety_identifier", &safety_identifier),
+                    ("model", &model),
+                    ("conversation_id", &conversation_id),
+                    ("raw_response", &json_raw_response),
+                ];
+                let mut columns = Vec::new();
+                let mut params: Vec<&dyn ToSql> = Vec::new();
+                for &(logical, val) in logical_fields {
+                    if logical != "id" && s.is_skipped(logical) {
+                        continue;
+                    }
+                    columns.push(s.col(logical));
+                    params.push(val);
+                }
+                let extra_cols: Vec<(&str, Option<String>)> =
+                    resolve_extra_column_values(s, &hook_extra);
+                for (name, val) in &extra_cols {
+                    columns.push(*name);
+                    params.push(val);
+                }
+                let open = (!s.is_skipped("raw_response"))
+                    .then(|| oracle_open_predicate(s.col("raw_response")));
+                let (sql, binds) = update_if_open_sql(&table, &columns, open.as_deref());
+                let named: Vec<(&str, &dyn ToSql)> = binds
+                    .iter()
+                    .map(String::as_str)
+                    .zip(params.iter().copied())
+                    .collect();
+                let stmt = conn.execute_named(&sql, &named).map_err(map_oracle_error)?;
+                stmt.row_count().map_err(map_oracle_error)
+            })
+            .await
+            .map_err(ResponseStorageError::StorageError)?;
+        if updated > 0 {
+            return Ok(ConditionalStore::Stored);
+        }
+        Ok(match self.get_response(&read_back).await? {
+            Some(current) => ConditionalStore::Closed(Box::new(current)),
+            None => ConditionalStore::Missing,
+        })
+    }
+
     async fn get_response(
         &self,
         response_id: &ResponseId,
@@ -1507,6 +1639,30 @@ impl ResponseStorage for OracleResponseStorage {
                     }
                     None => Ok(None),
                 }
+            })
+            .await
+            .map_err(ResponseStorageError::StorageError)
+    }
+
+    async fn list_open_background_responses(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
+        let schema = self.store.schema.clone();
+        let Some(sql) = open_background_sql(&schema, &self.select_base, limit) else {
+            return Ok(Vec::new());
+        };
+
+        self.store
+            .execute(move |conn| {
+                let mut stmt = conn.statement(&sql).build().map_err(map_oracle_error)?;
+                let mut rows = stmt.query(&[]).map_err(map_oracle_error)?;
+                let mut results = Vec::new();
+                for row in &mut rows {
+                    let row = row.map_err(map_oracle_error)?;
+                    results.push(Self::build_response_from_row(&row, &schema)?);
+                }
+                Ok(results)
             })
             .await
             .map_err(ResponseStorageError::StorageError)
@@ -1757,6 +1913,42 @@ mod tests {
             .skip_columns
             .insert("raw_response".to_string());
         assert!(find_by_output_item_sql(&schema, "SELECT 1 FROM dual").is_none());
+    }
+
+    #[test]
+    fn open_background_lookup_reads_the_status_and_flag_from_the_json_text() {
+        let schema = SchemaConfig::default();
+        let sql = open_background_sql(&schema, "SELECT id FROM responses", 64).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM (SELECT id FROM responses WHERE JSON_VALUE(raw_response, '$.background') \
+             = 'true' AND JSON_VALUE(raw_response, '$.status') IN ('queued', 'in_progress') \
+             AND JSON_EXISTS(raw_response, '$._lease') \
+             ORDER BY created_at ASC) WHERE ROWNUM <= 64"
+        );
+
+        let mut skipped = SchemaConfig::default();
+        skipped
+            .responses
+            .skip_columns
+            .insert("raw_response".to_string());
+        assert!(open_background_sql(&skipped, "SELECT id FROM responses", 64).is_none());
+    }
+
+    #[test]
+    fn update_if_open_sql_updates_the_row_under_its_id_only_while_its_status_is_open() {
+        let open = oracle_open_predicate("raw_response");
+        let (sql, binds) =
+            update_if_open_sql("responses", &["id", "input", "raw_response"], Some(&open));
+        assert_eq!(binds, ["v1", "v2", "v3"]);
+        assert_eq!(
+            sql,
+            "UPDATE responses SET input = :v2, raw_response = :v3 WHERE id = :v1 AND \
+             COALESCE(JSON_VALUE(raw_response, '$.status'), ' ') NOT IN ('completed', \
+             'incomplete', 'failed', 'cancelled')"
+        );
+        let (plain, _) = update_if_open_sql("r", &["response_key", "input"], None);
+        assert_eq!(plain, "UPDATE r SET input = :v2 WHERE response_key = :v1");
     }
 
     #[test]

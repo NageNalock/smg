@@ -13,11 +13,11 @@ use tracing::warn;
 use crate::{
     context::{current_request_context, with_extra_columns},
     core::{
-        Conversation, ConversationId, ConversationItem, ConversationItemId, ConversationItemResult,
-        ConversationItemStorage, ConversationItemStorageError, ConversationMetadata,
-        ConversationResult, ConversationStorage, ConversationStorageError, ListParams,
-        NewConversation, NewConversationItem, ResponseChain, ResponseId, ResponseResult,
-        ResponseStorage, ResponseStorageError, StoredResponse,
+        ConditionalStore, Conversation, ConversationId, ConversationItem, ConversationItemId,
+        ConversationItemResult, ConversationItemStorage, ConversationItemStorageError,
+        ConversationMetadata, ConversationResult, ConversationStorage, ConversationStorageError,
+        ListParams, NewConversation, NewConversationItem, ResponseChain, ResponseId,
+        ResponseResult, ResponseStorage, ResponseStorageError, StoredResponse,
     },
     hooks::{BeforeHookResult, ExtraColumns, StorageHook, StorageOperation},
 };
@@ -455,6 +455,42 @@ impl ResponseStorage for HookedResponseStorage {
         Ok(result)
     }
 
+    /// A store that may be refused by the record's status: the before-hook
+    /// of [`Self::store_response`] runs for every attempt; the after-hook
+    /// runs only when the record was written, with the response's id as its
+    /// result, as a plain store's does (a hook that mirrors or audits writes
+    /// sees one contract on both paths, and nothing for a refused write).
+    async fn store_response_if_open(
+        &self,
+        response: StoredResponse,
+    ) -> ResponseResult<ConditionalStore> {
+        let payload = serde_json::to_value(&response).unwrap_or_default();
+        let id = serde_json::to_value(&response.id).unwrap_or_default();
+        let extra = run_before(
+            &*self.hook,
+            StorageOperation::StoreResponse,
+            &payload,
+            ResponseStorageError::StorageError,
+        )
+        .await?;
+
+        let result =
+            with_extra_columns(extra.clone(), self.inner.store_response_if_open(response)).await?;
+
+        if matches!(result, ConditionalStore::Stored) {
+            run_after(
+                &*self.hook,
+                StorageOperation::StoreResponse,
+                &payload,
+                &id,
+                &extra,
+            )
+            .await;
+        }
+
+        Ok(result)
+    }
+
     async fn get_response(
         &self,
         response_id: &ResponseId,
@@ -579,6 +615,16 @@ impl ResponseStorage for HookedResponseStorage {
         Ok(result)
     }
 
+    /// The gateway's own maintenance read (the records whose running gateway
+    /// may be gone), not a client operation: no hook runs for it. The close
+    /// that follows is a store and runs the hooks as every store does.
+    async fn list_open_background_responses(
+        &self,
+        limit: usize,
+    ) -> ResponseResult<Vec<StoredResponse>> {
+        self.inner.list_open_background_responses(limit).await
+    }
+
     async fn list_identifier_responses(
         &self,
         identifier: &str,
@@ -684,6 +730,7 @@ mod tests {
     struct MockHook {
         before_count: AtomicUsize,
         after_count: AtomicUsize,
+        after_results: parking_lot::Mutex<Vec<serde_json::Value>>,
         reject_before: parking_lot::Mutex<Option<String>>,
     }
 
@@ -692,8 +739,14 @@ mod tests {
             Self {
                 before_count: AtomicUsize::new(0),
                 after_count: AtomicUsize::new(0),
+                after_results: parking_lot::Mutex::new(Vec::new()),
                 reject_before: parking_lot::Mutex::new(None),
             }
+        }
+
+        /// The `result` of every after-hook call, in order.
+        fn after_results(&self) -> Vec<serde_json::Value> {
+            self.after_results.lock().clone()
         }
 
         fn set_reject(&self, msg: &str) {
@@ -729,10 +782,11 @@ mod tests {
             _operation: StorageOperation,
             _context: Option<&RequestContext>,
             _payload: &serde_json::Value,
-            _result: &serde_json::Value,
+            result: &serde_json::Value,
             extra: &ExtraColumns,
         ) -> Result<ExtraColumns, HookError> {
             self.after_count.fetch_add(1, Ordering::SeqCst);
+            self.after_results.lock().push(result.clone());
             Ok(extra.clone())
         }
     }
@@ -1422,6 +1476,73 @@ mod tests {
         // list_identifier_responses triggers its own before/after hook
         assert_eq!(hook.before_calls(), 3);
         assert_eq!(hook.after_calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn hooked_conditional_store_runs_the_store_hooks_and_keeps_a_closed_record() {
+        let inner = Arc::new(MemoryResponseStorage::new());
+        let hook = Arc::new(MockHook::new());
+        let hooked = HookedResponseStorage::new(inner, hook.clone());
+
+        let record = |status: &str| {
+            let mut stored = StoredResponse::new(None);
+            stored.id = ResponseId::from("resp_1");
+            stored.raw_response = json!({"background": true, "status": status});
+            stored
+        };
+        hooked.store_response(record("queued")).await.unwrap();
+        assert!(matches!(
+            hooked
+                .store_response_if_open(record("cancelled"))
+                .await
+                .unwrap(),
+            ConditionalStore::Stored
+        ));
+        assert!(matches!(
+            hooked
+                .store_response_if_open(record("completed"))
+                .await
+                .unwrap(),
+            ConditionalStore::Closed(current) if current.raw_response["status"] == "cancelled"
+        ));
+        assert_eq!(hook.before_calls(), 3, "each store runs the before-hook");
+        assert_eq!(
+            hook.after_calls(),
+            2,
+            "the after-hook runs for the two writes, not for the refused one"
+        );
+        assert_eq!(
+            hook.after_results(),
+            vec![json!("resp_1"), json!("resp_1")],
+            "the after-hook's result is the response's id, as for a plain store"
+        );
+        let stored = hooked
+            .get_response(&ResponseId::from("resp_1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.raw_response["status"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn hooked_response_lists_open_background_responses_without_a_hook_round() {
+        let inner = Arc::new(MemoryResponseStorage::new());
+        let hook = Arc::new(MockHook::new());
+        let hooked = HookedResponseStorage::new(inner, hook.clone());
+
+        let mut open = StoredResponse::new(None);
+        open.raw_response = json!({"background": true, "status": "in_progress", "_lease": {"owner": "gw_a", "expires_at": 1}});
+        let open_id = hooked.store_response(open).await.unwrap();
+        let mut closed = StoredResponse::new(None);
+        closed.raw_response = json!({"background": true, "status": "completed"});
+        hooked.store_response(closed).await.unwrap();
+        assert_eq!(hook.before_calls(), 2);
+
+        let listed = hooked.list_open_background_responses(10).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, open_id);
+        assert_eq!(hook.before_calls(), 2, "a maintenance read runs no hook");
+        assert_eq!(hook.after_calls(), 2);
     }
 
     #[tokio::test]

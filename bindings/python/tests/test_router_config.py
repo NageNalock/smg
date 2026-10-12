@@ -527,6 +527,7 @@ class TestRouterPositionalSignature:
             "mm_allowed_media_domains",
             "mm_allow_private_media_hosts",
             "sse_keepalive_secs",
+            "background_lease_ttl_secs",
         ]
 
 

@@ -15,11 +15,13 @@ use crate::{
     config::PostgresConfig,
     context::current_extra_columns,
     core::{
-        make_item_id, Conversation, ConversationId, ConversationItem, ConversationItemId,
-        ConversationItemResult, ConversationItemStorage, ConversationItemStorageError,
-        ConversationMetadata, ConversationResult, ConversationStorage, ConversationStorageError,
-        ListParams, NewConversation, NewConversationItem, ResponseId, ResponseResult,
-        ResponseStorage, ResponseStorageError, SortOrder, StoredResponse,
+        make_item_id, sql_string_list, ConditionalStore, Conversation, ConversationId,
+        ConversationItem, ConversationItemId, ConversationItemResult, ConversationItemStorage,
+        ConversationItemStorageError, ConversationMetadata, ConversationResult,
+        ConversationStorage, ConversationStorageError, ListParams, NewConversation,
+        NewConversationItem, ResponseId, ResponseResult, ResponseStorage, ResponseStorageError,
+        SortOrder, StoredResponse, BACKGROUND_LEASE_KEY, OPEN_RESPONSE_STATUSES,
+        TERMINAL_RESPONSE_STATUSES,
     },
     postgres_migrations::POSTGRES_HISTORY_MIGRATIONS,
     schema::SchemaConfig,
@@ -217,7 +219,11 @@ impl PostgresStore {
                     describe_error(&e)
                 )
             })?;
-        if let Some(index_ddl) = PostgresResponseStorage::index_ddl(schema) {
+        // Each response index in a savepoint of its own: one that cannot be
+        // created (the safety-identifier column may be missing, a stored
+        // object may defeat the open-background index's expression) leaves
+        // the others in place.
+        for index_ddl in PostgresResponseStorage::index_ddls(schema) {
             let index = tx.savepoint("response_index").await.map_err(|e| {
                 format!("failed to open the index savepoint: {}", describe_error(&e))
             })?;
@@ -230,7 +236,8 @@ impl PostgresStore {
                 })?,
                 Err(e) => {
                     tracing::warn!(
-                        "response index not created (the safety_identifier column may be missing): {}",
+                        index_ddl,
+                        "response index not created: {}",
                         describe_error(&e)
                     );
                     index.rollback().await.map_err(|e| {
@@ -1108,19 +1115,24 @@ impl PostgresResponseStorage {
         )
     }
 
-    /// The index on the safety identifier, created by the bootstrap after
-    /// the migrations (a legacy table gains the column in v1), unless the
+    /// The response indexes, created by the bootstrap after the migrations,
+    /// each in a savepoint of its own: the index on the safety identifier (a
+    /// legacy table gains the column in v1) unless the column is skipped, and
+    /// the partial index behind the reaper's listing of the open background
+    /// records ([`open_background_index_sql`]) unless the stored object's
     /// column is skipped.
-    pub(crate) fn index_ddl(schema: &SchemaConfig) -> Option<String> {
+    pub(crate) fn index_ddls(schema: &SchemaConfig) -> Vec<String> {
         let s = &schema.responses;
-        if s.is_skipped("safety_identifier") {
-            return None;
+        let mut ddls = Vec::new();
+        if !s.is_skipped("safety_identifier") {
+            let table = s.qualified_table(schema.owner.as_deref());
+            ddls.push(format!(
+                "CREATE INDEX IF NOT EXISTS responses_safety_idx ON {table} ({});",
+                s.col("safety_identifier")
+            ));
         }
-        let table = s.qualified_table(schema.owner.as_deref());
-        Some(format!(
-            "CREATE INDEX IF NOT EXISTS responses_safety_idx ON {table} ({});",
-            s.col("safety_identifier")
-        ))
+        ddls.extend(open_background_index_sql(schema));
+        ddls
     }
 
     /// The index behind [`ResponseStorage::delete_unstored_older_than`]: the
@@ -1251,6 +1263,81 @@ fn find_by_output_item_sql(schema: &SchemaConfig, select_base: &str) -> Option<S
     ))
 }
 
+/// The stored object's `field` as text: an SQL expression over the `json`
+/// column `col_raw` that no stored object can make fail. The `json` field
+/// operators (`->>`, and a cast to `jsonb`) de-escape every string of the
+/// document they walk and refuse `\u0000`, which `json` accepts on input and
+/// serde_json writes for a NUL in a model's or a client's string; the escape
+/// is turned into a space escape (`\u0020`) before the text is parsed. A
+/// replacement that kept the backslash in place is the point: the six
+/// characters `\u0000` written literally in a string (code, prose about
+/// escapes) are stored as `\\u0000`, and a replacement by nothing would
+/// leave a lone backslash and invalid text. Every function in the
+/// expression is immutable, so it can be indexed; the stored text is never
+/// changed.
+fn json_field_text(col_raw: &str, field: &str) -> String {
+    format!("replace({col_raw}::text, '\\u0000', '\\u0020')::json->>'{field}'")
+}
+
+/// The condition of a row whose stored object's status is one a response
+/// still leaves: the predicate of [`open_background_index_sql`] and of the
+/// listing it serves.
+fn open_status_condition(col_raw: &str) -> String {
+    format!(
+        "{} IN ({})",
+        json_field_text(col_raw, "status"),
+        sql_string_list(&OPEN_RESPONSE_STATUSES)
+    )
+}
+
+/// The index behind [`ResponseStorage::list_open_background_responses`]: a
+/// partial index over the rows whose stored object's status is one a
+/// response still leaves, keyed by that status, so the listing every
+/// gateway's reaper runs reads the few open rows instead of scanning the
+/// table. Postgres evaluates the key and the predicate on every INSERT and
+/// UPDATE of the table once the index exists, hence [`json_field_text`]: an
+/// object with a `\u0000` escape stores as it did without the index. Created
+/// by the bootstrap after the migrations, in a savepoint of its own like the
+/// identifier index. `None` when the schema skips the column.
+fn open_background_index_sql(schema: &SchemaConfig) -> Option<String> {
+    let s = &schema.responses;
+    if s.is_skipped("raw_response") {
+        return None;
+    }
+    let table = s.qualified_table(schema.owner.as_deref());
+    let col_raw = s.col("raw_response");
+    Some(format!(
+        "CREATE INDEX IF NOT EXISTS responses_open_background_idx ON {table} \
+         (({})) WHERE {};",
+        json_field_text(col_raw, "status"),
+        open_status_condition(col_raw)
+    ))
+}
+
+/// The query behind [`ResponseStorage::list_open_background_responses`]:
+/// the rows whose stored object carries a status the response still leaves
+/// (the condition of [`open_background_index_sql`], so the partial index
+/// serves the query), `background: true` and a lease, oldest first, `$1` the
+/// most rows. `None` when the schema skips the column (nothing to list).
+fn open_background_sql(schema: &SchemaConfig, select_base: &str) -> Option<String> {
+    let s = &schema.responses;
+    if s.is_skipped("raw_response") {
+        return None;
+    }
+    let col_raw = s.col("raw_response");
+    let order = if s.is_skipped("created_at") {
+        String::new()
+    } else {
+        format!(" ORDER BY {} ASC", s.col("created_at"))
+    };
+    Some(format!(
+        "{select_base} WHERE {} AND {} = 'true' AND {} IS NOT NULL{order} LIMIT $1",
+        open_status_condition(col_raw),
+        json_field_text(col_raw, "background"),
+        json_field_text(col_raw, BACKGROUND_LEASE_KEY)
+    ))
+}
+
 /// How a response is stored under its id, decided once at start-up from the
 /// catalog (`store_path_for`). The table the store creates has a primary key
 /// on the id, so it takes the one-statement path; a configured table that
@@ -1377,6 +1464,91 @@ fn locked_merge_sql(table: &str, col_names: &[&str]) -> String {
     )
 }
 
+/// The columns a response is written to and their values, in the order of
+/// the statement's parameters (the id first), skipping the configured
+/// `skip_columns` and appending the extra columns of hooks or defaults.
+#[expect(
+    clippy::ref_option,
+    reason = "the previous id is pushed as a `&dyn ToSql` that lives as long as the caller's `Option<String>`"
+)]
+fn write_columns<'a>(
+    s: &'a crate::schema::TableConfig,
+    response: &'a StoredResponse,
+    previous_id: &'a Option<String>,
+    extra_cols: &'a [(&'a str, Option<String>)],
+) -> (Vec<&'a str>, Vec<&'a (dyn ToSql + Sync)>) {
+    let mut col_names: Vec<&str> = vec![s.col("id")];
+    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&response.id.0];
+    if !s.is_skipped("conversation_id") {
+        col_names.push(s.col("conversation_id"));
+        params.push(&response.conversation_id);
+    }
+    if !s.is_skipped("previous_response_id") {
+        col_names.push(s.col("previous_response_id"));
+        params.push(previous_id);
+    }
+    if !s.is_skipped("input") {
+        col_names.push(s.col("input"));
+        params.push(&response.input);
+    }
+    if !s.is_skipped("created_at") {
+        col_names.push(s.col("created_at"));
+        params.push(&response.created_at);
+    }
+    if !s.is_skipped("safety_identifier") {
+        col_names.push(s.col("safety_identifier"));
+        params.push(&response.safety_identifier);
+    }
+    if !s.is_skipped("model") {
+        col_names.push(s.col("model"));
+        params.push(&response.model);
+    }
+    if !s.is_skipped("raw_response") {
+        col_names.push(s.col("raw_response"));
+        params.push(&response.raw_response);
+    }
+    if !s.is_skipped("tenant") {
+        col_names.push(s.col("tenant"));
+        params.push(&response.tenant);
+    }
+    for (name, val) in extra_cols {
+        col_names.push(*name);
+        params.push(val);
+    }
+    (col_names, params)
+}
+
+/// The condition under which [`ResponseStorage::store_response_if_open`]
+/// writes: the stored object's status is not terminal
+/// ([`TERMINAL_RESPONSE_STATUSES`]; a record without a status counts as
+/// open), read as [`json_field_text`] reads it.
+fn open_predicate(col_raw: &str) -> String {
+    format!(
+        "COALESCE({}, '') NOT IN ({})",
+        json_field_text(col_raw, "status"),
+        sql_string_list(&TERMINAL_RESPONSE_STATUSES)
+    )
+}
+
+/// The statement of [`ResponseStorage::store_response_if_open`]: an UPDATE of
+/// every column of the row under the id, applied only while `open` holds
+/// (none: the schema skips the status' column, so the update is plain). The
+/// condition is evaluated on the row's current version under its lock, so a
+/// close that lands first makes this statement update nothing.
+fn update_if_open_sql(table: &str, col_names: &[&str], open: Option<&str>) -> String {
+    let id_col = col_names.first().copied().unwrap_or("id");
+    let assignments: Vec<String> = col_names
+        .iter()
+        .enumerate()
+        .map(|(i, col)| format!("{col} = ${}", i + 1))
+        .collect();
+    let condition = open.map(|open| format!(" AND {open}")).unwrap_or_default();
+    format!(
+        "UPDATE {table} SET {} WHERE {id_col} = $1{condition}",
+        assignments.join(", ")
+    )
+}
+
 /// The lock statement of the locked path, sent through the simple query
 /// protocol (one round trip, nothing to prepare): the key is a locally
 /// computed integer.
@@ -1403,66 +1575,13 @@ impl ResponseStorage for PostgresResponseStorage {
         &self,
         response: StoredResponse,
     ) -> Result<ResponseId, ResponseStorageError> {
-        let StoredResponse {
-            id: response_id,
-            previous_response_id,
-            input,
-            created_at,
-            safety_identifier,
-            model,
-            conversation_id,
-            raw_response,
-            tenant,
-        } = response;
-        let previous_id = previous_response_id.map(|r| r.0);
-
         let s = &self.store.schema.responses;
         let table = s.qualified_table(self.store.schema.owner.as_deref());
-
-        // Build dynamic column/param lists, skipping configured skip_columns
-        let mut col_names: Vec<&str> = vec![s.col("id")];
-        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&response_id.0];
-
-        if !s.is_skipped("conversation_id") {
-            col_names.push(s.col("conversation_id"));
-            params.push(&conversation_id);
-        }
-        if !s.is_skipped("previous_response_id") {
-            col_names.push(s.col("previous_response_id"));
-            params.push(&previous_id);
-        }
-        if !s.is_skipped("input") {
-            col_names.push(s.col("input"));
-            params.push(&input);
-        }
-        if !s.is_skipped("created_at") {
-            col_names.push(s.col("created_at"));
-            params.push(&created_at);
-        }
-        if !s.is_skipped("safety_identifier") {
-            col_names.push(s.col("safety_identifier"));
-            params.push(&safety_identifier);
-        }
-        if !s.is_skipped("model") {
-            col_names.push(s.col("model"));
-            params.push(&model);
-        }
-        if !s.is_skipped("raw_response") {
-            col_names.push(s.col("raw_response"));
-            params.push(&raw_response);
-        }
-        if !s.is_skipped("tenant") {
-            col_names.push(s.col("tenant"));
-            params.push(&tenant);
-        }
-
-        // Append extra columns from hooks or defaults
+        let previous_id = response.previous_response_id.as_ref().map(|r| r.0.clone());
         let hook_extra = current_extra_columns().unwrap_or_default();
         let extra_cols: Vec<(&str, Option<String>)> = resolve_extra_column_values(s, &hook_extra);
-        for (name, val) in &extra_cols {
-            col_names.push(*name);
-            params.push(val);
-        }
+        let (col_names, params) = write_columns(s, &response, &previous_id, &extra_cols);
+        let response_id = response.id.clone();
 
         let mut client = self
             .store
@@ -1513,6 +1632,40 @@ impl ResponseStorage for PostgresResponseStorage {
         Ok(response_id)
     }
 
+    async fn store_response_if_open(
+        &self,
+        response: StoredResponse,
+    ) -> ResponseResult<ConditionalStore> {
+        let s = &self.store.schema.responses;
+        let table = s.qualified_table(self.store.schema.owner.as_deref());
+        let previous_id = response.previous_response_id.as_ref().map(|r| r.0.clone());
+        let hook_extra = current_extra_columns().unwrap_or_default();
+        let extra_cols: Vec<(&str, Option<String>)> = resolve_extra_column_values(s, &hook_extra);
+        let (col_names, params) = write_columns(s, &response, &previous_id, &extra_cols);
+        let open = (!s.is_skipped("raw_response")).then(|| open_predicate(s.col("raw_response")));
+        let sql = update_if_open_sql(&table, &col_names, open.as_deref());
+
+        let client = self
+            .store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        let store_err =
+            |e: tokio_postgres::Error| ResponseStorageError::StorageError(e.to_string());
+        let stmt = client.prepare_cached(&sql).await.map_err(store_err)?;
+        let rows = client.execute(&stmt, &params).await.map_err(store_err)?;
+        if rows > 0 {
+            return Ok(ConditionalStore::Stored);
+        }
+        // Nothing moved: the record is closed, or gone.
+        drop(client);
+        Ok(match self.get_response(&response.id).await? {
+            Some(current) => ConditionalStore::Closed(Box::new(current)),
+            None => ConditionalStore::Missing,
+        })
+    }
+
     async fn get_response(
         &self,
         response_id: &ResponseId,
@@ -1556,6 +1709,32 @@ impl ResponseStorage for PostgresResponseStorage {
             Some(row) => Self::build_response_from_row(row, &self.store.schema).map(Some),
             None => Ok(None),
         }
+    }
+
+    async fn list_open_background_responses(
+        &self,
+        limit: usize,
+    ) -> ResponseResult<Vec<StoredResponse>> {
+        let Some(sql) = open_background_sql(&self.store.schema, &self.select_base) else {
+            return Ok(Vec::new());
+        };
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let client = self
+            .store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        let rows = client
+            .query(&sql, &[&limit])
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        let schema = &self.store.schema;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(Self::build_response_from_row(&row, schema)?);
+        }
+        Ok(out)
     }
 
     async fn delete_response(&self, response_id: &ResponseId) -> ResponseResult<()> {
@@ -1752,18 +1931,25 @@ mod tests {
         assert!(
             PostgresResponseStorage::table_ddl(&schema).contains("safety_identifier VARCHAR(128)")
         );
+        let ddls = PostgresResponseStorage::index_ddls(&schema);
+        assert_eq!(ddls.len(), 2, "{ddls:?}");
         assert_eq!(
-            PostgresResponseStorage::index_ddl(&schema).as_deref(),
-            Some(
-                "CREATE INDEX IF NOT EXISTS responses_safety_idx ON responses (safety_identifier);"
-            )
+            ddls[0],
+            "CREATE INDEX IF NOT EXISTS responses_safety_idx ON responses (safety_identifier);"
+        );
+        assert_eq!(
+            Some(&ddls[1]),
+            open_background_index_sql(&schema).as_ref(),
+            "the open-background index is the second statement"
         );
         let mut skipped = SchemaConfig::default();
         skipped
             .responses
             .skip_columns
             .insert("safety_identifier".to_string());
-        assert!(PostgresResponseStorage::index_ddl(&skipped).is_none());
+        let ddls = PostgresResponseStorage::index_ddls(&skipped);
+        assert_eq!(ddls.len(), 1, "{ddls:?}");
+        assert!(ddls[0].contains("responses_open_background_idx"));
         // The links index is a statement of its own, run after the migrations.
         assert_eq!(
             PostgresConversationItemStorage::index_ddl(&schema),
@@ -1772,6 +1958,66 @@ mod tests {
         assert!(
             !PostgresConversationItemStorage::table_ddl(&schema).contains("CREATE INDEX"),
             "the tables' DDL carries no index"
+        );
+    }
+
+    #[test]
+    fn the_open_background_index_covers_the_listing_s_status_condition() {
+        let schema = SchemaConfig::default();
+        assert_eq!(
+            open_background_index_sql(&schema).unwrap(),
+            "CREATE INDEX IF NOT EXISTS responses_open_background_idx ON responses \
+             ((replace(raw_response::text, '\\u0000', '\\u0020')::json->>'status')) \
+             WHERE replace(raw_response::text, '\\u0000', '\\u0020')::json->>'status' \
+             IN ('queued', 'in_progress');"
+        );
+        let mut skipped = SchemaConfig::default();
+        skipped
+            .responses
+            .skip_columns
+            .insert("raw_response".to_string());
+        assert!(open_background_index_sql(&skipped).is_none());
+    }
+
+    #[test]
+    fn open_background_sql_filters_on_the_stored_status_and_flag_oldest_first() {
+        let schema = SchemaConfig::default();
+        let sql = open_background_sql(&schema, "SELECT id, raw_response FROM responses").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT id, raw_response FROM responses WHERE \
+             replace(raw_response::text, '\\u0000', '\\u0020')::json->>'status' \
+             IN ('queued', 'in_progress') AND \
+             replace(raw_response::text, '\\u0000', '\\u0020')::json->>'background' = 'true' AND \
+             replace(raw_response::text, '\\u0000', '\\u0020')::json->>'_lease' IS NOT NULL \
+             ORDER BY created_at ASC LIMIT $1"
+        );
+
+        let mut skipped = SchemaConfig::default();
+        skipped
+            .responses
+            .skip_columns
+            .insert("raw_response".to_string());
+        assert!(open_background_sql(&skipped, "SELECT id FROM responses").is_none());
+    }
+
+    #[test]
+    fn update_if_open_sql_updates_the_row_under_its_id_only_while_its_status_is_open() {
+        let open = open_predicate("raw_response");
+        assert_eq!(
+            open,
+            "COALESCE(replace(raw_response::text, '\\u0000', '\\u0020')::json->>'status', '') \
+             NOT IN ('completed', 'incomplete', 'failed', 'cancelled')"
+        );
+        assert_eq!(
+            update_if_open_sql("responses", &["id", "input", "raw_response"], Some(&open)),
+            "UPDATE responses SET id = $1, input = $2, raw_response = $3 WHERE id = $1 AND \
+             COALESCE(replace(raw_response::text, '\\u0000', '\\u0020')::json->>'status', '') \
+             NOT IN ('completed', 'incomplete', 'failed', 'cancelled')"
+        );
+        assert_eq!(
+            update_if_open_sql("r", &["response_key", "input"], None),
+            "UPDATE r SET response_key = $1, input = $2 WHERE response_key = $1"
         );
     }
 

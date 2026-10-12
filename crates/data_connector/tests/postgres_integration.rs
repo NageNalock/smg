@@ -38,8 +38,8 @@ use std::{
 
 use chrono::{TimeDelta, Utc};
 use data_connector::{
-    create_storage, ConversationItemId, HistoryBackend, ListParams, NewConversation,
-    NewConversationItem, PostgresConfig, SchemaConfig, SortOrder, StorageBundle,
+    create_storage, ConditionalStore, ConversationItemId, HistoryBackend, ListParams,
+    NewConversation, NewConversationItem, PostgresConfig, SchemaConfig, SortOrder, StorageBundle,
     StorageFactoryConfig, StoredResponse, TableConfig,
 };
 use serde_json::json;
@@ -1612,4 +1612,313 @@ async fn responses_and_conversations_keep_their_tenant_and_the_identifier_querie
         .delete_conversation(&created.id)
         .await
         .expect("delete conversation"));
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn open_background_responses_are_listed_until_they_close() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let bundle = postgres_bundle(&db_url).await.expect("create storage");
+    let storage = bundle.response_storage;
+
+    // Three records of this run: a background response in flight (with the
+    // lease its gateway wrote), one that closed, and a foreground one.
+    let record = |status: &str, background: bool| {
+        let mut stored = StoredResponse::new(None);
+        let mut raw = json!({"id": stored.id.0, "status": status, "output": []});
+        if background {
+            raw["background"] = json!(true);
+            raw["_lease"] = json!({"owner": "gw_test", "expires_at": 1_700_000_000});
+        }
+        stored.raw_response = raw;
+        stored
+    };
+    let open = record("in_progress", true);
+    let closed = record("completed", true);
+    let foreground = record("in_progress", false);
+    for stored in [&open, &closed, &foreground] {
+        storage.store_response(stored.clone()).await.expect("store");
+    }
+
+    let listed_ids =
+        |responses: Vec<StoredResponse>| responses.into_iter().map(|r| r.id.0).collect::<Vec<_>>();
+    let ids = listed_ids(
+        storage
+            .list_open_background_responses(10_000)
+            .await
+            .expect("list"),
+    );
+    assert!(
+        ids.contains(&open.id.0),
+        "the open background record is listed: {ids:?}"
+    );
+    assert!(!ids.contains(&closed.id.0), "a closed record is not");
+    assert!(
+        !ids.contains(&foreground.id.0),
+        "a foreground record is not"
+    );
+    let listed = storage
+        .list_open_background_responses(10_000)
+        .await
+        .expect("list");
+    let found = listed
+        .iter()
+        .find(|r| r.id == open.id)
+        .expect("the open record");
+    assert_eq!(found.raw_response["_lease"]["owner"], "gw_test");
+
+    // Its terminal store takes it out of the list.
+    let mut done = open.clone();
+    done.raw_response["status"] = json!("failed");
+    storage.store_response(done).await.expect("store");
+    let ids = listed_ids(
+        storage
+            .list_open_background_responses(10_000)
+            .await
+            .expect("list"),
+    );
+    assert!(!ids.contains(&open.id.0), "{ids:?}");
+
+    for stored in [&open, &closed, &foreground] {
+        storage.delete_response(&stored.id).await.expect("delete");
+    }
+
+    // The listing is served by the partial index created with the table.
+    let (client, connection) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test drives its own connection for the one query it makes"
+    )]
+    let driver = tokio::spawn(connection);
+    let indexes = client
+        .query(
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'responses_open_background_idx'",
+            &[],
+        )
+        .await
+        .expect("pg_indexes");
+    assert_eq!(indexes.len(), 1, "the open-background index exists");
+    let indexdef: String = indexes[0].get(0);
+    assert!(
+        indexdef.contains("WHERE") && indexdef.contains("'status'"),
+        "{indexdef}"
+    );
+    drop(client);
+    let _ = driver.await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_stored_object_with_a_nul_escape_is_stored_listed_and_moved_under_the_index() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let bundle = postgres_bundle(&db_url).await.expect("create storage");
+    let storage = bundle.response_storage;
+
+    // An open background record whose object carries a NUL in a string (as a
+    // model's or a client's text can), stored after the partial index exists
+    // (the store created it with the table); and an open one without a lease.
+    let record = |status: &str, text: &str, lease: bool| {
+        let mut stored = StoredResponse::new(None);
+        let mut raw = json!({
+            "id": stored.id.0, "status": status, "background": true,
+            "instructions": text, "output": [],
+        });
+        if lease {
+            raw["_lease"] = json!({"owner": "gw_test", "expires_at": 1_700_000_000});
+        }
+        stored.raw_response = raw;
+        stored
+    };
+    let nul = record("in_progress", "a\u{0}b", true);
+    // The six characters of the escape written literally in a string (code,
+    // prose about escapes): stored as an escaped backslash followed by the
+    // text, which the index's expression must leave valid.
+    let literal = record("in_progress", "char c = '\\u0000';", true);
+    let no_lease = record("queued", "plain", false);
+    storage
+        .store_response(nul.clone())
+        .await
+        .expect("an object with a NUL escape stores under the index");
+    storage
+        .store_response(literal.clone())
+        .await
+        .expect("an object with the escape's text written literally stores under the index");
+    storage
+        .store_response(no_lease.clone())
+        .await
+        .expect("store");
+
+    let listed = storage
+        .list_open_background_responses(10_000)
+        .await
+        .expect("list");
+    let found = listed
+        .iter()
+        .find(|r| r.id == nul.id)
+        .expect("the record with the NUL escape is listed");
+    assert_eq!(
+        found.raw_response["instructions"], "a\u{0}b",
+        "the text round-trips"
+    );
+    let found = listed
+        .iter()
+        .find(|r| r.id == literal.id)
+        .expect("the record with the literal text is listed");
+    assert_eq!(
+        found.raw_response["instructions"], "char c = '\\u0000';",
+        "the text round-trips"
+    );
+    assert!(
+        listed.iter().all(|r| r.id != no_lease.id),
+        "a record without a lease is not listed"
+    );
+
+    // Its transitions are conditional writes over the same expression.
+    let mut moved = nul.clone();
+    moved.raw_response["status"] = json!("completed");
+    assert!(matches!(
+        storage
+            .store_response_if_open(moved.clone())
+            .await
+            .expect("conditional store"),
+        ConditionalStore::Stored
+    ));
+    assert!(matches!(
+        storage
+            .store_response_if_open(moved)
+            .await
+            .expect("conditional store"),
+        ConditionalStore::Closed(_)
+    ));
+    assert!(storage
+        .list_open_background_responses(10_000)
+        .await
+        .expect("list")
+        .iter()
+        .all(|r| r.id != nul.id));
+
+    // The listing is served by the partial index: with sequential scans off
+    // the planner must still find a plan, through the index.
+    let (client, connection) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test drives its own connection for the queries it makes"
+    )]
+    let driver = tokio::spawn(connection);
+    client
+        .batch_execute("SET enable_seqscan = off")
+        .await
+        .expect("set");
+    let plan = client
+        .query(
+            "EXPLAIN SELECT id FROM responses WHERE \
+             replace(raw_response::text, '\\u0000', '\\u0020')::json->>'status' \
+             IN ('queued', 'in_progress') AND \
+             replace(raw_response::text, '\\u0000', '\\u0020')::json->>'background' = 'true' AND \
+             replace(raw_response::text, '\\u0000', '\\u0020')::json->>'_lease' IS NOT NULL \
+             ORDER BY created_at ASC LIMIT 1024",
+            &[],
+        )
+        .await
+        .expect("explain");
+    let plan: Vec<String> = plan.iter().map(|row| row.get::<_, String>(0)).collect();
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("responses_open_background_idx")),
+        "{plan:?}"
+    );
+    drop(client);
+    let _ = driver.await;
+
+    for stored in [&nul, &literal, &no_lease] {
+        storage.delete_response(&stored.id).await.expect("delete");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_conditional_store_replaces_an_open_record_and_refuses_a_closed_or_missing_one() {
+    let Some(url) = test_db_url() else {
+        return;
+    };
+    let bundle = postgres_bundle(&url).await.expect("create storage");
+    let storage = bundle.response_storage;
+
+    let base = StoredResponse::new(None);
+    let record = |status: &str| {
+        let mut stored = base.clone();
+        stored.raw_response =
+            json!({"id": stored.id.0, "background": true, "status": status, "output": []});
+        stored
+    };
+    // Missing: nothing is written.
+    assert!(matches!(
+        storage
+            .store_response_if_open(record("in_progress"))
+            .await
+            .expect("conditional store"),
+        ConditionalStore::Missing
+    ));
+    assert!(storage.get_response(&base.id).await.expect("get").is_none());
+
+    // Open: replaced.
+    storage
+        .store_response(record("queued"))
+        .await
+        .expect("store");
+    assert!(matches!(
+        storage
+            .store_response_if_open(record("in_progress"))
+            .await
+            .expect("conditional store"),
+        ConditionalStore::Stored
+    ));
+    let stored = storage
+        .get_response(&base.id)
+        .await
+        .expect("get")
+        .expect("stored");
+    assert_eq!(stored.raw_response["status"], "in_progress");
+    assert!(matches!(
+        storage
+            .store_response_if_open(record("cancelled"))
+            .await
+            .expect("conditional store"),
+        ConditionalStore::Stored
+    ));
+
+    // Closed: refused, the record handed back as it is.
+    let ConditionalStore::Closed(current) = storage
+        .store_response_if_open(record("completed"))
+        .await
+        .expect("conditional store")
+    else {
+        panic!("a cancelled record is closed");
+    };
+    assert_eq!(current.raw_response["status"], "cancelled");
+    let stored = storage
+        .get_response(&base.id)
+        .await
+        .expect("get")
+        .expect("stored");
+    assert_eq!(stored.raw_response["status"], "cancelled");
+    assert!(
+        storage
+            .list_open_background_responses(10_000)
+            .await
+            .expect("list")
+            .iter()
+            .all(|r| r.id != base.id),
+        "a closed record is not among the open ones"
+    );
+
+    storage.delete_response(&base.id).await.expect("delete");
 }
