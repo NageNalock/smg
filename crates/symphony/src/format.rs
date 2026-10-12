@@ -31,6 +31,10 @@
 //!   knows a stop sequence ended the stream hands the end over as another finish
 //!   (`EngineFinish::Other`), and the call stays cut, since a stop sequence never completes a
 //!   call.
+//! - The **stop tokens** are the terminals that are tokens the engine stops on (Harmony's
+//!   `<|call|>`): the stop decoder hides them, so the engine never reads one, and a constraint
+//!   derived from the table can end a region one of them closes with no text of its own, since
+//!   the model's stop ends the region there ([`Format::is_stop_token`]).
 //!
 //! The first state in the table is where an output starts, unless the prompt moved the engine
 //! before the output began: the engine replays the prompt's terminals over the same table, from
@@ -135,6 +139,8 @@ pub struct Format {
     structural_tokens: Vec<String>,
     /// The arguments states whose call the stream's stop closes.
     stop_closes: Vec<usize>,
+    /// The texts of the tokens the engine stops on that are terminals.
+    stop_tokens: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -180,6 +186,7 @@ impl Format {
             turn_opener: None,
             structural_tokens: Vec::new(),
             stop_closes: Vec::new(),
+            stop_tokens: Vec::new(),
         }
     }
 
@@ -259,6 +266,29 @@ impl Format {
         let state = self.state_named(state);
         self.stop_closes.push(state);
         self
+    }
+
+    /// The texts among `stops` (the model's end-of-sequence and stop tokens) that are terminals of
+    /// the table, each kept once in the order given; other texts are not kept. The terminals must
+    /// already be in the table. Parsing does not change, since the stop decoder hides these
+    /// tokens; [`Self::is_stop_token`] tells a constraint derived from the table which closing
+    /// terminals the model's stop writes.
+    #[must_use]
+    pub fn stop_tokens<'t>(mut self, stops: impl IntoIterator<Item = &'t str>) -> Self {
+        for stop in stops {
+            let terminal = self.terminals.iter().any(|terminal| terminal.text == stop);
+            if terminal && !self.stop_tokens.iter().any(|known| known == stop) {
+                self.stop_tokens.push(stop.to_string());
+            }
+        }
+        self
+    }
+
+    /// Whether `text` is a terminal of the table that is a token the engine stops on
+    /// ([`Self::stop_tokens`]): a region it closes ends at the model's stop, so a constraint can
+    /// end that region with no text of its own.
+    pub fn is_stop_token(&self, text: &str) -> bool {
+        self.stop_tokens.iter().any(|stop| stop == text)
     }
 
     /// The text that opens the turn the model writes, `<|im_start|>assistant` for ChatML: the
@@ -511,6 +541,31 @@ mod tests {
     #[should_panic(expected = "format t: no state named \"call\"")]
     fn a_stop_row_for_a_state_the_table_lacks_is_a_programming_error() {
         let _ = two_states().closes_at_stop("call");
+    }
+
+    #[test]
+    fn the_stop_tokens_kept_are_the_terminals_among_the_stops_each_once() {
+        let format = two_states().terminal("call", "<|call|>").stop_tokens([
+            "<|return|>",
+            "<|call|>",
+            "</a>",
+            "<|call|>",
+        ]);
+        assert!(format.is_stop_token("<|call|>"));
+        assert!(format.is_stop_token("</a>"));
+        assert!(
+            !format.is_stop_token("<|return|>"),
+            "a stop the table has no terminal for is not kept"
+        );
+        assert!(!format.is_stop_token("<a>"));
+        assert_eq!(format.stop_tokens, ["<|call|>", "</a>"]);
+        assert!(
+            !two_states()
+                .stop_tokens(["<|call|>"])
+                .is_stop_token("<|call|>"),
+            "a stop named before its terminal is not one yet"
+        );
+        assert!(format.validate().is_ok());
     }
 
     #[test]
