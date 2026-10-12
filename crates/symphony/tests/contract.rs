@@ -34,6 +34,7 @@ use symphony::{
     json::PartialJson,
     shape::{
         self, Arguments, Atom, CallShape, Class, Dialect, End, NameSource, Path, Pattern, Slot,
+        ValueParser,
     },
     tagged::{Placement, Spelling},
     CallSyntax, Declared, DropReason, Emits, Engine, EngineFinish, Event, Events, FinishReason,
@@ -436,6 +437,7 @@ fn qwen3_5_serve_shaped() -> Box<dyn Parser> {
                 [],
             )]
             .into(),
+            values: ValueParser::Raw,
         },
         trailer: Pattern([Atom::Lit("</function>".into()), run(space(), 0, true, None)].into()),
         word: word(),
@@ -497,6 +499,11 @@ fn muse_shaped() -> Box<dyn Parser> {
                 .into(),
             ),
             ends: [ends_at([Atom::Lit("</atem:parameter>".into())], [])].into(),
+            values: ValueParser::Json {
+                dialect: Dialect::default(),
+                allow_non_json: true,
+                strip: true,
+            },
         },
         trailer: Pattern::default(),
         word: word(),
@@ -551,6 +558,7 @@ fn params_tags() -> Box<dyn Parser> {
                 ends_at([], [Atom::Lit("<k=".into())]),
             ]
             .into(),
+            values: ValueParser::Raw,
         },
         trailer: Pattern::default(),
         word: word(),

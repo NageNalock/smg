@@ -60,7 +60,9 @@
 //!   before it, the stream's stop too; any other is the call's text.
 //! - With the tagged syntax, a value's type comes from the request's tools ([`Declared`]): a
 //!   declared string streams, every other value is written at its close. A call to a function the
-//!   request did not declare has every value inferred.
+//!   request did not declare has every value inferred. A shaped call's values read through the
+//!   table's reader ([`Format::reads_values_with`]) with the parameter's schema from the same
+//!   tools.
 //! - Call ids are `call_<index>` for now; the id scheme is the maintainer's decision
 //!   (deterministic or carrying the conversation's history) and changes only this one line.
 //! - Every text event says how many tokens it carries, counted by the [`Ledger`] from the deltas'
@@ -102,7 +104,8 @@ use crate::{
     json,
     markers::{Piece, Scanner},
     parser::{ParseError, Parser},
-    pythonic, shape,
+    pythonic,
+    shape::{self, ValueRead},
     tagged::{self, Declared},
     tokens::Ledger,
 };
@@ -203,7 +206,7 @@ enum Call {
 }
 
 impl Call {
-    fn new(syntax: Option<CallSyntax>, index: u32) -> Self {
+    fn new(syntax: Option<CallSyntax>, index: u32, values: &'static dyn ValueRead) -> Self {
         let id = format!("call_{index}");
         match syntax {
             // `None` is unreachable: `Format::validate`, run by `Engine::new`, refuses a table
@@ -231,7 +234,7 @@ impl Call {
             // enters the call's state with that assembler; a table that validates enters the
             // state no other way.
             Some(CallSyntax::Shaped(shape)) => {
-                Self::Shaped(shape::Assembler::new(index, id, shape, None))
+                Self::Shaped(shape::Assembler::new(index, id, shape, values, None))
             }
         }
     }
@@ -578,7 +581,9 @@ impl Engine {
         }
         let terminal = self.format.terminal_text(index);
         let id = format!("call_{}", self.calls);
-        let call = shape::Assembler::new(self.calls, id, shape, terminal.chars().next_back());
+        let values = self.format.value_reader();
+        let call =
+            shape::Assembler::new(self.calls, id, shape, values, terminal.chars().next_back());
         Some(Pending {
             terminal: index,
             from,
@@ -891,7 +896,11 @@ impl Engine {
     }
 
     fn new_call(&self) -> Call {
-        Call::new(self.format.call_syntax().copied(), self.calls)
+        Call::new(
+            self.format.call_syntax().copied(),
+            self.calls,
+            self.format.value_reader(),
+        )
     }
 
     /// Ends the call region: the assembler closes what arrived, and the result says whether it took

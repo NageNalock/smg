@@ -36,7 +36,8 @@
 //! tag with its key and its value and the ends a value may have), and the trailer before the
 //! region's closing terminal. A table holds one as [`CallSyntax::Shaped`], [`intern`]ed, and the
 //! shape's [`Assembler`] turns a call written so into its events, giving back to the engine the
-//! bytes of a header that did not match.
+//! bytes of a header that did not match. A value's text reads by the template's [`ValueParser`]
+//! and is typed by the table's [`ValueRead`]er, [`Inferred`] unless the table names another.
 //!
 //! [`formats`]: crate::formats
 //! [`CallSyntax::Shaped`]: crate::CallSyntax::Shaped
@@ -46,6 +47,7 @@ mod class;
 mod intern;
 mod matcher;
 mod params;
+mod read;
 
 use std::fmt;
 
@@ -54,6 +56,8 @@ pub use class::Class;
 pub use intern::Interner;
 use matcher::reads_through;
 pub use matcher::{Match, Matcher, Suffix, Verdict, HOLD_CAP};
+pub(crate) use read::Values;
+pub use read::{Duplicates, Inferred, Schema, ValueParser, ValueRead};
 
 /// A linear pattern: its atoms, matched one after another from the start of the text it is run
 /// over.
@@ -231,10 +235,12 @@ pub enum NameSource {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Arguments {
     /// One JSON value, the arguments themselves, the call named by the header or the template
-    /// (`content: json`). They stream as the model's bytes.
+    /// (`content: json`). They stream as the model's bytes, but for a string member of the top
+    /// level the table's [`ValueRead`]er holds to type it.
     Json(Dialect),
     /// One JSON object that names the call and holds its arguments (`"function": "{content}"`):
-    /// the name at `name`, the arguments at `arguments`, which stream as the model's bytes.
+    /// the name at `name`, the arguments at `arguments`, read by the JSON syntax's own reader and
+    /// streamed as the model's bytes; the table's reader is not asked about their members.
     Envelope {
         dialect: Dialect,
         name: Path,
@@ -245,8 +251,13 @@ pub enum Arguments {
     /// ends with the first of `ends` that matches (`\s*</parameter>`, or a lookahead at the next
     /// parameter's tag). A parameter counts once its end matched, as a regular expression's
     /// `finditer` finds it; text between parameters is skipped, and each value is written as JSON
-    /// when its parameter ends.
-    Params { tag: Pattern, ends: Box<[End]> },
+    /// when its parameter ends, its text read by `values` and typed by the table's
+    /// [`ValueRead`]er.
+    Params {
+        tag: Pattern,
+        ends: Box<[End]>,
+        values: ValueParser,
+    },
 }
 
 /// The JSON a template writes: plain JSON, or a dialect of it, keys left bare and strings between
@@ -404,7 +415,7 @@ impl CallShape {
                 Ok(())
             }
             Arguments::Json(_) => Ok(()),
-            Arguments::Params { tag, ends } => self.check_params(tag, ends),
+            Arguments::Params { tag, ends, .. } => self.check_params(tag, ends),
         }
     }
 

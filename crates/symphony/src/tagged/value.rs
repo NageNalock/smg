@@ -197,6 +197,13 @@ impl Declared {
         self.functions.get(function)?.get(parameter).copied()
     }
 
+    /// The schema `function` declares for `parameter`: its whole `parameters`, where a `$ref`
+    /// points, and the parameter's own schema, if it declares one.
+    pub fn parameter(&self, function: &str, parameter: &str) -> Option<(&Value, &Value)> {
+        let root = self.schemas.get(function)?;
+        Some((root, root.get("properties")?.get(parameter)?))
+    }
+
     /// The kind `function` declares at `path` below its parameters, for a value inside another:
     /// below an object a segment selects that property's schema, below an array any segment
     /// selects the items' schema (MiniMax writes a list's elements as `<item>` elements, and a
@@ -305,6 +312,12 @@ fn members(schema: &Value) -> impl Iterator<Item = &Value> {
         .into_iter()
         .flatten();
     any.chain(one).chain(all)
+}
+
+/// The kind a parameter's `schema` declares, a `$ref` in it pointing into `root`, the tool's
+/// whole `parameters`: what [`Declared::kind`] gives for it.
+pub(crate) fn kind_of(root: &Value, schema: &Value) -> Option<Kind> {
+    Kind::of(root, schema)
 }
 
 fn parameters_of(schema: &Value) -> HashMap<String, Kind> {

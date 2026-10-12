@@ -96,7 +96,7 @@
 
 use crate::{
     pythonic,
-    shape::CallShape,
+    shape::{CallShape, ValueRead, Values},
     tagged::{self, keyed},
 };
 
@@ -207,6 +207,8 @@ pub struct Format {
     trimmed: Vec<usize>,
     /// The states whose stays are joined, each with its joiner.
     joiners: Vec<(usize, String)>,
+    /// How a shaped call's values read.
+    values: Values,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -266,6 +268,7 @@ impl Format {
             framing: Vec::new(),
             trimmed: Vec::new(),
             joiners: Vec::new(),
+            values: Values::inferred(),
         }
     }
 
@@ -403,6 +406,22 @@ impl Format {
     /// end that region with no text of its own.
     pub fn is_stop_token(&self, text: &str) -> bool {
         self.stop_tokens.iter().any(|stop| stop == text)
+    }
+
+    /// The table's shaped calls read their values with `reader`: a tagged value's text by the
+    /// shape's parser, typed by the parameter's schema; a member of JSON arguments held and typed
+    /// where the reader says; a key written twice as it says. Without the row they read as the
+    /// tagged tables read theirs ([`Inferred`](crate::shape::Inferred)). No other call syntax
+    /// reads it.
+    #[must_use]
+    pub fn reads_values_with(mut self, reader: &'static dyn ValueRead) -> Self {
+        self.values = Values(reader);
+        self
+    }
+
+    /// The reader a shaped call's values read with.
+    pub(crate) fn value_reader(&self) -> &'static dyn ValueRead {
+        self.values.0
     }
 
     /// The text that opens the turn the model writes, `<|im_start|>assistant` for ChatML: the

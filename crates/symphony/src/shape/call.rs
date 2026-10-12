@@ -47,8 +47,11 @@ use super::params::Params;
 use crate::{
     engine::TEXT_AFTER_THE_OBJECT,
     event::{DropReason, Event, Events, MalformedReason, Text},
-    json,
-    shape::{Arguments, CallShape, Match, Matcher, NameSource, Slot, Suffix, Verdict},
+    json::{self, arguments::Strings},
+    shape::{
+        Arguments, CallShape, Match, Matcher, NameSource, Schema, Slot, Suffix, ValueParser,
+        ValueRead, Verdict,
+    },
     tagged::Declared,
 };
 
@@ -72,6 +75,8 @@ pub struct Assembler {
     index: u32,
     id: String,
     shape: &'static CallShape,
+    /// How the call's values read.
+    values: &'static dyn ValueRead,
     /// The terminal's last character, which a `\b` at the header's start reads.
     before: Option<char>,
     stage: Stage,
@@ -103,7 +108,10 @@ enum Body {
 /// Arguments written as one JSON value or one object, and what follows them.
 #[derive(Clone, Debug)]
 struct Value {
-    reader: Reader,
+    reader: JsonReader,
+    /// The call's name, whose tool's schema types a member the table's reader holds; empty while an
+    /// object that names the call has not done so.
+    name: String,
     /// The last character the call took, which a `\b` at the start of the trailer reads.
     before: Option<char>,
     /// Bytes after the arguments, held until the region closes, since they may be the trailer.
@@ -116,14 +124,14 @@ struct Value {
 
 /// How the arguments are read.
 #[derive(Clone, Debug)]
-enum Reader {
+enum JsonReader {
     /// One JSON value, the call already started.
     Json(json::Arguments),
     /// One object that names the call and holds its arguments.
     Envelope(json::Assembler),
 }
 
-impl Reader {
+impl JsonReader {
     /// Whether the arguments are over: the value or the object is whole.
     fn over(&self) -> bool {
         match self {
@@ -147,11 +155,13 @@ impl Reader {
 
 impl Assembler {
     /// An assembler for the call at `index`, with the id the format minted for it, of `shape`,
-    /// right after its region's terminal, whose last character is `before`.
+    /// whose values read with `values`, right after its region's terminal, whose last character is
+    /// `before`.
     pub fn new(
         index: u32,
         id: impl Into<String>,
         shape: &'static CallShape,
+        values: &'static dyn ValueRead,
         before: Option<char>,
     ) -> Self {
         let matcher =
@@ -160,6 +170,7 @@ impl Assembler {
             index,
             id: id.into(),
             shape,
+            values,
             before,
             stage: Stage::Header(Box::new(matcher)),
         }
@@ -234,8 +245,9 @@ impl Assembler {
                     why: DropReason::Wrapper,
                 });
             }
-            let reader = Reader::Envelope(json::Assembler::new(self.index, self.id.clone()));
-            self.stage = Stage::Body(Body::Value(Box::new(Value::new(reader, before))));
+            let reader = JsonReader::Envelope(json::Assembler::new(self.index, self.id.clone()));
+            let value = Value::new(reader, String::new(), before);
+            self.stage = Stage::Body(Body::Value(Box::new(value)));
             return held[end..].to_string();
         }
         let name = match &shape.name {
@@ -252,15 +264,16 @@ impl Assembler {
             source: Text::uncounted(header),
         });
         let body = match &shape.arguments {
-            Arguments::Params { tag, ends } => Body::Params(Box::new(Params::new(
+            Arguments::Params { tag, ends, values } => Body::Params(Box::new(Params::new(
                 self.index,
                 shape,
-                (tag, ends),
-                name,
+                (tag, ends, values),
+                (name, self.values),
                 before,
             ))),
             Arguments::Json(_) | Arguments::Envelope { .. } => Body::Value(Box::new(Value::new(
-                Reader::Json(json::Arguments::new(self.index)),
+                JsonReader::Json(json::Arguments::new(self.index)),
+                name,
                 before,
             ))),
         };
@@ -273,8 +286,8 @@ impl Assembler {
         match &self.stage {
             Stage::Body(body) => match body {
                 Body::Value(value) => match &value.reader {
-                    Reader::Json(_) => true,
-                    Reader::Envelope(assembler) => assembler.started(),
+                    JsonReader::Json(_) => true,
+                    JsonReader::Envelope(assembler) => assembler.started(),
                 },
                 Body::Params(_) => true,
             },
@@ -291,7 +304,7 @@ impl Assembler {
             return;
         };
         match body {
-            Body::Value(value) => value.feed(shape, bytes, out),
+            Body::Value(value) => value.feed(shape, (self.values, declared), bytes, out),
             Body::Params(params) => params.feed(bytes, declared, out),
         }
     }
@@ -361,10 +374,36 @@ impl Assembler {
     }
 }
 
+/// The table's reader, asked about the members of one call's JSON arguments.
+struct Typing<'a> {
+    values: &'static dyn ValueRead,
+    declared: &'a Declared,
+    name: &'a str,
+}
+
+impl Typing<'_> {
+    fn schema(&self, key: &str) -> Option<Schema<'_>> {
+        self.declared
+            .parameter(self.name, key)
+            .map(|(root, property)| Schema { root, property })
+    }
+}
+
+impl Strings for Typing<'_> {
+    fn holds(&self, key: &str) -> bool {
+        !self.values.streams(&ValueParser::json(), self.schema(key))
+    }
+
+    fn typed(&self, key: &str, raw: &str) -> Option<String> {
+        self.values.member(raw, self.schema(key))
+    }
+}
+
 impl Value {
-    fn new(reader: Reader, before: Option<char>) -> Self {
+    fn new(reader: JsonReader, name: String, before: Option<char>) -> Self {
         Self {
             reader,
+            name,
             before,
             after: String::new(),
             tail: None,
@@ -372,12 +411,23 @@ impl Value {
         }
     }
 
-    fn feed(&mut self, shape: &'static CallShape, bytes: &str, out: &mut Events) {
+    fn feed(
+        &mut self,
+        shape: &'static CallShape,
+        (values, declared): (&'static dyn ValueRead, &Declared),
+        bytes: &str,
+        out: &mut Events,
+    ) {
         let mut rest = bytes;
         if !self.reader.over() {
+            let typing = Typing {
+                values,
+                declared,
+                name: &self.name,
+            };
             let taken = match &mut self.reader {
-                Reader::Json(arguments) => arguments.feed(rest, out),
-                Reader::Envelope(assembler) => assembler.feed(rest, out),
+                JsonReader::Json(arguments) => arguments.feed(rest, &typing, out),
+                JsonReader::Envelope(assembler) => assembler.feed(rest, out),
             };
             if let Some(last) = rest[..taken].chars().next_back() {
                 self.before = Some(last);
@@ -430,11 +480,11 @@ impl Value {
         let (between, trailer) = after.split_at(at);
         let surplus = reader.surplus();
         let enveloped = match reader {
-            Reader::Json(mut arguments) => {
+            JsonReader::Json(mut arguments) => {
                 arguments.finish(out);
                 false
             }
-            Reader::Envelope(assembler) => {
+            JsonReader::Envelope(assembler) => {
                 assembler.finish(out);
                 true
             }
@@ -457,12 +507,12 @@ impl Value {
     /// caller ends it.
     fn finish(self, out: &mut Events) -> bool {
         match self.reader {
-            Reader::Json(mut arguments) => {
+            JsonReader::Json(mut arguments) => {
                 arguments.finish(out);
                 wrapping(&self.after, &MalformedReason::UnterminatedRegion, out);
                 true
             }
-            Reader::Envelope(assembler) => {
+            JsonReader::Envelope(assembler) => {
                 assembler.finish(out);
                 wrapping(&self.after, &MalformedReason::UnterminatedRegion, out);
                 false
@@ -506,7 +556,7 @@ mod tests {
         format::{CallSyntax, Emits, Format},
         input::{EngineFinish, Input, TokenSpan},
         parser::Parser,
-        shape::{intern, Atom, Class, Dialect, End, Path, Pattern, ShapeError},
+        shape::{intern, Atom, Class, Dialect, Duplicates, End, Path, Pattern, ShapeError},
     };
 
     fn word() -> Class {
@@ -1164,6 +1214,7 @@ mod tests {
             arguments: Arguments::Params {
                 tag: Pattern([lit("<k="), word_run(Some(Slot::Key)), lit(">"), value()].into()),
                 ends: ends.into(),
+                values: ValueParser::Raw,
             },
             trailer,
             word: word(),
@@ -1412,6 +1463,7 @@ mod tests {
                 arguments: Arguments::Params {
                     tag: Pattern([lit("<k="), word_run(Some(Slot::Key)), lit(">"), value()].into()),
                     ends: ends.into(),
+                    values: ValueParser::Raw,
                 },
                 trailer,
                 word: word(),
@@ -1467,6 +1519,7 @@ mod tests {
             arguments: Arguments::Params {
                 tag: Pattern(tag.into()),
                 ends: closed_by_tag().into(),
+                values: ValueParser::Raw,
             },
             trailer: Pattern::default(),
             word: word(),
@@ -1483,6 +1536,171 @@ mod tests {
         assert_eq!(
             shape(vec![lit("<k="), word_run(Some(Slot::Key)), lit(">")]).check(),
             Err(ShapeError::Uncaptured(Slot::Value))
+        );
+    }
+
+    /// A reader stricter than the default: a `text` value stripped when its parser says, a value
+    /// or a JSON member the schema declares an integer written as the integer it spells (the
+    /// member held until whole), any other value a string, and the first of two values for a key.
+    #[derive(Debug)]
+    struct Strict;
+
+    fn integer(schema: Option<Schema<'_>>) -> bool {
+        schema.and_then(|schema| schema.property.get("type")) == Some(&serde_json::json!("integer"))
+    }
+
+    impl ValueRead for Strict {
+        fn read(&self, parser: &ValueParser, text: &str, schema: Option<Schema<'_>>) -> String {
+            let text = match parser {
+                ValueParser::Text { strip: true } => text.trim(),
+                _ => text,
+            };
+            match text.parse::<i64>() {
+                Ok(number) if integer(schema) => number.to_string(),
+                _ => serde_json::Value::String(text.to_string()).to_string(),
+            }
+        }
+
+        fn streams(&self, _parser: &ValueParser, schema: Option<Schema<'_>>) -> bool {
+            !integer(schema)
+        }
+
+        fn member(&self, raw: &str, schema: Option<Schema<'_>>) -> Option<String> {
+            let text: String = serde_json::from_str(raw).ok()?;
+            integer(schema)
+                .then(|| text.parse::<i64>().ok())
+                .flatten()
+                .map(|number| number.to_string())
+        }
+
+        fn duplicates(&self) -> Duplicates {
+            Duplicates::First
+        }
+    }
+
+    static STRICT: Strict = Strict;
+
+    fn tools() -> Declared {
+        Declared::of(&[openai_protocol::common::Tool {
+            tool_type: "function".to_string(),
+            function: openai_protocol::common::Function {
+                name: "f".to_string(),
+                description: None,
+                parameters: serde_json::json!({"type": "object", "properties": {
+                    "n": {"type": "integer"},
+                    "s": {"type": "string"},
+                }}),
+                strict: None,
+                extra: Default::default(),
+            },
+        }])
+    }
+
+    #[test]
+    fn a_tables_reader_holds_and_types_the_json_members_it_says() {
+        let format = table(named(Pattern::default())).reads_values_with(&STRICT);
+        let events = run_declared(
+            &format,
+            &tools(),
+            "",
+            "<c><n=f>{\"n\": \"5\", \"s\": \"5\", \"m\": [\"5\"], \"x\": \"1\"}</c>",
+            EngineFinish::Stop,
+        );
+        assert_eq!(
+            events[2],
+            Event::ToolCallArguments {
+                index: 0,
+                json: "{\"n\": 5, \"s\": \"5\", \"m\": [\"5\"], \"x\": \"1\"}".to_string(),
+                source: Text::uncounted(
+                    "{\"n\": \"5\", \"s\": \"5\", \"m\": [\"5\"], \"x\": \"1\"}"
+                ),
+            },
+            "the integer's string is held and written as the integer; the rest stream as written"
+        );
+        let broken = run_declared(
+            &format,
+            &tools(),
+            "",
+            "<c><n=f>{\"n\": \"5\", x}</c>",
+            EngineFinish::Stop,
+        );
+        assert_eq!(
+            broken[2..4],
+            [
+                Event::ToolCallArguments {
+                    index: 0,
+                    json: "{\"n\": 5, ".to_string(),
+                    source: Text::uncounted("{\"n\": \"5\", "),
+                },
+                Event::Malformed {
+                    text: Text::uncounted("x}"),
+                    why: MalformedReason::InvalidArguments,
+                },
+            ],
+            "a held string that closed before the bytes broke is typed at every cut"
+        );
+        let mut engine = Engine::new(format, tools());
+        let mut out = Events::new();
+        engine
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: "<c><n=f>{\"s\": \"a\", \"n\": \"12",
+                    spans: &[],
+                },
+                &mut out,
+            )
+            .expect("a delta");
+        let sent: String = out
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::ToolCallArguments { json, .. } => Some(json),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sent, "{\"s\": \"a\", \"n\": ",
+            "a held string waits for its close; the members before it are sent"
+        );
+    }
+
+    #[test]
+    fn a_tables_reader_reads_each_value_by_its_parser_and_may_keep_the_first_of_two() {
+        let shape = intern(CallShape {
+            header: Pattern::default(),
+            name: NameSource::Literal("f".into()),
+            arguments: Arguments::Params {
+                tag: Pattern([lit("<k="), word_run(Some(Slot::Key)), lit(">"), value()].into()),
+                ends: closed_by_tag().into(),
+                values: ValueParser::Text { strip: true },
+            },
+            trailer: Pattern::default(),
+            word: word(),
+            hold_cap: 64,
+        });
+        let format = table(shape).reads_values_with(&STRICT);
+        let events = run_declared(
+            &format,
+            &tools(),
+            "",
+            "<c><k=n> 7 </k><k=s> x </k><k=n>8</k></c>",
+            EngineFinish::Stop,
+        );
+        assert_eq!(
+            &events[2..],
+            [
+                member("{\"n\": 7, \"s\": \"x\"", "<k=n> 7 </k><k=s> x </k>"),
+                Event::Malformed {
+                    text: Text::uncounted("<k=n>8</k>"),
+                    why: MalformedReason::Other(
+                        super::super::params::KEY_WRITTEN_TWICE.to_string()
+                    ),
+                },
+                closed(),
+                end("</c>"),
+                finish(1),
+            ]
         );
     }
 

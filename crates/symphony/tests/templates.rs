@@ -28,7 +28,10 @@ use openai_protocol::common::{Function, Tool};
 use serde_json::{json, Value};
 use symphony::{
     adapt,
-    shape::{self, Arguments, Atom, CallShape, Class, Dialect, End, NameSource, Pattern, Slot},
+    shape::{
+        self, Arguments, Atom, CallShape, Class, Dialect, End, NameSource, Pattern, Slot,
+        ValueParser,
+    },
     CallSyntax, Declared, Emits, Engine, EngineFinish, Format, Parser,
 };
 
@@ -305,6 +308,11 @@ fn muse() -> Format {
                 ahead: Pattern::default(),
             }]
             .into(),
+            values: ValueParser::Json {
+                dialect: Dialect::default(),
+                allow_non_json: true,
+                strip: true,
+            },
         },
         trailer: Pattern::default(),
         word,
@@ -381,6 +389,7 @@ fn serve_qwen3_5() -> Format {
                 ahead: Pattern::default(),
             }]
             .into(),
+            values: ValueParser::Raw,
         },
         trailer: Pattern([Atom::Lit("</function>".into()), run(space, 0, true, None)].into()),
         word: python_word(),

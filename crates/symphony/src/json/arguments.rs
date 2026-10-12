@@ -13,6 +13,12 @@
 //! from its first letter, so that where the chunks were cut does not decide which of its bytes
 //! were sent.
 //!
+//! A reader of the template's values may type a member of an object's top level whose value is a
+//! string (a string `"5"` the tool declares an integer is written `5`), which it can do only with
+//! the whole string: the caller's [`Strings`] says which members' strings are held from their
+//! opening quote until they close, and what is written for them then, the string's bytes the
+//! fragment's source either way. [`AsWritten`] holds none.
+//!
 //! The value ends where it is whole: at its closing bracket or quote, or before the byte after a
 //! number or a literal; a number or a literal that the text ends on is whole once the caller says
 //! no more bytes come. `feed` returns how many of a piece's bytes the value took, all of them
@@ -25,6 +31,32 @@ use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
     json::{is_complete, Prefix},
 };
+
+/// What the reader does with a member of the value's top-level object whose value is a string:
+/// sends its bytes as they arrive, or holds them until the string closes and writes what
+/// [`typed`](Self::typed) gives for it.
+pub trait Strings {
+    /// Whether the string value of the member `key` is held until it closes.
+    fn holds(&self, key: &str) -> bool;
+
+    /// The JSON written for the held string `raw` (its JSON text, quotes included) of the member
+    /// `key`; `None` writes the model's bytes.
+    fn typed(&self, key: &str, raw: &str) -> Option<String>;
+}
+
+/// Every string sent as the model wrote it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AsWritten;
+
+impl Strings for AsWritten {
+    fn holds(&self, _key: &str) -> bool {
+        false
+    }
+
+    fn typed(&self, _key: &str, _raw: &str) -> Option<String> {
+        None
+    }
+}
 
 /// The whitespace JSON allows before a value.
 fn json_space(c: char) -> bool {
@@ -47,6 +79,119 @@ pub struct Arguments {
     invalid_from: Option<usize>,
     /// Where the value ended, once it is whole.
     whole: Option<usize>,
+    /// The top-level object's members, as far as holding a string needs them.
+    members: Members,
+}
+
+/// The members of the value's top-level object, read as far as the bytes are a JSON prefix: which
+/// key a string value belongs to, and where a held one starts and closes.
+#[derive(Clone, Debug, Default)]
+struct Members {
+    /// Bytes read.
+    at: usize,
+    /// Containers open around `at`: one inside the top-level object.
+    depth: usize,
+    /// Whether the value is an object.
+    object: bool,
+    /// Inside the top-level object, whether a key comes next.
+    key_next: bool,
+    /// The string being read, if one is.
+    string: Option<Quoted>,
+    /// The last key read inside the top-level object, as it stands between its quotes.
+    key: String,
+    /// The held strings that have closed and not been written: their start, end and key.
+    closed: Vec<(usize, usize, String)>,
+    /// Where a held string that has not closed starts.
+    open: Option<usize>,
+}
+
+/// A string being read: where its opening quote is, whether the last character was a backslash,
+/// and what the string is.
+#[derive(Clone, Copy, Debug)]
+struct Quoted {
+    start: usize,
+    escaped: bool,
+    role: Role,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    /// A key of the top-level object.
+    Key,
+    /// A value of the top-level object that is held.
+    Held,
+    /// Any other string.
+    Other,
+}
+
+impl Members {
+    /// Read `value` on to `to`, asking `strings` whether each top-level string value is held. A
+    /// place already read is not read again.
+    fn read(&mut self, value: &str, to: usize, strings: &dyn Strings) {
+        if to <= self.at {
+            return;
+        }
+        for (offset, c) in value[self.at..to].char_indices() {
+            let at = self.at + offset;
+            if let Some(quoted) = &mut self.string {
+                match c {
+                    _ if quoted.escaped => quoted.escaped = false,
+                    '\\' => quoted.escaped = true,
+                    '"' => {
+                        let quoted = *quoted;
+                        self.string = None;
+                        match quoted.role {
+                            Role::Key => self.key = value[quoted.start + 1..at].to_string(),
+                            Role::Held => {
+                                self.closed.push((quoted.start, at + 1, decoded(&self.key)));
+                                self.open = None;
+                            }
+                            Role::Other => {}
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            let top = self.object && self.depth == 1;
+            match c {
+                '{' | '[' => {
+                    self.object |= self.depth == 0 && c == '{';
+                    self.depth += 1;
+                    self.key_next = self.object && self.depth == 1;
+                }
+                '}' | ']' => self.depth = self.depth.saturating_sub(1),
+                ',' if top => self.key_next = true,
+                ':' if top => self.key_next = false,
+                '"' => {
+                    let role = if !top {
+                        Role::Other
+                    } else if self.key_next {
+                        Role::Key
+                    } else if strings.holds(&decoded(&self.key)) {
+                        Role::Held
+                    } else {
+                        Role::Other
+                    };
+                    if role == Role::Held {
+                        self.open = Some(at);
+                    }
+                    self.string = Some(Quoted {
+                        start: at,
+                        escaped: false,
+                        role,
+                    });
+                }
+                _ => {}
+            }
+        }
+        self.at = to;
+    }
+}
+
+/// A key as it stands between its quotes, decoded where it is a JSON string's text.
+fn decoded(key: &str) -> String {
+    serde_json::from_str(&format!("\"{key}\"")).unwrap_or_else(|_| key.to_string())
 }
 
 impl Arguments {
@@ -60,6 +205,7 @@ impl Arguments {
             prefix: Prefix::default(),
             invalid_from: None,
             whole: None,
+            members: Members::default(),
         }
     }
 
@@ -73,10 +219,10 @@ impl Arguments {
         self.whole.is_some()
     }
 
-    /// Append the next bytes, push the events they complete, and return how many of them the
-    /// value took: all of them before its end, up to its end in the piece that carries it, and
-    /// none once it is whole.
-    pub fn feed(&mut self, bytes: &str, out: &mut Events) -> usize {
+    /// Append the next bytes, push the events they complete, holding the string values `strings`
+    /// holds, and return how many of them the value took: all of them before its end, up to its
+    /// end in the piece that carries it, and none once it is whole.
+    pub fn feed(&mut self, bytes: &str, strings: &dyn Strings, out: &mut Events) -> usize {
         if self.whole.is_some() {
             return 0;
         }
@@ -112,16 +258,18 @@ impl Arguments {
             if let Some(from) = refused.filter(|&from| from < end) {
                 self.invalid_from = Some(from.max(self.emitted));
             }
+            // The members are read as far as the bytes are a JSON prefix, in the piece that breaks
+            // it too, so that a held string that closed before the break is written as `strings`
+            // says whichever piece the break came in.
+            self.members
+                .read(&self.value, self.invalid_from.unwrap_or(end), strings);
         }
-        let held = match (self.whole, self.invalid_from) {
-            (None, None) => self.prefix.word_start(),
-            _ => None,
-        };
-        self.emit(
-            held.map_or(end, |word| word.clamp(self.emitted, end)),
-            end,
-            out,
-        );
+        let mut upto = end;
+        if self.invalid_from.is_none() && self.whole.is_none() {
+            let held = [self.prefix.word_start(), self.members.open];
+            upto = held.into_iter().flatten().fold(end, usize::min);
+        }
+        self.emit(upto.max(self.emitted), end, strings, out);
         self.value.truncate(end);
         taken + end - before
     }
@@ -137,29 +285,54 @@ impl Arguments {
             self.whole = Some(self.value.len());
         }
         let end = self.value.len();
-        self.emit(end, end, out);
+        self.emit(end, end, &AsWritten, out);
         self.whole.is_some()
     }
 
     /// The value's bytes up to `upto` not yet accounted for, the rest up to `end` held: a fragment
-    /// for the part that keeps the value a JSON prefix, malformed text for the part after it.
-    fn emit(&mut self, upto: usize, end: usize, out: &mut Events) {
+    /// for the part that keeps the value a JSON prefix, a held string that closed written as
+    /// `strings` says, and malformed text for the part after the prefix broke. A held string the
+    /// prefix broke in, or one the bytes end in, is sent as the model wrote it.
+    fn emit(&mut self, upto: usize, end: usize, strings: &dyn Strings, out: &mut Events) {
         let valid_end = self.invalid_from.unwrap_or(upto).min(upto);
-        if self.emitted < valid_end {
-            let fresh = &self.value[self.emitted..valid_end];
+        let ready = self
+            .members
+            .closed
+            .iter()
+            .take_while(|&&(_, close, _)| close <= valid_end)
+            .count();
+        let closed: Vec<(usize, usize, String)> = self.members.closed.drain(..ready).collect();
+        for (start, close, key) in closed {
+            self.fragment(start, out);
+            let raw = &self.value[start..close];
+            let typed = strings.typed(&key, raw);
             out.push(Event::ToolCallArguments {
                 index: self.index,
-                json: fresh.to_string(),
-                source: Text::uncounted(fresh),
+                json: typed.unwrap_or_else(|| raw.to_string()),
+                source: Text::uncounted(raw),
             });
-            self.emitted = valid_end;
+            self.emitted = close;
         }
+        self.fragment(valid_end, out);
         if self.invalid_from.is_some() && self.emitted < end {
             out.push(Event::Malformed {
                 text: Text::uncounted(&self.value[self.emitted..end]),
                 why: MalformedReason::InvalidArguments,
             });
             self.emitted = end;
+        }
+    }
+
+    /// The value's bytes from what was sent up to `upto`, as a fragment of the model's bytes.
+    fn fragment(&mut self, upto: usize, out: &mut Events) {
+        if self.emitted < upto {
+            let fresh = &self.value[self.emitted..upto];
+            out.push(Event::ToolCallArguments {
+                index: self.index,
+                json: fresh.to_string(),
+                source: Text::uncounted(fresh),
+            });
+            self.emitted = upto;
         }
     }
 }
@@ -175,7 +348,7 @@ mod tests {
         let mut out = Events::new();
         let taken = pieces
             .iter()
-            .map(|piece| arguments.feed(piece, &mut out))
+            .map(|piece| arguments.feed(piece, &AsWritten, &mut out))
             .collect();
         let fed = arguments.whole();
         let finished = arguments.finish(&mut out);
@@ -281,6 +454,52 @@ mod tests {
         assert_eq!(fragments(&events), "[1");
         assert!(!whole, "an array a brace cut short is not whole");
         assert_eq!(sources(&events), "[1} more");
+    }
+
+    /// Holds the member `n`'s string and writes it as the integer it spells.
+    struct HoldsN;
+
+    impl Strings for HoldsN {
+        fn holds(&self, key: &str) -> bool {
+            key == "n"
+        }
+
+        fn typed(&self, _key: &str, raw: &str) -> Option<String> {
+            let text: String = serde_json::from_str(raw).ok()?;
+            text.parse::<i64>().ok().map(|number| number.to_string())
+        }
+    }
+
+    /// The fragments and the malformed text for `pieces`, read with [`HoldsN`].
+    fn held(pieces: &[&str]) -> (String, String) {
+        let mut arguments = Arguments::new(0);
+        let mut out = Events::new();
+        for piece in pieces {
+            arguments.feed(piece, &HoldsN, &mut out);
+        }
+        arguments.finish(&mut out);
+        let events = out.drain();
+        let malformed = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        (fragments(&events), malformed)
+    }
+
+    #[test]
+    fn a_held_string_is_written_the_same_whichever_piece_breaks_the_value() {
+        let text = "{\"s\": \"a\", \"n\": \"5\", x}";
+        let whole = held(&[text]);
+        assert_eq!(
+            whole,
+            ("{\"s\": \"a\", \"n\": 5, ".to_string(), "x}".to_string())
+        );
+        for cut in (1..text.len()).filter(|&cut| text.is_char_boundary(cut)) {
+            assert_eq!(held(&[&text[..cut], &text[cut..]]), whole, "cut at {cut}");
+        }
     }
 
     #[test]

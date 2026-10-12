@@ -10,9 +10,10 @@
 //! and on a match writes the parameter as one JSON member, `{"key": value` and then `, "key":
 //! value`, the bytes of the whole parameter its source. On no match the search goes on after the
 //! trigger's first character, as `finditer` tries the next place. The text the search passes over
-//! is dropped as wrapping. A value is written when its parameter ends, typed by the parameter's
-//! declared type, and a key written twice is written again, which a JSON reader takes as the last
-//! value at the first one's place, as a Python dict does.
+//! is dropped as wrapping. A value is written when its parameter ends, its text read by the
+//! template's parser and typed by the table's reader with the parameter's schema; a key written
+//! twice is written again, which a JSON reader takes as the last value at the first one's place,
+//! as a Python dict does, unless the reader keeps the first.
 //!
 //! A value has no cap: it may be as long as the call. The call's text ends where its trailer
 //! begins, which is known only when a closing terminal comes, so the reader keeps the trailer's
@@ -24,12 +25,14 @@
 
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
-    shape::{Atom, CallShape, End, Match, Matcher, Pattern, Slot, Suffix, Verdict},
-    tagged::{
-        assembler::push_quoted,
-        value::{json, Declared},
+    shape::{
+        Atom, CallShape, Duplicates, End, Match, Matcher, Pattern, Schema, Slot, Suffix,
+        ValueParser, ValueRead, Verdict,
     },
+    tagged::{assembler::push_quoted, value::Declared},
 };
+
+pub(super) const KEY_WRITTEN_TWICE: &str = "a parameter whose key the call already wrote";
 
 /// The parameters of one shaped call, from the bytes after its header.
 #[derive(Clone, Debug)]
@@ -40,8 +43,13 @@ pub(crate) struct Params {
     ends: &'static [End],
     /// The literal every parameter begins with.
     trigger: &'static str,
-    /// The call's name, which types its values.
+    /// How a value's text reads, and the reader that types it.
+    parser: &'static ValueParser,
+    values: &'static dyn ValueRead,
+    /// The call's name, whose tool's schema types its values.
     name: String,
+    /// The keys written, for a reader that keeps the first of two.
+    keys: Vec<String>,
     search: Search,
     /// The character before the bytes the search holds, which a `\b` at a tag's start reads.
     before: Option<char>,
@@ -79,15 +87,16 @@ enum Skipped {
 }
 
 impl Params {
-    /// The parameters of the call at `index`, named `name`, each written as `tag` and ended by
-    /// one of `ends` (the shape's [`Arguments::Params`](super::Arguments::Params)), after the
-    /// header, whose last character is `before`. A tag that begins with no literal, which a shape
-    /// that checks does not have, is looked for at every place.
+    /// The parameters of the call at `index`, named `name`, each written as `tag`, ended by one of
+    /// `ends` and its value's text read by `parser` (the shape's
+    /// [`Arguments::Params`](super::Arguments::Params)) and typed by `values`, after the header,
+    /// whose last character is `before`. A tag that begins with no literal, which a shape that
+    /// checks does not have, is looked for at every place.
     pub(crate) fn new(
         index: u32,
         shape: &'static CallShape,
-        (tag, ends): (&'static Pattern, &'static [End]),
-        name: String,
+        (tag, ends, parser): (&'static Pattern, &'static [End], &'static ValueParser),
+        (name, values): (String, &'static dyn ValueRead),
         before: Option<char>,
     ) -> Self {
         let trigger = match tag.0.first() {
@@ -100,7 +109,10 @@ impl Params {
             tag,
             ends,
             trigger,
+            parser,
+            values,
             name,
+            keys: Vec::new(),
             search: Search::Scanning(String::new()),
             before,
             written: 0,
@@ -271,14 +283,30 @@ impl Params {
     }
 
     /// Writes the parameter `found` matched in `parameter`, its bytes: its key and its value as
-    /// the next member of the arguments' object.
+    /// the next member of the arguments' object, the value read by the parser and typed by the
+    /// reader with the parameter's schema. A key written before is written again, or, for a reader
+    /// that keeps the first, the parameter is returned as `Malformed`.
     fn write(&mut self, parameter: &str, found: &Match, declared: &Declared, out: &mut Events) {
         let span = |slot| found.span(slot).map_or("", |span| &parameter[span]);
         let (key, value) = (span(Slot::Key), span(Slot::Value));
+        let again = self.keys.iter().any(|written| written == key);
+        if again && self.values.duplicates() == Duplicates::First {
+            out.push(Event::Malformed {
+                text: Text::uncounted(parameter),
+                why: MalformedReason::Other(KEY_WRITTEN_TWICE.to_string()),
+            });
+            return;
+        }
+        if !again {
+            self.keys.push(key.to_string());
+        }
+        let schema = declared
+            .parameter(&self.name, key)
+            .map(|(root, property)| Schema { root, property });
         let mut member = String::from(if self.written == 0 { "{" } else { ", " });
         push_quoted(&mut member, key);
         member.push_str(": ");
-        member.push_str(&json(value, declared.kind(&self.name, key)));
+        member.push_str(&self.values.read(self.parser, value, schema));
         out.push(Event::ToolCallArguments {
             index: self.index,
             json: member,
