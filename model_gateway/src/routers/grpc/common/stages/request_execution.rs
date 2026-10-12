@@ -33,6 +33,7 @@ use crate::{
         },
         error,
         grpc::{
+            backend_client::BackendClient,
             common::stages::encode::EncodeDispatchPlan,
             context::{
                 ClientSelection, DispatchContext, ExecutionPlan, ExecutionPlanKind,
@@ -45,6 +46,7 @@ use crate::{
             },
             utils::{
                 account_pd_leg_failure,
+                request_deadline::{self, Phase, RequestDeadline},
                 stream_failure::UpstreamClass,
                 tonic_ext::{TonicResultExt, TonicStatusExt},
             },
@@ -297,6 +299,7 @@ pub(crate) async fn execute_plan(
     ctx: &mut DispatchContext,
     mut execution_plan: ExecutionPlan,
     last_attempt: bool,
+    request_timeout: Duration,
 ) -> Result<(), Response> {
     // One bootstrap room per backend request the plan will post: a batched
     // completion fans out one PD dispatch per sub-request, so admission has
@@ -397,17 +400,35 @@ pub(crate) async fn execute_plan(
         otel.status_code = tracing::field::Empty,
     );
 
+    // The request's deadline on its worker(s): `--request-timeout-secs` from
+    // this dispatch, over the call that opens each stream and over the
+    // stream itself, as the HTTP path's upstream client is bounded (see
+    // `utils::request_deadline`). The admission wait above has its own
+    // budget and is not part of it.
+    let deadline = RequestDeadline::from_now(request_timeout);
+
     let result = async {
         match execution_plan {
             ExecutionPlan::Single(request) => match request {
-                ProtoRequest::Generate(req) => execute_single(req, clients, workers, ledger).await,
+                ProtoRequest::Generate(req) => {
+                    execute_single(req, clients, workers, ledger, deadline).await
+                }
                 ProtoRequest::Embed(req) => {
-                    execute_single_embed(req, clients, workers, ledger).await
+                    execute_single_embed(req, clients, workers, ledger, deadline).await
                 }
             },
             ExecutionPlan::PrefillDecode(req) => {
                 let prefill_guard = require_prefill_guard(prefill_guard)?;
-                execute_pd_dispatch(req, clients, workers, model, prefill_guard, ledger).await
+                execute_pd_dispatch(
+                    req,
+                    clients,
+                    workers,
+                    model,
+                    prefill_guard,
+                    ledger,
+                    deadline,
+                )
+                .await
             }
             ExecutionPlan::EncodePrefillDecode { request } => {
                 // Bootstrap info was injected into the prefill request during
@@ -422,6 +443,7 @@ pub(crate) async fn execute_plan(
                     encode_dispatch,
                     prefill_guard,
                     ledger,
+                    deadline,
                 )
                 .await
             }
@@ -434,6 +456,7 @@ pub(crate) async fn execute_plan(
                     model,
                     prefill_guard,
                     ledger,
+                    deadline,
                 )
                 .await
             }
@@ -478,6 +501,132 @@ fn require_prefill_guard(guard: Option<PrefillLoadGuard>) -> Result<PrefillLoadG
     })
 }
 
+/// Await a worker's answer to `call` within the request's deadline. Past it,
+/// the request is answered with the deadline's status, which the caller
+/// samples through the ledger and translates like any failed dispatch, and
+/// the call is retired off the request path (see [`retire_late_call`]).
+async fn call_within<T: Send + 'static>(
+    deadline: RequestDeadline,
+    worker: Arc<dyn Worker>,
+    worker_type: &'static str,
+    request_id: String,
+    mut call: Pin<Box<dyn Future<Output = Result<T, tonic::Status>> + Send>>,
+) -> Result<T, tonic::Status> {
+    match tokio::time::timeout_at(deadline.at(), &mut call).await {
+        Ok(result) => result,
+        // A leg the request already gave up on (see `retire_pd_leg`) was
+        // charged by its retirement; its deadline passing is nothing more to
+        // log or count, and the call is cancelled here.
+        Err(_elapsed) if RETIRED_LEG.try_with(|retired| *retired).unwrap_or(false) => {
+            debug!(
+                request_id = %request_id,
+                worker = worker.url(),
+                worker_type,
+                "The request deadline passed on a retired PD leg's call; the call is cancelled"
+            );
+            Err(deadline.status())
+        }
+        Err(_elapsed) => {
+            request_deadline::note_expiry(
+                &worker,
+                worker_type,
+                &request_id,
+                Phase::Dispatch,
+                deadline.timeout(),
+                false,
+            );
+            retire_late_call(call, deadline.timeout(), request_id);
+            Err(deadline.status())
+        }
+    }
+}
+
+/// Finish off a call the request's deadline left pending. The request is
+/// already answered; what is left is the engine-side request, which the
+/// worker will start the moment the call lands and then run to its own end.
+/// Dropping the stream as soon as it opens is the abort path the gateway
+/// uses on a client disconnect, and the only thing that frees that slot
+/// early. A call that has not landed after one more timeout is given up:
+/// cancelling it ends it on the worker.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the late call is retired off the request path; its wait is bounded by one more request timeout"
+)]
+fn retire_late_call<T: Send + 'static>(
+    call: Pin<Box<dyn Future<Output = Result<T, tonic::Status>> + Send>>,
+    grace: Duration,
+    request_id: String,
+) {
+    tokio::spawn(async move {
+        match tokio::time::timeout(grace, call).await {
+            Ok(Ok(answer)) => {
+                debug!(
+                    request_id = %request_id,
+                    "The worker answered a timed-out request's dispatch; the answer is dropped, which aborts the engine-side request"
+                );
+                drop(answer);
+            }
+            Ok(Err(status)) => {
+                debug!(
+                    request_id = %request_id,
+                    grpc_code = ?status.code(),
+                    "A timed-out request's dispatch failed after the deadline: {}",
+                    status.message()
+                );
+            }
+            Err(_elapsed) => {
+                debug!(
+                    request_id = %request_id,
+                    "A timed-out request's dispatch did not land within one more timeout; the call is cancelled"
+                );
+            }
+        }
+    });
+}
+
+/// `request` sent to `worker` through `client`, under the request's deadline
+/// when the worker is known (see [`call_within`]).
+fn dispatch_within(
+    deadline: RequestDeadline,
+    worker: Option<&Arc<dyn Worker>>,
+    worker_type: &'static str,
+    mut client: BackendClient,
+    request: ProtoGenerateRequest,
+) -> PdLegDispatch {
+    let request_id = request.request_id().to_owned();
+    let call: PdLegDispatch = Box::pin(async move { client.generate(request).await });
+    match worker {
+        Some(worker) => Box::pin(call_within(
+            deadline,
+            Arc::clone(worker),
+            worker_type,
+            request_id,
+            call,
+        )),
+        None => call,
+    }
+}
+
+/// `stream`, from `worker`, under the request's deadline when the worker is
+/// known (see [`ProtoStream::bounded`]).
+fn bound_within(
+    stream: ProtoStream,
+    deadline: RequestDeadline,
+    worker: Option<&Arc<dyn Worker>>,
+    worker_type: &'static str,
+    request_id: &str,
+) -> ProtoStream {
+    match worker {
+        Some(worker) => stream.bounded(
+            deadline,
+            Arc::clone(worker),
+            worker_type,
+            request_id.to_owned(),
+        ),
+        None => stream,
+    }
+}
+
 async fn execute_pd_dispatch(
     proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
@@ -485,6 +634,7 @@ async fn execute_pd_dispatch(
     model: &str,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    deadline: RequestDeadline,
 ) -> Result<ExecutionResult, Response> {
     let Some(runtime_type) = workers.disaggregated_runtime_type() else {
         error!(
@@ -520,6 +670,7 @@ async fn execute_pd_dispatch(
                 model,
                 prefill_guard,
                 ledger,
+                deadline,
             )
             .await
         }
@@ -533,6 +684,7 @@ async fn execute_pd_dispatch(
                     protocol,
                     prefill_guard,
                     ledger,
+                    deadline,
                 )
                 .await
             }
@@ -544,6 +696,7 @@ async fn execute_pd_dispatch(
                     protocol,
                     prefill_guard,
                     ledger,
+                    deadline,
                 )
                 .await
             }
@@ -590,6 +743,10 @@ fn attribute_pd_legs(result: ExecutionResult, workers: &WorkerSelection) -> Exec
 /// with its own rendezvous room, and merge their legs into one PD result
 /// whose responses carry the sample index. Fail-fast: the first pair that
 /// fails to start fails the request, and dropping the others aborts them.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the dispatch shape's parameters plus the request's deadline"
+)]
 async fn execute_fanout_pd(
     proto_request: ProtoGenerateRequest,
     n: u32,
@@ -598,6 +755,7 @@ async fn execute_fanout_pd(
     protocol: PdProtocol,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    deadline: RequestDeadline,
 ) -> Result<ExecutionResult, Response> {
     let subs = fan_out_pd_request(&proto_request, n, |sub| {
         maybe_inject_pd_metadata(sub, workers);
@@ -614,7 +772,16 @@ async fn execute_fanout_pd(
     let dispatches = subs.into_iter().zip(guards).map(|(sub, guard)| {
         let mut clients = clients.clone();
         async move {
-            execute_parallel_pd(sub, &mut clients, workers, protocol, guard, ledger).await
+            execute_parallel_pd(
+                sub,
+                &mut clients,
+                workers,
+                protocol,
+                guard,
+                ledger,
+                deadline,
+            )
+            .await
         }
     });
     let results = try_join_all(dispatches).await?;
@@ -667,6 +834,10 @@ async fn execute_fanout_pd(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the dispatch shape's parameters plus the request's deadline"
+)]
 async fn execute_epd_dispatch(
     mut proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
@@ -675,6 +846,7 @@ async fn execute_epd_dispatch(
     encode_dispatch: Option<EncodeDispatchPlan>,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    deadline: RequestDeadline,
 ) -> Result<ExecutionResult, Response> {
     if let Some(encode_dispatch) = encode_dispatch {
         spawn_encode_dispatch(encode_dispatch);
@@ -687,6 +859,7 @@ async fn execute_epd_dispatch(
         model,
         prefill_guard,
         ledger,
+        deadline,
     )
     .await
 }
@@ -738,6 +911,10 @@ fn spawn_encode_dispatch(encode_dispatch: EncodeDispatchPlan) {
 /// Dispatch one backend request per batched prompt concurrently, preserving
 /// prompt order. Fail-fast: the first failed dispatch fails the batch and
 /// drops the remaining streams (abort-on-drop reclaims them backend-side).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the dispatch shape's parameters plus the request's deadline"
+)]
 async fn execute_batch_dispatch(
     kind: ExecutionPlanKind,
     requests: Vec<ProtoGenerateRequest>,
@@ -746,6 +923,7 @@ async fn execute_batch_dispatch(
     model: &str,
     prefill_guard: Option<PrefillLoadGuard>,
     ledger: &AttemptLedger,
+    deadline: RequestDeadline,
 ) -> Result<ExecutionResult, Response> {
     // One Prefill handle per PD sub-request, all on the one admission slot.
     let prefill_guards: Vec<Option<PrefillLoadGuard>> = match kind {
@@ -766,7 +944,7 @@ async fn execute_batch_dispatch(
             async move {
                 match kind {
                     ExecutionPlanKind::Single => {
-                        execute_single(request, &mut clients, workers, ledger).await
+                        execute_single(request, &mut clients, workers, ledger, deadline).await
                     }
                     // Completion EPD carries no encode jobs; sub-requests dispatch as PD.
                     ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
@@ -778,6 +956,7 @@ async fn execute_batch_dispatch(
                             model,
                             prefill_guard,
                             ledger,
+                            deadline,
                         )
                         .await
                     }
@@ -794,6 +973,7 @@ async fn execute_single(
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
     ledger: &AttemptLedger,
+    deadline: RequestDeadline,
 ) -> Result<ExecutionResult, Response> {
     let client = clients.single_mut().ok_or_else(|| {
         error!(
@@ -812,10 +992,18 @@ async fn execute_single(
 
     let prompt_tokens = u64::try_from(proto_request.prompt_len()).unwrap_or(u64::MAX);
     let streaming = proto_request.stream();
+    let request_id = proto_request.request_id().to_owned();
     if let Some(worker) = workers.single() {
         Metrics::record_worker_request(worker.url(), worker.model_id());
     }
-    let result = client.generate(proto_request).await;
+    let result = dispatch_within(
+        deadline,
+        workers.single(),
+        metrics_labels::WORKER_REGULAR,
+        client.clone(),
+        proto_request,
+    )
+    .await;
     if let Some(status) = result.breaker_status() {
         workers.record_outcome(ledger, status);
     }
@@ -846,6 +1034,13 @@ async fn execute_single(
         Some(worker) => stream.tracked(Arc::clone(worker), prompt_tokens, streaming),
         None => stream,
     };
+    let stream = bound_within(
+        stream,
+        deadline,
+        workers.single(),
+        metrics_labels::WORKER_REGULAR,
+        &request_id,
+    );
 
     Ok(ExecutionResult::Single { stream })
 }
@@ -857,6 +1052,11 @@ fn start_failure_response(
     description: &str,
     code: &str,
 ) -> Response {
+    // The gateway's own deadline passed before the worker answered: logged
+    // when it did; the client reads the HTTP path's 504 for it.
+    if request_deadline::is_request_timeout(e) {
+        return request_deadline::response(e);
+    }
     // The request's media failed, not the worker (see `TonicStatusExt::media_fault`):
     // the answer is for the media, and another worker fetching the same URL
     // would meet the same host, so the request is not replayed.
@@ -891,6 +1091,7 @@ async fn execute_single_embed(
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
     ledger: &AttemptLedger,
+    deadline: RequestDeadline,
 ) -> Result<ExecutionResult, Response> {
     let client = clients.single_mut().ok_or_else(|| {
         error!(
@@ -906,7 +1107,21 @@ async fn execute_single_embed(
     if let Some(worker) = workers.single() {
         Metrics::record_worker_request(worker.url(), worker.model_id());
     }
-    let result = client.embed(proto_request).await;
+    let result = match workers.single() {
+        Some(worker) => {
+            let request_id = proto_request.request_id().to_owned();
+            let mut client = client.clone();
+            call_within(
+                deadline,
+                Arc::clone(worker),
+                metrics_labels::WORKER_REGULAR,
+                request_id,
+                Box::pin(async move { client.embed(proto_request).await }),
+            )
+            .await
+        }
+        None => client.embed(proto_request).await,
+    };
     if let Some(status) = result.breaker_status() {
         workers.record_outcome(ledger, status);
     }
@@ -937,6 +1152,7 @@ async fn execute_parallel_pd(
     protocol: PdProtocol,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    deadline: RequestDeadline,
 ) -> Result<ExecutionResult, Response> {
     let runtime = workers
         .disaggregated_runtime_type()
@@ -990,9 +1206,10 @@ async fn execute_parallel_pd(
         prefill_worker.and_then(|worker| PrefillLegBound::at(worker, prompt_tokens, prefill_start));
     // Each leg owns its client handle (a cheap channel clone, the same one
     // batched dispatch takes per sub-request) so the leg still in flight when
-    // its partner fails can be moved off the request path.
-    let mut prefill_client = prefill_client.clone();
-    let mut decode_client = decode_client.clone();
+    // its partner fails can be moved off the request path. Each leg's
+    // dispatch is under the request's deadline on its own, so a leg the
+    // deadline ends is a failed leg to the dispatch below, its partner
+    // retired like any other.
     for worker in [workers.prefill_worker(), workers.decode_worker()]
         .into_iter()
         .flatten()
@@ -1008,14 +1225,25 @@ async fn execute_parallel_pd(
         prefill_worker.and_then(|worker| PrefillTicket::book(worker, prompt_tokens));
     let prefill_dispatch: PdLegDispatch = Box::pin(dispatch_prefill_within(
         bound,
-        Box::pin(async move { prefill_client.generate(prefill_request).await }),
+        dispatch_within(
+            deadline,
+            workers.prefill_worker(),
+            metrics_labels::WORKER_PREFILL,
+            prefill_client.clone(),
+            prefill_request,
+        ),
         prefill_worker.cloned(),
         prefill_label,
         request_id.clone(),
         prompt_tokens,
     ));
-    let decode_dispatch: PdLegDispatch =
-        Box::pin(async move { decode_client.generate(decode_request).await });
+    let decode_dispatch: PdLegDispatch = dispatch_within(
+        deadline,
+        workers.decode_worker(),
+        metrics_labels::WORKER_DECODE,
+        decode_client.clone(),
+        decode_request,
+    );
 
     match dispatch_pd_legs(prefill_dispatch, decode_dispatch).await {
         PdDispatchOutcome::Both(prefill_result, decode_result) => {
@@ -1063,6 +1291,7 @@ async fn execute_parallel_pd(
             match first_prefill_response_within(
                 &mut prefill_stream,
                 bound,
+                deadline,
                 prefill_worker,
                 prefill_label,
                 &request_id,
@@ -1100,6 +1329,21 @@ async fn execute_parallel_pd(
             // if prefill is still running there is nothing to hand off yet, and
             // stopping it promptly frees capacity.
             let decode_stream = decode_stream.defer_abort_until_first_item();
+            // Both legs' streams are under the request's deadline.
+            let prefill_stream = bound_within(
+                prefill_stream,
+                deadline,
+                workers.prefill_worker(),
+                metrics_labels::WORKER_PREFILL,
+                &request_id,
+            );
+            let decode_stream = bound_within(
+                decode_stream,
+                deadline,
+                workers.decode_worker(),
+                metrics_labels::WORKER_DECODE,
+                &request_id,
+            );
 
             Ok(ExecutionResult::PrefillDecode {
                 prefill: prefill_stream,
@@ -1244,7 +1488,10 @@ fn pd_leg_error(
             return prefill_silence_response(error, prefill);
         }
     }
-    UpstreamClass::account_dispatch_failure(leg.name(), connection, error);
+    // A leg the request's deadline ended was counted as a timeout when it was.
+    if !request_deadline::is_request_timeout(error) {
+        UpstreamClass::account_dispatch_failure(leg.name(), connection, error);
+    }
     account_pd_leg_failure(leg.name(), error);
     start_failure_response(
         error,
@@ -1295,6 +1542,13 @@ impl Retirement {
     }
 }
 
+tokio::task_local! {
+    /// Set on the task that finishes off a retired PD leg, so the request
+    /// deadline wrapped around its call (`call_within`) expires quietly: the
+    /// retirement charged what the leg was worth.
+    static RETIRED_LEG: bool;
+}
+
 /// Finish off a leg that was still dispatching when its request gave up on
 /// it: its partner failed, or its own silence bound passed
 /// ([`Retirement`]).
@@ -1321,7 +1575,7 @@ fn retire_pd_leg(
     retirement: Retirement,
 ) {
     tokio::spawn(async move {
-        let result = dispatch.await;
+        let result = RETIRED_LEG.scope(true, dispatch).await;
         if let Some(status) = result.breaker_status().filter(|_| retirement.charges()) {
             worker.record_outcome(status);
         }
@@ -1339,6 +1593,15 @@ fn retire_pd_leg(
                 } else {
                     drop(stream);
                 }
+            }
+            // The request's deadline ended this leg's dispatch with its
+            // partner's: counted as a timeout when it did.
+            Err(error) if request_deadline::is_request_timeout(&error) => {
+                debug!(
+                    leg = leg.name(),
+                    worker = worker.url(),
+                    "The PD leg abandoned after its partner timed out was timed out as well"
+                );
             }
             Err(error) if retirement.charges() => {
                 UpstreamClass::account_dispatch_failure(leg.name(), connection, &error);
@@ -1505,6 +1768,7 @@ async fn dispatch_prefill_within(
 async fn first_prefill_response_within(
     stream: &mut ProtoStream,
     bound: Option<PrefillLegBound>,
+    request_deadline: RequestDeadline,
     worker: Option<&Arc<dyn Worker>>,
     connection: &'static str,
     request_id: &str,
@@ -1515,8 +1779,26 @@ async fn first_prefill_response_within(
     };
     let mut deadline = bound.deadline;
     loop {
-        if let Ok(first) = stream.first_response_within(deadline).await {
+        // The silence bound's reprieves never outlast the request's own
+        // deadline: the stream is bounded by it only after this wait (the
+        // tracked stream's replay is what the silence rule reads), so the
+        // deadline is applied here as it is on the stream, charged to the
+        // worker whose prefill the request was still waiting for.
+        let request_at = request_deadline.at().into_std();
+        let until = deadline.min(request_at);
+        if let Ok(first) = stream.first_response_within(until).await {
             return Ok(first);
+        }
+        if Instant::now() >= request_at {
+            request_deadline::note_expiry(
+                worker,
+                metrics_labels::WORKER_PREFILL,
+                request_id,
+                Phase::Stream,
+                request_deadline.timeout(),
+                false,
+            );
+            return Err(request_deadline.status());
         }
         let Some(more) = liveness::prefill_leg_reprieve(worker, bound.bound) else {
             return Err(prefill_leg_silent(
@@ -1549,7 +1831,11 @@ fn sequential_prefill_failure(
             return prefill_silence_response(e, prefill);
         }
     }
-    UpstreamClass::account_dispatch_failure(metrics_labels::WORKER_PREFILL, connection, e);
+    // A dispatch the request's deadline ended was counted as a timeout
+    // when it was.
+    if !request_deadline::is_request_timeout(e) {
+        UpstreamClass::account_dispatch_failure(metrics_labels::WORKER_PREFILL, connection, e);
+    }
     account_pd_leg_failure(metrics_labels::WORKER_PREFILL, e);
     start_failure_response(
         e,
@@ -1652,6 +1938,7 @@ async fn execute_sequential_pd(
     model: &str,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    deadline: RequestDeadline,
 ) -> Result<ExecutionResult, Response> {
     let runtime = workers
         .disaggregated_runtime_type()
@@ -1812,7 +2099,6 @@ async fn execute_sequential_pd(
     if let Some(prefill) = prefill_worker {
         Metrics::record_worker_request(prefill.url(), prefill.model_id());
     }
-    let mut prefill_client = prefill_client.clone();
     // Booked before the call is polled, for the servicers that send their
     // headers with the first message (see `PrefillTicket::book`); the bound
     // above was read before the booking.
@@ -1820,7 +2106,13 @@ async fn execute_sequential_pd(
         prefill_worker.and_then(|worker| PrefillTicket::book(worker, prompt_tokens));
     let prefill_stream = dispatch_prefill_within(
         bound,
-        Box::pin(async move { prefill_client.generate(prefill_request).await }),
+        dispatch_within(
+            deadline,
+            workers.prefill_worker(),
+            metrics_labels::WORKER_PREFILL,
+            prefill_client.clone(),
+            prefill_request,
+        ),
         prefill_worker.cloned(),
         prefill_label,
         request_id.clone(),
@@ -1840,6 +2132,7 @@ async fn execute_sequential_pd(
     if let Err(e) = first_prefill_response_within(
         &mut prefill_stream,
         bound,
+        deadline,
         prefill_worker,
         prefill_label,
         &request_id,
@@ -1856,6 +2149,14 @@ async fn execute_sequential_pd(
             prefill_label,
         ));
     }
+    // The prefill's one answer is under the request's deadline too.
+    let mut prefill_stream = bound_within(
+        prefill_stream,
+        deadline,
+        workers.prefill_worker(),
+        metrics_labels::WORKER_PREFILL,
+        &request_id,
+    );
 
     // Drain prefill response, harvesting connector params, the processed
     // media identity, input logprobs and the prefix-cache hit from the
@@ -1879,6 +2180,11 @@ async fn execute_sequential_pd(
                         prefill_input_logprobs = Some(logprobs);
                     }
                 }
+            }
+            // The request's deadline ended the prefill's answer: logged and
+            // charged to the prefill worker when it did.
+            Err(e) if request_deadline::is_request_timeout(&e) => {
+                return Err(request_deadline::response(&e));
             }
             Err(e) => {
                 if let Some(status) = e.breaker_status() {
@@ -2010,11 +2316,25 @@ async fn execute_sequential_pd(
     // call so a worker that holds its response headers until the first token
     // still lands in the decode phase.
     let decode_sent = Instant::now();
-    let decode_stream = decode_client.generate(decode_request).await.map_err(|e| {
+    let decode_stream = dispatch_within(
+        deadline,
+        workers.decode_worker(),
+        metrics_labels::WORKER_DECODE,
+        decode_client.clone(),
+        decode_request,
+    )
+    .await
+    .map_err(|e| {
         if let Some(status) = e.breaker_status() {
             workers.record_outcome_decode(ledger, status);
         }
-        UpstreamClass::account_dispatch_failure(metrics_labels::WORKER_DECODE, decode_label, &e);
+        if !request_deadline::is_request_timeout(&e) {
+            UpstreamClass::account_dispatch_failure(
+                metrics_labels::WORKER_DECODE,
+                decode_label,
+                &e,
+            );
+        }
         account_pd_leg_failure(metrics_labels::WORKER_DECODE, &e);
         start_failure_response(
             &e,
@@ -2047,10 +2367,17 @@ async fn execute_sequential_pd(
     // path for the same invariant). The client's prompt-side usage is the
     // prefill leg's: the decode leg's responses carry the prefix-cache hit
     // the prefill leg reported, not the transfer the decode leg counts as
-    // cached.
+    // cached. Both legs' streams are under the request's deadline.
     let decode_stream = decode_stream
         .defer_abort_until_first_item()
         .decode_leg(prefill_cached_tokens);
+    let decode_stream = bound_within(
+        decode_stream,
+        deadline,
+        workers.decode_worker(),
+        metrics_labels::WORKER_DECODE,
+        &request_id,
+    );
 
     // Surface the PD shape (not `Single`) so the streaming layer anchors TTFT
     // at prefill dispatch. Without this, the decode stream is established only
@@ -2561,6 +2888,7 @@ mod tests {
         let first = first_prefill_response_within(
             &mut stream,
             Some(three_second_bound()),
+            RequestDeadline::from_now(Duration::from_secs(1800)),
             Some(&prefill),
             metrics_labels::CONNECTION_GRPC,
             "chatcmpl-ended",

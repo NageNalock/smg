@@ -714,7 +714,7 @@ impl HarmonyStreamingProcessor {
         tx: &SseSender,
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
-    ) -> Result<ResponsesIterationResult, String> {
+    ) -> Result<ResponsesIterationResult, HarmonyStreamError> {
         match execution_result {
             context::ExecutionResult::Single { stream } => {
                 debug!("Processing Responses API single stream mode");
@@ -739,13 +739,13 @@ impl HarmonyStreamingProcessor {
                 )
                 .await
             }
-            context::ExecutionResult::Embedding { .. } => {
-                Err("Embeddings not supported in Responses API streaming".to_string())
-            }
+            context::ExecutionResult::Embedding { .. } => Err(HarmonyStreamError::Internal(
+                "Embeddings not supported in Responses API streaming".to_string(),
+            )),
             // Batch results exist only on the completions pipeline.
-            context::ExecutionResult::Batch { .. } => {
-                Err("Batched results not supported in Responses API streaming".to_string())
-            }
+            context::ExecutionResult::Batch { .. } => Err(HarmonyStreamError::Internal(
+                "Batched results not supported in Responses API streaming".to_string(),
+            )),
         }
     }
 
@@ -757,7 +757,7 @@ impl HarmonyStreamingProcessor {
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
-    ) -> Result<ResponsesIterationResult, String> {
+    ) -> Result<ResponsesIterationResult, HarmonyStreamError> {
         // Phase 1: Drain prefill stream. The client's prompt-side usage is the
         // prefill leg's prefix-cache hit: the decode leg counts the KV it was
         // handed as cached, so its responses are restamped with the prefill
@@ -765,7 +765,7 @@ impl HarmonyStreamingProcessor {
         let prefill_cached_tokens =
             drain_prefill(&mut prefill_stream, prefill_guards, false, |_| {})
                 .await
-                .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
+                .map_err(|status| HarmonyStreamError::upstream("Prefill", status))?;
         let decode_stream = decode_stream.decode_leg(prefill_cached_tokens);
 
         // Phase 2: Process decode stream
@@ -783,7 +783,7 @@ impl HarmonyStreamingProcessor {
         tx: &SseSender,
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
-    ) -> Result<ResponsesIterationResult, String> {
+    ) -> Result<ResponsesIterationResult, HarmonyStreamError> {
         let mut parser =
             HarmonyParserAdapter::new().map_err(|e| format!("Failed to create parser: {e}"))?;
 
@@ -817,7 +817,8 @@ impl HarmonyStreamingProcessor {
         let mut chunk_count = 0;
         while let Some(result) = decode_stream.next().await {
             chunk_count += 1;
-            let response = result.map_err(|e| format!("Decode stream error: {}", e.message()))?;
+            let response =
+                result.map_err(|status| HarmonyStreamError::upstream("Decode", status))?;
 
             match response.into_response() {
                 ProtoResponseVariant::Chunk(chunk_wrapper) => {
@@ -1412,5 +1413,100 @@ mod tests {
             "image_generation_call must ride the structured-event path",
         );
         assert!(!expected_streams_arguments(image_generation));
+    }
+}
+
+/// Why a Harmony Responses stream stopped before its result: the worker's
+/// stream failed (its status kept, so the request's own deadline keeps the
+/// HTTP path's timeout code on the SSE error event too) or the gateway's own
+/// processing failed (a parser or serialization error, a closed channel).
+#[derive(Debug)]
+pub enum HarmonyStreamError {
+    /// The prefill or decode stream ended with `status`.
+    Upstream {
+        phase: &'static str,
+        status: tonic::Status,
+    },
+    /// A failure of the gateway's own processing, as its message.
+    Internal(String),
+}
+
+impl HarmonyStreamError {
+    fn upstream(phase: &'static str, status: tonic::Status) -> Self {
+        Self::Upstream { phase, status }
+    }
+
+    /// Whether the stream ended on the request's own deadline.
+    pub fn is_request_timeout(&self) -> bool {
+        matches!(self, Self::Upstream { status, .. } if utils::request_deadline::is_request_timeout(status))
+    }
+
+    /// The SSE error event for the failure: the request deadline's own code
+    /// and message (the worker was charged when the stream expired; nothing
+    /// is charged again here), a worker failure's code with the phase named,
+    /// or `processing_error` for the gateway's own failures.
+    pub fn event(&self) -> (String, &'static str) {
+        match self {
+            Self::Upstream { status, .. }
+                if utils::request_deadline::is_request_timeout(status) =>
+            {
+                (
+                    status.message().to_string(),
+                    utils::request_deadline::REQUEST_TIMEOUT_CODE,
+                )
+            }
+            Self::Upstream { phase, status } => (
+                format!("{phase} stream error: {}", status.message()),
+                "worker_stream_failed",
+            ),
+            Self::Internal(message) => (message.clone(), "processing_error"),
+        }
+    }
+}
+
+impl From<String> for HarmonyStreamError {
+    fn from(message: String) -> Self {
+        Self::Internal(message)
+    }
+}
+
+#[cfg(test)]
+mod stream_error_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn the_deadlines_failure_keeps_its_own_code_and_message() {
+        let status =
+            utils::request_deadline::RequestDeadline::from_now(Duration::from_secs(15)).status();
+        let failure = HarmonyStreamError::upstream("Decode", status.clone());
+        assert!(failure.is_request_timeout());
+        assert_eq!(
+            failure.event(),
+            (
+                status.message().to_string(),
+                utils::request_deadline::REQUEST_TIMEOUT_CODE
+            )
+        );
+    }
+
+    #[test]
+    fn a_worker_failure_names_its_phase_and_a_gateway_failure_its_message() {
+        let failure = HarmonyStreamError::upstream("Prefill", tonic::Status::unavailable("gone"));
+        assert!(!failure.is_request_timeout());
+        assert_eq!(
+            failure.event(),
+            (
+                "Prefill stream error: gone".to_string(),
+                "worker_stream_failed"
+            )
+        );
+        let failure = HarmonyStreamError::from("Parse error: x".to_string());
+        assert!(!failure.is_request_timeout());
+        assert_eq!(
+            failure.event(),
+            ("Parse error: x".to_string(), "processing_error")
+        );
     }
 }

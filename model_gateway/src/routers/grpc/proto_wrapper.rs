@@ -19,7 +19,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use futures::future::select_all;
+use futures::future::{select_all, Either};
 use futures_util::StreamExt;
 use memmap2::MmapOptions;
 use rand::RngExt;
@@ -46,6 +46,7 @@ use tokio::time::error::Elapsed;
 use crate::{
     routers::grpc::{
         multimodal::{log_mm_timing_enabled, mm_rdma_exporter},
+        utils::request_deadline::{self, RequestDeadline},
         zmq_client::ZmqGenerateStream,
     },
     worker::{liveness, Worker},
@@ -2756,6 +2757,10 @@ pub enum ProtoStream {
     /// Any of the above, with the worker it came from: every response is a
     /// sign of life for that worker (see [`crate::worker::liveness`]).
     Tracked(Box<TrackedStream>),
+    /// Any of the above, ended by the gateway's request deadline when it
+    /// passes before the stream completes (see
+    /// [`crate::routers::grpc::utils::request_deadline`]).
+    Bounded(Box<BoundedStream>),
     /// The decode leg of a disaggregated request: every response restamped
     /// with the prefill leg's prefix-cache hit (see [`PrefillCachedTokens`]).
     DecodeLeg(Box<DecodeLegStream>),
@@ -2854,6 +2859,86 @@ impl FirstItem {
             Some(Err(_)) => Self::Failure,
             None => Self::End,
         }
+    }
+}
+
+impl TrackedStream {
+    /// The bookkeeping of one message: progress for the worker, and the end
+    /// of the prompt's pending prefill with the first response.
+    fn note(&mut self, item: Option<&Result<ProtoGenerateResponse, tonic::Status>>) {
+        if let Some(Ok(response)) = item {
+            liveness::on_token_progress(&self.worker);
+            if let Some(ticket) = self.prefill.as_mut() {
+                ticket.first_response(u64::from(response.cached_tokens()));
+            }
+            self.prefill = None;
+        }
+    }
+
+    /// The next message of a tracked layer over a transport stream, polled
+    /// in place; the caller has checked the inner stream is no wrapper.
+    async fn next_in_place(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+        if let Some(item) = self.replay.take() {
+            return item;
+        }
+        let item = self.inner.next_untracked().await;
+        self.note(item.as_ref());
+        item
+    }
+}
+
+/// A [`ProtoStream`] under the request's deadline: past it, the stream ends
+/// with the deadline's status and the stream it wrapped is dropped at once,
+/// which aborts the engine-side request.
+pub struct BoundedStream {
+    /// The stream, until the deadline ends it.
+    inner: Option<ProtoStream>,
+    deadline: RequestDeadline,
+    /// The deadline as one timer, armed when the stream is bounded and polled
+    /// beside every message: a timeout future per message would register and
+    /// deregister a timer for each token instead.
+    sleep: Pin<Box<tokio::time::Sleep>>,
+    /// The worker the stream came from, charged when the deadline passes.
+    worker: Arc<dyn Worker>,
+    worker_type: &'static str,
+    request_id: String,
+}
+
+impl BoundedStream {
+    async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+        let inner = self.inner.as_mut()?;
+        // The dispatched shape, a bounded layer over a tracked layer over a
+        // transport stream, is polled in place; anything deeper recurses.
+        let next = match inner {
+            ProtoStream::Tracked(tracked) if !tracked.inner.is_wrapper() => {
+                Either::Left(Either::Left(tracked.next_in_place()))
+            }
+            inner if inner.is_wrapper() => Either::Left(Either::Right(Box::pin(inner.next()))),
+            inner => Either::Right(inner.next_untracked()),
+        };
+        tokio::select! {
+            // A ready message goes ahead of a deadline that passed in the same poll.
+            biased;
+            item = next => return item,
+            () = self.sleep.as_mut() => {}
+        }
+        Some(Err(self.expire()))
+    }
+
+    /// End the stream with the deadline's status: the stream it wrapped is
+    /// dropped now, which aborts the engine-side request, and the worker is
+    /// charged for the request it did not finish in time.
+    fn expire(&mut self) -> tonic::Status {
+        self.inner = None;
+        request_deadline::note_expiry(
+            &self.worker,
+            self.worker_type,
+            &self.request_id,
+            request_deadline::Phase::Stream,
+            self.deadline.timeout(),
+            true,
+        );
+        self.deadline.status()
     }
 }
 
@@ -3252,6 +3337,9 @@ impl ProtoStream {
         match self {
             Self::Tracked(tracked) => Some(&tracked.worker),
             Self::DecodeLeg(leg) => leg.inner.worker(),
+            // The deadline wrapper keeps the worker it would charge at expiry:
+            // the same one a failure before the deadline is charged to.
+            Self::Bounded(bounded) => Some(&bounded.worker),
             _ => None,
         }
     }
@@ -3271,48 +3359,78 @@ impl ProtoStream {
         }))
     }
 
+    /// End this stream with the gateway's request deadline when it passes
+    /// before the stream completes: the stream is dropped then, which aborts
+    /// the engine-side request, and `worker`, which serves it as
+    /// `worker_type`, is charged for the request it did not finish in time.
+    #[must_use]
+    pub(crate) fn bounded(
+        self,
+        deadline: RequestDeadline,
+        worker: Arc<dyn Worker>,
+        worker_type: &'static str,
+        request_id: String,
+    ) -> Self {
+        Self::Bounded(Box::new(BoundedStream {
+            inner: Some(self),
+            deadline,
+            sleep: Box::pin(tokio::time::sleep_until(deadline.at())),
+            worker,
+            worker_type,
+            request_id,
+        }))
+    }
+
     /// Get next item from stream
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
-        if let Self::DecodeLeg(leg) = self {
+        match self {
             // A decode leg's messages are polled in place as a tracked
             // stream's are, without a boxed future per message; a wrapper
             // inside the wrapper recurses. The inner stream did its own
             // bookkeeping and engine-error mapping; only the prompt-side usage
             // changes here.
-            let item = if matches!(leg.inner, Self::Tracked(_) | Self::DecodeLeg(_)) {
-                Box::pin(leg.inner.next()).await
-            } else {
-                leg.inner.next_untracked().await
-            };
-            return item.map(|result| {
-                result.map(|mut response| {
-                    response.restamp_cached_tokens(&leg.prefill);
-                    response
+            Self::DecodeLeg(leg) => {
+                let item = if leg.inner.is_wrapper() {
+                    Box::pin(leg.inner.next()).await
+                } else {
+                    leg.inner.next_untracked().await
+                };
+                item.map(|result| {
+                    result.map(|mut response| {
+                        response.restamp_cached_tokens(&leg.prefill);
+                        response
+                    })
                 })
-            });
-        }
-        let Self::Tracked(tracked) = self else {
-            return self.next_untracked().await;
-        };
-        if let Some(item) = tracked.replay.take() {
-            return item;
-        }
-        // Every dispatched stream is one tracked layer over a transport
-        // stream: its messages are polled in place, without a boxed future
-        // per message. A tracked stream inside a tracked stream recurses.
-        let item = if matches!(tracked.inner, Self::Tracked(_)) {
-            Box::pin(tracked.inner.next()).await
-        } else {
-            tracked.inner.next_untracked().await
-        };
-        if let Some(Ok(response)) = &item {
-            liveness::on_token_progress(&tracked.worker);
-            if let Some(ticket) = tracked.prefill.as_mut() {
-                ticket.first_response(u64::from(response.cached_tokens()));
             }
-            tracked.prefill = None;
+            // Every dispatched stream is one tracked layer over a transport
+            // stream, under the request's deadline: its messages are polled
+            // in place, without a boxed future per message. A wrapper inside
+            // a wrapper recurses. An item pulled ahead by
+            // [`Self::first_response_within`] is handed over first.
+            Self::Tracked(tracked) => {
+                if let Some(item) = tracked.replay.take() {
+                    return item;
+                }
+                let item = if tracked.inner.is_wrapper() {
+                    Box::pin(tracked.inner.next()).await
+                } else {
+                    tracked.inner.next_untracked().await
+                };
+                tracked.note(item.as_ref());
+                item
+            }
+            Self::Bounded(bounded) => bounded.next().await,
+            _ => self.next_untracked().await,
         }
-        item
+    }
+
+    /// Whether this is a layer over another stream rather than a transport
+    /// stream.
+    fn is_wrapper(&self) -> bool {
+        matches!(
+            self,
+            Self::Tracked(_) | Self::Bounded(_) | Self::DecodeLeg(_)
+        )
     }
 
     /// The next item of a stream that is not [`Self::Tracked`]; a tracked
@@ -3352,10 +3470,9 @@ impl ProtoStream {
                 .await
                 .map(|result| result.map(|r| ProtoGenerateResponse::Vllm(Box::new(r)))),
             Self::Fanout(stream) => stream.next().await,
-            Self::Tracked(_) => return Box::pin(self.next()).await,
-            // Reached only with one wrapper inside another: [`Self::next`]
-            // polls a decode leg in place.
-            Self::DecodeLeg(_) => return Box::pin(self.next()).await,
+            Self::Tracked(_) | Self::Bounded(_) | Self::DecodeLeg(_) => {
+                return Box::pin(self.next()).await
+            }
         };
         item.map(reject_engine_error)
     }
@@ -3372,6 +3489,11 @@ impl ProtoStream {
             Self::Fanout(stream) => stream.mark_completed(),
             Self::Tracked(stream) => stream.inner.mark_completed(),
             Self::DecodeLeg(leg) => leg.inner.mark_completed(),
+            Self::Bounded(stream) => {
+                if let Some(inner) = stream.inner.as_mut() {
+                    inner.mark_completed();
+                }
+            }
         }
     }
 
@@ -3414,6 +3536,24 @@ impl ProtoStream {
                 Self::DecodeLeg(Box::new(DecodeLegStream {
                     inner: inner.defer_abort_until_first_item(),
                     prefill,
+                }))
+            }
+            Self::Bounded(stream) => {
+                let BoundedStream {
+                    inner,
+                    deadline,
+                    sleep,
+                    worker,
+                    worker_type,
+                    request_id,
+                } = *stream;
+                Self::Bounded(Box::new(BoundedStream {
+                    inner: inner.map(Self::defer_abort_until_first_item),
+                    deadline,
+                    sleep,
+                    worker,
+                    worker_type,
+                    request_id,
                 }))
             }
         }

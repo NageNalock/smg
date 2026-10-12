@@ -4067,6 +4067,8 @@ pub(crate) mod eof_tests;
 mod failure_tests;
 #[cfg(test)]
 mod pd_usage_tests;
+#[cfg(test)]
+mod timeout_tests;
 
 #[cfg(test)]
 mod sse_bytes_tests;

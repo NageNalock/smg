@@ -123,6 +123,10 @@ pub(crate) struct PipelineDeps {
     /// `--queue-timeout-secs`: a request still ahead of worker selection this
     /// long after the gateway accepted it is refused instead of dispatched.
     queue_timeout: Duration,
+    /// `--request-timeout-secs`: a dispatched request the worker has not
+    /// finished this long after its dispatch is timed out (see
+    /// [`utils::request_deadline`]).
+    request_timeout: Duration,
 }
 
 impl PipelineDeps {
@@ -142,6 +146,7 @@ impl PipelineDeps {
         configured_reasoning_parser: Option<String>,
         rate_limit_manager: Option<Arc<RateLimitManager>>,
         queue_timeout: Duration,
+        request_timeout: Duration,
     ) -> Self {
         Self {
             worker_registry,
@@ -153,6 +158,7 @@ impl PipelineDeps {
             configured_reasoning_parser,
             rate_limit_manager,
             queue_timeout,
+            request_timeout,
         }
     }
 
@@ -164,6 +170,7 @@ impl PipelineDeps {
         prefill_admission: Option<Arc<PrefillAdmission>>,
         rate_limit_manager: Option<Arc<RateLimitManager>>,
         queue_timeout: Duration,
+        request_timeout: Duration,
     ) -> Self {
         Self {
             worker_registry,
@@ -175,6 +182,7 @@ impl PipelineDeps {
             configured_reasoning_parser: None,
             rate_limit_manager,
             queue_timeout,
+            request_timeout,
         }
     }
 
@@ -241,6 +249,7 @@ impl PipelineDeps {
             configured_reasoning_parser: None,
             rate_limit_manager: None,
             queue_timeout: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(1800),
         }
     }
 }
@@ -272,6 +281,9 @@ pub(crate) struct RequestPipeline {
     worker_registry: Arc<WorkerRegistry>,
     /// Shapes a forced tool call's constraint for each attempt's worker.
     tool_parser_factory: ToolParserFactory,
+    /// The deadline each dispatch attempt gets on its worker, from
+    /// `--request-timeout-secs`.
+    request_timeout: Duration,
 }
 
 /// Outcome of one full pipeline run.
@@ -451,6 +463,7 @@ impl RequestPipeline {
             mode,
             worker_registry: deps.worker_registry.clone(),
             tool_parser_factory: deps.tool_parser_factory.clone(),
+            request_timeout: deps.request_timeout,
         })
     }
 
@@ -600,7 +613,7 @@ impl RequestPipeline {
             dctx.workers.as_ref(),
         ));
 
-        execute_plan(dctx, attempt_plan, last_attempt).await?;
+        execute_plan(dctx, attempt_plan, last_attempt, self.request_timeout).await?;
         self.stages
             .response_processing
             .process(dctx, spec.clone())
@@ -1652,6 +1665,7 @@ mod alias_pipeline_tests {
             None,
             None,
             Duration::from_secs(60),
+            Duration::from_secs(1800),
         );
         let pipeline = RequestPipeline::build(Endpoint::Chat, Mode::PrefillDecode, &deps).unwrap();
         let components = Arc::new(SharedComponents {
@@ -2216,6 +2230,7 @@ mod request_release_tests {
             None,
             None,
             Duration::from_secs(60),
+            Duration::from_secs(1800),
         );
         let pipeline =
             RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
@@ -2318,6 +2333,7 @@ mod request_release_tests {
             None,
             None,
             Duration::from_secs(60),
+            Duration::from_secs(1800),
         );
         let pipeline =
             RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
@@ -2390,6 +2406,7 @@ mod request_release_tests {
             None,
             None,
             Duration::from_secs(60),
+            Duration::from_secs(1800),
         );
         let pipeline =
             RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
@@ -2479,6 +2496,7 @@ mod request_release_tests {
             prefill_admission,
             None,
             Duration::from_secs(60),
+            Duration::from_secs(1800),
         );
         RequestPipeline::build(Endpoint::Completion, mode, &deps).expect("completion pipeline")
     }
@@ -2493,6 +2511,7 @@ mod request_release_tests {
             None,
             None,
             Duration::from_secs(60),
+            Duration::from_secs(1800),
         );
         RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
             .expect("completion pipeline")
@@ -3772,6 +3791,7 @@ mod request_release_tests {
             None,
             None,
             Duration::from_secs(60),
+            Duration::from_secs(1800),
         );
         let pipeline =
             RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");

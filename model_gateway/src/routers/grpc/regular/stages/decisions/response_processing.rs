@@ -12,7 +12,7 @@ use crate::routers::{
         context::{DispatchContext, ExecutionResult, FinalResponse},
         proto_wrapper::{ProtoGenerateComplete, ProtoResponseVariant},
         spec::{DecisionQuestionSpec, ResponseSpec},
-        utils::tonic_ext::TonicStatusExt,
+        utils::request_deadline,
     },
 };
 
@@ -34,8 +34,12 @@ async fn collect_score(
     };
     let mut complete = None;
     while let Some(response) = stream.next().await {
+        // The request's own deadline is the terminal 504 (the replay layer
+        // must not spend a second budget on another worker); any other
+        // failure of the scoring stream is the worker's.
         let response = response.map_err(|status| {
-            status.to_http_error(
+            request_deadline::stream_error_response(
+                &status,
                 "worker_stream_failed",
                 format!("Decisions scoring failed: {}", status.message()),
             )

@@ -16,7 +16,8 @@ use crate::{
                 FanoutChild, PrefillCachedTokens, ProtoGenerateComplete, ProtoResponseVariant,
             },
             utils::{
-                account_pd_leg_failure, stream_failure::UpstreamClass, tonic_ext::TonicStatusExt,
+                account_pd_leg_failure, request_deadline, stream_failure::UpstreamClass,
+                tonic_ext::TonicStatusExt,
             },
         },
     },
@@ -113,13 +114,17 @@ pub(crate) async fn collect_responses(
                 })
                 .await
                 .map_err(|e| {
-                    if let Some(worker) = &prefill_worker {
+                    // A stream the request's deadline ended was charged to its
+                    // worker when it ended (see `request_deadline`).
+                    let charged_at_expiry = request_deadline::is_request_timeout(&e);
+                    if let Some(worker) = prefill_worker.as_ref().filter(|_| !charged_at_expiry) {
                         if let Some(sample) = UpstreamClass::of(&e).breaker_sample {
                             worker.record_outcome(sample);
                         }
                         UpstreamClass::account_collected_failure(worker.as_ref(), &e);
                     }
-                    e.to_http_error(
+                    request_deadline::stream_error_response(
+                        &e,
                         "worker_stream_failed",
                         format!("Prefill stream failed: {}", e.message()),
                     )
@@ -221,6 +226,11 @@ async fn collect_stream_responses<S: FanoutChild>(
                         // Empty response - no action needed
                     }
                 }
+            }
+            // The deadline's passing was logged and charged when it ended the
+            // stream; the client reads the HTTP path's 504 for it.
+            Err(e) if request_deadline::is_request_timeout(&e) => {
+                return Err(request_deadline::response(&e));
             }
             Err(e) => {
                 if let Some(leg) = leg {

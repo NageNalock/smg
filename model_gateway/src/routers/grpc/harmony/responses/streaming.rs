@@ -2,7 +2,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::response::Response;
+use axum::{http::StatusCode, response::Response};
 use openai_protocol::responses::{ResponseUsage, ResponsesRequest};
 use serde_json::json;
 use smg_mcp::{McpServerBinding, McpToolSession};
@@ -18,12 +18,13 @@ use super::{
 };
 use crate::{
     middleware::TenantRequestMeta,
-    observability::metrics::Metrics,
+    observability::metrics::{metrics_labels, Metrics},
     routers::{
         common::{
             mcp_utils::DEFAULT_MAX_ITERATIONS,
             sse::{sse_channel, SseSender},
         },
+        error::HEADER_X_SMG_ERROR_CODE,
         grpc::{
             common::responses::{
                 await_stream_startup, ensure_mcp_connection, persist_response_if_needed,
@@ -31,10 +32,79 @@ use crate::{
                 streaming::{failure_reason, ResponseStreamEventEmitter, StreamStartupSender},
                 BackgroundStream, ResponsesContext,
             },
-            harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
+            harmony::{
+                processor::ResponsesIterationResult,
+                streaming::{HarmonyStreamError, HarmonyStreamingProcessor},
+            },
+            utils::request_deadline,
         },
     },
 };
+
+/// The error event of a dispatch that failed before its stream began. The
+/// request deadline's 504 (the worker's stream did not open in time) is sent
+/// under the deadline's own code and message, as the HTTP relay and the
+/// in-stream deadline send it; any other failure keeps the pipeline's error.
+async fn emit_dispatch_failure(
+    err_response: Response,
+    emitter: &mut ResponseStreamEventEmitter,
+    tx: &SseSender,
+) {
+    // The gateway deadline's 504 carries the deadline's own code in the
+    // error-code header; a worker's own DEADLINE_EXCEEDED maps to a 504 too
+    // and keeps its classification.
+    let gateway_deadline = err_response.status() == StatusCode::GATEWAY_TIMEOUT
+        && err_response
+            .headers()
+            .get(HEADER_X_SMG_ERROR_CODE)
+            .and_then(|value| value.to_str().ok())
+            == Some(request_deadline::REQUEST_TIMEOUT_CODE);
+    if gateway_deadline {
+        let message = axum::body::to_bytes(err_response.into_body(), 64 * 1024)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|json| json["error"]["message"].as_str().map(str::to_string))
+            .unwrap_or_else(|| {
+                "request timed out in the gateway before the worker's stream began".to_string()
+            });
+        emitter
+            .emit_error(&message, Some(request_deadline::REQUEST_TIMEOUT_CODE), tx)
+            .await;
+        return;
+    }
+    emitter
+        .emit_error(
+            &format!("Pipeline execution failed: {err_response:?}"),
+            Some("pipeline_error"),
+            tx,
+        )
+        .await;
+}
+
+/// The error event of a stream that failed after it began. A stream the
+/// request deadline ended is the request's outcome: the router's timeout
+/// error is counted here (the worker was charged when the stream expired),
+/// as the chat path's stream consumer counts it.
+async fn emit_stream_failure(
+    failure: HarmonyStreamError,
+    model: &str,
+    emitter: &mut ResponseStreamEventEmitter,
+    tx: &SseSender,
+) {
+    if failure.is_request_timeout() {
+        Metrics::record_router_error(
+            metrics_labels::ROUTER_GRPC,
+            metrics_labels::BACKEND_HARMONY,
+            metrics_labels::CONNECTION_GRPC,
+            model,
+            metrics_labels::ENDPOINT_RESPONSES,
+            metrics_labels::ERROR_TIMEOUT,
+        );
+    }
+    let (message, code) = failure.event();
+    emitter.emit_error(&message, Some(code), tx).await;
+}
 
 /// Serve Harmony Responses API with streaming (SSE)
 ///
@@ -285,13 +355,7 @@ async fn execute_mcp_tool_loop_streaming(
                 if startup_pending {
                     return;
                 }
-                emitter
-                    .emit_error(
-                        &format!("Pipeline execution failed: {err_response:?}"),
-                        Some("pipeline_error"),
-                        tx,
-                    )
-                    .await;
+                emit_dispatch_failure(err_response, emitter, tx).await;
                 return;
             }
         };
@@ -307,10 +371,8 @@ async fn execute_mcp_tool_loop_streaming(
         .await
         {
             Ok(result) => result,
-            Err(err_msg) => {
-                emitter
-                    .emit_error(&err_msg, Some("processing_error"), tx)
-                    .await;
+            Err(failure) => {
+                emit_stream_failure(failure, &current_request.model, emitter, tx).await;
                 return;
             }
         };
@@ -585,13 +647,7 @@ async fn execute_without_mcp_streaming(
             if startup_pending {
                 return;
             }
-            emitter
-                .emit_error(
-                    &format!("Pipeline execution failed: {err_response:?}"),
-                    Some("pipeline_error"),
-                    tx,
-                )
-                .await;
+            emit_dispatch_failure(err_response, emitter, tx).await;
             return;
         }
     };
@@ -607,10 +663,8 @@ async fn execute_without_mcp_streaming(
     .await
     {
         Ok(result) => result,
-        Err(err_msg) => {
-            emitter
-                .emit_error(&err_msg, Some("processing_error"), tx)
-                .await;
+        Err(failure) => {
+            emit_stream_failure(failure, &current_request.model, emitter, tx).await;
             return;
         }
     };
