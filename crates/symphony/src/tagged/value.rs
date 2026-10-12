@@ -18,9 +18,12 @@
 //!   type at all: `"type": "string"`, a list of types or an `anyOf` that includes it, or, when the
 //!   schema has no `type`, an `enum` of strings, with or without `null` among them, or a `const`
 //!   string, which is an enum of one. An `allOf` admits what all of its members that name a type
-//!   admit, so `{"allOf": [{"type": "string"}, {"maxLength": 8}]}` is a string. OpenAPI's
-//!   `"nullable": true` admits `null` beside the schema's types. A `type` decides alone when it
-//!   is there, as it does for the engine's parser: BFCL declares `{"type": "array", "enum":
+//!   admit, so `{"allOf": [{"type": "string"}, {"maxLength": 8}]}` is a string, and it narrows
+//!   the types named beside it to those, so `{"type": ["string", "null"], "allOf": [{"type":
+//!   "string"}, {"maxLength": 8}]}` is a string that is never null. A `number` admits every
+//!   integer, so an `allOf` of an `integer` and a `number` is an integer. OpenAPI's
+//!   `"nullable": true` admits `null` beside whatever else the schema admits. An `enum` beside a
+//!   `type` adds nothing, as for the engine's parser: BFCL declares `{"type": "array", "enum":
 //!   [...]}` for a list whose members come from the enum, and that is an array. When the schema
 //!   admits `null` as well as `string`, the text `null`, and the `None` a template writes for a
 //!   null argument, are null; any other text is the string. A string declared alone keeps `null`
@@ -153,16 +156,26 @@ impl Types {
         Self(self.0 | other.0)
     }
 
+    /// The types both sets admit. JSON Schema's `number` admits every integer, so where one set
+    /// admits `number` and the other `integer`, both admit `integer`.
     fn meet(self, other: Self) -> Self {
-        Self(self.0 & other.0)
+        let both = Self(self.0 & other.0);
+        let integers = (self.has(Self::NUMBER) && other.has(Self::INTEGER))
+            || (self.has(Self::INTEGER) && other.has(Self::NUMBER));
+        if integers {
+            both.join(Self::INTEGER)
+        } else {
+            both
+        }
     }
 
-    /// The types `schema` admits: its `type`, as one name or a list; `null` when it is OpenAPI's
-    /// `"nullable": true`; the types of its `anyOf` or `oneOf` members; the types every member of
-    /// an `allOf` that admits any admits; and, when it has no `type`, `string` for an `enum` of
-    /// strings, and `null` too when `null` is among them (what Pydantic writes for
-    /// `Literal["a", "b", None]`), with a `const` read as an enum of one. A `$ref` into `root`
-    /// admits what its target admits.
+    /// The types `schema` admits: its `type`, as one name or a list; the types of its `anyOf` or
+    /// `oneOf` members; and, when it has no `type`, `string` for an `enum` of strings, and `null`
+    /// too when `null` is among them (what Pydantic writes for `Literal["a", "b", None]`), with a
+    /// `const` read as an enum of one. An `allOf` of several members narrows those to what each of
+    /// its members that admits a type admits ([`Lookup::narrowed_by_all`]). `null` joins the rest
+    /// when the schema is OpenAPI's `"nullable": true`. A `$ref` into `root` admits what its
+    /// target admits.
     fn admitted(root: &Value, schema: &Value) -> Self {
         Lookup {
             root,
@@ -217,22 +230,17 @@ impl<'a> Lookup<'a> {
             ),
             _ => (Types::NONE, false),
         };
-        if schema.get("nullable") == Some(&Value::Bool(true)) {
-            types = types.join(Types::NULL);
-        }
         for member in members(schema) {
             types = types.join(self.admitted(member));
         }
-        types = types.join(self.admitted_by_all(schema));
-        if typed {
-            return types;
-        }
+        // A `type` decides over an `enum` or a `const` beside it.
         let constant = schema.get("const").map(std::slice::from_ref);
         if let Some(values) = schema
             .get("enum")
             .and_then(Value::as_array)
             .map(Vec::as_slice)
             .or(constant)
+            .filter(|_| !typed)
         {
             let strings_or_null = values
                 .iter()
@@ -244,24 +252,31 @@ impl<'a> Lookup<'a> {
                 }
             }
         }
+        types = self.narrowed_by_all(schema, types);
+        if schema.get("nullable") == Some(&Value::Bool(true)) {
+            types = types.join(Types::NULL);
+        }
         types
     }
 
-    /// The types an `allOf` of several members admits: those that every member naming a type
-    /// admits. A member that admits no type (`{"maxLength": 8}`, a description) narrows nothing,
-    /// so only the members that admit a type are met; an `allOf` none of whose members admits one
-    /// admits nothing. A one-member `allOf` is a wrapper, read with the `anyOf` members
-    /// ([`members`]).
-    fn admitted_by_all(&mut self, schema: &'a Value) -> Types {
+    /// What `schema` admits once its `allOf` of several members is read, `own` being what the
+    /// rest of the schema admits: the types that every member and `own` admit, of those that
+    /// admit a type, since every keyword of a schema holds of the same value. So `{"type":
+    /// ["string", "null"], "allOf": [{"type": "string"}, {"maxLength": 8}]}` is a string and
+    /// never null. A member that admits no type (`{"maxLength": 8}`, a description) narrows
+    /// nothing, nor does a schema that names no type beside its `allOf`. A one-member `allOf` is
+    /// a wrapper, read with the `anyOf` members ([`members`]).
+    fn narrowed_by_all(&mut self, schema: &'a Value, own: Types) -> Types {
         let Some(all) = schema
             .get("allOf")
             .and_then(Value::as_array)
             .filter(|all| all.len() > 1)
         else {
-            return Types::NONE;
+            return own;
         };
         all.iter()
             .map(|member| self.admitted(member))
+            .chain(std::iter::once(own))
             .filter(|types| *types != Types::NONE)
             .reduce(Types::meet)
             .unwrap_or(Types::NONE)
@@ -1560,6 +1575,94 @@ mod tests {
         }
         // A digit for a string bounded in a second member stays the string.
         assert_eq!(json("3", declared.kind("f", "bounded")), r#""3""#);
+    }
+
+    #[test]
+    fn a_number_and_an_integer_in_an_all_of_admit_the_integers() {
+        let declared = Declared::of(&[tool(
+            "f",
+            value!({
+                "counted": {"allOf": [{"type": "integer"}, {"type": "number"}]},
+                "reversed": {"allOf": [{"type": "number"}, {"type": "integer"}]},
+                "optional": {"allOf": [{"type": ["integer", "null"]}, {"type": "number"}]},
+                "beside": {"type": "number", "allOf": [{"type": "integer"}, {"minimum": 0}]},
+                "measured": {"allOf": [{"type": "number"}, {"minimum": 0}]},
+                "either": {"allOf": [{"type": ["integer", "number"]}, {"type": "number"}]},
+            }),
+        )]);
+        for parameter in ["counted", "reversed", "optional", "beside"] {
+            assert_eq!(
+                declared.kind("f", parameter),
+                Some(Kind::Integer),
+                "{parameter}"
+            );
+        }
+        assert_eq!(json("007", declared.kind("f", "counted")), "7");
+        // A number that need not be whole is inferred, as a `number` alone is.
+        assert_eq!(declared.kind("f", "measured"), None);
+        assert_eq!(declared.kind("f", "either"), None);
+    }
+
+    #[test]
+    fn an_all_of_narrows_the_types_named_beside_it() {
+        let declared = Declared::of(&[tool(
+            "f",
+            value!({
+                // A string or null whose `allOf` admits a string only: a string, never null.
+                "bounded": {
+                    "type": ["string", "null"],
+                    "allOf": [{"type": "string"}, {"maxLength": 8}]
+                },
+                "optional": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "allOf": [{"type": "string"}, {"maxLength": 8}]
+                },
+                "named": {
+                    "enum": ["a", "b", null],
+                    "allOf": [{"type": "string"}, {"maxLength": 1}]
+                },
+                // Members that name no type narrow nothing.
+                "loose": {
+                    "type": ["string", "null"],
+                    "allOf": [{"maxLength": 8}, {"description": "a note"}]
+                },
+                // Types that no member admits leave nothing to read the value as.
+                "contradicted": {
+                    "type": "integer",
+                    "allOf": [{"type": "string"}, {"maxLength": 8}]
+                },
+                // OpenAPI's nullable admits null beside what the rest admits, `allOf` and all.
+                "nullable": {
+                    "type": "string",
+                    "nullable": true,
+                    "allOf": [{"type": "string"}, {"maxLength": 8}]
+                },
+                // Below the top level too: an array, so its items are read.
+                "listed": {
+                    "type": ["array", "object"],
+                    "allOf": [{"type": "array"}, {"minItems": 1}],
+                    "items": {"type": "integer"}
+                },
+            }),
+        )]);
+        for (parameter, kind) in [
+            ("bounded", Some(Kind::String)),
+            ("optional", Some(Kind::String)),
+            ("named", Some(Kind::String)),
+            ("loose", Some(Kind::NullableString)),
+            ("contradicted", None),
+            ("nullable", Some(Kind::NullableString)),
+            ("listed", Some(Kind::Array)),
+        ] {
+            assert_eq!(declared.kind("f", parameter), kind, "{parameter}");
+        }
+        assert_eq!(json("None", declared.kind("f", "bounded")), r#""None""#);
+        assert_eq!(json("null", declared.kind("f", "bounded")), r#""null""#);
+        assert_eq!(json("None", declared.kind("f", "nullable")), "null");
+        assert_eq!(
+            declared.kind_at("f", &["listed", "item"]),
+            Some(Kind::Integer)
+        );
     }
 
     #[test]
