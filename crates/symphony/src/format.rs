@@ -48,6 +48,17 @@
 //! a marker quoted in an earlier turn moves nothing. A table that names no opener is replayed
 //! from the prompt's start.
 //!
+//! A table read from a response template names its **turn anchors** instead, as Hugging Face's
+//! `start_anchor` does: one literal or several (Gemma 4's template starts a turn after
+//! `<|turn>model\n` or after `<tool_response|>`). The anchors are found as a regular expression's
+//! `finditer` finds an alternation of them: from the prompt's start, the earliest match, of the
+//! anchors that match there the first in the table's order, then on from that match's end, so
+//! that matches never overlap; the last match is the turn's. The replay starts after its end, in
+//! the state the anchor names: the first state, or one the anchor already entered (a template
+//! whose anchor ends with the thought's opener). A prompt that holds no anchor replays nothing,
+//! and the output starts in the first state. A table names a turn opener or turn anchors, not
+//! both.
+//!
 //! The table holds what is static about a format. What belongs to one request, the tools that
 //! type a tagged call's values, reaches the [`Engine`] with the request, not the table.
 //!
@@ -142,6 +153,8 @@ pub struct Format {
     transitions: Vec<Transition>,
     calls: Option<CallSyntax>,
     turn_opener: Option<String>,
+    /// The turn anchors, in the order a match at one place prefers them.
+    anchors: Vec<Anchor>,
     structural_tokens: Vec<String>,
     /// The arguments states whose call the stream's stop closes.
     stop_closes: Vec<usize>,
@@ -163,6 +176,14 @@ struct Terminal {
 struct State {
     name: String,
     emits: Emits,
+}
+
+/// A literal that starts the model's turn in the prompt, and the state the output starts in after
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Anchor {
+    text: String,
+    state: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,6 +213,7 @@ impl Format {
             transitions: Vec::new(),
             calls: None,
             turn_opener: None,
+            anchors: Vec::new(),
             structural_tokens: Vec::new(),
             stop_closes: Vec::new(),
             stop_tokens: Vec::new(),
@@ -320,6 +342,31 @@ impl Format {
         self
     }
 
+    /// A literal that starts the model's turn in the prompt, as a response template's
+    /// `start_anchor`: the prompt's replay starts after the end of the last anchor found (see the
+    /// turn anchors in [`crate::format`]), in the first state. Anchors added earlier are preferred
+    /// where several match at one place.
+    #[must_use]
+    pub fn turn_anchor(mut self, text: &str) -> Self {
+        self.anchors.push(Anchor {
+            text: text.to_string(),
+            state: 0,
+        });
+        self
+    }
+
+    /// A turn anchor after which the output starts in `state`: an anchor that already opened the
+    /// thought, or closed it. The state must already be in the table.
+    #[must_use]
+    pub fn turn_anchor_starting_in(mut self, text: &str, state: &str) -> Self {
+        let state = self.state_named(state);
+        self.anchors.push(Anchor {
+            text: text.to_string(),
+            state,
+        });
+        self
+    }
+
     /// The turn opener, if the table names one.
     pub(crate) fn turn_opener(&self) -> Option<&str> {
         self.turn_opener.as_deref()
@@ -327,12 +374,68 @@ impl Format {
 
     /// The part of `prompt` the engine replays to find the state the generation starts in: from
     /// the last occurrence of the turn opener, or the whole prompt when the table names none or
-    /// the prompt does not hold it. A caller that keeps the prompt for a later `Input::Prompt`
-    /// need keep only this.
+    /// the prompt does not hold it; for a table with turn anchors, from the start of the last
+    /// anchor found, or nothing when the prompt holds none. A caller that keeps the prompt for a
+    /// later `Input::Prompt` need keep only this: replayed again, it gives itself.
     pub fn replay<'p>(&self, prompt: &'p str) -> &'p str {
+        if !self.anchors.is_empty() {
+            let from = self.last_anchor(prompt).map_or(prompt.len(), |(at, _)| at);
+            return &prompt[from..];
+        }
         match self.turn_opener().and_then(|opener| prompt.rfind(opener)) {
             Some(at) => &prompt[at..],
             None => prompt,
+        }
+    }
+
+    /// The text of `prompt` the engine replays, and the state the replay starts in: after the
+    /// last turn anchor, in the state it names; otherwise [`Self::replay`]'s part, from the first
+    /// state.
+    pub(crate) fn turn<'p>(&self, prompt: &'p str) -> (&'p str, usize) {
+        if self.anchors.is_empty() {
+            return (self.replay(prompt), 0);
+        }
+        match self.last_anchor(prompt) {
+            Some((at, anchor)) => (&prompt[at + anchor.text.len()..], anchor.state),
+            None => ("", 0),
+        }
+    }
+
+    /// The last turn anchor in `prompt` and where it starts, found as `finditer` finds the
+    /// alternation of the anchors: the earliest match, the first anchor in the table's order
+    /// where several match there, then on from that match's end. Each anchor's next occurrence is
+    /// searched for again only once the matches have passed it, so a prompt costs one pass per
+    /// anchor. An anchor with no text never matches.
+    fn last_anchor(&self, prompt: &str) -> Option<(usize, &Anchor)> {
+        let find = |anchor: &Anchor, from: usize| {
+            if anchor.text.is_empty() {
+                return None;
+            }
+            prompt[from..]
+                .find(anchor.text.as_str())
+                .map(|at| from + at)
+        };
+        let mut next: Vec<Option<usize>> =
+            self.anchors.iter().map(|anchor| find(anchor, 0)).collect();
+        let mut from = 0;
+        let mut last = None;
+        loop {
+            for (anchor, at) in self.anchors.iter().zip(next.iter_mut()) {
+                if at.is_some_and(|at| at < from) {
+                    *at = find(anchor, from);
+                }
+            }
+            let Some((at, index)) = next
+                .iter()
+                .enumerate()
+                .filter_map(|(index, at)| at.map(|at| (at, index)))
+                .min()
+            else {
+                return last;
+            };
+            let anchor = &self.anchors[index];
+            last = Some((at, anchor));
+            from = at + anchor.text.len();
         }
     }
 
@@ -429,9 +532,9 @@ impl Format {
     /// emit reasoning (a thought the output starts inside is entered by the prompt's replay, which
     /// pushes `ReasoningStart`; an arguments state at the start has its call opened by the
     /// engine), a call syntax when a state emits arguments, a text for every terminal, a turn
-    /// opener that is not empty, a stop row only for an arguments state, and a framing row only
-    /// for a state of content or wrapping. The builder keeps a row from naming what the table
-    /// lacks; this checks the rest.
+    /// opener and turn anchors that are not empty and not both named, a stop row only for an
+    /// arguments state, and a framing row only for a state of content or wrapping. The builder
+    /// keeps a row from naming what the table lacks; this checks the rest.
     pub fn validate(&self) -> Result<(), String> {
         let Some(first) = self.states.first() else {
             return Err(format!("format {}: a table with no state", self.name));
@@ -466,6 +569,15 @@ impl Format {
         }
         if self.turn_opener.as_deref() == Some("") {
             return Err(format!("format {}: an empty turn opener", self.name));
+        }
+        if self.anchors.iter().any(|anchor| anchor.text.is_empty()) {
+            return Err(format!("format {}: an empty turn anchor", self.name));
+        }
+        if self.turn_opener.is_some() && !self.anchors.is_empty() {
+            return Err(format!(
+                "format {}: a turn opener and turn anchors; a table names one",
+                self.name
+            ));
         }
         if let Some(state) = self
             .stop_closes
@@ -579,6 +691,139 @@ mod tests {
     #[should_panic(expected = "format t: no state named \"call\"")]
     fn a_stop_row_for_a_state_the_table_lacks_is_a_programming_error() {
         let _ = two_states().closes_at_stop("call");
+    }
+
+    /// Gemma 4's two anchors, spelled from the response template of `google/gemma-4-31B-it` (its
+    /// `tokenizer_config.json`), around a thought and the content.
+    fn gemma_anchors() -> Format {
+        Format::new("anchors")
+            .terminal("think_open", "<|channel>thought\n")
+            .terminal("think_close", "<channel|>")
+            .state("content", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .transition("content", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "content")
+            .turn_anchor("<|turn>model\n")
+            .turn_anchor("<tool_response|>")
+    }
+
+    #[test]
+    fn the_last_anchor_of_either_kind_starts_the_turn_after_its_end() {
+        let format = gemma_anchors();
+        let turn = "<|turn>user\nWeather?<turn|>\n<|turn>model\n";
+        assert_eq!(format.replay(turn), "<|turn>model\n");
+        assert_eq!(format.turn(turn), ("", 0));
+        let after_a_tool = "<|turn>model\n<|tool_call>call:f{}<tool_call|><|tool_response>\
+                            response:f{}<tool_response|><|channel>thought\n";
+        assert_eq!(
+            format.replay(after_a_tool),
+            "<tool_response|><|channel>thought\n"
+        );
+        assert_eq!(format.turn(after_a_tool), ("<|channel>thought\n", 0));
+        let later_turn = "<|turn>model\n<tool_response|>Done.<turn|>\n<|turn>user\nThanks<turn|>\n\
+                          <|turn>model\n";
+        assert_eq!(format.turn(later_turn), ("", 0));
+    }
+
+    #[test]
+    fn anchors_are_found_as_finditer_finds_them() {
+        let doubled = Format::new("doubled")
+            .state("content", Emits::Content)
+            .turn_anchor("aa");
+        // `finditer` takes `aa` at 0 and goes on from 2: the turn starts after the first two.
+        assert_eq!(doubled.turn("aaa"), ("a", 0));
+        assert_eq!(doubled.turn("aaaa"), ("", 0));
+        let longest_first = Format::new("longest first")
+            .state("content", Emits::Content)
+            .turn_anchor("ab")
+            .turn_anchor("a");
+        assert_eq!(longest_first.turn("xab"), ("", 0));
+        let shortest_first = Format::new("shortest first")
+            .state("content", Emits::Content)
+            .turn_anchor("a")
+            .turn_anchor("ab");
+        assert_eq!(shortest_first.turn("xab"), ("b", 0));
+        // A later anchor that starts inside the last match is not one.
+        let overlapping = Format::new("overlapping")
+            .state("content", Emits::Content)
+            .turn_anchor("<a><b>")
+            .turn_anchor("<b>c");
+        assert_eq!(overlapping.turn("<a><b>c"), ("c", 0));
+        assert_eq!(overlapping.turn("<b>c<a><b>c"), ("c", 0));
+    }
+
+    #[test]
+    fn a_prompt_without_an_anchor_replays_nothing_and_a_replay_gives_itself() {
+        let format = gemma_anchors();
+        assert_eq!(format.replay("hello "), "");
+        assert_eq!(format.turn("hello "), ("", 0));
+        assert_eq!(format.turn(""), ("", 0));
+        for prompt in [
+            "<|turn>model\n",
+            "<|turn>model\n<|channel>thought\nPlan",
+            "a<tool_response|>b<|turn>model\nc<tool_response|>d",
+            "no anchor at all",
+        ] {
+            let kept = format.replay(prompt);
+            assert_eq!(format.replay(kept), kept, "{prompt:?}");
+            assert_eq!(format.turn(kept), format.turn(prompt), "{prompt:?}");
+        }
+    }
+
+    #[test]
+    fn an_anchor_names_the_state_the_output_starts_in() {
+        // TRL's Nemotron 3 template: the anchor pattern `<\|im_start\|>assistant\n<think>(?:\n|
+        // </think>)?` is three literals, the longer ones first as the greedy `?` tries them.
+        let format = Format::new("nemotron 3")
+            .terminal("think_close", "</think>")
+            .state("content", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .transition("reasoning", "think_close", "content")
+            .turn_anchor_starting_in("<|im_start|>assistant\n<think>\n", "reasoning")
+            .turn_anchor_starting_in("<|im_start|>assistant\n<think></think>", "content")
+            .turn_anchor_starting_in("<|im_start|>assistant\n<think>", "reasoning");
+        assert!(format.validate().is_ok());
+        assert_eq!(
+            format.turn("<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"),
+            ("", 1)
+        );
+        assert_eq!(
+            format.turn("<|im_start|>assistant\n<think></think>"),
+            ("", 0)
+        );
+        assert_eq!(format.turn("<|im_start|>assistant\n<think>"), ("", 1));
+        assert_eq!(format.turn("<|im_start|>assistant\n<think>x"), ("x", 1));
+    }
+
+    #[test]
+    fn an_anchor_is_not_empty_and_a_table_names_an_opener_or_anchors() {
+        assert_eq!(
+            Format::new("empty")
+                .state("c", Emits::Content)
+                .turn_anchor("")
+                .validate(),
+            Err("format empty: an empty turn anchor".to_string())
+        );
+        assert_eq!(
+            Format::new("both")
+                .state("c", Emits::Content)
+                .opens_turn("<|assistant|>")
+                .turn_anchor("<|assistant|>")
+                .validate(),
+            Err("format both: a turn opener and turn anchors; a table names one".to_string())
+        );
+        // An empty anchor never matches, even in a table nobody validated.
+        let unchecked = Format::new("unchecked")
+            .state("c", Emits::Content)
+            .turn_anchor("")
+            .turn_anchor("x");
+        assert_eq!(unchecked.turn("axb"), ("b", 0));
+    }
+
+    #[test]
+    #[should_panic(expected = "format t: no state named \"thought\"")]
+    fn an_anchor_starting_in_a_state_the_table_lacks_is_a_programming_error() {
+        let _ = two_states().turn_anchor_starting_in("<turn>", "thought");
     }
 
     #[test]

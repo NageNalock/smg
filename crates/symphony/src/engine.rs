@@ -64,6 +64,9 @@
 //! `<think>\n\n</think>\n\n`, which leaves the engine in content. A prompt that leaves an
 //! arguments state open is read as content for now (a prefilled call is a later step).
 //!
+//! A table with turn anchors ([`Format::turn_anchor`]) is replayed from the end of the last
+//! anchor, in the state that anchor names, and not at all when the prompt holds none.
+//!
 //! [`Declared`]: crate::tagged::Declared
 
 use crate::{
@@ -498,13 +501,14 @@ impl Engine {
         }
     }
 
-    /// Where the prompt leaves the engine: its terminals replayed over the table from the initial
-    /// state, starting at the last turn opener the table names. An arguments state is not entered
-    /// from the prompt.
+    /// Where the prompt leaves the engine: its terminals replayed over the table from the state the
+    /// turn starts in, starting at the last turn opener the table names, or after its last turn
+    /// anchor. An arguments state is not entered from the prompt: the engine rests where the turn
+    /// started.
     fn seed(&mut self, prompt: &str, out: &mut Events) {
-        let turn = self.format.replay(prompt);
+        let (turn, start) = self.format.turn(prompt);
         let mut scanner = Scanner::new(self.format.terminal_texts());
-        let mut state = 0;
+        let mut state = start;
         let pieces = scanner.feed(turn).into_iter().chain(scanner.finish());
         for piece in pieces {
             if let Piece::Marker(index) = piece {
@@ -513,7 +517,10 @@ impl Engine {
                 }
             }
         }
-        if self.format.emits(state) != Emits::Arguments {
+        if self.format.emits(state) == Emits::Arguments {
+            state = start;
+        }
+        if state != self.state {
             self.enter(state, out);
         }
     }
@@ -659,6 +666,29 @@ mod tests {
                 spans: &[],
             },
             Input::End { finish },
+        ] {
+            engine.feed(input, &mut out).expect("in order");
+        }
+        out.drain()
+    }
+
+    /// The events of `output` after `prompt`, ended by a stop.
+    fn run_after(format: Format, prompt: &str, output: &str) -> Vec<Event> {
+        let mut engine = Engine::new(format, declared());
+        let mut out = Events::new();
+        for input in [
+            Input::Prompt {
+                token_ids: &[],
+                text: prompt,
+            },
+            Input::Delta {
+                token_ids: &[],
+                text: output,
+                spans: &[],
+            },
+            Input::End {
+                finish: EngineFinish::Stop,
+            },
         ] {
             engine.feed(input, &mut out).expect("in order");
         }
@@ -945,6 +975,69 @@ mod tests {
             malformed, "xy",
             "without the row the wrapping's text is reported"
         );
+    }
+
+    /// Gemma 4's turn, spelled from the response template of `google/gemma-4-31B-it` (its
+    /// `tokenizer_config.json`): two anchors, a thought, the calls, and the content outside them.
+    fn gemma_turn() -> Format {
+        Format::new("gemma turn")
+            .terminal("think_open", "<|channel>thought\n")
+            .terminal("think_close", "<channel|>")
+            .terminal("call_open", "<|tool_call>")
+            .terminal("call_close", "<tool_call|>")
+            .state("content", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("call", Emits::Arguments)
+            .transition("content", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "content")
+            .transition("content", "call_open", "call")
+            .transition("call", "call_close", "content")
+            .calls(CallSyntax::Gemma)
+            .turn_anchor("<|turn>model\n")
+            .turn_anchor("<tool_response|>")
+    }
+
+    #[test]
+    fn the_turn_starts_after_the_last_anchor() {
+        // After a tool's response the template opens a thought: the output starts inside it.
+        let prompt = "<|turn>user\nWeather?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{\
+                      city:<|\"|>Paris<|\"|>}<tool_call|><|tool_response>response:get_weather{\
+                      temp:20}<tool_response|><|channel>thought\n";
+        let events = run_after(gemma_turn(), prompt, "It is warm.<channel|>20 degrees.");
+        assert_eq!(events.first(), Some(&Event::ReasoningStart));
+        let [content, reasoning, ..] = kinds(&events);
+        assert_eq!([content, reasoning], ["20 degrees.", "It is warm."]);
+        // A thought opened in an earlier turn moves nothing.
+        let later = "<|turn>model\n<|channel>thought\nPlan<turn|>\n<|turn>user\nAgain<turn|>\n\
+                     <|turn>model\n";
+        let [content, reasoning, ..] = kinds(&run_after(gemma_turn(), later, "Hello."));
+        assert_eq!([content, reasoning], ["Hello.", ""]);
+    }
+
+    #[test]
+    fn a_prompt_without_an_anchor_replays_nothing() {
+        // The prompt opens a thought but holds no anchor: the output starts in the first state.
+        let [content, reasoning, ..] =
+            kinds(&run_after(gemma_turn(), "<|channel>thought\n", "Hello."));
+        assert_eq!([content, reasoning], ["Hello.", ""]);
+    }
+
+    #[test]
+    fn the_output_starts_in_the_state_its_anchor_names() {
+        // TRL's DeepSeek R1 distill template: the anchor ends with the thought's opener.
+        let distill = || {
+            Format::new("r1 distill")
+                .terminal("think_close", "</think>")
+                .state("content", Emits::Content)
+                .state("reasoning", Emits::Reasoning)
+                .transition("reasoning", "think_close", "content")
+                .turn_anchor_starting_in("<\u{ff5c}Assistant\u{ff5c}><think>\n", "reasoning")
+        };
+        let prompt = "<\u{ff5c}User\u{ff5c}>2+2?<\u{ff5c}Assistant\u{ff5c}><think>\n";
+        let events = run_after(distill(), prompt, "Four.</think>\n\n4");
+        assert_eq!(events.first(), Some(&Event::ReasoningStart));
+        let [content, reasoning, ..] = kinds(&events);
+        assert_eq!([content, reasoning], ["\n\n4", "Four."]);
     }
 
     #[test]
