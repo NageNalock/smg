@@ -63,7 +63,8 @@ pub struct RouterConfig {
     pub health_check_port: Option<u16>,
     /// Explicit async runtime worker-thread count. `None` uses tokio's default
     /// (`available_parallelism()`), which already honors the cgroup CPU quota on
-    /// Rust 1.95+ and is therefore container-aware. `Some` pins a count.
+    /// Rust 1.95+ and is therefore container-aware. `Some` pins a count of at
+    /// least 1: the runtime builder panics on 0, so `ConfigValidator` refuses it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_worker_threads: Option<usize>,
     pub max_payload_size: usize,
@@ -80,6 +81,19 @@ pub struct RouterConfig {
     /// `0` disables the watchdog.
     #[serde(default = "default_stream_body_stall_timeout_secs")]
     pub stream_body_stall_timeout_secs: u64,
+    /// Close a connection that has not delivered a complete request head
+    /// within this many seconds of being accepted, and a keep-alive
+    /// connection whose next request head stalls for this long after its
+    /// first byte. `0` disables the bound.
+    #[serde(default = "default_header_read_timeout_secs")]
+    pub header_read_timeout_secs: u64,
+    /// Close a keep-alive connection that has had no request in flight for
+    /// this many seconds; an open streaming response counts as in flight.
+    /// The bound starts with the connection's first request: a connection
+    /// that never sends one is bounded by `header_read_timeout_secs` alone.
+    /// `0` keeps idle connections until the client closes them.
+    #[serde(default = "default_idle_connection_timeout_secs")]
+    pub idle_connection_timeout_secs: u64,
     pub request_timeout_secs: u64,
     /// Idle timeout for pooled upstream connections. Must stay below the
     /// backend HTTP server's keep-alive timeout (the engines default to
@@ -324,7 +338,10 @@ pub struct RouterConfig {
     #[serde(default = "default_priority_scheduler_max_class")]
     pub priority_scheduler_default_max_class: String,
     /// Optional path to the priority-scheduler YAML (per-class + per-tenant
-    /// overrides). Absent → built-in defaults, empty tenant policy map.
+    /// overrides). Absent → built-in defaults, empty tenant policy map. With
+    /// the scheduler enabled, a file that cannot be read, parsed or validated
+    /// is a configuration error (`ConfigValidator`), not a fallback to the
+    /// legacy admission.
     #[serde(default)]
     pub priority_scheduler_config: Option<String>,
     /// Cap on per-tenant scheduler metric label cardinality (top-N tenants
@@ -894,6 +911,31 @@ pub enum CacheIndexKind {
     Hash,
 }
 
+/// What `power_of_two` compares its candidates by.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerOfTwoLoadMetric {
+    /// Least-load expected wait of two random workers.
+    #[default]
+    ExpectedWait,
+    /// Router in-flight requests of two random workers, then expected wait.
+    Requests,
+    /// Router in-flight requests of every healthy worker, then expected wait.
+    LeastRequests,
+}
+
+impl PowerOfTwoLoadMetric {
+    /// Parse the CLI spelling (`expected_wait` / `requests` / `least_requests`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "expected_wait" => Some(Self::ExpectedWait),
+            "requests" => Some(Self::Requests),
+            "least_requests" => Some(Self::LeastRequests),
+            _ => None,
+        }
+    }
+}
+
 /// Policy configuration for routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -978,7 +1020,11 @@ pub enum PolicyConfig {
     /// but WorkerMonitor does not yet use per-policy intervals. This field is reserved for
     /// future support of different polling cadences per policy.
     #[serde(rename = "power_of_two")]
-    PowerOfTwo { load_check_interval_secs: u64 },
+    PowerOfTwo {
+        load_check_interval_secs: u64,
+        #[serde(default)]
+        load_metric: PowerOfTwoLoadMetric,
+    },
 
     /// Least-(token-)work policy: routes to the worker minimizing the expected
     /// wait `(queued_tokens + inflight_tokens) / throughput + kv_pressure_weight * k/(1-k)`
@@ -1117,6 +1163,14 @@ fn default_upstream_pool_idle_timeout_secs() -> u64 {
 
 fn default_stream_body_stall_timeout_secs() -> u64 {
     300
+}
+
+fn default_header_read_timeout_secs() -> u64 {
+    30
+}
+
+fn default_idle_connection_timeout_secs() -> u64 {
+    90
 }
 
 fn default_max_buffered_request_bytes() -> u64 {
@@ -1497,6 +1551,8 @@ impl Default for RouterConfig {
             max_payload_size: 536_870_912, // 512MB
             max_buffered_request_bytes: default_max_buffered_request_bytes(),
             stream_body_stall_timeout_secs: default_stream_body_stall_timeout_secs(),
+            header_read_timeout_secs: default_header_read_timeout_secs(),
+            idle_connection_timeout_secs: default_idle_connection_timeout_secs(),
             request_timeout_secs: 1800, // 30 minutes
             upstream_pool_idle_timeout_secs: default_upstream_pool_idle_timeout_secs(),
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
@@ -1928,6 +1984,29 @@ mod tests {
     }
 
     #[test]
+    fn test_connection_timeouts_serde_default_and_roundtrip() {
+        // Config files predating the fields deserialize to the defaults.
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("header_read_timeout_secs").unwrap();
+        object.remove("idle_connection_timeout_secs").unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(without.header_read_timeout_secs, 30);
+        assert_eq!(without.idle_connection_timeout_secs, 90);
+
+        // The disabling zero round-trips instead of reverting to the default.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .header_read_timeout_secs(0)
+            .idle_connection_timeout_secs(0)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.header_read_timeout_secs, 0);
+        assert_eq!(with.idle_connection_timeout_secs, 0);
+    }
+
+    #[test]
     fn test_stream_body_stall_timeout_serde_default_and_roundtrip() {
         // Config files predating the field deserialize to the 300s default.
         let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
@@ -2190,6 +2269,7 @@ mod tests {
 
         let power_of_two = PolicyConfig::PowerOfTwo {
             load_check_interval_secs: 60,
+            load_metric: Default::default(),
         };
         assert_eq!(power_of_two.name(), "power_of_two");
     }
@@ -2224,6 +2304,7 @@ mod tests {
 
         let power_of_two = PolicyConfig::PowerOfTwo {
             load_check_interval_secs: 60,
+            load_metric: Default::default(),
         };
         let json = serde_json::to_string(&power_of_two).unwrap();
         assert!(json.contains("\"type\":\"power_of_two\""));
@@ -2378,11 +2459,13 @@ mod tests {
     fn test_power_of_two_parameters() {
         let power_of_two = PolicyConfig::PowerOfTwo {
             load_check_interval_secs: 120,
+            load_metric: Default::default(),
         };
 
         match power_of_two {
             PolicyConfig::PowerOfTwo {
                 load_check_interval_secs,
+                ..
             } => {
                 assert_eq!(load_check_interval_secs, 120);
             }
@@ -2936,6 +3019,7 @@ discovery:
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
+                load_metric: Default::default(),
             }),
         };
 
@@ -2998,6 +3082,7 @@ discovery:
             prefill_policy: None,
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
+                load_metric: Default::default(),
             }),
         };
 

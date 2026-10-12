@@ -34,8 +34,8 @@ use crate::{
         ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
     },
     traits::{
-        ChatTemplateOutput, Decoder, Encoder, Encoding, IncrementalDecoder, SpecialTokens,
-        TokenIdType, Tokenizer,
+        ChatTemplateOutput, DecodeStep, Decoder, Encoder, Encoding, IncrementalDecoder,
+        SpecialTokens, TokenIdType, Tokenizer,
     },
 };
 
@@ -285,6 +285,10 @@ impl Encoder for CachedTokenizer {
 }
 
 impl Decoder for CachedTokenizer {
+    fn uses_byte_fallback(&self) -> bool {
+        self.inner.uses_byte_fallback()
+    }
+
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
         // Decoding is not cached (it's fast enough and rarely repeated)
         self.inner.decode(token_ids, skip_special_tokens)
@@ -302,6 +306,48 @@ impl Decoder for CachedTokenizer {
     ) -> Result<Option<String>> {
         self.inner
             .decode_step(token_id, ids, prefix, prefix_index, skip_special_tokens)
+    }
+
+    fn decode_step_eager(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<Option<String>> {
+        self.inner
+            .decode_step_eager(token_id, ids, prefix, prefix_index, skip_special_tokens)
+    }
+
+    fn decode_step_reporting(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+        eager: bool,
+    ) -> Result<DecodeStep> {
+        self.inner.decode_step_reporting(
+            token_id,
+            ids,
+            prefix,
+            prefix_index,
+            skip_special_tokens,
+            eager,
+        )
+    }
+
+    fn finish_decode(
+        &self,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<DecodeStep> {
+        self.inner
+            .finish_decode(ids, prefix, prefix_index, skip_special_tokens)
     }
 
     fn incremental_decoder(

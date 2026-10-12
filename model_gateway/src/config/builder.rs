@@ -154,6 +154,7 @@ impl RouterConfigBuilder {
     pub fn power_of_two_policy(mut self, load_check_interval_secs: u64) -> Self {
         self.config.policy = PolicyConfig::PowerOfTwo {
             load_check_interval_secs,
+            load_metric: Default::default(),
         };
         self
     }
@@ -223,6 +224,16 @@ impl RouterConfigBuilder {
 
     pub fn stream_body_stall_timeout_secs(mut self, secs: u64) -> Self {
         self.config.stream_body_stall_timeout_secs = secs;
+        self
+    }
+
+    pub fn header_read_timeout_secs(mut self, secs: u64) -> Self {
+        self.config.header_read_timeout_secs = secs;
+        self
+    }
+
+    pub fn idle_connection_timeout_secs(mut self, secs: u64) -> Self {
+        self.config.idle_connection_timeout_secs = secs;
         self
     }
 

@@ -18,7 +18,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicI64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -74,7 +74,7 @@ type OutputReceiver<O> = mpsc::UnboundedReceiver<Result<O>>;
 /// utility calls by the call id this client issued; closing fails both.
 struct RequestRegistry<O> {
     closed: bool,
-    requests: HashMap<String, OutputSender<O>>,
+    requests: HashMap<String, InFlight<O>>,
     utility_calls: HashMap<i64, UtilitySender>,
     /// When `requests` last went from empty to non-empty, while it is
     /// non-empty: the start of the busy period the engine is in.
@@ -93,6 +93,23 @@ struct RequestRegistry<O> {
     /// re-arms the silence watchdog for the remainder of the window the
     /// engine's unanswered work has left, not a whole one.
     busy_started: Arc<Notify>,
+    /// Prompt tokens of the registered requests that have produced no output
+    /// yet: the engine's prefill work in hand, as the servicer reports it.
+    prefill_pending: u64,
+    /// Registered requests the engine reports on every step it decodes: the
+    /// silence [`Client::output_silence`] counts is theirs. A request the
+    /// engine reports at intervals is quiet while healthy and counts none.
+    every_step: usize,
+}
+
+/// One registered request: its output stream, whether the engine reports it
+/// on every step ([`EngineProtocol::reported_every_step`]) and, until its
+/// first output, the prompt the engine still has to prefill for it.
+struct InFlight<O> {
+    sender: OutputSender<O>,
+    prompt_tokens: u64,
+    started: bool,
+    every_step: bool,
 }
 
 /// Completes one utility call with its value, or the error that ended it.
@@ -109,13 +126,22 @@ impl<O> Default for RequestRegistry<O> {
             unanswered_before: Duration::ZERO,
             silence_window: ENGINE_SILENCE_DEATH_TIMEOUT,
             busy_started: Arc::new(Notify::new()),
+            prefill_pending: 0,
+            every_step: 0,
         }
     }
 }
 
 impl<O: EngineOutput> RequestRegistry<O> {
-    /// Register a new request, returning the receiver for its output stream.
-    fn register(&mut self, request_id: String) -> Result<OutputReceiver<O>> {
+    /// Register a new request of `prompt_tokens`, reported by the engine on
+    /// every step or at intervals (`every_step`), returning the receiver for
+    /// its output stream.
+    fn register(
+        &mut self,
+        request_id: String,
+        prompt_tokens: u64,
+        every_step: bool,
+    ) -> Result<OutputReceiver<O>> {
         if self.closed {
             return Err(Error::ClientClosed {
                 message: "client is shutting down".to_string(),
@@ -139,14 +165,40 @@ impl<O: EngineOutput> RequestRegistry<O> {
             self.in_flight_since = Some(now);
             self.busy_started.notify_one();
         }
-        self.requests.insert(request_id, sender);
+        self.requests.insert(
+            request_id,
+            InFlight {
+                sender,
+                prompt_tokens,
+                started: false,
+                every_step,
+            },
+        );
+        self.prefill_pending = self.prefill_pending.saturating_add(prompt_tokens);
+        if every_step {
+            self.every_step += 1;
+        }
         Ok(receiver)
     }
 
-    /// Drop a request's entry. The last one ends the busy period, whose
-    /// in-flight time counts as unanswered until the engine's next output.
-    fn retire(&mut self, request_id: &str) -> Option<OutputSender<O>> {
-        let sender = self.requests.remove(request_id)?;
+    /// The request's prompt is prefilled (its first output came, or it is
+    /// gone before one): it no longer counts as pending prefill.
+    fn prefilled(&mut self, entry: &mut InFlight<O>) {
+        if !entry.started {
+            entry.started = true;
+            self.prefill_pending = self.prefill_pending.saturating_sub(entry.prompt_tokens);
+        }
+    }
+
+    /// Drop a request's entry, settling its pending prefill and its place in
+    /// the silence count. The last one ends the busy period, whose in-flight
+    /// time counts as unanswered until the engine's next output.
+    fn retire(&mut self, request_id: &str) -> Option<InFlight<O>> {
+        let mut entry = self.requests.remove(request_id)?;
+        self.prefilled(&mut entry);
+        if entry.every_step {
+            self.every_step = self.every_step.saturating_sub(1);
+        }
         if self.requests.is_empty() {
             let now = Instant::now();
             if let Some(since) = self.in_flight_since.take() {
@@ -154,7 +206,7 @@ impl<O: EngineOutput> RequestRegistry<O> {
             }
             self.idle_since = Some(now);
         }
-        Some(sender)
+        Some(entry)
     }
 
     /// The engine answered (an output of any kind): nothing in flight is
@@ -190,8 +242,8 @@ impl<O: EngineOutput> RequestRegistry<O> {
             // Terminal: retire the entry before handing the output over, while
             // its request id is still borrowable.
             match self.retire(output.request_id()) {
-                Some(sender) => {
-                    let _ = sender.send(Ok(output));
+                Some(entry) => {
+                    let _ = entry.sender.send(Ok(output));
                 }
                 None => trace!(
                     request_id = output.request_id(),
@@ -200,16 +252,21 @@ impl<O: EngineOutput> RequestRegistry<O> {
             }
             return;
         }
-        let Some(sender) = self.requests.get(output.request_id()) else {
+        let Some(entry) = self.requests.get_mut(output.request_id()) else {
             trace!(
                 request_id = output.request_id(),
                 "output for unknown/finished request; dropping"
             );
             return;
         };
+        if !entry.started {
+            // The first output: the prompt is prefilled.
+            entry.started = true;
+            self.prefill_pending = self.prefill_pending.saturating_sub(entry.prompt_tokens);
+        }
         // A failed send hands the output back, so the receiver-gone (stream
         // dropped) path retires the entry without an owned key either.
-        if let Err(mpsc::error::SendError(Ok(undelivered))) = sender.send(Ok(output)) {
+        if let Err(mpsc::error::SendError(Ok(undelivered))) = entry.sender.send(Ok(output)) {
             self.retire(undelivered.request_id());
         }
     }
@@ -219,6 +276,16 @@ impl<O: EngineOutput> RequestRegistry<O> {
         for request_id in request_ids {
             self.retire(request_id);
         }
+    }
+
+    /// Prompt tokens of the in-flight requests without a first output yet.
+    fn prefill_pending_tokens(&self) -> u64 {
+        self.prefill_pending
+    }
+
+    /// In-flight requests the engine reports on every step it decodes.
+    fn reported_every_step(&self) -> usize {
+        self.every_step
     }
 
     /// Register a utility call, returning the receiver its reply resolves.
@@ -254,11 +321,13 @@ impl<O: EngineOutput> RequestRegistry<O> {
     /// error and close the registry.
     fn fail_all(&mut self, error: Arc<Error>) {
         self.closed = true;
-        for (_, sender) in self.requests.drain() {
-            let _ = sender.send(Err(Error::Shared(error.clone())));
+        for (_, entry) in self.requests.drain() {
+            let _ = entry.sender.send(Err(Error::Shared(error.clone())));
         }
         self.in_flight_since = None;
         self.unanswered_before = Duration::ZERO;
+        self.prefill_pending = 0;
+        self.every_step = 0;
         for (_, sender) in self.utility_calls.drain() {
             let _ = sender.send(Err(Error::Shared(error.clone())));
         }
@@ -352,6 +421,17 @@ struct ClientInner<P: EngineProtocol> {
     /// Issues utility call ids; the engine echoes one on its reply. Positive
     /// only: vLLM reserves negative ids for notices it sends unprompted.
     next_call_id: AtomicI64,
+    /// The engine's last output of any kind (a token, a completion, a
+    /// stats-only step), in milliseconds on `output_clock`; reset at the
+    /// first submission the engine reports every step after a spell without
+    /// one, so the silence such a request sees counts from its own dispatch.
+    /// Read by [`Client::output_silence`].
+    output_clock: Instant,
+    last_output_ms: AtomicU64,
+    /// The engine has sent a scheduler step without any token (a stats-only
+    /// step report): its silence is then the scheduler's own, not a prefill
+    /// in progress. Read by [`Client::reports_steps`].
+    steps_reported: AtomicBool,
 }
 
 impl<P: EngineProtocol> ClientInner<P> {
@@ -438,6 +518,12 @@ impl<P: EngineProtocol> ClientInner<P> {
                 Ok(engine.engine_id.clone())
             }
         }
+    }
+
+    /// Stamp an output from the engine (or a dispatch onto an idle one) now.
+    fn note_output(&self) {
+        let millis = u64::try_from(self.output_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_output_ms.store(millis, Ordering::Relaxed);
     }
 
     /// Retire in-flight request ids from a rank. Idempotent: an id already
@@ -858,6 +944,9 @@ impl<P: EngineProtocol> Client<P> {
             wave: lockstep.then(|| Mutex::new(0)),
             abort_tx,
             next_call_id: AtomicI64::new(1),
+            output_clock: Instant::now(),
+            last_output_ms: AtomicU64::new(0),
+            steps_reported: AtomicBool::new(false),
         });
 
         // Input writer: the one owner of the input socket's send half.
@@ -934,6 +1023,60 @@ impl<P: EngineProtocol> Client<P> {
         self.inner.routing.lock().load.get(&engine_index).copied()
     }
 
+    /// How long the engine has produced nothing while this client holds
+    /// requests in flight on it that the engine reports on every step
+    /// ([`EngineProtocol::reported_every_step`]): the time since its last
+    /// output batch of any kind (a token, a completion, a stats-only step),
+    /// counted from the dispatch of the first such request after a spell
+    /// without one; `None` while none is in flight. A request the engine
+    /// reports at intervals (one that does not stream, one streamed every so
+    /// many tokens) is quiet while healthy, so it counts no silence of its
+    /// own, though its prompt counts in [`Self::prefill_pending_tokens`]
+    /// (its prefill silences the rest). A frozen engine keeps its connection
+    /// open and its last load report standing, so this is the first sign of
+    /// it: the servicer puts it on the load record it pushes
+    /// (`EngineLoad.engine_silence_ms`) for the gateway's wedge rule, with
+    /// [`Self::reports_steps`] beside it to say whether the silence is the
+    /// scheduler's own.
+    pub fn output_silence(&self) -> Option<Duration> {
+        if self.inner.registry.lock().reported_every_step() == 0 {
+            return None;
+        }
+        let since = Duration::from_millis(self.inner.last_output_ms.load(Ordering::Relaxed));
+        Some(self.inner.output_clock.elapsed().saturating_sub(since))
+    }
+
+    /// Whether the engine's wire reports every scheduler step: it has shown
+    /// a scheduler step without any token (a stats-only step report, which
+    /// vLLM sends every step while its stats logging is on), or the launcher
+    /// that started the engine said so ([`Self::note_reports_steps`]). From
+    /// then on [`Self::output_silence`] is the scheduler's silence. A wire
+    /// that carries token batches only (SGLang, TokenSpeed) never sets it,
+    /// and its silence may be a prefill in progress, which the gateway
+    /// allows for.
+    pub fn reports_steps(&self) -> bool {
+        self.inner.steps_reported.load(Ordering::Relaxed)
+    }
+
+    /// The engine's wire reports every scheduler step, as the launcher that
+    /// started the engine knows (its scheduler statistics are on): hold
+    /// [`Self::reports_steps`] from now rather than from the first stats-only
+    /// step batch, so an engine that freezes before its first batch after
+    /// the servicer connected is judged on the step-reporting path too. A
+    /// client told nothing is classified by what its wire shows.
+    pub fn note_reports_steps(&self) {
+        self.inner.steps_reported.store(true, Ordering::Relaxed);
+    }
+
+    /// Prompt tokens of the in-flight requests that have produced no output
+    /// yet: the engine's prefill work in hand, which the servicer puts on its
+    /// load record (`EngineLoad.prefill_pending_tokens`) so a gateway can
+    /// allow for it when it judges a token-batch wire's silence, whatever it
+    /// has in flight on the engine itself.
+    pub fn prefill_pending_tokens(&self) -> u64 {
+        self.inner.registry.lock().prefill_pending_tokens()
+    }
+
     /// Submit a request and return a stream of its outputs. The request is
     /// routed by `data_parallel_rank` (SMG-pinned) or, unpinned, to the
     /// least-loaded engine (see [`ClientInner::select_engine`]).
@@ -957,7 +1100,20 @@ impl<P: EngineProtocol> Client<P> {
         // rejects a duplicate id), and in-flight slots are held by id, so a
         // reservation taken before that gate could collide with the live
         // request's own slot and release it on rollback.
-        let receiver = self.inner.registry.lock().register(request_id.clone())?;
+        let every_step = P::reported_every_step(&request);
+        let receiver = {
+            let mut registry = self.inner.registry.lock();
+            let quiet = registry.reported_every_step() == 0;
+            let receiver =
+                registry.register(request_id.clone(), P::prompt_tokens(&request), every_step)?;
+            // The silence a request sees counts from its dispatch: an engine
+            // with nothing it reports every step had nothing to say until
+            // now.
+            if quiet && every_step {
+                self.inner.note_output();
+            }
+            receiver
+        };
 
         // Selection reserves the engine's in-flight slot; every failure path
         // from here to a successful hand-off must release it.
@@ -1200,6 +1356,13 @@ async fn run_dispatcher<P: EngineProtocol>(
                 match output {
                     Some(Ok(batch)) => {
                         consecutive_decode_errors = 0;
+                        inner.note_output();
+                        if batch.outputs.is_empty()
+                            && batch.finished_request_ids.is_empty()
+                            && batch.load.is_some()
+                        {
+                            inner.steps_reported.store(true, Ordering::Relaxed);
+                        }
                         if let Some(load) = batch.load {
                             inner.routing.lock().load.insert(batch.engine_index, load);
                         }
@@ -1667,6 +1830,90 @@ mod tests {
         assert!(second.finished());
         // Terminal output ends the stream.
         assert!(stream.next().await.is_none());
+    }
+
+    /// The silence the servicer reports for a frozen engine: nothing while
+    /// idle, counted from the dispatch, reset by any output batch (a
+    /// stats-only step included), gone with the last in-flight request.
+    #[tokio::test]
+    async fn output_silence_counts_from_the_dispatch_and_ends_with_the_requests() {
+        let (client, mut engine, _ns) = connect().await;
+        assert_eq!(client.output_silence(), None, "nothing in flight");
+        let mut stream = client.submit(request_for("req-1", 0)).await.unwrap();
+        engine.recv_request().await.unwrap();
+        let at_dispatch = client.output_silence().expect("a request is in flight");
+        assert!(at_dispatch < Duration::from_millis(500), "{at_dispatch:?}");
+        assert!(
+            !client.reports_steps(),
+            "no step without a token seen yet: a token-batch wire until shown otherwise"
+        );
+        assert_eq!(
+            client.prefill_pending_tokens(),
+            3,
+            "the request's three prompt tokens are the engine's prefill in hand"
+        );
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let grown = client.output_silence().expect("still in flight");
+        assert!(
+            grown >= Duration::from_millis(70),
+            "grows while the engine is silent: {grown:?}"
+        );
+
+        // A stats-only step is output: the engine is alive, if quiet.
+        let stats_only = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 0,
+            scheduler_stats: Some(Box::new(SchedulerStats {
+                num_running_reqs: 1,
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        engine
+            .send_output(vec![Bytes::from(encode_msgpack(&stats_only).unwrap())])
+            .await
+            .unwrap();
+        let deadline = Instant::now() + TIMEOUT;
+        while client.engine_load(0).is_none() {
+            assert!(Instant::now() < deadline, "stats never arrived");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let after_stats = client.output_silence().expect("still in flight");
+        assert!(
+            after_stats < grown,
+            "reset by the step: {after_stats:?} after {grown:?}"
+        );
+        assert!(
+            client.reports_steps(),
+            "a stats-only step shows the wire reports every step"
+        );
+        assert_eq!(
+            client.prefill_pending_tokens(),
+            3,
+            "a step without an output for the request leaves its prompt pending"
+        );
+
+        // The terminal output ends the request: nothing in flight, no silence.
+        engine
+            .send_output(batch(
+                0,
+                EngineCoreOutput {
+                    request_id: "req-1".into(),
+                    new_token_ids: vec![11],
+                    finish_reason: Some(EngineCoreFinishReason::Stop),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .unwrap();
+        let last = stream.next().await.unwrap().unwrap();
+        assert!(last.finished());
+        assert!(stream.next().await.is_none());
+        assert_eq!(client.output_silence(), None, "nothing in flight again");
+        assert_eq!(
+            client.prefill_pending_tokens(),
+            0,
+            "its first output settled the prompt"
+        );
     }
 
     /// A stream that outlives its client is truncated, not complete: it must
@@ -2187,6 +2434,321 @@ mod tests {
         assert!(second.finished());
         // Terminal output ends the stream.
         assert!(stream.next().await.is_none());
+    }
+
+    /// A launcher that knows the engine's scheduler statistics are on tells
+    /// the client so: the wire counts as step-reporting from the start, before
+    /// any batch, and the first request's silence counts from its dispatch;
+    /// a client told nothing waits for a stats-only step batch to say so.
+    #[tokio::test]
+    async fn a_client_told_its_engine_reports_steps_is_step_reporting_before_any_batch() {
+        let (client, mut engine, _ns) = connect().await;
+        assert!(
+            !client.reports_steps(),
+            "told nothing and shown nothing: a token-batch wire until shown otherwise"
+        );
+        client.note_reports_steps();
+        assert!(
+            client.reports_steps(),
+            "the launcher's word holds before any batch"
+        );
+        let _stream = client.submit(request_for("req-1", 0)).await.unwrap();
+        engine.recv_request().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let silence = client.output_silence().expect("a request is in flight");
+        assert!(
+            silence >= Duration::from_millis(70) && client.reports_steps(),
+            "the first request's silence is the scheduler's own from its dispatch: {silence:?}"
+        );
+        assert_eq!(client.prefill_pending_tokens(), 3);
+    }
+
+    /// The silence the servicer reports is counted over the requests the
+    /// engine reports every step. A request it reports at intervals (one that
+    /// does not stream, one streamed every so many tokens) is quiet while
+    /// healthy: it counts no silence however long it runs, though its prompt
+    /// counts as pending prefill; a streaming request beside it counts from
+    /// its own dispatch, and takes the silence with it when it ends.
+    #[tokio::test]
+    async fn a_request_reported_at_intervals_counts_no_silence() {
+        use crate::protocol::tokenspeed::{
+            output::BatchTokenIDOutSlim, request::TokenizedGenerateReqInput,
+            sampling::SamplingParams,
+        };
+        let ns = IpcNamespace::new().unwrap();
+        let (handshake, input, output) = (
+            ns.handshake_endpoint(),
+            ns.input_endpoint(),
+            ns.output_endpoint(),
+        );
+        let _ns = ns;
+        let (transport, engine) = tokio::join!(
+            connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response()
+            ),
+        );
+        let client = TokenSpeedClient::new(transport.unwrap());
+        let mut engine = engine.unwrap();
+        let request = |rid: &str, input_ids: Vec<u32>, stream: bool, stream_interval| {
+            TokenizedGenerateReqInput {
+                rid: rid.to_string(),
+                input_ids,
+                sampling_params: SamplingParams {
+                    max_new_tokens: Some(4),
+                    stream_interval,
+                    ..SamplingParams::default()
+                },
+                stream,
+                ..TokenizedGenerateReqInput::default()
+            }
+        };
+        let done = |rid: &str, prompt_tokens: u32| BatchTokenIDOutSlim {
+            rids: vec![rid.to_string()],
+            output_ids: vec![vec![11]],
+            finished_reasons: vec!["stop".into()],
+            prompt_tokens: vec![prompt_tokens],
+            completion_tokens: vec![1],
+            cached_tokens: vec![0],
+            output_token_logprobs_val: vec![vec![]],
+            output_token_logprobs_idx: vec![vec![]],
+            ..Default::default()
+        };
+
+        // A request that does not stream is reported at its end: it is owed
+        // nothing in between, so it counts no silence, however long it runs.
+        let mut unstreamed = client
+            .submit(request("ts-end", vec![1, 2, 3], false, None))
+            .await
+            .unwrap();
+        engine.recv_request().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(client.output_silence(), None, "reported at its end only");
+        assert_eq!(
+            client.prefill_pending_tokens(),
+            3,
+            "its prompt is pending prefill all the same"
+        );
+        // So is one streamed every eight tokens.
+        let mut spaced = client
+            .submit(request("ts-spaced", vec![4, 5], true, Some(8)))
+            .await
+            .unwrap();
+        engine.recv_request().await.unwrap();
+        assert_eq!(client.output_silence(), None, "streamed at an interval");
+        assert_eq!(client.prefill_pending_tokens(), 5);
+        // A streaming request is reported every step: the silence counts
+        // from its dispatch, not from the quiet requests' earlier ones.
+        let mut streamed = client
+            .submit(request("ts-step", vec![6], true, None))
+            .await
+            .unwrap();
+        engine.recv_request().await.unwrap();
+        let at_dispatch = client
+            .output_silence()
+            .expect("a request reported every step is in flight");
+        assert!(
+            at_dispatch < Duration::from_millis(150),
+            "counted from its own dispatch: {at_dispatch:?}"
+        );
+        assert_eq!(client.prefill_pending_tokens(), 6);
+        // Its end takes the silence with it, though the other two go on.
+        engine
+            .send_output(vec![Bytes::from(
+                encode_msgpack(&done("ts-step", 1)).unwrap(),
+            )])
+            .await
+            .unwrap();
+        assert!(streamed.next().await.unwrap().unwrap().finished());
+        assert!(streamed.next().await.is_none());
+        assert_eq!(
+            client.output_silence(),
+            None,
+            "the requests left are reported at intervals"
+        );
+        assert_eq!(
+            client.prefill_pending_tokens(),
+            5,
+            "the ended request's prompt settled; the others' stand"
+        );
+        // The other two end: nothing pending, nothing in flight.
+        for (rid, stream, prompt_tokens) in [
+            ("ts-end", &mut unstreamed, 3),
+            ("ts-spaced", &mut spaced, 2),
+        ] {
+            engine
+                .send_output(vec![Bytes::from(
+                    encode_msgpack(&done(rid, prompt_tokens)).unwrap(),
+                )])
+                .await
+                .unwrap();
+            assert!(stream.next().await.unwrap().unwrap().finished());
+            assert!(stream.next().await.is_none());
+        }
+        assert_eq!(client.prefill_pending_tokens(), 0);
+        assert_eq!(client.output_silence(), None);
+    }
+
+    /// The same on the SGLang wire, embeddings included: a generation that
+    /// does not stream, or streams every so many tokens, counts no silence;
+    /// an embedding (one forward, one output) and a streaming generation at
+    /// an interval of one count from their own dispatch and take the silence
+    /// with them when they end.
+    #[tokio::test]
+    async fn an_sglang_request_reported_at_intervals_counts_no_silence() {
+        use crate::protocol::sglang::{
+            output::{BatchEmbeddingSlimOutput, BatchTokenIDSlimOutput},
+            request::{SglangRequest, TokenizedEmbeddingReqInput, TokenizedGenerateReqInput},
+            sampling::SamplingParams,
+        };
+        let ns = IpcNamespace::new().unwrap();
+        let (handshake, input, output) = (
+            ns.handshake_endpoint(),
+            ns.input_endpoint(),
+            ns.output_endpoint(),
+        );
+        let _ns = ns;
+        let (transport, engine) = tokio::join!(
+            connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response()
+            ),
+        );
+        let client = SglangClient::new(transport.unwrap());
+        let mut engine = engine.unwrap();
+        let generate = |rid: &str, input_ids: Vec<u32>, stream: bool, stream_interval| {
+            SglangRequest::Generate(TokenizedGenerateReqInput {
+                rid: rid.to_string(),
+                input_ids,
+                sampling_params: SamplingParams {
+                    max_new_tokens: Some(4),
+                    stream_interval,
+                    ..SamplingParams::default()
+                },
+                stream,
+                ..TokenizedGenerateReqInput::default()
+            })
+        };
+        let done = |rid: &str, prompt_tokens: u32| BatchTokenIDSlimOutput {
+            rids: vec![rid.to_string()],
+            output_ids: vec![vec![11]],
+            finished_reasons: vec!["stop".into()],
+            finished_messages: vec![None],
+            finished_matched: vec![None],
+            prompt_tokens: vec![prompt_tokens],
+            completion_tokens: vec![1],
+            cached_tokens: vec![0],
+            output_token_logprobs_val: vec![vec![]],
+            output_token_logprobs_idx: vec![vec![]],
+            finished_status: vec![None],
+            ..Default::default()
+        };
+
+        // A generation that does not stream is reported at its end: no
+        // silence, however long it runs; its prompt is pending all the same.
+        let mut unstreamed = client
+            .submit(generate("sg-end", vec![1, 2, 3], false, None))
+            .await
+            .unwrap();
+        engine.recv_request().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(client.output_silence(), None, "reported at its end only");
+        assert_eq!(client.prefill_pending_tokens(), 3);
+        // So is one streamed every eight tokens.
+        let mut spaced = client
+            .submit(generate("sg-spaced", vec![4, 5], true, Some(8)))
+            .await
+            .unwrap();
+        engine.recv_request().await.unwrap();
+        assert_eq!(client.output_silence(), None, "streamed at an interval");
+        assert_eq!(client.prefill_pending_tokens(), 5);
+        // An embedding is owed its one output: it counts from its dispatch.
+        let mut embed = client
+            .submit(SglangRequest::Embed(TokenizedEmbeddingReqInput {
+                rid: "sg-embed".to_string(),
+                input_ids: vec![6, 7],
+                ..TokenizedEmbeddingReqInput::default()
+            }))
+            .await
+            .unwrap();
+        engine.recv_request().await.unwrap();
+        let at_dispatch = client
+            .output_silence()
+            .expect("an embedding in flight is owed its output");
+        assert!(
+            at_dispatch < Duration::from_millis(150),
+            "counted from its own dispatch: {at_dispatch:?}"
+        );
+        assert_eq!(client.prefill_pending_tokens(), 7);
+        // Its result ends it, and the silence with it.
+        let result = BatchEmbeddingSlimOutput {
+            rids: vec!["sg-embed".to_string()],
+            embeddings: vec![vec![0.5]],
+            prompt_tokens: vec![2],
+            cached_tokens: vec![0],
+            finished_reasons: vec!["stop".into()],
+            finished_messages: vec![None],
+            finished_status: vec![None],
+            ..Default::default()
+        };
+        engine
+            .send_output(vec![Bytes::from(encode_msgpack(&result).unwrap())])
+            .await
+            .unwrap();
+        assert!(embed.next().await.unwrap().unwrap().finished());
+        assert!(embed.next().await.is_none());
+        assert_eq!(
+            client.output_silence(),
+            None,
+            "the generations left are reported at intervals"
+        );
+        assert_eq!(client.prefill_pending_tokens(), 5);
+        // A streaming generation at the default interval is reported every
+        // step: it counts from its own dispatch, not from the embedding's.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut streamed = client
+            .submit(generate("sg-step", vec![8], true, None))
+            .await
+            .unwrap();
+        engine.recv_request().await.unwrap();
+        let at_dispatch = client
+            .output_silence()
+            .expect("a streaming generation at an interval of one is owed every step");
+        assert!(
+            at_dispatch < Duration::from_millis(150),
+            "counted from its own dispatch: {at_dispatch:?}"
+        );
+        assert_eq!(client.prefill_pending_tokens(), 6);
+        engine
+            .send_output(vec![Bytes::from(
+                encode_msgpack(&done("sg-step", 1)).unwrap(),
+            )])
+            .await
+            .unwrap();
+        assert!(streamed.next().await.unwrap().unwrap().finished());
+        assert!(streamed.next().await.is_none());
+        assert_eq!(client.output_silence(), None);
+        assert_eq!(client.prefill_pending_tokens(), 5);
+        // The quiet two end: nothing pending, nothing in flight.
+        for (rid, stream, prompt_tokens) in [
+            ("sg-end", &mut unstreamed, 3),
+            ("sg-spaced", &mut spaced, 2),
+        ] {
+            engine
+                .send_output(vec![Bytes::from(
+                    encode_msgpack(&done(rid, prompt_tokens)).unwrap(),
+                )])
+                .await
+                .unwrap();
+            assert!(stream.next().await.unwrap().unwrap().finished());
+            assert!(stream.next().await.is_none());
+        }
+        assert_eq!(client.prefill_pending_tokens(), 0);
+        assert_eq!(client.output_silence(), None);
     }
 
     /// A lockstep group is paused when the client connects, so the first submit

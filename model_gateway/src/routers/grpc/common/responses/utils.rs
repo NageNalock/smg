@@ -20,8 +20,9 @@ use super::background;
 use crate::{
     routers::{
         common::{
-            mcp_utils::ensure_request_mcp_client, openai_bridge,
-            persistence_utils::persist_conversation_items,
+            mcp_utils::ensure_request_mcp_client,
+            openai_bridge,
+            persistence_utils::{persist_conversation_items, PersistStep},
         },
         error,
     },
@@ -310,7 +311,9 @@ pub(crate) fn namespace_test_request() -> ResponsesRequest {
     })).unwrap()
 }
 
-/// Persist response to storage if store=true
+/// Persist response to storage if store=true; an unstored background response
+/// keeps its result in the record its client polls, for the polling window
+/// only (see [`background::finish_unstored`]).
 ///
 /// Common helper function to avoid duplication across sync and streaming paths
 /// in both harmony and regular responses implementations.
@@ -323,12 +326,19 @@ pub(crate) async fn persist_response_if_needed(
     request_context: Option<StorageRequestContext>,
 ) {
     if !original_request.store.unwrap_or(true) {
+        // Nothing of an unstored response reaches the conversation and
+        // history side; a background one still has the record its client
+        // polls, and the result goes there.
+        if original_request.background.unwrap_or(false) {
+            background::finish_unstored(&response_storage, response, request_context).await;
+        }
         return;
     }
+    let background = original_request.background.unwrap_or(false);
     // A background response's record may have been closed while the work
     // ran (a cancel, here or on another gateway sharing the store): a
     // terminal record is not rewritten by a late result.
-    if original_request.background.unwrap_or(false)
+    if background
         && background::is_closed(&response_storage, &response.id, request_context.clone()).await
     {
         debug!(
@@ -338,30 +348,212 @@ pub(crate) async fn persist_response_if_needed(
         return;
     }
 
-    if let Ok(response_json) = to_value(response) {
-        if let Err(e) = persist_conversation_items(
-            conversation_storage,
-            conversation_item_storage,
-            response_storage,
+    let Ok(response_json) = to_value(response) else {
+        return;
+    };
+    // A background response's terminal write is retried at the status-watch
+    // cadence within the terminal write window while the store answers with
+    // an error: the result of a run that outlived a store blip is stored once
+    // the store is back. Only the write of the response record is retried:
+    // once it landed, the conversation linking runs once (as before), so a
+    // retry can neither store the record twice nor link the items twice. A
+    // foreground response is written once, as before: its client is waiting
+    // for the answer. A background stream attached through the Harmony paths
+    // receives its terminal event after this persist, so during a store
+    // outage that event can wait for up to the window; the regular streaming
+    // paths emit it first.
+    let every = background::STATUS_WATCH;
+    let deadline = tokio::time::Instant::now() + background::terminal_write_window(every);
+    let mut attempts = 0u32;
+    loop {
+        match persist_conversation_items(
+            conversation_storage.clone(),
+            conversation_item_storage.clone(),
+            response_storage.clone(),
             &response_json,
             original_request,
-            request_context,
+            request_context.clone(),
         )
         .await
         {
-            warn!("Failed to persist response: {}", e);
-        } else {
-            debug!("Persisted response: {}", response.id);
+            Ok(()) => {
+                debug!("Persisted response: {}", response.id);
+                return;
+            }
+            Err(e)
+                if background
+                    && e.step == PersistStep::ResponseRecord
+                    && e.retryable
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                if attempts == 0 {
+                    warn!(
+                        response_id = %response.id,
+                        error = %e,
+                        "Failed to persist the background response; retrying while the store is unreachable"
+                    );
+                } else {
+                    debug!(response_id = %response.id, attempts, error = %e, "The background response persist still fails");
+                }
+                attempts += 1;
+                tokio::time::sleep(every).await;
+                // A cancel that landed meanwhile wins: a closed record is not
+                // rewritten by the result that waited for the store.
+                if background::is_closed(&response_storage, &response.id, request_context.clone())
+                    .await
+                {
+                    debug!(
+                        response_id = %response.id,
+                        "Background response record was closed while its result waited for the store; the result is not stored"
+                    );
+                    return;
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.step,
+                    PersistStep::ConversationLookup | PersistStep::Linking
+                ) =>
+            {
+                warn!(
+                    response_id = %response.id,
+                    error = %e,
+                    "Response stored; its items were not linked into the conversation"
+                );
+                return;
+            }
+            Err(e) => {
+                warn!("Failed to persist response: {}", e);
+                return;
+            }
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
-    use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+    use openai_protocol::{
+        model_card::ModelCard, responses::ResponseStatus, worker::HealthCheckConfig,
+    };
+    use serde_json::json;
+    use smg_data_connector::{
+        ListParams, MemoryConversationItemStorage, MemoryConversationStorage,
+        MemoryResponseStorage, NewConversation, ResponseId, SortOrder,
+    };
 
     use super::*;
     use crate::worker::{BasicWorkerBuilder, UNKNOWN_MODEL_ID};
+
+    /// The terminal object of `request` with one output message.
+    fn completed_response(id: &str, request: &ResponsesRequest) -> ResponsesResponse {
+        let message = serde_json::from_value(json!({
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "hello", "annotations": []}]
+        }))
+        .unwrap();
+        ResponsesResponse::builder(id, &request.model)
+            .copy_from_request(request)
+            .created_at(chrono::Utc::now().timestamp())
+            .completed_at(chrono::Utc::now().timestamp())
+            .status(ResponseStatus::Completed)
+            .add_output(message)
+            .build()
+    }
+
+    /// `background: true` with `store: false`, the public API's probe: the
+    /// result is written over the record the client polls and nothing is
+    /// linked to the conversation; a foreground `store: false` response
+    /// stores nothing at all.
+    #[tokio::test]
+    async fn an_unstored_background_response_finishes_in_its_record_and_the_history_keeps_nothing()
+    {
+        let conversation_storage: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let item_storage: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let response_storage: Arc<dyn ResponseStorage> = Arc::new(MemoryResponseStorage::new());
+        let conversation = conversation_storage
+            .create_conversation(NewConversation::default())
+            .await
+            .unwrap();
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "hi",
+            "background": true,
+            "store": false,
+            "conversation": conversation.id.0,
+            "max_output_tokens": 64
+        }))
+        .unwrap();
+        background::store_record(
+            &response_storage,
+            &background::queued_response("resp_u", &request),
+            &request,
+            None,
+        )
+        .await
+        .unwrap();
+
+        persist_response_if_needed(
+            conversation_storage.clone(),
+            item_storage.clone(),
+            response_storage.clone(),
+            &completed_response("resp_u", &request),
+            &request,
+            None,
+        )
+        .await;
+
+        let stored = response_storage
+            .get_response(&ResponseId::from("resp_u"))
+            .await
+            .unwrap()
+            .expect("the record is polled");
+        assert_eq!(
+            stored.raw_response["status"], "completed",
+            "{}",
+            stored.raw_response
+        );
+        assert_eq!(stored.raw_response["store"], false);
+        assert_eq!(
+            stored.raw_response["output"][0]["content"][0]["text"],
+            "hello"
+        );
+        let items = item_storage
+            .list_items(
+                &conversation.id,
+                ListParams {
+                    limit: 10,
+                    order: SortOrder::Asc,
+                    after: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            items.is_empty(),
+            "nothing is linked to the conversation: {items:?}"
+        );
+
+        let mut foreground = request;
+        foreground.background = None;
+        persist_response_if_needed(
+            conversation_storage,
+            item_storage,
+            response_storage.clone(),
+            &completed_response("resp_f", &foreground),
+            &foreground,
+            None,
+        )
+        .await;
+        assert!(response_storage
+            .get_response(&ResponseId::from("resp_f"))
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     fn registry_with_aliased_worker() -> Arc<WorkerRegistry> {
         let registry = Arc::new(WorkerRegistry::new());

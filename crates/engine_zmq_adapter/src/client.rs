@@ -708,6 +708,19 @@ impl ZmqEngineClient {
         &self,
         req: sglang_proto::GenerateRequest,
     ) -> Result<Vec<SglangGenerateStream>, tonic::Status> {
+        self.generate_sglang_streams_with_trace(req, None).await
+    }
+
+    /// [`generate_sglang_streams`](Self::generate_sglang_streams) with the
+    /// caller's W3C trace context: `trace_headers` ride beside every choice's
+    /// request (the scheduler's struct has no slot for them; the plugin in
+    /// the scheduler starts the request's trace from them), so the engine's
+    /// spans join the caller's trace as they do behind SGLang's own frontend.
+    pub async fn generate_sglang_streams_with_trace(
+        &self,
+        req: sglang_proto::GenerateRequest,
+        trace_headers: Option<BTreeMap<String, String>>,
+    ) -> Result<Vec<SglangGenerateStream>, tonic::Status> {
         let ZmqBackend::Sglang(client) = &self.backend else {
             return Err(tonic::Status::internal(
                 "this ZMQ backend is not an SGLang scheduler",
@@ -715,7 +728,9 @@ impl ZmqEngineClient {
         };
         let mut streams = Vec::new();
         for (index, sub) in fan_out_sglang_requests(req).into_iter().enumerate() {
-            let request = translate_request_sglang(sub).map_err(tonic::Status::invalid_argument)?;
+            let mut request =
+                translate_request_sglang(sub).map_err(tonic::Status::invalid_argument)?;
+            request.trace_headers.clone_from(&trace_headers);
             let stream = client
                 .submit(SglangRequest::Generate(request))
                 .await
@@ -890,6 +905,50 @@ impl ZmqEngineClient {
             ZmqBackend::Vllm(client) => client.engine_load(engine_index),
             ZmqBackend::TokenSpeed(client) => client.engine_load(engine_index),
             ZmqBackend::Sglang(client) => client.engine_load(engine_index),
+        }
+    }
+
+    /// The engine's silence on the requests in flight on it (the ZMQ client's
+    /// `output_silence`): the time since its last output of any kind, `None`
+    /// while nothing is in flight.
+    pub fn output_silence(&self) -> Option<Duration> {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.output_silence(),
+            ZmqBackend::TokenSpeed(client) => client.output_silence(),
+            ZmqBackend::Sglang(client) => client.output_silence(),
+        }
+    }
+
+    /// Whether the engine's wire has shown a scheduler step without any
+    /// token, so its silence is the scheduler's own (the ZMQ client's
+    /// `reports_steps`).
+    pub fn reports_steps(&self) -> bool {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.reports_steps(),
+            ZmqBackend::TokenSpeed(client) => client.reports_steps(),
+            ZmqBackend::Sglang(client) => client.reports_steps(),
+        }
+    }
+
+    /// The engine's wire reports every scheduler step, as the launcher that
+    /// started the engine knows: `reports_steps` holds from now rather than
+    /// from the first stats-only step batch (see the client's own
+    /// `note_reports_steps`).
+    pub fn note_reports_steps(&self) {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.note_reports_steps(),
+            ZmqBackend::TokenSpeed(client) => client.note_reports_steps(),
+            ZmqBackend::Sglang(client) => client.note_reports_steps(),
+        }
+    }
+
+    /// Prompt tokens of the in-flight requests without a first output yet
+    /// (the ZMQ client's `prefill_pending_tokens`).
+    pub fn prefill_pending_tokens(&self) -> u64 {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.prefill_pending_tokens(),
+            ZmqBackend::TokenSpeed(client) => client.prefill_pending_tokens(),
+            ZmqBackend::Sglang(client) => client.prefill_pending_tokens(),
         }
     }
 

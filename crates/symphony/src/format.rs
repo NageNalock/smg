@@ -60,12 +60,13 @@ pub enum CallSyntax {
     /// enter and leave the state are the call's own markers, and the call's end carries the
     /// closing one.
     Keyed(keyed::Tags),
-    /// Python calls, `name(key=value, ...)`, one or several, framed as the family's template
-    /// frames them (one per line: Olmo 3; a Python list: LFM2.5, Llama 3.2's pythonic template).
-    /// The region's markers are the terminals; each call ends at its own `)`, and the region's
-    /// closing marker is wrapping. The assembler reads either framing; the grammar derived from
-    /// the table writes the one named.
-    Pythonic(pythonic::Framing),
+    /// Python calls, `name(key=value, ...)`, one or several, in the family's dialect: framed as
+    /// its template frames them (one per line: Olmo 3; a Python list: LFM2.5, Llama 3.2's
+    /// pythonic template), the values as it writes them (Python's words and quotes: LFM2.5; JSON,
+    /// through `tojson`: Olmo 3). The region's markers are the terminals; each call ends at its
+    /// own `)`, and the region's closing marker is wrapping. The assembler reads either framing
+    /// and both spellings; the grammar derived from the table writes the dialect named.
+    Pythonic(pythonic::Dialect),
     /// A JSON list of calls with no markers around it, or content: xLAM. The table's one state is
     /// an arguments state entered at the output's start, and the assembler decides at the first
     /// byte that is not whitespace.
@@ -86,6 +87,17 @@ pub enum CallSyntax {
     /// `boolean`, `null`, `array`, `object`). The terminal that enters the state is the call tag's
     /// opening, and the one that leaves it is `<|close|>call<|sep|>`, which the call's end carries.
     Xtml,
+    /// The tool's name as text, then this marker, then one JSON object `{"name": …, "args": …}`:
+    /// Inkling, whose every message starts the arguments state and says what it is only after
+    /// its opener (`<|content_thinking|>`, `<|content_text|>`, or the name and the marker). The
+    /// terminals that leave the state are the message's own; the object's close is the call's end,
+    /// and the message's closing terminal is the region's.
+    NamedJson(&'static str),
+    /// Gemma 4's `call:NAME{key:value,…}`: keys bare, a string between `<|"|>` tokens, numbers and
+    /// words bare, lists and objects nested the same way, the keys sorted by the template. The
+    /// terminals that enter and leave the state are the call's own markers, and the call's end
+    /// carries the closing one.
+    Gemma,
 }
 
 /// What the text inside a state is.

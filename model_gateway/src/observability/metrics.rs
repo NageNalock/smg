@@ -3,7 +3,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration};
 
 use dashmap::DashMap;
-use llm_tokenizer::cache::{cache_activity_stats, CacheActivityStats};
+use llm_tokenizer::{
+    cache::{cache_activity_stats, CacheActivityStats},
+    decode_activity_stats,
+};
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{
     DistributionBuilder, Matcher, PrometheusBuilder, PrometheusHandle,
@@ -236,6 +239,7 @@ pub(crate) fn init_metrics() {
         "Tokenizer cache entries removed for capacity; excludes clear, drop and replacement"
     );
     describe_counter!("smg_tokenizer_cache_reused_bytes_total", "UTF-8 input bytes served by tokenizer cache hits: whole inputs for L0, matched prefixes for L1; not memory usage");
+    describe_counter!("smg_detokenize_prefix_mismatch_total", "Incremental decode steps and end-of-input finishes whose output no longer started with the text already decoded and went on with the remainder (several per stream are possible; unary responses count too), by kind: byte_run (an invalid byte collapsed a ByteFallback run whose characters were already decoded) or decoder (another decoder step rewrote the decoded prefix)");
 
     #[cfg(all(
         feature = "jemalloc-stats",
@@ -264,6 +268,10 @@ pub(crate) fn init_metrics() {
     describe_gauge!(
         "smg_http_connections_active",
         "Currently active HTTP connections"
+    );
+    describe_counter!(
+        "smg_http_connection_timeouts_total",
+        "HTTP connections closed for carrying no request, by the timeout that closed them (header_read, idle)"
     );
     describe_counter!(
         "smg_http_rate_limit_total",
@@ -369,6 +377,10 @@ pub(crate) fn init_metrics() {
     describe_counter!(
         "smg_pd_bootstrap_failures_total",
         "PD bootstrap injection failures"
+    );
+    describe_counter!(
+        "smg_pd_rendezvous_failures_total",
+        "PD rendezvous failures by leg (the worker type of the leg that failed) and phase: a bootstrap port that refused the registration probe (probe), and the failures the engines report on the gRPC path when the legs never met (bootstrap) or the KV handoff after they met failed (transfer)"
     );
     describe_counter!(
         "smg_pd_kv_transfer_failures_total",
@@ -678,6 +690,11 @@ pub(crate) fn init_metrics() {
         "smg_worker_cb_consecutive_successes",
         "Current consecutive success count per worker"
     );
+    describe_counter!(
+        "smg_worker_cb_health_readmissions_total",
+        "Times a worker's open circuit breaker went half-open because the worker's health \
+         returned (its promotion to Ready) rather than at the breaker's timeout, by worker"
+    );
 
     // Layer 3: Worker resilience metrics (retry)
     describe_counter!(
@@ -909,6 +926,13 @@ pub fn init_startup_series() {
 pub(super) fn record_tokenizer_cache_activity() {
     for stats in cache_activity_stats() {
         record_tokenizer_cache_activity_snapshot(stats);
+    }
+}
+
+pub(super) fn record_detokenize_activity() {
+    for stats in decode_activity_stats() {
+        counter!("smg_detokenize_prefix_mismatch_total", "kind" => stats.kind)
+            .absolute(stats.prefix_mismatches);
     }
 }
 
@@ -1282,6 +1306,16 @@ impl Metrics {
             "path" => path_interned,
             "status_code" => status_str,
             "error_code" => error_interned
+        )
+        .increment(1);
+    }
+
+    /// Record a connection closed by one of the HTTP edge's connection
+    /// timeouts (`header_read` or `idle`).
+    pub fn record_http_connection_timeout(timeout: &'static str) {
+        counter!(
+            "smg_http_connection_timeouts_total",
+            "timeout" => timeout
         )
         .increment(1);
     }
@@ -1704,6 +1738,20 @@ impl Metrics {
     /// Record a PD bootstrap injection failure.
     pub fn record_pd_bootstrap_failure() {
         counter!("smg_pd_bootstrap_failures_total").increment(1);
+    }
+
+    /// Record a PD rendezvous failure by `leg` (the worker type of the leg
+    /// that failed) and `phase` (`probe` at registration; `bootstrap` or
+    /// `transfer` as the engine reported it). Its own family: the injection
+    /// failures above keep their unlabelled series, so a bare selector on
+    /// it still reads them alone.
+    pub fn record_pd_rendezvous_failure(leg: &'static str, phase: &'static str) {
+        counter!(
+            "smg_pd_rendezvous_failures_total",
+            "leg" => leg,
+            "phase" => phase
+        )
+        .increment(1);
     }
 
     /// Record a PD KV-transfer failure (missing connector params at handoff).
@@ -2321,6 +2369,28 @@ impl Metrics {
             "outcome" => outcome
         )
         .increment(1);
+    }
+
+    /// Record an open circuit breaker put on trial (half-open) by the
+    /// worker's return to health rather than by its timeout.
+    pub fn record_worker_cb_health_readmission(worker: &str) {
+        let worker_interned = intern_string(worker);
+        counter!(
+            "smg_worker_cb_health_readmissions_total",
+            "worker" => worker_interned
+        )
+        .increment(1);
+    }
+
+    /// Publish the health-readmission counter at zero, so the series exists
+    /// before the worker's first return.
+    pub fn init_worker_cb_health_readmissions(worker: &str) {
+        let worker_interned = intern_string(worker);
+        counter!(
+            "smg_worker_cb_health_readmissions_total",
+            "worker" => worker_interned
+        )
+        .absolute(0);
     }
 
     /// Set circuit breaker consecutive failures
@@ -3420,6 +3490,43 @@ mod tests {
         assert!(
             rendered.contains("smg_pd_kv_transfer_failures_total 2"),
             "kv transfer failure counter wrong; rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_record_pd_rendezvous_failure_by_leg_and_phase() {
+        let (rendered, ()) = with_test_recorder(|| {
+            Metrics::record_pd_bootstrap_failure();
+            Metrics::record_pd_rendezvous_failure(metrics_labels::WORKER_PREFILL, "probe");
+            Metrics::record_pd_rendezvous_failure(metrics_labels::WORKER_DECODE, "bootstrap");
+            Metrics::record_pd_rendezvous_failure(metrics_labels::WORKER_DECODE, "bootstrap");
+        });
+        // Two families: the injection series keeps its unlabelled shape, and
+        // the labelled rendezvous counts never join it.
+        assert!(
+            rendered.contains("smg_pd_bootstrap_failures_total 1"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("smg_pd_bootstrap_failures_total{"),
+            "{rendered}"
+        );
+        let labelled: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_pd_rendezvous_failures_total{"))
+            .collect();
+        assert_eq!(labelled.len(), 2, "{rendered}");
+        assert!(
+            labelled.iter().any(|line| line.contains(r#"leg="prefill""#)
+                && line.contains(r#"phase="probe""#)
+                && line.ends_with(" 1")),
+            "{rendered}"
+        );
+        assert!(
+            labelled.iter().any(|line| line.contains(r#"leg="decode""#)
+                && line.contains(r#"phase="bootstrap""#)
+                && line.ends_with(" 2")),
+            "{rendered}"
         );
     }
 }

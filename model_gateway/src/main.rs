@@ -31,9 +31,9 @@ use smg::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, FileDiscoveryConfig,
         HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind,
         ManualAssignmentMode, MetricsConfig, OracleConfig, PdPairingMode, PolicyConfig,
-        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig,
-        RoutingMode, SchemaConfig, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
-        DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
+        PostgresConfig, PowerOfTwoLoadMetric, RedisConfig, RetryConfig, RouterConfig,
+        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
+        TokenizerCacheConfig, TraceConfig, DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
     },
     mesh_discovery::MeshDiscoveryConfig,
     observability::{
@@ -197,6 +197,13 @@ fn parse_transport_mode(value: &str) -> Result<TransportMode, String> {
 fn parse_kv_index_kind(value: &str) -> Result<KvIndexKind, String> {
     KvIndexKind::parse(value)
         .ok_or_else(|| format!("invalid value '{value}'; expected positional or chain"))
+}
+
+/// Parse the `--power-of-two-load-metric` value into a `PowerOfTwoLoadMetric`.
+fn parse_power_of_two_load_metric(value: &str) -> Result<PowerOfTwoLoadMetric, String> {
+    PowerOfTwoLoadMetric::parse(value).ok_or_else(|| {
+        format!("invalid value '{value}'; expected expected_wait, requests, or least_requests")
+    })
 }
 
 /// Parse the `--mm-processing` value into an `MmProcessingMode`.
@@ -476,6 +483,10 @@ struct CliArgs {
     /// this count; 0 disables. Set below the engine's max batch size
     #[arg(long, default_value_t = 0, help_heading = "Routing Policy")]
     least_load_max_waiting_requests: u32,
+
+    /// What power_of_two compares: expected_wait (default), requests or least_requests
+    #[arg(long, default_value = "expected_wait", value_parser = parse_power_of_two_load_metric, help_heading = "Routing Policy")]
+    power_of_two_load_metric: PowerOfTwoLoadMetric,
 
     /// Enable data parallelism aware scheduling
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
@@ -975,6 +986,21 @@ struct CliArgs {
     #[arg(long, default_value_t = 300, help_heading = "Request Handling")]
     stream_body_stall_timeout_secs: u64,
 
+    /// Close a connection that has not sent a complete request head within
+    /// this many seconds of being accepted (and a keep-alive connection whose
+    /// next request head stalls for this long after its first byte). 0
+    /// disables
+    #[arg(long, default_value_t = 30, help_heading = "Request Handling")]
+    header_read_timeout_secs: u64,
+
+    /// Close a keep-alive connection that has had no request in flight for
+    /// this many seconds; an open streaming response counts as in flight. The
+    /// bound starts with the connection's first request (a connection that
+    /// never sends one is bounded by --header-read-timeout-secs alone). 0
+    /// keeps idle connections open until the client closes them
+    #[arg(long, default_value_t = 90, help_heading = "Request Handling")]
+    idle_connection_timeout_secs: u64,
+
     /// CORS allowed origins
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
     cors_allowed_origins: Vec<String>,
@@ -1011,7 +1037,10 @@ struct CliArgs {
     #[arg(long, default_value = "default", help_heading = "Priority Scheduler")]
     priority_scheduler_default_max_class: String,
 
-    /// Optional path to the priority-scheduler YAML config.
+    /// Optional path to the priority-scheduler YAML config. With
+    /// --priority-scheduler-enabled, a file that cannot be read, parsed or
+    /// validated is a start-up error; without a path the built-in class
+    /// defaults apply.
     #[arg(long, help_heading = "Priority Scheduler")]
     priority_scheduler_config: Option<String>,
 
@@ -1417,9 +1446,9 @@ struct CliArgs {
     webrtc_stun_server: Option<String>,
 
     // ==================== Runtime ====================
-    /// Explicit async runtime worker-thread count. Leave unset to use tokio's
-    /// default (`available_parallelism()`), which already honors the cgroup CPU
-    /// quota on Rust 1.95+ and is therefore container-aware.
+    /// Explicit async runtime worker-thread count, at least 1. Leave unset to
+    /// use tokio's default (`available_parallelism()`), which already honors the
+    /// cgroup CPU quota on Rust 1.95+ and is therefore container-aware.
     #[arg(long, help_heading = "Runtime")]
     runtime_worker_threads: Option<usize>,
 }
@@ -1776,6 +1805,7 @@ impl CliArgs {
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
+                load_metric: self.power_of_two_load_metric,
             },
             "least_load" => PolicyConfig::LeastLoad {
                 load_check_interval_secs: 5,
@@ -2195,6 +2225,8 @@ impl CliArgs {
             .max_payload_size(self.max_payload_size)
             .max_buffered_request_bytes(self.max_buffered_request_bytes)
             .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
+            .header_read_timeout_secs(self.header_read_timeout_secs)
+            .idle_connection_timeout_secs(self.idle_connection_timeout_secs)
             .request_timeout_secs(self.request_timeout_secs)
             .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
@@ -2840,6 +2872,25 @@ mod tests {
 
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.stream_body_stall_timeout_secs, 300);
+    }
+
+    /// The connection-level timeouts of the HTTP edge are router settings
+    /// and must flow into `RouterConfig`, with zero kept as "disabled".
+    #[test]
+    fn connection_timeout_flags_flow_into_router_config() {
+        let cli = cli_args_from(&[
+            "--header-read-timeout-secs",
+            "5",
+            "--idle-connection-timeout-secs",
+            "0",
+        ]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.header_read_timeout_secs, 5);
+        assert_eq!(router_config.idle_connection_timeout_secs, 0);
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.header_read_timeout_secs, 30);
+        assert_eq!(defaults.idle_connection_timeout_secs, 90);
     }
 
     #[test]

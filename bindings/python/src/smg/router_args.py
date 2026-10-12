@@ -347,6 +347,11 @@ class RouterArgs:
     # one beyond answers 429. 0 = background mode off (such requests run in
     # the foreground); appended last for the same reason
     max_background_responses: int = 1024
+    power_of_two_load_metric: str = "expected_wait"
+    # HTTP edge: seconds to receive a complete request head, and seconds a
+    # keep-alive connection may sit with no request in flight (0 disables)
+    header_read_timeout_secs: int = 30
+    idle_connection_timeout_secs: int = 90
 
     @staticmethod
     def add_cli_args(
@@ -628,6 +633,13 @@ class RouterArgs:
                 " reported waiting requests (plus dispatches since their last"
                 " poll) have reached this count; 0 disables"
             ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}power-of-two-load-metric",
+            type=str,
+            choices=["expected_wait", "requests", "least_requests"],
+            default=RouterArgs.power_of_two_load_metric,
+            help="What power_of_two compares: expected_wait, requests or least_requests",
         )
         routing_group.add_argument(
             f"--{prefix}balance-abs-threshold",
@@ -1494,6 +1506,30 @@ class RouterArgs:
             help="Grace period in seconds to wait for in-flight requests during shutdown",
         )
         request_group.add_argument(
+            f"--{prefix}header-read-timeout-secs",
+            type=int,
+            default=RouterArgs.header_read_timeout_secs,
+            help=(
+                "Close a connection that has not sent a complete request head"
+                " within this many seconds of being accepted (and a keep-alive"
+                " connection whose next request head stalls for this long after"
+                " its first byte). 0 disables"
+            ),
+        )
+        request_group.add_argument(
+            f"--{prefix}idle-connection-timeout-secs",
+            type=int,
+            default=RouterArgs.idle_connection_timeout_secs,
+            help=(
+                "Close a keep-alive connection that has had no request in flight"
+                " for this many seconds; an open streaming response counts as in"
+                " flight. The bound starts with the connection's first request (a"
+                " connection that never sends one is bounded by"
+                " --header-read-timeout-secs alone). 0 keeps idle connections open"
+                " until the client closes them"
+            ),
+        )
+        request_group.add_argument(
             f"--{prefix}trust-tenant-header",
             action="store_true",
             default=False,
@@ -1585,7 +1621,12 @@ class RouterArgs:
             f"--{prefix}priority-scheduler-config",
             type=str,
             default=None,
-            help="Optional path to the priority-scheduler YAML config.",
+            help=(
+                "Optional path to the priority-scheduler YAML config. With "
+                "--priority-scheduler-enabled, a file that cannot be read, parsed "
+                "or validated is a start-up error; without a path the built-in "
+                "class defaults apply."
+            ),
         )
         scheduler_group.add_argument(
             f"--{prefix}priority-scheduler-tenant-metric-top-n",
