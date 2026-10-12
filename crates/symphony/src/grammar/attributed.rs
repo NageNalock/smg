@@ -17,17 +17,17 @@ use serde_json::Value;
 
 use super::{
     schema::{self, shape, Definitions},
-    CallMarkers, Grammar, Tag,
+    CallMarkers, Count, Grammar, Tag,
 };
 use crate::tagged::attributed::Tags;
 
 /// The calls for `tools`, in the family's spelling: in the table's one block, in a block each, or
-/// with no block at all.
+/// with no block at all; as many as `count` lets the model write.
 pub(super) fn calls(
     markers: &CallMarkers<'_>,
     tags: &Tags,
     tools: &[&Tool],
-    at_least_one: bool,
+    count: Count<'_>,
 ) -> Grammar {
     let ends = Ends {
         parameter_close: tags.parameter_close,
@@ -50,33 +50,27 @@ pub(super) fn calls(
     };
     let Some(block) = markers.block.as_ref() else {
         // No block: each call is a tag its opener triggers, the text between calls free.
-        return Grammar::TriggeredTags {
-            triggers: vec![markers.call_open.to_string()],
-            tags: tools.iter().map(|tool| invoke(tool, "", "")).collect(),
-            at_least_one,
-        };
+        return count.triggered(
+            vec![markers.call_open.to_string()],
+            tools.iter().map(|tool| invoke(tool, "", "")).collect(),
+        );
     };
     if tags.block_per_call {
         // A block around each call: the block's opener triggers the tag, so the newline the
         // template writes before it is free text.
         let before = format!("{}\n", block.open);
-        return Grammar::TriggeredTags {
-            triggers: vec![block.open.to_string()],
-            tags: tools
+        return count.triggered(
+            vec![block.open.to_string()],
+            tools
                 .iter()
                 .map(|tool| invoke(tool, &before, block.close))
                 .collect(),
-            at_least_one,
-        };
+        );
     }
     Grammar::Sequence(vec![
         Grammar::ConstString(format!("\n{}\n", block.open)),
-        Grammar::TagsWithSeparator {
-            tags: tools.iter().map(|tool| invoke(tool, "", "")).collect(),
-            separator: String::new(),
-            at_least_one,
-        },
-        Grammar::ConstString(block.close.to_string()),
+        count.separated(tools.iter().map(|tool| invoke(tool, "", "")).collect()),
+        Grammar::ConstString(count.end(block.close)),
     ])
 }
 
