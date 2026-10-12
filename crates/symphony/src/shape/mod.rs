@@ -41,7 +41,7 @@
 //!
 //! A [`Layout`] says how the model's chat template writes a turn where the patterns leave the text
 //! open: which whitespace a `\s*` stands for, which attributes a skip passes, what the text outside
-//! every field is: what a structural tag needs to write only what the template renders.
+//! every field is. The structural tags of a shaped call are written from it.
 //!
 //! [`formats`]: crate::formats
 //! [`CallSyntax::Shaped`]: crate::CallSyntax::Shaped
@@ -490,6 +490,37 @@ impl CallShape {
             return Err(ShapeError::TrailerReadsTheEnd(index));
         }
         Ok(())
+    }
+
+    /// The literals a call of this shape writes as its own tags inside its region, which free text
+    /// before a call may not write and a client that shows a call as text strips: the one a
+    /// parameter's tag begins with, and each literal of a value's ends longer than one character
+    /// and not whitespace alone. A header's and a trailer's literals are the template's text
+    /// around a name or after the arguments (`name="`, `}`), too common to keep out of free text,
+    /// and arguments written as JSON have no tags of their own.
+    pub fn tag_texts<'s>(&'s self) -> Vec<&'s str> {
+        let Arguments::Params { tag, ends, .. } = &self.arguments else {
+            return Vec::new();
+        };
+        let mut texts: Vec<&'s str> = Vec::new();
+        let mut keep = |text: &'s str| {
+            if !texts.contains(&text) {
+                texts.push(text);
+            }
+        };
+        if let Some(Atom::Lit(trigger)) = tag.0.first() {
+            keep(trigger);
+        }
+        for end in ends {
+            for atom in end.consume.0.iter().chain(end.ahead.0.iter()) {
+                if let Atom::Lit(lit) = atom {
+                    if lit.chars().nth(1).is_some() && !lit.chars().all(char::is_whitespace) {
+                        keep(lit);
+                    }
+                }
+            }
+        }
+        texts
     }
 
     /// The cap on what a header or a trailer holds undecided, in bytes.

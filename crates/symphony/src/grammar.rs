@@ -29,7 +29,9 @@
 //! for MiniMax M3, the XML tree of elements with the table's separator before every tag (the
 //! `xml` module); Gemma 4's `call:NAME{key:value}` spelling, the keys sorted and each string
 //! between `<|"|>` tokens (the `gemma` module); for Inkling, the call marker and a JSON object
-//! whose `args` the schema accepts, wherever the marker stands in a message. The gateway's old
+//! whose `args` the schema accepts, wherever the marker stands in a message; for a call given as
+//! data, its tagged parameters as the table's layout says the model's chat template writes them
+//! (the `shaped` module), and no tag for a table without a layout. The gateway's old
 //! parsers wrote these tags by hand, one function per parser;
 //! where one exists for a format Symphony has, the derived tag is pinned to it in the tests, so
 //! the switch changes nothing an engine sees.
@@ -59,7 +61,9 @@
 //! messages as a wrapper state does: a way in passes through it, and it holds no answer. A stop
 //! token ends the region it closes at the model's stop, and the stop decoder hides it, so no tag
 //! writes it: a region's close is never one, no way in steps on one, and an answer a stop token
-//! may close ends with nothing after its JSON.
+//! may close ends with nothing after its JSON. Such a table may also have a layout
+//! ([`Format::with_layout`]): its tags then write the thought and the answer with the text the
+//! layout writes around them.
 //!
 //! Inkling's named JSON takes the tag the gateway's old Inkling parser writes, the call marker its
 //! trigger inside whatever message the model is writing. A table without calls gives `None`, and
@@ -97,6 +101,7 @@ use serde_json::{json, Value};
 
 use crate::{
     format::{CallSyntax, Emits, Format},
+    shape::{Layout, Message},
     tagged::{dsml, keyed::Tags as KeyedTags},
 };
 
@@ -105,6 +110,7 @@ mod gemma;
 mod keyed;
 mod pythonic;
 mod schema;
+mod shaped;
 mod tagged;
 mod xml;
 mod xtml;
@@ -616,9 +622,15 @@ impl Format {
             CallSyntax::Gemma => (gemma::calls(markers?, &named, count), true),
             CallSyntax::NamedJson(marker) => (self.named_json_calls(marker, &named, count)?, false),
             // A template's patterns do not say which text a run of whitespace or a skipped
-            // attribute stands for, and a tag must write only what the template renders: a shaped
-            // call's tag waits for the layout its chat template renders, so none is derived yet.
-            CallSyntax::Shaped(_) => return None,
+            // attribute stands for, and a tag writes only what the template renders: a shaped
+            // call's tag is written from the layout its chat template renders, and a table
+            // without one has none. With no call owed, the tag takes no prefix: its own free text
+            // writes the thought, where a prefix before it would let an engine end the prefix
+            // inside the call's terminal and write the rest as free text, a call no tag constrains.
+            CallSyntax::Shaped(shape) => (
+                shaped::calls(self, shape, self.layout()?, &named, count)?,
+                options.at_least_one,
+            ),
         };
         self.led(calls, options.reasoning_open, prefixed)
             .map(|grammar| self.bounded(grammar))
@@ -646,10 +658,19 @@ impl Format {
             style: None,
         };
         let content = self.answer_state()?;
+        let (before, after) = self.around(|layout| layout.answer.as_ref());
         if content == 0 {
-            let answer = match self.turn_end() {
-                "" => answer,
-                end => Grammar::Sequence(vec![answer, Grammar::ConstString(end.to_string())]),
+            let mut parts = vec![answer];
+            if !before.is_empty() {
+                parts.insert(0, Grammar::ConstString(before.to_string()));
+            }
+            let end = format!("{after}{}", self.turn_end());
+            if !end.is_empty() {
+                parts.push(Grammar::ConstString(end));
+            }
+            let answer = match parts.len() {
+                1 => parts.remove(0),
+                _ => Grammar::Sequence(parts),
             };
             return self
                 .led(answer, reasoning_open, true)
@@ -662,14 +683,35 @@ impl Format {
             _ => 0,
         };
         let way = self.way_in(start, content)?;
-        // An answer a stop token may close ends at the model's stop, which writes nothing.
+        // The thought's close and what the layout writes after a thought, then the rows into the
+        // answer, what the layout writes before an answer standing right before the last of them,
+        // the terminal that opens it.
+        let mut begin = way.close.unwrap_or("").to_string();
+        if way.close.is_some() {
+            begin.push_str(self.around(|layout| layout.thought.as_ref()).1);
+        }
+        match way.rows.split_last() {
+            Some((opener, rows)) => {
+                begin.extend(rows.iter().copied());
+                begin.push_str(before);
+                begin.push_str(opener);
+            }
+            None => begin.push_str(before),
+        }
+        // An answer the stop ends, as the layout writes it or where a stop token may close it,
+        // ends at the model's stop, which writes nothing.
+        let stops = self
+            .layout()
+            .and_then(|layout| layout.answer.as_ref())
+            .map_or_else(|| self.stopped(content), |message| message.stops);
         let mut end = match self.close_of(content) {
-            Some((close, _)) if !self.stopped(content) => close.to_string(),
+            Some((close, _)) if !stops => close.to_string(),
             _ => String::new(),
         };
+        end.push_str(after);
         end.push_str(self.turn_end());
         self.led(
-            Grammar::Tag(Tag::new(way.begin(), answer, end)),
+            Grammar::Tag(Tag::new(begin, answer, end)),
             reasoning_open,
             false,
         )
@@ -703,10 +745,23 @@ impl Format {
         let text = Grammar::AnyText {
             excludes: self.excluded_but(&[]),
         };
+        let (before, after) = self.around(|layout| layout.thought.as_ref());
         Some(Grammar::Sequence(vec![
-            Grammar::Tag(Tag::new(thought.open, text, thought.close)),
+            Grammar::Tag(Tag::new(
+                format!("{before}{}", thought.open),
+                text,
+                format!("{}{after}", thought.close),
+            )),
             body,
         ]))
+    }
+
+    /// What the table's layout writes before a region's opener and after its close, for the
+    /// region `which` picks (a thought or an answer); nothing for a table without one.
+    fn around(&self, which: impl Fn(&Layout) -> Option<&Message>) -> (&str, &str) {
+        self.layout()
+            .and_then(which)
+            .map_or(("", ""), |message| (&*message.before, &*message.after))
     }
 
     /// `body` after the prefix a prompt's open thought takes: free text that can write none of the
@@ -2882,6 +2937,49 @@ mod tests {
         let message = read(&format, &[], "<t>", &format!("plan</t><n><a>{json}</a>"));
         assert_eq!(message["content"], value!(json));
         assert_eq!(message["reasoning"], value!("plan"));
+    }
+
+    #[test]
+    fn a_layouts_text_before_an_answer_stands_before_the_terminal_that_opens_it() {
+        // The way in from the open thought is its close and two rows, `<n>` and the answer's
+        // opener `<a>`: the layout's text after a thought follows the close, and its text before
+        // an answer comes right before `<a>`, not before the first row.
+        let format = Format::new("two markers")
+            .terminal("think_open", "<t>")
+            .terminal("think_close", "</t>")
+            .terminal("next", "<n>")
+            .terminal("answer_open", "<a>")
+            .terminal("answer_close", "</a>")
+            .state("outside", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("gap", Emits::Content)
+            .state("content", Emits::Content)
+            .transition("outside", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "gap")
+            .transition("gap", "next", "outside")
+            .transition("outside", "answer_open", "content")
+            .transition("content", "answer_close", "outside")
+            .framing("outside")
+            .framing("gap")
+            .with_layout(Layout {
+                thought: Some(Message {
+                    after: "\n".into(),
+                    ..Message::default()
+                }),
+                answer: Some(Message {
+                    before: " ".into(),
+                    ..Message::default()
+                }),
+                ..Layout::default()
+            });
+        assert_eq!(
+            answer(&format, true).map(|payload| payload["format"]["begin"].clone()),
+            Some(value!("</t>\n<n> <a>"))
+        );
+        assert_eq!(
+            answer(&format, false).map(|payload| payload["format"]["begin"].clone()),
+            Some(value!(" <a>"))
+        );
     }
 
     /// Every node of `payload` of `kind`, depth first.

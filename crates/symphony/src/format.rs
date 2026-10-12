@@ -186,7 +186,8 @@ impl CallSyntax {
     /// grammar writes inside a call's region, which free text before a call may not write, and
     /// which a client that shows a call as text has to strip. JSON, Python and xLAM's list have
     /// none, their calls being their own text, and neither has MiniMax M3's XML tree, whose
-    /// element tags are the arguments' keys.
+    /// element tags are the arguments' keys. A call given as data has its parameters' (see
+    /// [`CallShape::tag_texts`]).
     pub fn tag_texts(&self) -> Vec<&'static str> {
         match self {
             Self::Tagged(..) => tagged::assembler::TAGS.to_vec(),
@@ -201,10 +202,8 @@ impl CallSyntax {
             Self::Xtml => xtml::TAGS.to_vec(),
             Self::NamedJson(marker) => vec![*marker],
             Self::Gemma => vec![gemma::STRING],
-            // A shaped call's tags are its shape's literals; no grammar is derived for one yet.
-            Self::Json | Self::Pythonic(_) | Self::JsonList | Self::Xml | Self::Shaped(_) => {
-                Vec::new()
-            }
+            Self::Shaped(shape) => shape.tag_texts(),
+            Self::Json | Self::Pythonic(_) | Self::JsonList | Self::Xml => Vec::new(),
         }
     }
 }
@@ -592,8 +591,10 @@ impl Format {
 
     /// How the model's chat template writes a turn of this table where the response template's
     /// patterns leave the text open ([`Layout`]), as whoever compiled the table learned it from a
-    /// rendering: what a structural tag needs to write only what the template renders. Parsing
-    /// does not read it. [`Layout::check`] says whether it fits the table. Given again, it
+    /// rendering. Parsing does not read it. The structural tags of a shaped call are written from
+    /// it, and every table's tags write a thought and an answer as it does
+    /// ([`Format::grammar_for`], [`Format::answer_grammar`]). [`Layout::check`] says whether it
+    /// fits the table; a shaped call whose layout does not fit has no tag. Given again, it
     /// replaces the one before.
     #[must_use]
     pub fn with_layout(mut self, layout: Layout) -> Self {

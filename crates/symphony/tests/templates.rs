@@ -28,11 +28,12 @@ use openai_protocol::common::{Function, Tool};
 use serde_json::{json, Value};
 use symphony::{
     adapt,
+    grammar::Options,
     shape::{
-        self, Arguments, Atom, CallShape, Class, Dialect, End, NameSource, Pattern, Slot,
-        ValueParser,
+        self, Arguments, Atom, CallLayout, CallShape, Class, Dialect, End, Layout, Message,
+        NameSource, Nested, Pattern, Segment, Slot, Spellings, ValueParser, Words, Written,
     },
-    CallSyntax, Declared, Emits, Engine, EngineFinish, Format, Parser,
+    CallSyntax, Declared, Emits, Engine, EngineFinish, Format, Grammar, Parser, Tag,
 };
 
 /// One output and the message it reads as.
@@ -1052,4 +1053,634 @@ fn every_table_here_is_valid_and_names_its_stop_tokens() {
     assert!(!gemma4().is_stop_token("<turn|>"));
     assert!(!inkling().is_stop_token("<|end_message|>"));
     assert!(!muse().is_stop_token("<|eom|>"));
+}
+
+// The structural tags of the shaped calls above, written from their chat templates' layouts.
+
+/// A text of the layout, from its literals and places.
+fn written(segments: impl IntoIterator<Item = Segment>) -> Written {
+    Written(segments.into_iter().collect())
+}
+
+fn piece(text: &str) -> Segment {
+    Segment::Lit(text.into())
+}
+
+/// How the chat template of `meta-models/Muse-Glimmer-30B` (revision `a4e59da52a7b`, its
+/// `chat_template.jinja`) writes a turn, as transformers 5.18.0's `apply_chat_template` rendered
+/// the probe conversation ([`probe_tools`]): a call is a message to the tool, ` to=NAME`
+/// and `<|message|>`, with `<atem:function_calls>` on a line of its own, which the response
+/// template reads as text outside every field; the invoke's one attribute is the name; a
+/// parameter a line, its value between the tags; between two calls the block's close, `<|eom|>`
+/// and the next message's start; after the last, the block's close, then `<|eot|>`, a stop token.
+/// The thought and the answer are messages to the model itself and to the user, with a space
+/// before the recipient; the answer ends at `<|eot|>`.
+fn muse_layout() -> Layout {
+    Layout {
+        call: CallLayout {
+            lead: written([
+                piece(" to="),
+                Segment::Slot(Slot::Name),
+                piece("<|message|><atem:function_calls>\n"),
+            ]),
+            header: written([piece(" name=\""), Segment::Slot(Slot::Name), piece("\">")]),
+            before: "\n".into(),
+            parameter: written([
+                piece("<atem:parameter name=\""),
+                Segment::Slot(Slot::Key),
+                piece("\">"),
+                Segment::Slot(Slot::Value),
+                piece("</atem:parameter>"),
+            ]),
+            between: "\n".into(),
+            after: "\n".into(),
+            trailer: "".into(),
+            close: Some("</atem:invoke>".into()),
+        },
+        between_calls: Some("\n</atem:function_calls><|eom|><|start|>assistant".into()),
+        after_calls: "\n</atem:function_calls>".into(),
+        values: Spellings::default(),
+        thought: Some(Message {
+            before: " ".into(),
+            after: "<|start|>assistant".into(),
+            stops: false,
+        }),
+        answer: Some(Message {
+            before: " ".into(),
+            after: "".into(),
+            stops: true,
+        }),
+    }
+}
+
+/// How the chat template of `Qwen/Qwen3.5-9B` (revision `c20223623576`, its `chat_template.jinja`)
+/// writes a turn, as transformers 5.18.0's `apply_chat_template` rendered the probe conversation:
+/// `<tool_call>`, the function's tag and each parameter's tag, value and close on lines of their
+/// own, `True` and `None` as Python writes them, lists and objects as JSON, a newline between two
+/// calls, nothing after the last but `<|im_end|>`, a stop token; the thought's close followed by
+/// a blank line.
+fn serve_qwen3_5_layout() -> Layout {
+    Layout {
+        call: CallLayout {
+            lead: Written::default(),
+            header: written([piece("\n<function="), Segment::Slot(Slot::Name), piece(">")]),
+            before: "\n".into(),
+            parameter: written([
+                piece("<parameter="),
+                Segment::Slot(Slot::Key),
+                piece(">\n"),
+                Segment::Slot(Slot::Value),
+                piece("\n</parameter>"),
+            ]),
+            between: "\n".into(),
+            after: "\n".into(),
+            trailer: "</function>\n".into(),
+            close: Some("</tool_call>".into()),
+        },
+        between_calls: Some("\n".into()),
+        after_calls: "".into(),
+        values: Spellings {
+            words: Words::Python,
+            nested: Nested::Json,
+        },
+        thought: Some(Message {
+            before: "".into(),
+            after: "\n\n".into(),
+            stops: false,
+        }),
+        answer: Some(Message {
+            before: "".into(),
+            after: "".into(),
+            stops: true,
+        }),
+    }
+}
+
+/// The probe conversation's tools: `fn_alpha`, a required parameter of each JSON type (`z` a
+/// nullable string), and `fn_beta`, one string.
+fn probe_tools() -> Vec<Tool> {
+    let tool = |name: &str, parameters: Value| Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: name.to_string(),
+            description: None,
+            parameters,
+            strict: None,
+            extra: Default::default(),
+        },
+    };
+    vec![
+        tool(
+            "fn_alpha",
+            json!({
+                "type": "object",
+                "properties": {
+                    "s": {"type": "string"},
+                    "i": {"type": "integer"},
+                    "n": {"type": "number"},
+                    "b": {"type": "boolean"},
+                    "a": {"type": "array", "items": {"type": "integer"}},
+                    "o": {"type": "object"},
+                    "z": {"type": "string", "nullable": true},
+                },
+                "required": ["s", "i", "n", "b", "a", "o", "z"],
+            }),
+        ),
+        tool(
+            "fn_beta",
+            json!({
+                "type": "object",
+                "properties": {"q": {"type": "string"}},
+                "required": ["q"],
+            }),
+        ),
+    ]
+}
+
+/// The probe's calls: `fn_alpha` with a value of each type, then `fn_beta`, as the tables here
+/// read them. The nullable `z` reads as null from the word the template writes for it (`null` in
+/// Muse Glimmer's calls, `None` in Qwen 3.5's), since its schema admits null.
+fn probe_calls(both: bool) -> Value {
+    let alpha = json!({"name": "fn_alpha", "arguments": {
+        "s": "sigma", "i": 42, "n": 2.5, "b": true, "a": [1, 2], "o": {"m": "mu"}, "z": null,
+    }});
+    let beta = json!({"name": "fn_beta", "arguments": {"q": "kappa"}});
+    if both {
+        json!([alpha, beta])
+    } else {
+        json!([alpha])
+    }
+}
+
+/// What Muse Glimmer's chat template rendered after the generation prompt (`<|start|>assistant`)
+/// for the probe's two calls, its first call alone and a JSON answer, each up to `<|eot|>`.
+const MUSE_CALLS: &str = " to=fn_alpha<|message|><atem:function_calls>\n<atem:invoke \
+     name=\"fn_alpha\">\n<atem:parameter name=\"s\">sigma</atem:parameter>\n<atem:parameter \
+     name=\"i\">42</atem:parameter>\n<atem:parameter name=\"n\">2.5</atem:parameter>\n\
+     <atem:parameter name=\"b\">true</atem:parameter>\n<atem:parameter name=\"a\">[1, \
+     2]</atem:parameter>\n<atem:parameter name=\"o\">{\"m\": \"mu\"}</atem:parameter>\n\
+     <atem:parameter name=\"z\">null</atem:parameter>\n</atem:invoke>\n</atem:function_calls>\
+     <|eom|><|start|>assistant to=fn_beta<|message|><atem:function_calls>\n<atem:invoke \
+     name=\"fn_beta\">\n<atem:parameter name=\"q\">kappa</atem:parameter>\n</atem:invoke>\n\
+     </atem:function_calls>";
+const MUSE_ONE_CALL: &str = " to=fn_alpha<|message|><atem:function_calls>\n<atem:invoke \
+     name=\"fn_alpha\">\n<atem:parameter name=\"s\">sigma</atem:parameter>\n<atem:parameter \
+     name=\"i\">42</atem:parameter>\n<atem:parameter name=\"n\">2.5</atem:parameter>\n\
+     <atem:parameter name=\"b\">true</atem:parameter>\n<atem:parameter name=\"a\">[1, \
+     2]</atem:parameter>\n<atem:parameter name=\"o\">{\"m\": \"mu\"}</atem:parameter>\n\
+     <atem:parameter name=\"z\">null</atem:parameter>\n</atem:invoke>\n</atem:function_calls>";
+const MUSE_ANSWER: &str = " to=user<|message|>{\"probe\": 1}";
+/// The generation prompt's end for Muse Glimmer.
+const MUSE_PROMPT: &str = "<|start|>user<|message|>Call the probe tools.<|eot|><|start|>assistant";
+
+/// What Qwen 3.5's chat template rendered for the probe's two calls and a JSON answer, each up to
+/// `<|im_end|>`: after its default generation prompt, which opens the thought, and after the one
+/// with thinking turned off, which opens and closes it.
+const QWEN3_5_CALLS_THINKING: &str = "\n</think>\n\n<tool_call>\n<function=fn_alpha>\n\
+     <parameter=s>\nsigma\n</parameter>\n<parameter=i>\n42\n</parameter>\n<parameter=n>\n2.5\n\
+     </parameter>\n<parameter=b>\nTrue\n</parameter>\n<parameter=a>\n[1, 2]\n</parameter>\n\
+     <parameter=o>\n{\"m\": \"mu\"}\n</parameter>\n<parameter=z>\nNone\n</parameter>\n\
+     </function>\n</tool_call>\n<tool_call>\n<function=fn_beta>\n<parameter=q>\nkappa\n\
+     </parameter>\n</function>\n</tool_call>";
+const QWEN3_5_ANSWER_THINKING: &str = "\n</think>\n\n{\"probe\": 1}";
+const QWEN3_5_PROMPT_THINKING: &str =
+    "<|im_start|>user\nCall the probe tools.<|im_end|>\n<|im_start|>assistant\n<think>\n";
+const QWEN3_5_PROMPT: &str = "<|im_start|>user\nCall the probe tools.<|im_end|>\n\
+     <|im_start|>assistant\n<think>\n\n</think>\n\n";
+
+/// The message `output` reads as under `format` after `prompt`, typed by the probe's tools.
+#[expect(
+    clippy::expect_used,
+    reason = "an output that does not parse fails the test that reads it"
+)]
+fn read_probe(format: &Format, prompt: &str, output: &str) -> Value {
+    let mut parser = Engine::new(format.clone(), Declared::of(&probe_tools()));
+    let events = replay_after(
+        &mut parser as &mut dyn Parser,
+        prompt,
+        output,
+        &[],
+        &EngineFinish::Stop,
+        false,
+    )
+    .expect("a parse");
+    let message = adapt::chat::message(0, &events).message;
+    let calls: Vec<Value> = message
+        .tool_calls
+        .unwrap_or_default()
+        .into_iter()
+        .map(|call| {
+            let arguments = call.function.arguments.unwrap_or_default();
+            json!({
+                "name": call.function.name,
+                "arguments": serde_json::from_str::<Value>(&arguments).expect("JSON arguments"),
+            })
+        })
+        .collect();
+    json!({
+        "reasoning": message.reasoning_content,
+        "content": message.content,
+        "calls": calls,
+    })
+}
+
+/// Where `grammar`, matched in `text` from `at`, can end, as an engine reads a structural tag: a
+/// JSON schema's leaf takes one JSON value of the type it names, free text holds no trigger, and
+/// a tag list's free text and tags follow the engines' `at_least_one` and `stop_after_first`.
+fn ends(grammar: &Grammar, text: &str, at: usize) -> Vec<usize> {
+    let mut found: Vec<usize> = match grammar {
+        Grammar::ConstString(literal) | Grammar::Token(literal) => text[at..]
+            .starts_with(literal.as_str())
+            .then_some(at + literal.len())
+            .into_iter()
+            .collect(),
+        Grammar::AnyText { excludes } => free(text, at, excludes),
+        Grammar::JsonSchema { schema, .. } => json_ends(schema, text, at),
+        Grammar::Regex(_) => Vec::new(),
+        Grammar::Sequence(parts) => parts.iter().fold(vec![at], |starts, part| {
+            starts
+                .iter()
+                .flat_map(|&start| ends(part, text, start))
+                .collect()
+        }),
+        Grammar::Or(options) => options
+            .iter()
+            .flat_map(|option| ends(option, text, at))
+            .collect(),
+        Grammar::Optional(inner) => std::iter::once(at).chain(ends(inner, text, at)).collect(),
+        Grammar::Star(inner) => repeated(inner, text, at, 0),
+        Grammar::Plus(inner) => repeated(inner, text, at, 1),
+        Grammar::Tag(tag) => tag_ends(tag, text, at),
+        Grammar::TriggeredTags {
+            triggers,
+            tags,
+            at_least_one,
+            stop_after_first,
+        } => triggered(triggers, tags, *at_least_one, *stop_after_first, text, at),
+        Grammar::TagsWithSeparator {
+            tags,
+            separator,
+            at_least_one,
+            stop_after_first,
+        } => {
+            let mut found = if *at_least_one { Vec::new() } else { vec![at] };
+            let mut frontier: Vec<usize> = tags
+                .iter()
+                .flat_map(|tag| tag_ends(tag, text, at))
+                .collect();
+            while let Some(end) = frontier.pop() {
+                if found.contains(&end) {
+                    continue;
+                }
+                found.push(end);
+                if *stop_after_first || !text[end..].starts_with(separator.as_str()) {
+                    continue;
+                }
+                let next = end + separator.len();
+                frontier.extend(tags.iter().flat_map(|tag| tag_ends(tag, text, next)));
+            }
+            found
+        }
+    };
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// Where free text from `at` can end: before any of `excludes` is whole in it.
+fn free(text: &str, at: usize, excludes: &[String]) -> Vec<usize> {
+    let mut found = vec![at];
+    for (offset, c) in text[at..].char_indices() {
+        let end = at + offset + c.len_utf8();
+        if excludes
+            .iter()
+            .any(|exclude| !exclude.is_empty() && text[at..end].contains(exclude.as_str()))
+        {
+            break;
+        }
+        found.push(end);
+    }
+    found
+}
+
+/// Where a JSON value from `at` can end: each place up to which the text is one JSON value of the
+/// type `schema` names (any value for a schema without one), with no space at its edges.
+fn json_ends(schema: &Value, text: &str, at: usize) -> Vec<usize> {
+    let fits = |value: &Value| match schema.get("type").and_then(Value::as_str) {
+        Some("integer") => value.is_i64() || value.is_u64(),
+        Some("number") => value.is_number(),
+        Some("boolean") => value.is_boolean(),
+        Some("string") => value.is_string(),
+        Some("array") => value.is_array(),
+        Some("object") => value.is_object(),
+        Some("null") => value.is_null(),
+        _ => true,
+    };
+    text[at..]
+        .char_indices()
+        .map(|(offset, c)| at + offset + c.len_utf8())
+        .filter(|&end| {
+            let candidate = &text[at..end];
+            candidate.trim() == candidate
+                && serde_json::from_str::<Value>(candidate).is_ok_and(|value| fits(&value))
+        })
+        .collect()
+}
+
+fn repeated(inner: &Grammar, text: &str, at: usize, least: usize) -> Vec<usize> {
+    let mut reached: Vec<(usize, usize)> = vec![(at, 0)];
+    let mut found = Vec::new();
+    while let Some((start, count)) = reached.pop() {
+        if count >= least && !found.contains(&start) {
+            found.push(start);
+        }
+        for end in ends(inner, text, start) {
+            if end > start && !reached.contains(&(end, count + 1)) && count < 64 {
+                reached.push((end, count + 1));
+            }
+        }
+    }
+    found
+}
+
+fn tag_ends(tag: &Tag, text: &str, at: usize) -> Vec<usize> {
+    let begin = Grammar::ConstString(tag.begin.clone());
+    let end = Grammar::ConstString(tag.end.clone());
+    ends(
+        &Grammar::Sequence(vec![begin, (*tag.content).clone(), end]),
+        text,
+        at,
+    )
+}
+
+fn triggered(
+    triggers: &[String],
+    tags: &[Tag],
+    at_least_one: bool,
+    stop_after_first: bool,
+    text: &str,
+    at: usize,
+) -> Vec<usize> {
+    let tags_from = |start: usize| -> Vec<usize> {
+        tags.iter()
+            .flat_map(|tag| tag_ends(tag, text, start))
+            .collect()
+    };
+    let mut found: Vec<usize> = Vec::new();
+    // (where free text may start, whether a tag was written)
+    let mut frontier: Vec<(usize, bool)> = if at_least_one {
+        tags_from(at).into_iter().map(|end| (end, true)).collect()
+    } else {
+        vec![(at, false)]
+    };
+    let mut seen: Vec<(usize, bool)> = Vec::new();
+    while let Some((start, written)) = frontier.pop() {
+        if seen.contains(&(start, written)) {
+            continue;
+        }
+        seen.push((start, written));
+        if written && stop_after_first {
+            found.push(start);
+            continue;
+        }
+        for end in free(text, start, triggers) {
+            found.push(end);
+            if triggers
+                .iter()
+                .any(|trigger| text[end..].starts_with(trigger.as_str()))
+            {
+                frontier.extend(tags_from(end).into_iter().map(|after| (after, true)));
+            }
+        }
+    }
+    found
+}
+
+/// Whether `grammar` takes all of `text`.
+fn accepts(grammar: &Grammar, text: &str) -> bool {
+    ends(grammar, text, 0).contains(&text.len())
+}
+
+#[test]
+fn every_layout_here_fits_its_table() {
+    assert_eq!(muse_layout().check(&muse()), Ok(()));
+    assert_eq!(serve_qwen3_5_layout().check(&serve_qwen3_5()), Ok(()));
+    // Recorded with the chat template, read back through the table: the probe's calls.
+    let muse = muse();
+    assert_eq!(
+        read_probe(&muse, MUSE_PROMPT, MUSE_CALLS),
+        json!({"reasoning": null, "content": null, "calls": probe_calls(true)})
+    );
+    assert_eq!(
+        read_probe(&muse, MUSE_PROMPT, MUSE_ONE_CALL),
+        json!({"reasoning": null, "content": null, "calls": probe_calls(false)})
+    );
+    let qwen = serve_qwen3_5();
+    assert_eq!(
+        read_probe(&qwen, QWEN3_5_PROMPT_THINKING, QWEN3_5_CALLS_THINKING),
+        json!({"reasoning": null, "content": null, "calls": probe_calls(true)})
+    );
+    // The JSON answers read back as that answer and no call.
+    let answer = json!({"reasoning": null, "content": "{\"probe\": 1}", "calls": []});
+    assert_eq!(read_probe(&muse, MUSE_PROMPT, MUSE_ANSWER), answer);
+    assert_eq!(
+        read_probe(&qwen, QWEN3_5_PROMPT_THINKING, QWEN3_5_ANSWER_THINKING),
+        answer
+    );
+}
+
+/// The tags of `format` for the probe's tools: a forced call, a named function (one call, at
+/// least one), one call at most, and a JSON answer; with `reasoning_open` as the prompt leaves it.
+#[expect(
+    clippy::expect_used,
+    reason = "a table with no tag for a mode fails the test that asks for it"
+)]
+fn modes(format: &Format, reasoning_open: bool) -> [Grammar; 4] {
+    let tools = probe_tools();
+    let options = |at_least_one, one_call| Options {
+        at_least_one,
+        reasoning_open,
+        one_call,
+    };
+    let tag = |options| format.grammar_for(&tools, options).expect("a tag");
+    [
+        tag(options(true, false)),
+        tag(options(true, true)),
+        tag(options(false, true)),
+        format
+            .answer_grammar(&json!({"type": "object"}), reasoning_open)
+            .expect("an answer tag"),
+    ]
+}
+
+#[test]
+fn muse_glimmers_tags_take_what_its_chat_template_writes() {
+    let format = muse().with_layout(muse_layout());
+    assert!(!format.reasoning_open(MUSE_PROMPT));
+    let [required, named, one, answer] = modes(&format, false);
+    assert!(accepts(&required, MUSE_CALLS));
+    assert!(accepts(&required, MUSE_ONE_CALL));
+    assert!(accepts(&named, MUSE_ONE_CALL));
+    assert!(!accepts(&named, MUSE_CALLS), "one call");
+    assert!(accepts(&one, MUSE_ONE_CALL));
+    assert!(
+        accepts(&one, MUSE_ANSWER),
+        "no call owed: the answer is free text"
+    );
+    assert!(accepts(&answer, MUSE_ANSWER));
+    // A forced call starts with the lead the template writes for the tool, and the invoke's
+    // marker triggers each call.
+    let payload = required.payload();
+    assert_eq!(
+        payload["format"]["elements"][0],
+        json!({"type": "or", "elements": [
+            {"type": "const_string", "value": " to=fn_alpha<|message|><atem:function_calls>\n"},
+            {"type": "const_string", "value": " to=fn_beta<|message|><atem:function_calls>\n"},
+        ]})
+    );
+    let calls = &payload["format"]["elements"][1];
+    assert_eq!(calls["triggers"], json!(["<atem:invoke"]));
+    assert_eq!(
+        calls["tags"][1]["begin"],
+        "<atem:invoke name=\"fn_beta\">\n"
+    );
+    assert_eq!(
+        calls["tags"][1]["end"], "</atem:invoke>",
+        "the newline after the last parameter is its own"
+    );
+    // Near misses: an unknown tool, a missing required key, a call without its lead or without
+    // its close.
+    for miss in [
+        MUSE_ONE_CALL.replace("fn_alpha", "fn_gamma"),
+        MUSE_ONE_CALL.replace("<atem:parameter name=\"s\">sigma</atem:parameter>\n", ""),
+        MUSE_ONE_CALL.replace(" to=fn_alpha<|message|><atem:function_calls>\n", ""),
+        MUSE_ONE_CALL.replace("</atem:invoke>", ""),
+        MUSE_ONE_CALL.replace("name=\"fn_alpha\"", "nom=\"fn_alpha\""),
+    ] {
+        assert!(!accepts(&required, &miss), "{miss:?}");
+        assert!(!accepts(&named, &miss), "{miss:?}");
+    }
+    assert!(!accepts(&answer, "{\"probe\": 1}"), "without the recipient");
+}
+
+#[test]
+fn qwen3_5s_tags_take_what_its_chat_template_writes() {
+    let format = serve_qwen3_5().with_layout(serve_qwen3_5_layout());
+    // The default prompt leaves the thought open: the tag follows a prefix, never a refusal.
+    assert!(format.reasoning_open(QWEN3_5_PROMPT_THINKING));
+    assert!(!format.reasoning_open(QWEN3_5_PROMPT));
+    let [required, named, one, answer] = modes(&format, true);
+    assert_eq!(required.payload()["format"]["type"], "sequence");
+    assert!(accepts(&required, QWEN3_5_CALLS_THINKING));
+    let one_call = QWEN3_5_CALLS_THINKING
+        .split_once("\n<tool_call>\n<function=fn_beta>")
+        .map(|(first, _)| first)
+        .expect("two calls");
+    assert!(accepts(&named, one_call));
+    assert!(!accepts(&named, QWEN3_5_CALLS_THINKING), "one call");
+    assert!(accepts(&one, one_call));
+    // With no call owed, the thought is the tag's own free text: no prefix whose end could split
+    // the call's marker, so a second call cannot pass as text.
+    assert_eq!(one.payload()["format"]["type"], "triggered_tags");
+    assert!(!accepts(&one, QWEN3_5_CALLS_THINKING), "one call");
+    assert!(accepts(&answer, QWEN3_5_ANSWER_THINKING));
+    let thought = format!("Probe thought.{QWEN3_5_CALLS_THINKING}");
+    assert!(accepts(&required, &thought), "the thought before its close");
+    // With thinking off, the prompt closed the thought: the calls start at once.
+    let [required, named, _, answer] = modes(&format, false);
+    let calls = QWEN3_5_CALLS_THINKING.trim_start_matches("\n</think>\n\n");
+    assert!(accepts(&required, calls));
+    assert!(accepts(
+        &named,
+        one_call.trim_start_matches("\n</think>\n\n")
+    ));
+    assert!(accepts(&answer, "{\"probe\": 1}"));
+    assert!(!accepts(&required, QWEN3_5_CALLS_THINKING));
+    for miss in [
+        calls.replace("fn_beta", "fn_gamma"),
+        calls.replace("<parameter=q>\nkappa\n</parameter>\n", ""),
+        calls.replace("\n<function=fn_alpha>", "\nfn_alpha"),
+        calls.replace("</function>\n</tool_call>", "</tool_call>"),
+        calls.replace("True", "true"),
+    ] {
+        assert!(!accepts(&required, &miss), "{miss:?}");
+    }
+    for (prompt, output) in [
+        (QWEN3_5_PROMPT, calls),
+        (QWEN3_5_PROMPT_THINKING, QWEN3_5_CALLS_THINKING),
+    ] {
+        assert_eq!(
+            read_probe(&format, prompt, output),
+            json!({"reasoning": null, "content": null, "calls": probe_calls(true)})
+        );
+    }
+    assert_eq!(
+        read_probe(&format, QWEN3_5_PROMPT_THINKING, one_call),
+        json!({"reasoning": null, "content": null, "calls": probe_calls(false)})
+    );
+}
+
+#[test]
+fn qwen3_5s_tag_is_the_tagged_tables_where_their_layouts_agree() {
+    // The registry's Qwen 3.5 table writes the same calls by hand: the same trigger, the same
+    // begin and end for every tool, and each parameter's tag, close and newline. The values
+    // differ only where the hand-written tag allows a spelling the chat template does not write:
+    // a newline on either side of a value that is not text, which the template always writes, and
+    // JSON's `true` beside Python's words. A string's text holds the same markers.
+    let tools = probe_tools();
+    let shaped = serve_qwen3_5()
+        .with_layout(serve_qwen3_5_layout())
+        .grammar(&tools, true, false)
+        .expect("a tag")
+        .payload();
+    let tagged = symphony::formats::qwen3(CallSyntax::Tagged(
+        symphony::tagged::Spelling::Json,
+        symphony::tagged::Placement::OwnLine,
+    ))
+    .grammar(&tools, true, false)
+    .expect("a tag")
+    .payload();
+    let (shaped, tagged) = (&shaped["format"], &tagged["format"]);
+    assert_eq!(shaped["triggers"], tagged["triggers"]);
+    assert_eq!(shaped["at_least_one"], tagged["at_least_one"]);
+    for at in 0..2 {
+        for field in ["begin", "end"] {
+            assert_eq!(
+                shaped["tags"][at][field], tagged["tags"][at][field],
+                "{field} of tag {at}"
+            );
+        }
+    }
+    let parameter = |tag: &Value, at: usize| tag["content"]["elements"][at].clone();
+    let newline = json!({"type": "optional", "content": {"type": "const_string", "value": "\n"}});
+    let alpha = (&shaped["tags"][0], &tagged["tags"][0]);
+    // `s`, a string: the tag, the text, the close and the newline, alike but for the text's
+    // markers, which leave out the opener of a call that would be text inside the value.
+    assert_eq!(
+        parameter(alpha.0, 0),
+        json!({"type": "sequence", "elements": [
+            {"type": "const_string", "value": "<parameter=s>\n"},
+            {"type": "any_text", "excludes": ["</parameter>", "</tool_call>"]},
+            {"type": "const_string", "value": "\n</parameter>\n"},
+        ]})
+    );
+    // `i`, an integer: the template's newlines, where the hand-written tag allows them.
+    assert_eq!(
+        parameter(alpha.0, 1)["elements"][1],
+        parameter(alpha.1, 1)["elements"][4]
+    );
+    assert_eq!(parameter(alpha.1, 1)["elements"][3], newline);
+    // `b`, a boolean: Python's words, as the template writes them; the hand-written tag takes
+    // JSON's too.
+    assert_eq!(
+        parameter(alpha.0, 3)["elements"][1],
+        json!({"type": "or", "elements": [
+            {"type": "const_string", "value": "True"},
+            {"type": "const_string", "value": "False"},
+        ]})
+    );
+    assert_eq!(
+        parameter(alpha.1, 3)["elements"][4]["elements"][1],
+        json!({"type": "const_string", "value": "True"})
+    );
 }

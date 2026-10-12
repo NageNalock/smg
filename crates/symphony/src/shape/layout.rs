@@ -20,12 +20,16 @@
 //! ([`Format::with_layout`]). Parsing does not read it. [`Layout::check`] says whether it fits the
 //! table: the header, a parameter and the trailer as written match the shape's patterns, capturing
 //! the name, the key and the value where the layout puts them, and the terminals it names close
-//! what it says they close. A structural tag written from it writes only what the template
-//! renders.
+//! what it says they close. The structural tags of a shaped call are written from the layout
+//! ([`Format::grammar_for`]), and a table's thought and answer as it writes them; a shaped call
+//! whose table has no layout that fits has no tag.
 //!
 //! [`Format::with_layout`]: crate::Format::with_layout
+//! [`Format::grammar_for`]: crate::Format::grammar_for
 
-use super::{Arguments, Atom, Class, Match, Matcher, NameSource, Pattern, Slot, Verdict};
+use super::{
+    Arguments, Atom, CallShape, Class, Match, Matcher, NameSource, Pattern, Slot, Verdict,
+};
 use crate::format::{CallSyntax, Emits, Format};
 
 /// A text as the template writes it, with the places where a call's name, a parameter's key and
@@ -59,6 +63,22 @@ impl Written {
             .count()
     }
 
+    /// The text with `name` and `key` written in their places, cut where the value stands: what
+    /// comes before the value, and what comes after it (empty when the text has no value).
+    pub(crate) fn around_the_value(&self, name: &str, key: &str) -> (String, String) {
+        let (mut before, mut after) = (String::new(), String::new());
+        let mut out = &mut before;
+        for segment in &*self.0 {
+            match segment {
+                Segment::Lit(text) => out.push_str(text),
+                Segment::Slot(Slot::Name) => out.push_str(name),
+                Segment::Slot(Slot::Key) => out.push_str(key),
+                Segment::Slot(Slot::Value) => out = &mut after,
+            }
+        }
+        (before, after)
+    }
+
     /// The text with `name`, `key` and `value` written in their places, and where each stands in
     /// it, by its slot.
     fn filled(&self, name: &str, key: &str, value: &str) -> (String, [Option<(usize, usize)>; 3]) {
@@ -85,7 +105,9 @@ impl Written {
 
 /// How a template writes one call of a shaped table, part by part, as its rendering showed: a
 /// call is `lead`, the region's terminal, `header`, `before`, the parameters (each as `parameter`
-/// says, `between` two of them), `after`, `trailer` and `close`.
+/// says, `between` two of them), `after`, `trailer` and `close`. The text `between` and `after`
+/// begin with alike follows every parameter (the newline a template writes after each), so a call
+/// that writes no parameter has `before` and then the rest of `after`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct CallLayout {
     /// What the template writes before the call's terminal, where a call is the first thing the
@@ -263,7 +285,7 @@ impl Layout {
         let Some(CallSyntax::Shaped(shape)) = format.call_syntax() else {
             return Err(LayoutError::Calls);
         };
-        let Arguments::Params { tag, ends, .. } = &shape.arguments else {
+        let Arguments::Params { tag, .. } = &shape.arguments else {
             return Err(LayoutError::Calls);
         };
         let call = &self.call;
@@ -284,34 +306,16 @@ impl Layout {
         }
         let name = captured(&shape.header, Slot::Name)
             .map_or_else(|| "f".to_string(), |(class, min)| sample(class, min));
+        let name = match &shape.name {
+            NameSource::Literal(literal) => literal.to_string(),
+            _ => name,
+        };
         let key = captured(tag, Slot::Key).map_or_else(|| "k".to_string(), |(c, m)| sample(c, m));
-        let value =
-            captured(tag, Slot::Value).map_or_else(|| "v".to_string(), |(c, m)| sample(c, m));
-        let (header, header_spans) = call.header.filled(&name, "", "");
-        let (written, spans) = parameter.filled("", &key, &value);
-        let tail = format!("{}{}", call.after, call.trailer);
-        // The header, followed by the call's text, as the stream reads it after the terminal.
-        let follows = format!(
-            "{header}{}{written}{}{written}{tail}",
-            call.before, call.between
-        );
-        let terminal_end = call_terminal(format).and_then(|t| t.chars().next_back());
-        let mut matcher = Matcher::new(&shape.header, &[], &shape.word, terminal_end);
-        let slots: &[Slot] = if header_names { &[Slot::Name] } else { &[] };
-        if !reads(&mut matcher, &follows, header.len(), &header_spans, slots) {
+        let terminal = call_terminal(format).unwrap_or_default();
+        if self.header_for(shape, terminal, &name).is_none() {
             return Err(LayoutError::Unmatched("header"));
         }
-        let before_parameter = format!("{header}{}", call.before).chars().next_back();
-        let rest = format!("{written}{}{written}{tail}", call.between);
-        let mut matcher =
-            Matcher::new(tag, ends, &shape.word, before_parameter.or(terminal_end)).hold_cap(None);
-        if !reads(
-            &mut matcher,
-            &rest,
-            written.len(),
-            &spans,
-            &[Slot::Key, Slot::Value],
-        ) {
+        if self.parameter_for(shape, &key).is_none() {
             return Err(LayoutError::Unmatched("parameter"));
         }
         if shape.trailer.0.is_empty() != call.trailer.is_empty() {
@@ -336,6 +340,76 @@ impl Layout {
             }
         }
         self.check_rows(format)
+    }
+
+    /// The header as written for a call to `name` after `terminal`, if the shape's header reads it
+    /// back as a call to that tool, with the call's text after it as a stream reads it: the header
+    /// captures exactly the name where the layout puts it, or, for a name the template writes,
+    /// `name` is that one. `None` for a name the header's class does not hold, or one longer than
+    /// the most a header holds undecided.
+    pub(crate) fn header_for(
+        &self,
+        shape: &CallShape,
+        terminal: &str,
+        name: &str,
+    ) -> Option<String> {
+        let header_names = match &shape.name {
+            NameSource::Header => true,
+            NameSource::Literal(literal) if **literal == *name => false,
+            NameSource::Literal(_) | NameSource::Body => return None,
+        };
+        let call = &self.call;
+        let (header, spans) = call.header.filled(name, "", "");
+        let follows = format!("{header}{}{}", call.before, self.sample_parameters(shape));
+        let mut matcher = Matcher::new(
+            &shape.header,
+            &[],
+            &shape.word,
+            terminal.chars().next_back(),
+        )
+        .hold_cap(Some(shape.cap()));
+        let slots: &[Slot] = if header_names { &[Slot::Name] } else { &[] };
+        reads(&mut matcher, &follows, header.len(), &spans, slots).then_some(header)
+    }
+
+    /// One parameter as written for `key`, cut where its value stands, if the shape's tag reads it
+    /// back with that key, its value where the layout puts it, with the call's text after it as a
+    /// stream reads it. `None` for a key the tag's class does not hold.
+    pub(crate) fn parameter_for(&self, shape: &CallShape, key: &str) -> Option<(String, String)> {
+        let Arguments::Params { tag, ends, .. } = &shape.arguments else {
+            return None;
+        };
+        let call = &self.call;
+        let value =
+            captured(tag, Slot::Value).map_or_else(|| "v".to_string(), |(c, m)| sample(c, m));
+        let (written, spans) = call.parameter.filled("", key, &value);
+        let rest = format!(
+            "{written}{}{written}{}{}",
+            call.between, call.after, call.trailer
+        );
+        // A tag begins with its trigger, a literal, so no `\b` reads the text before it.
+        let mut matcher = Matcher::new(tag, ends, &shape.word, None).hold_cap(None);
+        let slots = [Slot::Key, Slot::Value];
+        reads(&mut matcher, &rest, written.len(), &spans, &slots)
+            .then(|| call.parameter.around_the_value("", key))
+    }
+
+    /// Two parameters as written, with samples for the key and the value, and what follows the
+    /// last: the call's text after the header, as a header's match reads on into it.
+    fn sample_parameters(&self, shape: &CallShape) -> String {
+        let call = &self.call;
+        let (key, value) = match &shape.arguments {
+            Arguments::Params { tag, .. } => (
+                captured(tag, Slot::Key).map_or_else(|| "k".to_string(), |(c, m)| sample(c, m)),
+                captured(tag, Slot::Value).map_or_else(|| "v".to_string(), |(c, m)| sample(c, m)),
+            ),
+            _ => ("k".to_string(), "v".to_string()),
+        };
+        let (written, _) = call.parameter.filled("", &key, &value);
+        format!(
+            "{written}{}{written}{}{}",
+            call.between, call.after, call.trailer
+        )
     }
 
     /// The rows the layout names: the call's close, the thought's and the answer's states.
