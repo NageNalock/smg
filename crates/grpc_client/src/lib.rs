@@ -15,6 +15,7 @@ pub mod common_proto {
 }
 pub mod abort_on_drop;
 pub mod channel;
+pub mod deadline;
 pub mod engine_load;
 pub mod media_fault;
 pub mod mlx_engine;
@@ -33,6 +34,7 @@ pub use channel::{
     connect_channel, connect_channel_with_timeout, is_transport_failure, normalize_grpc_endpoint,
     DEFAULT_CONNECT_TIMEOUT,
 };
+pub use deadline::{is_call_deadline, CallDeadline};
 /// The HTTP/2 layer under the channels, re-exported for callers that build
 /// or classify the transport faults [`is_transport_failure`] recognises.
 pub use h2;

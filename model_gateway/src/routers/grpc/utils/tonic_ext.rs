@@ -2,10 +2,13 @@
 
 use axum::response::Response;
 use http::StatusCode;
-use smg_grpc_client::{is_transport_failure, WorkerMediaFault};
+use smg_grpc_client::{is_call_deadline, is_transport_failure, WorkerMediaFault};
 use tonic::Code;
 
-use crate::routers::error;
+use crate::routers::{common::retry::mark_non_retryable, error};
+
+/// The HTTP path's code for its upstream client's timeout.
+pub(crate) const REQUEST_TIMEOUT_CODE: &str = "call_upstream_timeout";
 
 /// Extension methods for `tonic::Status`.
 pub(crate) trait TonicStatusExt {
@@ -86,6 +89,13 @@ impl TonicStatusExt for tonic::Status {
     }
 
     fn to_http_error(&self, code: &str, msg: String) -> Response {
+        // The HTTP path's answer for its client timeout, terminal for the
+        // retry layer (a replay would hold the client for a second timeout).
+        if is_call_deadline(self) {
+            let mut response = error::gateway_timeout(REQUEST_TIMEOUT_CODE, self.message());
+            mark_non_retryable(&mut response);
+            return response;
+        }
         error::create_error(self.http_status(), code, msg)
     }
 
@@ -183,6 +193,35 @@ mod tests {
         assert_eq!(result.breaker_status(), Some(502));
         assert!(DEFAULT_RETRYABLE_STATUS_CODES.contains(&502));
         assert!(!DEFAULT_RETRYABLE_STATUS_CODES.contains(&400));
+    }
+
+    /// The call's deadline answers the HTTP path's 504 for its client timeout
+    /// under the caller's wording, terminal for the retry layer; a
+    /// `DEADLINE_EXCEEDED` the worker answered keeps the caller's code and
+    /// stays retryable by status.
+    #[test]
+    fn the_calls_deadline_answers_the_http_paths_terminal_504() {
+        use smg_grpc_client::CallDeadline;
+
+        use crate::routers::{
+            common::retry::is_retryable_response, error::extract_error_code_from_response,
+        };
+        let deadline = CallDeadline::after(std::time::Duration::from_secs(15)).status();
+        let response = deadline.to_http_error("worker_stream_failed", "stream failed".into());
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            REQUEST_TIMEOUT_CODE
+        );
+        assert!(!is_retryable_response(&response));
+        let engine = tonic::Status::deadline_exceeded("engine scheduling deadline exceeded");
+        let response = engine.to_http_error("worker_stream_failed", "stream failed".into());
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "worker_stream_failed"
+        );
+        assert!(is_retryable_response(&response));
     }
 
     #[test]

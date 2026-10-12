@@ -222,7 +222,7 @@ fn response_stream<S>(body: S, client: VllmEngineClient) -> ProtoStream
 where
     S: futures::Stream<Item = Result<Frame<Bytes>, tonic::Status>> + Send + 'static,
 {
-    let stream = AbortOnDropStream::new(decoded_stream(body), "eof-test".to_string(), client);
+    let stream = AbortOnDropStream::new(decoded_stream(body), "eof-test".to_string(), client, None);
     // No generation was sent to the mock, so there is nothing to cancel.
     stream.mark_completed();
     ProtoStream::Vllm(stream)

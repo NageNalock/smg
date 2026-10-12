@@ -30,6 +30,8 @@ use std::{
 use tonic::Streaming;
 use tracing::{debug, warn};
 
+use crate::deadline::CallDeadline;
+
 /// Upper bound on how long a deferred abort waits for the stream's first
 /// item before aborting anyway. Bounds the detached drain task when the
 /// backend never produces output (e.g. its upstream handoff peer died).
@@ -80,12 +82,23 @@ pub struct AbortOnDropStream<T: Send + 'static, C: AbortOnDropClient> {
     /// How long a drop waits for the worker to end the stream after the
     /// abort before releasing it with a reset (see `Drop`).
     release_drain_bound: Duration,
+    /// The call's deadline and its timer, while armed.
+    deadline: Option<(CallDeadline, Pin<Box<tokio::time::Sleep>>)>,
+    /// Set once the deadline ended the stream: nothing follows.
+    expired: bool,
     _marker: PhantomData<fn() -> T>,
 }
 
 impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
-    /// Wrap a streaming response so it auto-aborts on drop.
-    pub fn new(stream: Streaming<T>, request_id: String, client: C) -> Self {
+    /// Wrap a streaming response so it auto-aborts on drop. Past `deadline`,
+    /// with no message arrived, the stream yields the deadline's status once
+    /// and ends (the abort-on-drop and its deferral stay with the drop).
+    pub fn new(
+        stream: Streaming<T>,
+        request_id: String,
+        client: C,
+        deadline: Option<CallDeadline>,
+    ) -> Self {
         debug!("Created AbortOnDropStream for request {}", request_id);
         Self {
             inner: Some(stream),
@@ -95,6 +108,9 @@ impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
             defer_abort_until_first_item: false,
             saw_item: false,
             release_drain_bound: RELEASE_DRAIN_MAX_WAIT,
+            deadline: deadline
+                .map(|deadline| (deadline, Box::pin(tokio::time::sleep_until(deadline.at())))),
+            expired: false,
             _marker: PhantomData,
         }
     }
@@ -262,6 +278,9 @@ impl<T: Send + 'static, C: AbortOnDropClient> futures::Stream for AbortOnDropStr
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
+        if this.expired {
+            return Poll::Ready(None);
+        }
         match this.inner.as_mut() {
             Some(inner) => {
                 let polled = Pin::new(inner).poll_next(cx);
@@ -271,7 +290,18 @@ impl<T: Send + 'static, C: AbortOnDropClient> futures::Stream for AbortOnDropStr
                     // state is resolved either way.
                     this.saw_item = true;
                 }
-                polled
+                if polled.is_ready() {
+                    return polled;
+                }
+                // Nothing arrived: past the deadline the stream ends with it.
+                let Some((deadline, sleep)) = this.deadline.as_mut() else {
+                    return Poll::Pending;
+                };
+                if sleep.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                this.expired = true;
+                Poll::Ready(Some(Err(deadline.status())))
             }
             // Only reachable if polled after Drop took the stream, which
             // cannot happen for an owned value; return end-of-stream rather

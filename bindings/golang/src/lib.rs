@@ -29,6 +29,9 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // thread.
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 use smg::observability::metrics::SERVER_MALLOC_CONF;
+
+/// The deadline of every call to the scheduler: the gateway's default `--request-timeout-secs`.
+pub(crate) const DEADLINE: std::time::Duration = std::time::Duration::from_secs(1800);
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 #[export_name = "_rjem_malloc_conf"]
 pub static MALLOC_CONF: &[u8; 72] = SERVER_MALLOC_CONF;

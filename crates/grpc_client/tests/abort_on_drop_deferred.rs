@@ -21,6 +21,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{transport::Server, Request, Response, Status};
 
+/// The call deadline these tests give the client; none of them reaches it.
+const CALL_TIMEOUT: Duration = Duration::from_secs(600);
+
 type GenerateTx = mpsc::Sender<Result<proto::GenerateResponse, Status>>;
 
 #[derive(Default)]
@@ -189,7 +192,10 @@ async fn default_mode_aborts_immediately_on_drop() {
     let (endpoint, state) = spawn_mock().await.unwrap();
     let client = VllmEngineClient::connect(&endpoint).await.unwrap();
 
-    let stream = client.generate(generate_request("imm-1")).await.unwrap();
+    let stream = client
+        .generate(generate_request("imm-1"), CALL_TIMEOUT)
+        .await
+        .unwrap();
     drop(stream);
 
     assert_eq!(wait_for_abort(&state).await, ["imm-1"]);
@@ -201,7 +207,7 @@ async fn deferred_mode_holds_abort_until_first_item() {
     let client = VllmEngineClient::connect(&endpoint).await.unwrap();
 
     let stream = client
-        .generate(generate_request("def-1"))
+        .generate(generate_request("def-1"), CALL_TIMEOUT)
         .await
         .unwrap()
         .defer_abort_until_first_item();
@@ -227,7 +233,7 @@ async fn deferred_mode_aborts_immediately_after_first_item_was_consumed() {
     let client = VllmEngineClient::connect(&endpoint).await.unwrap();
 
     let mut stream = client
-        .generate(generate_request("def-2"))
+        .generate(generate_request("def-2"), CALL_TIMEOUT)
         .await
         .unwrap()
         .defer_abort_until_first_item();
@@ -248,7 +254,7 @@ async fn mark_completed_suppresses_abort_in_deferred_mode() {
     let client = VllmEngineClient::connect(&endpoint).await.unwrap();
 
     let stream = client
-        .generate(generate_request("done-1"))
+        .generate(generate_request("done-1"), CALL_TIMEOUT)
         .await
         .unwrap()
         .defer_abort_until_first_item();

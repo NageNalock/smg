@@ -8,6 +8,8 @@
 //! pipeline (which works against [`ProtoStream`]/[`ProtoGenerateRequest`]) is
 //! shared unchanged.
 
+use std::time::Duration;
+
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
     messages::CreateMessageRequest, worker::WorkerLoadResponse,
@@ -260,9 +262,10 @@ impl BackendClient {
     pub async fn generate(
         &mut self,
         req: ProtoGenerateRequest,
+        timeout: Duration,
     ) -> Result<ProtoStream, tonic::Status> {
         match self {
-            Self::Grpc(client) => client.generate(req).await,
+            Self::Grpc(client) => client.generate(req, timeout).await,
             Self::Zmq(client) => Ok(ProtoStream::Zmq(zmq_client::generate(client, req).await?)),
         }
     }
@@ -270,9 +273,10 @@ impl BackendClient {
     pub async fn embed(
         &mut self,
         req: ProtoEmbedRequest,
+        timeout: Duration,
     ) -> Result<ProtoEmbedComplete, tonic::Status> {
         match self {
-            Self::Grpc(client) => client.embed(req).await,
+            Self::Grpc(client) => client.embed(req, timeout).await,
             Self::Zmq(_) => Err(tonic::Status::unimplemented(
                 "ZMQ backend does not support embedding yet",
             )),

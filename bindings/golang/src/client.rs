@@ -25,6 +25,7 @@ use super::{
     tool_constraint::tool_constraint_for,
     utils::chat_requires_reasoning,
 };
+use crate::DEADLINE;
 
 /// Handle for complete client SDK (gRPC client + tokenizer)
 /// This handle manages the connection to sglang and provides a complete SDK interface
@@ -225,7 +226,7 @@ pub unsafe extern "C" fn sgl_client_chat_completion_stream(
     };
 
     // Send request and get stream
-    let stream = match RUNTIME.block_on(async { client.generate(proto_request).await }) {
+    let stream = match RUNTIME.block_on(async { client.generate(proto_request, DEADLINE).await }) {
         Ok(s) => s,
         Err(e) => {
             set_error_message(error_out, &format!("Failed to send request: {e}"));

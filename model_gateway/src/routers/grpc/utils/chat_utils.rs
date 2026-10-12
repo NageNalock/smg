@@ -60,15 +60,21 @@ pub(crate) type SseSender = sse::SseSender;
 /// `async` because the sender is bounded: awaits if the buffer is full so the
 /// terminal error frame still applies backpressure rather than being dropped.
 pub(crate) async fn send_error_sse(tx: &SseSender, message: impl ToString, error_type: &str) {
-    let chunk = format!(
-        "data: {}\n\n",
-        json!({
-            "error": {
-                "message": message.to_string(),
-                "type": error_type,
-            }
-        })
-    );
+    send_error_sse_with_code(tx, message, error_type, None).await;
+}
+
+/// [`send_error_sse`] with the error's `code` next to its type, when it has one.
+pub(crate) async fn send_error_sse_with_code(
+    tx: &SseSender,
+    message: impl ToString,
+    error_type: &str,
+    code: Option<&str>,
+) {
+    let mut error = json!({ "message": message.to_string(), "type": error_type });
+    if let Some(code) = code {
+        error["code"] = json!(code);
+    }
+    let chunk = format!("data: {}\n\n", json!({ "error": error }));
     let _ = tx.send(Ok(Bytes::from(chunk))).await;
 }
 

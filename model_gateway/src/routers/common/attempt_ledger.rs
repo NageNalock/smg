@@ -25,7 +25,7 @@
 //! window closes on that worker only, its partner stays selectable, and
 //! when no other worker of the leg's kind is available the answer stands.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{http::StatusCode, response::Response};
 use parking_lot::Mutex;
@@ -72,10 +72,21 @@ pub(crate) fn is_definitive_failure(response: &Response) -> bool {
         && response.extensions().get::<UpstreamAnswer>().is_some()
 }
 
-/// What one request's attempts have told the worker pool so far.
-#[derive(Debug, Default)]
+/// What one request's attempts have told the worker pool so far, and the
+/// deadline every call of an attempt to a gRPC worker carries
+/// (`--request-timeout-secs`; see `smg_grpc_client::CallDeadline`).
+#[derive(Debug)]
 pub(crate) struct AttemptLedger {
     inner: Mutex<Ledger>,
+    request_timeout: Duration,
+}
+
+impl Default for AttemptLedger {
+    /// No deadline to speak of (a year): for the HTTP proxy's executor, whose
+    /// client bounds its calls, and for contexts built without a config.
+    fn default() -> Self {
+        Self::bounded(Duration::from_secs(365 * 24 * 60 * 60))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -88,6 +99,19 @@ struct Ledger {
 }
 
 impl AttemptLedger {
+    /// A fresh ledger whose attempts' calls carry `request_timeout`.
+    pub(crate) fn bounded(request_timeout: Duration) -> Self {
+        Self {
+            inner: Mutex::default(),
+            request_timeout,
+        }
+    }
+
+    /// The deadline every call of an attempt to a gRPC worker carries.
+    pub(crate) fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
     /// Record an attempt's outcome on `worker`'s circuit breaker: a success or
     /// a capacity pushback as always, a failure only the first time this
     /// request fails on the worker.

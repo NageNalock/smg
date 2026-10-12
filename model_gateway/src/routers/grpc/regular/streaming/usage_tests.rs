@@ -146,6 +146,7 @@ async fn scheduler_stream(frames: Vec<scheduler::GenerateResponse>) -> Scripted 
         decoded_stream(stream::iter(body)),
         "cmpl-usage".to_string(),
         client,
+        None,
     );
     // No generation was sent to the mock, so there is nothing to cancel.
     stream.mark_completed();

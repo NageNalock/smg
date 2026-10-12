@@ -210,6 +210,8 @@ pub(crate) struct SharedComponents {
     /// is answered 503 `tokenizer_load_failed` without a retry hint, instead
     /// of the not-ready 503 of a load in flight.
     pub tokenizer_load_failures: Arc<TokenizerLoadFailures>,
+    /// `--request-timeout-secs`: the deadline of every call to a gRPC worker.
+    pub request_timeout: std::time::Duration,
 }
 
 /// Ingress-phase state (evolves through preparation, worker selection,
@@ -936,6 +938,7 @@ impl RequestContext {
             RequestType::Transcription { request, .. } => request.model.clone(),
         };
         drop(request_type);
+        let request_timeout = components.request_timeout;
         drop(components);
         let routing = state.routing_snapshot.ok_or_else(|| {
             error!(
@@ -973,7 +976,7 @@ impl RequestContext {
             request_id,
             cache_trace: None,
             attempt: 0,
-            ledger: AttemptLedger::default(),
+            ledger: AttemptLedger::bounded(request_timeout),
             tried: Vec::new(),
             model_id,
             dispatch_model,

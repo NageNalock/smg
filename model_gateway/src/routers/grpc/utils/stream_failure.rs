@@ -26,15 +26,17 @@
 use std::{fmt, sync::Arc};
 
 use axum::http::StatusCode;
+use smg_grpc_client::is_call_deadline;
 use tracing::{error, warn};
 
 use super::{
-    chat_utils::{send_error_sse, SseSender},
+    chat_utils::{send_error_sse_with_code, SseSender},
     metrics::error_type_from_status,
     pd_bootstrap::account_pd_leg_failure,
-    tonic_ext::TonicStatusExt,
+    tonic_ext::{TonicStatusExt, REQUEST_TIMEOUT_CODE},
 };
 use crate::{
+    middleware::messages_error_type,
     observability::metrics::{metrics_labels, Metrics},
     routers::{
         error::error_type_for_status,
@@ -227,6 +229,16 @@ impl StreamFailure {
         }
     }
 
+    /// Whether the call's deadline ended the stream: the gateway's own cut.
+    pub(crate) fn is_request_timeout(&self) -> bool {
+        matches!(self, Self::Upstream { status, .. } if is_call_deadline(status))
+    }
+
+    /// The error `code` next to the event's type, when the failure has one.
+    pub(crate) fn code(&self) -> Option<&'static str> {
+        self.is_request_timeout().then_some(REQUEST_TIMEOUT_CODE)
+    }
+
     /// The class of an upstream failure's status; a failure of the gateway's
     /// own processing has none.
     pub(crate) fn class(&self) -> Option<UpstreamClass> {
@@ -239,16 +251,23 @@ impl StreamFailure {
     /// The `type` of the SSE error event that ends the response:
     /// `stream_error` for a stream the worker failed, the HTTP error body's
     /// type for any other status the engine answered, `internal_error` for a
-    /// failure of the gateway's own processing.
+    /// failure of the gateway's own processing, and for a stream the call's
+    /// deadline ended the type of the HTTP path's 504.
     pub(crate) fn error_type(&self) -> &'static str {
+        if self.is_request_timeout() {
+            return error_type_for_status(StatusCode::GATEWAY_TIMEOUT);
+        }
         self.class().map_or(INTERNAL_ERROR_TYPE, |class| {
             class.client_type(STREAM_ERROR_TYPE)
         })
     }
 
     /// The same for the messages API's error event, whose type for a failure
-    /// on the server's side is `api_error`.
+    /// on the server's side is `api_error` and for a timeout `timeout_error`.
     pub(crate) fn messages_error_type(&self) -> &'static str {
+        if self.is_request_timeout() {
+            return messages_error_type(StatusCode::GATEWAY_TIMEOUT);
+        }
         self.class().map_or(MESSAGES_API_ERROR_TYPE, |class| {
             class.client_type(MESSAGES_API_ERROR_TYPE)
         })
@@ -272,6 +291,10 @@ impl fmt::Display for StreamFailure {
     /// wording clients have been reading.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            // The deadline says what happened in the gateway's own words.
+            Self::Upstream { status, .. } if is_call_deadline(status) => {
+                f.write_str(status.message())
+            }
             Self::Upstream {
                 status,
                 leg: UpstreamLeg::Answer,
@@ -359,6 +382,11 @@ impl StreamSource {
             UpstreamLeg::Prefill => (self.prefill.as_ref(), metrics_labels::WORKER_PREFILL),
         };
         let class = UpstreamClass::of(status);
+        let ended_by = if is_call_deadline(status) {
+            "Stream ended at the request's deadline (--request-timeout-secs)"
+        } else {
+            "Stream ended by the engine before completion"
+        };
         warn!(
             request_id = %self.request_id,
             worker = worker.map_or("none", |worker| worker.url()),
@@ -367,7 +395,8 @@ impl StreamSource {
             grpc_code = ?status.code(),
             http_status = class.http.as_u16(),
             error_type = class.error_type,
-            "Stream ended by the engine before completion: {}",
+            "{}: {}",
+            ended_by,
             status.message()
         );
         if let (Some(worker), Some(sample)) = (worker, class.breaker_sample) {
@@ -417,7 +446,7 @@ pub(crate) async fn send_stream_failure(
             "Streaming response failed in the gateway: {message}"
         );
     }
-    send_error_sse(tx, failure, failure.error_type()).await;
+    send_error_sse_with_code(tx, failure, failure.error_type(), failure.code()).await;
 }
 
 #[cfg(test)]
@@ -668,6 +697,31 @@ mod tests {
         let rendered = handle.render();
         assert_eq!(worker_error_type(&rendered), None, "{rendered}");
         assert_eq!(router_error_type(&rendered), "validation_error");
+    }
+
+    /// A stream the call's deadline ended is charged as a timeout like any
+    /// `DEADLINE_EXCEEDED`, and reaches the client as the HTTP path's 504
+    /// for its client timeout: `server_error` with the code, the Messages
+    /// API's `timeout_error`, the gateway's own words as the message.
+    #[test]
+    fn a_stream_the_calls_deadline_ended_is_the_http_paths_504_typed_and_coded() {
+        let status =
+            smg_grpc_client::CallDeadline::after(std::time::Duration::from_secs(15)).status();
+        let failure = StreamFailure::upstream(status.clone(), 5);
+        assert!(failure.is_request_timeout());
+        assert_eq!(failure.error_type(), "server_error");
+        assert_eq!(failure.messages_error_type(), "timeout_error");
+        assert_eq!(failure.code(), Some("call_upstream_timeout"));
+        assert_eq!(failure.to_string(), status.message());
+        assert!(
+            !StreamFailure::upstream(tonic::Status::deadline_exceeded("too slow"), 5)
+                .is_request_timeout()
+        );
+        let (worker, handle) = account_on_a_fresh_worker(status);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+        let rendered = handle.render();
+        assert_eq!(worker_error_type(&rendered), Some("timeout"));
+        assert_eq!(router_error_type(&rendered), "timeout");
     }
 
     #[test]

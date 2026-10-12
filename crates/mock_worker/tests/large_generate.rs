@@ -2,6 +2,7 @@
 //! prompt's token ids as one message; a million of them are a few megabytes,
 //! which tonic's default message limit (4 MiB) refuses.
 
+use std::time::Duration;
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -9,6 +10,9 @@ use mock_worker::{config::Config, grpc::serve_with_listener};
 use smg_grpc_client::tokenspeed_scheduler::{tokenspeed_proto as ts, TokenSpeedSchedulerClient};
 use tokio::net::TcpListener;
 use ts::generate_response::Response as GenResp;
+
+/// The call deadline these tests give the client; none of them reaches it.
+const CALL_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Serve `cfg` on a free port and connect the gateway's client to it.
 async fn start(cfg: Config) -> TokenSpeedSchedulerClient {
@@ -53,7 +57,7 @@ async fn a_million_token_generate_round_trips_by_default() {
     let client = start(Config::default()).await;
 
     let mut stream = client
-        .generate(million_token_request())
+        .generate(million_token_request(), CALL_TIMEOUT)
         .await
         .expect("the worker accepts a million-token Generate");
     let mut last = None;
@@ -81,7 +85,7 @@ async fn a_configured_limit_refuses_a_larger_message() {
     })
     .await;
 
-    let err = match client.generate(million_token_request()).await {
+    let err = match client.generate(million_token_request(), CALL_TIMEOUT).await {
         Ok(_) => panic!("a message above the configured limit is refused"),
         Err(err) => err,
     };

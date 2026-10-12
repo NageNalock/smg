@@ -556,10 +556,13 @@ async fn engine_calls_carry_the_current_span_trace_context() {
             .expect("connect to the stub");
         let stream = client
             .as_tokenspeed()
-            .generate(ts::GenerateRequest {
-                request_id: "trace-context-1".to_string(),
-                ..Default::default()
-            })
+            .generate(
+                ts::GenerateRequest {
+                    request_id: "trace-context-1".to_string(),
+                    ..Default::default()
+                },
+                Duration::from_secs(60),
+            )
             .instrument(span)
             .await
             .expect("generate against the stub");

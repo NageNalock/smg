@@ -4,6 +4,7 @@
 //! deadline, the exit code is 0, and the log says what was drained.
 #![cfg(unix)]
 
+use std::time::Duration;
 use std::{
     io::Read,
     net::{SocketAddr, TcpListener, TcpStream},
@@ -24,6 +25,9 @@ use engine_zmq_client::{
 use futures::StreamExt;
 use serde_json::json;
 use smg_grpc_client::{tokenspeed_proto as ts, TokenSpeedSchedulerClient};
+
+/// The call deadline these tests give the client; none of them reaches it.
+const CALL_TIMEOUT: Duration = Duration::from_secs(600);
 
 mod common;
 
@@ -247,7 +251,7 @@ async fn sigterm_lets_the_streams_in_flight_finish_then_exits_zero() {
             .await
             .expect("connect to the gRPC worker");
     let mut grpc = client
-        .generate(generate_request("in-flight", 40))
+        .generate(generate_request("in-flight", 40), CALL_TIMEOUT)
         .await
         .expect("generate");
     let first = grpc.next().await.expect("a first frame").expect("ok");
@@ -340,7 +344,7 @@ async fn the_drain_deadline_bounds_the_exit() {
             .await
             .expect("connect to the gRPC worker");
     let mut grpc = client
-        .generate(generate_request("long", 400))
+        .generate(generate_request("long", 400), CALL_TIMEOUT)
         .await
         .expect("generate");
     grpc.next().await.expect("a first frame").expect("ok");
@@ -429,7 +433,7 @@ async fn a_second_signal_during_the_drain_exits_at_once() {
             .await
             .expect("connect to the gRPC worker");
     let mut grpc = client
-        .generate(generate_request("long", 400))
+        .generate(generate_request("long", 400), CALL_TIMEOUT)
         .await
         .expect("generate");
     grpc.next().await.expect("a first frame").expect("ok");

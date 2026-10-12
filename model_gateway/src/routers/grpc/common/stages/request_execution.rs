@@ -821,7 +821,7 @@ async fn execute_single(
     // large part of the dispatch, and inlined in the pipeline's future it
     // put that future over the size bound.
     let result = dispatch_single_booked(
-        Box::pin(client.generate(proto_request)),
+        Box::pin(client.generate(proto_request, ledger.request_timeout())),
         worker,
         prompt_tokens,
         streaming,
@@ -935,7 +935,7 @@ async fn execute_single_embed(
     if let Some(worker) = workers.single() {
         Metrics::record_worker_request(worker.url(), worker.model_id());
     }
-    let result = client.embed(proto_request).await;
+    let result = client.embed(proto_request, ledger.request_timeout()).await;
     if let Some(status) = result.breaker_status() {
         workers.record_outcome(ledger, status);
     }
@@ -1022,6 +1022,7 @@ async fn execute_parallel_pd(
     // its partner fails can be moved off the request path.
     let mut prefill_client = prefill_client.clone();
     let mut decode_client = decode_client.clone();
+    let timeout = ledger.request_timeout();
     for worker in [workers.prefill_worker(), workers.decode_worker()]
         .into_iter()
         .flatten()
@@ -1037,14 +1038,14 @@ async fn execute_parallel_pd(
         prefill_worker.and_then(|worker| PrefillTicket::book(worker, prompt_tokens));
     let prefill_dispatch: PdLegDispatch = Box::pin(dispatch_prefill_within(
         bound,
-        Box::pin(async move { prefill_client.generate(prefill_request).await }),
+        Box::pin(async move { prefill_client.generate(prefill_request, timeout).await }),
         prefill_worker.cloned(),
         prefill_label,
         request_id.clone(),
         prompt_tokens,
     ));
     let decode_dispatch: PdLegDispatch =
-        Box::pin(async move { decode_client.generate(decode_request).await });
+        Box::pin(async move { decode_client.generate(decode_request, timeout).await });
 
     match dispatch_pd_legs(prefill_dispatch, decode_dispatch).await {
         PdDispatchOutcome::Both(prefill_result, decode_result) => {
@@ -1842,6 +1843,7 @@ async fn execute_sequential_pd(
         Metrics::record_worker_request(prefill.url(), prefill.model_id());
     }
     let mut prefill_client = prefill_client.clone();
+    let timeout = ledger.request_timeout();
     // Booked before the call is polled, for the servicers that send their
     // headers with the first message (see `PrefillTicket::book`); the bound
     // above was read before the booking.
@@ -1849,7 +1851,7 @@ async fn execute_sequential_pd(
         prefill_worker.and_then(|worker| PrefillTicket::book(worker, prompt_tokens));
     let prefill_stream = dispatch_prefill_within(
         bound,
-        Box::pin(async move { prefill_client.generate(prefill_request).await }),
+        Box::pin(async move { prefill_client.generate(prefill_request, timeout).await }),
         prefill_worker.cloned(),
         prefill_label,
         request_id.clone(),
@@ -2039,19 +2041,26 @@ async fn execute_sequential_pd(
     // call so a worker that holds its response headers until the first token
     // still lands in the decode phase.
     let decode_sent = Instant::now();
-    let decode_stream = decode_client.generate(decode_request).await.map_err(|e| {
-        if let Some(status) = e.breaker_status() {
-            workers.record_outcome_decode(ledger, status);
-        }
-        UpstreamClass::account_dispatch_failure(metrics_labels::WORKER_DECODE, decode_label, &e);
-        account_pd_leg_failure(metrics_labels::WORKER_DECODE, &e);
-        start_failure_response(
-            &e,
-            "execute_sequential_pd",
-            PdLeg::Decode.error_message(),
-            PdLeg::Decode.error_code(),
-        )
-    })?;
+    let decode_stream = decode_client
+        .generate(decode_request, timeout)
+        .await
+        .map_err(|e| {
+            if let Some(status) = e.breaker_status() {
+                workers.record_outcome_decode(ledger, status);
+            }
+            UpstreamClass::account_dispatch_failure(
+                metrics_labels::WORKER_DECODE,
+                decode_label,
+                &e,
+            );
+            account_pd_leg_failure(metrics_labels::WORKER_DECODE, &e);
+            start_failure_response(
+                &e,
+                "execute_sequential_pd",
+                PdLeg::Decode.error_message(),
+                PdLeg::Decode.error_code(),
+            )
+        })?;
 
     workers.record_outcome_decode(ledger, 200);
     // Decode established: record the success-only PD metrics here.

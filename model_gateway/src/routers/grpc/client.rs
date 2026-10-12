@@ -1,6 +1,6 @@
 //! Unified gRPC client wrapper for SGLang, vLLM, and TensorRT-LLM backends
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
@@ -434,18 +434,20 @@ impl GrpcClient {
     ///
     /// Dispatches to the appropriate backend client and wraps the result in ProtoStream.
     /// Returns `tonic::Status` on error so callers can inspect the gRPC status code directly.
+    /// `timeout` is the call's deadline (see `smg_grpc_client::CallDeadline`).
     pub async fn generate(
         &mut self,
         req: ProtoGenerateRequest,
+        timeout: Duration,
     ) -> Result<ProtoStream, tonic::Status> {
         match (self, req) {
             (Self::Sglang(client), ProtoGenerateRequest::Sglang(boxed_req)) => {
-                let stream = client.generate(*boxed_req).await?;
+                let stream = client.generate(*boxed_req, timeout).await?;
                 Ok(ProtoStream::Sglang(stream))
             }
             (Self::Vllm(client), ProtoGenerateRequest::Vllm(boxed_req)) => {
                 let shm_handles = collect_vllm_generate_request_shm_handles(&boxed_req);
-                match client.generate(*boxed_req).await {
+                match client.generate(*boxed_req, timeout).await {
                     Ok(stream) => Ok(ProtoStream::Vllm(stream)),
                     Err(error) => {
                         cleanup_mm_shm_handles(&shm_handles);
@@ -454,16 +456,16 @@ impl GrpcClient {
                 }
             }
             (Self::Trtllm(client), ProtoGenerateRequest::Trtllm(boxed_req)) => {
-                let stream = client.generate(*boxed_req).await?;
+                let stream = client.generate(*boxed_req, timeout).await?;
                 Ok(ProtoStream::Trtllm(stream))
             }
             (Self::Mlx(client), ProtoGenerateRequest::Mlx(boxed_req)) => {
-                let stream = client.generate(*boxed_req).await?;
+                let stream = client.generate(*boxed_req, timeout).await?;
                 Ok(ProtoStream::Mlx(stream))
             }
             (Self::TokenSpeed(client), ProtoGenerateRequest::TokenSpeed(boxed_req)) => {
                 let shm_handles = collect_tokenspeed_generate_request_shm_handles(&boxed_req);
-                match client.generate(*boxed_req).await {
+                match client.generate(*boxed_req, timeout).await {
                     Ok(stream) => Ok(ProtoStream::TokenSpeed(stream)),
                     Err(error) => {
                         cleanup_mm_shm_handles(&shm_handles);
@@ -482,14 +484,15 @@ impl GrpcClient {
     pub async fn embed(
         &mut self,
         req: ProtoEmbedRequest,
+        timeout: Duration,
     ) -> Result<ProtoEmbedComplete, tonic::Status> {
         match (self, req) {
             (Self::Sglang(client), ProtoEmbedRequest::Sglang(boxed_req)) => {
-                let resp = client.embed(*boxed_req).await?;
+                let resp = client.embed(*boxed_req, timeout).await?;
                 Ok(ProtoEmbedComplete::Sglang(resp))
             }
             (Self::Vllm(client), ProtoEmbedRequest::Vllm(boxed_req)) => {
-                let resp = client.embed(*boxed_req).await?;
+                let resp = client.embed(*boxed_req, timeout).await?;
                 Ok(ProtoEmbedComplete::Vllm(resp))
             }
             (Self::TokenSpeed(_), _) => Err(tonic::Status::unimplemented(

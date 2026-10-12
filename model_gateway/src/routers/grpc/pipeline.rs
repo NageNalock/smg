@@ -1674,6 +1674,7 @@ mod alias_pipeline_tests {
             multimodal: None,
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
+            request_timeout: Duration::from_secs(60),
         });
         let request: GenerateRequest = serde_json::from_value(json!({
             "model": MODEL_ALIAS,
@@ -2194,6 +2195,7 @@ mod request_release_tests {
             multimodal,
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
+            request_timeout: Duration::from_secs(60),
         })
     }
 
@@ -3742,6 +3744,7 @@ mod request_release_tests {
             multimodal,
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
+            request_timeout: Duration::from_secs(60),
         })
     }
 
@@ -4317,6 +4320,7 @@ mod rate_limit_reserve_tests {
             multimodal: None,
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
+            request_timeout: Duration::from_secs(60),
         })
     }
 

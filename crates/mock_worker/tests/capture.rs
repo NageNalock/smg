@@ -20,6 +20,9 @@ use smg_grpc_client::{tokenspeed_proto as ts, TokenSpeedSchedulerClient};
 use tokio::net::TcpListener;
 use ts::generate_response::Response as GenResp;
 
+/// The call deadline these tests give the client; none of them reaches it.
+const CALL_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// A canned worker that captures to `capture` when it is set.
 fn config(capture: Option<PathBuf>) -> Config {
     Config {
@@ -77,7 +80,7 @@ async fn generate(
     client: &TokenSpeedSchedulerClient,
     req: ts::GenerateRequest,
 ) -> Vec<ts::GenerateResponse> {
-    let mut stream = client.generate(req).await.expect("generate");
+    let mut stream = client.generate(req, CALL_TIMEOUT).await.expect("generate");
     let mut frames = Vec::new();
     while let Some(frame) = stream.next().await {
         frames.push(frame.expect("a response frame"));
@@ -159,7 +162,7 @@ async fn line_is_on_disk_before_the_first_frame() {
     if let Some(sampling) = req.sampling_params.as_mut() {
         sampling.max_new_tokens = Some(1);
     }
-    let mut stream = client.generate(req).await.expect("generate");
+    let mut stream = client.generate(req, CALL_TIMEOUT).await.expect("generate");
 
     let lines = captured(&path);
     assert_eq!(lines.len(), 1, "the line is written before any frame");
