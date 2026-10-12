@@ -61,6 +61,10 @@
 //!   `<|call|>`): the stop decoder hides them, so the engine never reads one, and a constraint
 //!   derived from the table can end a region one of them closes with no text of its own, since
 //!   the model's stop ends the region there ([`Format::is_stop_token`]).
+//! - A table **thinks first** when its template writes the thought before every call and answer
+//!   it renders, which the template and its rendering tell, not the call syntax: the structural
+//!   tags then write the thought before the call or the answer when the prompt has not opened it.
+//!   A template whose thought the model may leave out (gpt-oss's analysis channel) does not.
 //!
 //! The first state in the table is where an output starts, unless the prompt moved the engine
 //! before the output began: the engine replays the prompt's terminals over the same table, from
@@ -215,6 +219,7 @@ pub struct Format {
     joiners: Vec<(usize, String)>,
     /// How a shaped call's values read.
     values: Values,
+    thinks_first: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -292,6 +297,7 @@ impl Format {
             trimmed: Vec::new(),
             joiners: Vec::new(),
             values: Values::inferred(),
+            thinks_first: false,
         }
     }
 
@@ -493,6 +499,22 @@ impl Format {
     /// The state the start row names, if the table has one.
     pub(crate) fn start(&self) -> Option<usize> {
         self.start
+    }
+
+    /// The template writes the thought before every call and answer it renders: a property of the
+    /// template and its rendering, not of the call syntax. The structural tags write the thought
+    /// first where the prompt has not opened it ([`Format::grammar`], [`Format::answer_grammar`]);
+    /// parsing does not change. The table must have a thought; the tags write it where it opens
+    /// from the turn's own state and closes back there, and give `None` otherwise.
+    #[must_use]
+    pub fn thinks_first(mut self) -> Self {
+        self.thinks_first = true;
+        self
+    }
+
+    /// Whether the template writes the thought before every call and answer.
+    pub(crate) fn writes_thought_first(&self) -> bool {
+        self.thinks_first
     }
 
     /// The turn opener, if the table names one.
@@ -778,10 +800,11 @@ impl Format {
     /// start row only where a turn's first byte is read from the first state and no opener replays
     /// it, a stop row only for an arguments state, a framing row only for a state of content or
     /// wrapping, a trim or join row only for a state of content or reasoning that is not framing,
-    /// and, for a shaped call, a shape a stream can run, opened only through its terminal (the
-    /// turn does not start in its state), no terminal the table ignores, and, when its header is
-    /// not empty, no row into its state from a state that holds a call. The builder keeps a row
-    /// from naming what the table lacks; this checks the rest.
+    /// a thought when the table thinks first, and, for a shaped call, a shape a stream can run,
+    /// opened only through its terminal (the turn does not start in its state), no terminal the
+    /// table ignores, and, when its header is not empty, no row into its state from a state that
+    /// holds a call. The builder keeps a row from naming what the table lacks; this checks the
+    /// rest.
     pub fn validate(&self) -> Result<(), String> {
         let Some(first) = self.states.first() else {
             return Err(format!("format {}: a table with no state", self.name));
@@ -878,6 +901,17 @@ impl Format {
                     self.name, state.name
                 ));
             }
+        }
+        if self.thinks_first
+            && !self
+                .states
+                .iter()
+                .any(|state| state.emits == Emits::Reasoning)
+        {
+            return Err(format!(
+                "format {}: a table that thinks first has no thought",
+                self.name
+            ));
         }
         if let Some(CallSyntax::Shaped(shape)) = self.calls {
             self.validate_shaped(shape)?;
@@ -980,6 +1014,14 @@ mod tests {
                 .validate(),
             Err("format opener: an empty turn opener".to_string())
         );
+        assert_eq!(
+            Format::new("first")
+                .state("c", Emits::Content)
+                .thinks_first()
+                .validate(),
+            Err("format first: a table that thinks first has no thought".to_string())
+        );
+        assert!(two_states().thinks_first().validate().is_ok());
         assert_eq!(
             Format::new("thought")
                 .state("r", Emits::Reasoning)

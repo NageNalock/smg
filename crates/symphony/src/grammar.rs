@@ -69,6 +69,12 @@
 //! written in, the schema, and the answer's close with the end of the turn. Where the output
 //! starts in content, as in ChatML's tables, it is the schema alone, after the prefix above when
 //! the prompt left the model inside its thought.
+//!
+//! Whether a thought comes before the call or the answer is the table's, not the syntax's: a
+//! table whose template writes the thought before every call and answer ([`Format::thinks_first`])
+//! gets it written first, its opener, its text and its close, where the prompt has not opened it;
+//! every other table leaves the thought to the model, as gpt-oss's template leaves its analysis
+//! channel.
 
 use std::collections::VecDeque;
 
@@ -467,48 +473,54 @@ impl Format {
         // The markers are the syntaxes' with a region of calls; xLAM's list has none.
         let markers = self.call_markers();
         let markers = markers.as_ref();
-        let calls = match self.call_syntax()? {
+        // Whether the tag takes the prefix when the prompt left the thought open: the syntaxes
+        // whose tag enters the calls from the thought on its own way in (Kimi K3's, MiniMax M3's,
+        // Inkling's) and xLAM's list, whose table has no thought, take none.
+        let (calls, prefixed) = match self.call_syntax()? {
             // The list stands alone in the turn, no marker before or after it, and its table has
             // no thought: the list is the same either way.
-            CallSyntax::JsonList => return Some(Self::json_list_calls(&named, count)),
-            CallSyntax::Json => Self::json_calls(markers?, &named, count),
+            CallSyntax::JsonList => (Self::json_list_calls(&named, count), false),
+            CallSyntax::Json => (Self::json_calls(markers?, &named, count), true),
             CallSyntax::Keyed(tags) if *tags == KeyedTags::PLAIN => {
-                Self::keyed_calls(markers?, &named, count)
+                (Self::keyed_calls(markers?, &named, count), true)
             }
-            CallSyntax::Dsml => Self::dsml_calls(markers?, &named, count)?,
-            CallSyntax::Attributed(tags) => attributed::calls(markers?, tags, &named, count),
+            CallSyntax::Dsml => (Self::dsml_calls(markers?, &named, count)?, true),
+            CallSyntax::Attributed(tags) => {
+                (attributed::calls(markers?, tags, &named, count), true)
+            }
             CallSyntax::Keyed(tags) => {
                 let markers = markers?;
                 let ways_in = self.ways_into_block(markers);
-                keyed::calls(markers, &ways_in, tags, &named, count)
+                (keyed::calls(markers, &ways_in, tags, &named, count), true)
             }
             CallSyntax::Xtml => {
                 let markers = markers?;
                 let ways_in = self.ways_into(markers.block.as_ref()?.state);
-                return xtml::calls(markers, &ways_in, &named, count);
+                (xtml::calls(markers, &ways_in, &named, count)?, false)
             }
             CallSyntax::Tagged(spelling, _) => {
                 let markers = markers?;
                 let ways_in = self.ways_into_block(markers);
-                tagged::calls(markers, &ways_in, *spelling, &named, count)
+                (
+                    tagged::calls(markers, &ways_in, *spelling, &named, count),
+                    true,
+                )
             }
-            CallSyntax::Pythonic(dialect) => pythonic::calls(markers?, *dialect, &named, count),
-            CallSyntax::Xml => {
-                return xml::calls(markers?, self.separator(), &named, count);
+            CallSyntax::Pythonic(dialect) => {
+                (pythonic::calls(markers?, *dialect, &named, count), true)
             }
-            CallSyntax::Gemma => gemma::calls(markers?, &named, count),
-            CallSyntax::NamedJson(marker) => {
-                return self.named_json_calls(marker, &named, count);
-            }
+            CallSyntax::Xml => (
+                xml::calls(markers?, self.separator(), &named, count)?,
+                false,
+            ),
+            CallSyntax::Gemma => (gemma::calls(markers?, &named, count), true),
+            CallSyntax::NamedJson(marker) => (self.named_json_calls(marker, &named, count)?, false),
             // A template's patterns do not say which text a run of whitespace or a skipped
             // attribute stands for, and a tag must write only what the template renders: a shaped
             // call's tag waits for the layout its chat template renders, so none is derived yet.
             CallSyntax::Shaped(_) => return None,
         };
-        if !options.reasoning_open {
-            return Some(calls);
-        }
-        self.after_the_thought(calls)
+        self.led(calls, options.reasoning_open, prefixed)
     }
 
     /// The structural tag for an answer that is JSON `schema` accepts (`response_format`
@@ -535,11 +547,10 @@ impl Format {
                 "" => answer,
                 end => Grammar::Sequence(vec![answer, Grammar::ConstString(end.to_string())]),
             };
-            if !reasoning_open {
-                return Some(answer);
-            }
-            return self.after_the_thought(answer);
+            return self.led(answer, reasoning_open, true);
         }
+        // The model starts in its thought when the prompt opened it, and otherwise in the turn's
+        // own state, which a thought written first also closes back to.
         let start = match self.state_emitting(Emits::Reasoning) {
             Some(reasoning) if reasoning_open => reasoning,
             _ => 0,
@@ -549,7 +560,44 @@ impl Format {
             .close_of(content)
             .map_or_else(String::new, |(close, _)| close.to_string());
         end.push_str(self.turn_end());
-        Some(Grammar::Tag(Tag::new(way.begin(), answer, end)))
+        self.led(
+            Grammar::Tag(Tag::new(way.begin(), answer, end)),
+            reasoning_open,
+            false,
+        )
+    }
+
+    /// `body` after what the model writes before it. With the prompt's thought open, the prefix
+    /// for a tag that takes one (`prefixed`, [`Self::after_the_thought`]), and nothing for a tag
+    /// whose ways in close the thought themselves. With the thought not open, the thought itself
+    /// where the table writes one before every call and answer ([`Format::thinks_first`]): the
+    /// thought's opener, its text, which writes none of the table's terminals nor the call
+    /// syntax's inner tags, and its close; `None` when the thought does not open from the turn's
+    /// own state, where the output starts, and close back there. A table that does not write its
+    /// thought first has nothing before `body`.
+    fn led(&self, body: Grammar, reasoning_open: bool, prefixed: bool) -> Option<Grammar> {
+        if reasoning_open {
+            return if prefixed {
+                self.after_the_thought(body)
+            } else {
+                Some(body)
+            };
+        }
+        if !self.writes_thought_first() {
+            return Some(body);
+        }
+        let reasoning = self.state_emitting(Emits::Reasoning)?;
+        let thought = self.region(reasoning, |state| self.is_call_state(state))?;
+        if thought.home != 0 {
+            return None;
+        }
+        let text = Grammar::AnyText {
+            excludes: self.excluded_but(&[]),
+        };
+        Some(Grammar::Sequence(vec![
+            Grammar::Tag(Tag::new(thought.open, text, thought.close)),
+            body,
+        ]))
     }
 
     /// `body` after the prefix a prompt's open thought takes: free text that can write none of the
@@ -564,9 +612,16 @@ impl Format {
         // prefix where the engine applies the grammar from the first token, and an engine that
         // runs a reasoning parser has consumed them before the grammar starts.
         let thought = self.region(reasoning, |state| self.is_call_state(state))?;
+        let excludes = self.excluded_but(&[thought.open, thought.close]);
+        Some(Grammar::Sequence(vec![Grammar::AnyText { excludes }, body]))
+    }
+
+    /// What free text before a tag may not write: the table's terminals, but `kept`, and the call
+    /// syntax's inner tags.
+    fn excluded_but(&self, kept: &[&str]) -> Vec<String> {
         let mut excludes: Vec<String> = self
             .terminal_texts()
-            .filter(|text| *text != thought.open && *text != thought.close)
+            .filter(|text| !kept.contains(text))
             .map(str::to_string)
             .collect();
         let inner: &[&str] = match self.call_syntax() {
@@ -583,7 +638,7 @@ impl Format {
             _ => &[],
         };
         excludes.extend(inner.iter().map(|tag| tag.to_string()));
-        Some(Grammar::Sequence(vec![Grammar::AnyText { excludes }, body]))
+        excludes
     }
 
     /// The JSON family: each call is the call markers around one JSON object whose `name` is the
@@ -2380,6 +2435,193 @@ mod tests {
                 format.name()
             );
         }
+    }
+
+    /// A table whose template writes a thought before every call and answer: `<think>` blocks
+    /// and `<tool_call>` blocks of JSON calls, everything else content, the turn's thought first.
+    fn thinking_first() -> Format {
+        Format::new("thinking_first")
+            .terminal("think_open", "<think>")
+            .terminal("think_close", "</think>")
+            .terminal("call_open", "<tool_call>")
+            .terminal("call_close", "</tool_call>")
+            .state("content", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("call", Emits::Arguments)
+            .transition("content", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "content")
+            .transition("content", "call_open", "call")
+            .transition("call", "call_close", "content")
+            .calls(CallSyntax::Json)
+            .thinks_first()
+    }
+
+    /// The thought a table that thinks first writes before a tag, as a payload node.
+    fn thought_node(excludes: Value) -> Value {
+        value!({
+            "type": "tag",
+            "begin": "<think>",
+            "content": {"type": "any_text", "excludes": excludes},
+            "end": "</think>",
+        })
+    }
+
+    #[test]
+    fn a_table_that_thinks_first_writes_the_thought_before_the_call() {
+        // The template writes a thought before every call, so the forced call's tag does too
+        // when the prompt has not opened it: the thought's opener, text that writes no marker, its
+        // close, then the call the table's syntax writes. With the thought open, the prefix as for
+        // any table; nothing is owed there, as an engine that runs a reasoning parser has read the
+        // thought's close before the grammar starts.
+        let tools = weather_tools();
+        let format = thinking_first();
+        let excludes = value!(["<think>", "</think>", "<tool_call>", "</tool_call>"]);
+        let plain = formats::qwen3(CallSyntax::Json);
+        for one_call in [false, true] {
+            let options = Options {
+                at_least_one: true,
+                reasoning_open: false,
+                one_call,
+            };
+            let calls = plain
+                .grammar_for(&tools, options)
+                .expect("a grammar")
+                .to_json();
+            assert_eq!(
+                format
+                    .grammar_for(&tools, options)
+                    .expect("a grammar")
+                    .payload(),
+                value!({"format": {"type": "sequence", "elements": [
+                    thought_node(excludes.clone()),
+                    calls,
+                ]}})
+            );
+        }
+        assert_eq!(
+            format.grammar(&tools, true, true),
+            plain.grammar(&tools, true, true)
+        );
+        // The same rows without the property, Qwen3's, give the tag alone.
+        assert_eq!(
+            plain
+                .grammar(&tools, true, false)
+                .expect("a grammar")
+                .payload()["format"]["type"],
+            "triggered_tags"
+        );
+    }
+
+    #[test]
+    fn a_table_that_thinks_first_writes_the_thought_before_the_answer() {
+        // The answer where the output starts in content: the thought, then the schema. With the
+        // thought open, the prefix and the schema, as for any table.
+        let format = thinking_first();
+        let schema = value!({"type": "json_schema", "json_schema": answer_schema()});
+        assert_eq!(
+            answer(&format, false),
+            Some(value!({"format": {"type": "sequence", "elements": [
+                thought_node(value!(["<think>", "</think>", "<tool_call>", "</tool_call>"])),
+                schema,
+            ]}}))
+        );
+        assert_eq!(
+            answer(&format, true),
+            answer(&formats::qwen3(CallSyntax::Json), true)
+        );
+    }
+
+    #[test]
+    fn a_turn_of_regions_that_thinks_first_closes_the_thought_then_goes_in() {
+        // Kimi K3's regions, thinking first: the thought is written whole, and the block of
+        // calls and the answer are entered from where its close leaves the engine, the turn's
+        // own state, as Kimi K3's prompt does not open the thought here.
+        let tools = weather_tools();
+        let format = formats::kimi_k3().thinks_first();
+        let calls = format
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
+        assert_eq!(calls["format"]["type"], "sequence");
+        assert_eq!(
+            calls["format"]["elements"][0]["begin"],
+            "<|open|>think<|sep|>"
+        );
+        assert_eq!(
+            calls["format"]["elements"][0]["end"],
+            "<|close|>think<|sep|>"
+        );
+        assert_eq!(
+            calls["format"]["elements"][1],
+            formats::kimi_k3()
+                .grammar(&tools, true, false)
+                .expect("a grammar")
+                .to_json()
+        );
+        let answer = answer(&format, false).expect("an answer");
+        assert_eq!(
+            answer["format"]["elements"][1]["begin"],
+            "<|open|>response<|sep|>"
+        );
+        // With the prompt's thought open, Kimi K3's tags as they are.
+        assert_eq!(
+            format.grammar(&tools, true, true),
+            formats::kimi_k3().grammar(&tools, true, true)
+        );
+    }
+
+    #[test]
+    fn a_thought_written_first_opens_where_the_output_starts() {
+        // The thought opens from a message's header, not from the turn's own state where the
+        // output starts: no lead the table has writes it first there, so the tags give `None`
+        // rather than a thought the model could not open.
+        let tools = weather_tools();
+        let headed = Format::new("headed")
+            .terminal("start", "<|start|>")
+            .terminal("think", "<|think|>")
+            .terminal("end", "<|end|>")
+            .terminal("calls_open", "<|calls|>")
+            .terminal("calls_close", "<|/calls|>")
+            .terminal("call_open", "<|call|>")
+            .terminal("call_close", "<|/call|>")
+            .state("between", Emits::Wrapper)
+            .state("header", Emits::Wrapper)
+            .state("reasoning", Emits::Reasoning)
+            .state("calls", Emits::Wrapper)
+            .state("call", Emits::Arguments)
+            .transition("between", "start", "header")
+            .transition("header", "think", "reasoning")
+            .transition("reasoning", "end", "header")
+            .transition("header", "calls_open", "calls")
+            .transition("calls", "call_open", "call")
+            .transition("call", "call_close", "calls")
+            .transition("calls", "calls_close", "header")
+            .calls(CallSyntax::Xtml);
+        assert!(headed.grammar(&tools, true, false).is_some());
+        assert!(headed
+            .clone()
+            .thinks_first()
+            .grammar(&tools, true, false)
+            .is_none());
+        assert_eq!(
+            headed.clone().thinks_first().grammar(&tools, true, true),
+            headed.grammar(&tools, true, true)
+        );
+    }
+
+    #[test]
+    fn a_thought_first_samples_read_back_as_the_thought_and_the_call() {
+        let tools = weather_tools();
+        let sample = "<think>Paris it is.</think><tool_call>\n{\"name\": \"get_weather\", \
+                      \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>";
+        assert_eq!(
+            read(&thinking_first(), &tools, "", sample),
+            value!({
+                "content": null,
+                "reasoning": "Paris it is.",
+                "calls": [{"name": "get_weather", "arguments": {"city": "Paris"}}],
+            })
+        );
     }
 
     #[test]
