@@ -29,6 +29,12 @@
 //!   comes before a complete call gives what is left as `Malformed` with a reason that says so,
 //!   since `UnterminatedRegion` means the stream ended inside the region; with the tagged syntax
 //!   the call is closed for the client first, as [`tagged::Assembler::close`] says.
+//! - A table can say that the stream's stop closes the call in a state
+//!   ([`Format::closes_at_stop`]), for a family whose last call ends with a stop token the stop
+//!   decoder hides: a stream that stops there ends the call as its closing terminal would, with
+//!   no bytes. One cut for length, aborted, or ended with any finish but `Stop` is cut as before;
+//!   a driver hands a stop sequence of the request's that matched inside the call over as such a
+//!   finish, so that it never completes the call (the stop row in [`crate::format`]).
 //! - With the tagged syntax, a value's type comes from the request's tools ([`Declared`]): a
 //!   declared string streams, every other value is written at its close. A call to a function the
 //!   request did not declare has every value inferred.
@@ -76,7 +82,7 @@ pub(crate) const TEXT_AFTER_THE_OBJECT: &str =
 const TEXT_BETWEEN_CALLS: &str = "text between a block's calls";
 
 /// Why a call region closed: its closing terminal (or the next opener) arrived, or the stream
-/// ended.
+/// stopped where the table says a stop closes it; or the stream ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Closed {
     ByMarker,
@@ -530,7 +536,15 @@ impl Engine {
         match self.emits() {
             Emits::Reasoning => out.push(Event::ReasoningEnd),
             Emits::Arguments => {
-                self.close_call(Closed::ByEnd, "", out);
+                // The stop token that closes the call is hidden, so the call's end has no bytes.
+                let closed = if matches!(finish, EngineFinish::Stop)
+                    && self.format.stop_closes(self.state)
+                {
+                    Closed::ByMarker
+                } else {
+                    Closed::ByEnd
+                };
+                self.close_call(closed, "", out);
             }
             Emits::Content | Emits::Wrapper => {}
         }
@@ -587,5 +601,223 @@ impl Parser for Engine {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use openai_protocol::common::{Function, Tool};
+    use serde_json::json as value;
+
+    use super::*;
+    use crate::{
+        formats::{glm, qwen3},
+        tagged::{Placement, Spelling},
+    };
+
+    fn declared() -> Declared {
+        Declared::of(&[Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "get_weather".to_string(),
+                description: None,
+                parameters: value!({"type": "object", "properties": {
+                    "city": {"type": "string"},
+                    "days": {"type": "integer"},
+                }}),
+                strict: None,
+                extra: Default::default(),
+            },
+        }])
+    }
+
+    /// GLM's last call, its closing marker not written: the stop token that would end it is
+    /// hidden by the stop decoder.
+    const LAST_CALL: &str = concat!(
+        "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>",
+        "<arg_key>days</arg_key><arg_value>3</arg_value>"
+    );
+
+    fn run(format: Format, output: &str, finish: EngineFinish) -> Vec<Event> {
+        let mut engine = Engine::new(format, declared());
+        let mut out = Events::new();
+        for input in [
+            Input::Delta {
+                token_ids: &[],
+                text: output,
+                spans: &[],
+            },
+            Input::End { finish },
+        ] {
+            engine.feed(input, &mut out).expect("in order");
+        }
+        out.drain()
+    }
+
+    /// Each call's arguments as the client joins them, and the bytes of each call's end.
+    fn calls(events: &[Event]) -> Vec<(String, Option<String>)> {
+        let mut calls: Vec<(String, Option<String>)> = Vec::new();
+        for event in events {
+            match event {
+                Event::ToolCallStart { .. } => calls.push((String::new(), None)),
+                Event::ToolCallArguments { json, .. } => {
+                    if let Some((arguments, _)) = calls.last_mut() {
+                        arguments.push_str(json);
+                    }
+                }
+                Event::ToolCallEnd { source, .. } => {
+                    if let Some((_, end)) = calls.last_mut() {
+                        *end = Some(source.text.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        calls
+    }
+
+    fn bytes(events: &[Event]) -> String {
+        let mut list = Events::new();
+        for event in events {
+            list.push(event.clone());
+        }
+        list.text()
+    }
+
+    #[test]
+    fn a_stop_closes_the_call_where_the_table_says_and_a_cut_stays_cut() {
+        let closed = calls(&run(
+            glm().closes_at_stop("call"),
+            LAST_CALL,
+            EngineFinish::Stop,
+        ));
+        assert_eq!(
+            closed,
+            [(
+                r#"{"city": "Paris", "days": 3}"#.to_string(),
+                Some(String::new())
+            )]
+        );
+        for finish in [EngineFinish::Length, EngineFinish::Abort] {
+            let events = run(glm().closes_at_stop("call"), LAST_CALL, finish);
+            assert_eq!(
+                calls(&events),
+                [(
+                    r#"{"city": "Paris", "days": 3"#.to_string(),
+                    Some(String::new())
+                )]
+            );
+            assert_eq!(bytes(&events), LAST_CALL);
+        }
+    }
+
+    #[test]
+    fn without_the_row_a_stop_leaves_the_call_cut() {
+        let events = run(glm(), LAST_CALL, EngineFinish::Stop);
+        assert_eq!(
+            calls(&events),
+            [(
+                r#"{"city": "Paris", "days": 3"#.to_string(),
+                Some(String::new())
+            )]
+        );
+    }
+
+    #[test]
+    fn a_closing_marker_the_model_wrote_ends_the_call_with_or_without_the_row() {
+        let output = format!("{LAST_CALL}</tool_call><tool_call>get_weather</tool_call>");
+        let with_row = run(glm().closes_at_stop("call"), &output, EngineFinish::Stop);
+        assert_eq!(with_row, run(glm(), &output, EngineFinish::Stop));
+        assert_eq!(
+            calls(&with_row),
+            [
+                (
+                    r#"{"city": "Paris", "days": 3}"#.to_string(),
+                    Some("</tool_call>".to_string())
+                ),
+                ("{}".to_string(), Some("</tool_call>".to_string())),
+            ]
+        );
+        assert_eq!(bytes(&with_row), output);
+    }
+
+    #[test]
+    fn a_stop_closes_the_call_as_its_closing_marker_would_wherever_it_stands() {
+        // Inside a string, inside an integer, between two parameters and inside a key: the call
+        // ends as `</tool_call>` there would end it, with no bytes for the end.
+        for output in [
+            "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Par",
+            "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>\
+             <arg_key>days</arg_key><arg_value>2",
+            "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>",
+            "<tool_call>get_weather<arg_key>ci",
+        ] {
+            let stopped = run(glm().closes_at_stop("call"), output, EngineFinish::Stop);
+            let marked = run(glm(), &format!("{output}</tool_call>"), EngineFinish::Stop);
+            let without_end_bytes = |events: &[Event]| -> Vec<Event> {
+                events
+                    .iter()
+                    .filter(|event| !matches!(event, Event::Dropped { .. }))
+                    .map(|event| match event {
+                        Event::ToolCallEnd { index, .. } => Event::ToolCallEnd {
+                            index: *index,
+                            source: Text::uncounted(""),
+                        },
+                        event => event.clone(),
+                    })
+                    .collect()
+            };
+            assert_eq!(
+                without_end_bytes(&stopped),
+                without_end_bytes(&marked),
+                "{output:?}"
+            );
+            assert_eq!(bytes(&stopped), output);
+        }
+        assert_eq!(
+            calls(&run(
+                glm().closes_at_stop("call"),
+                "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Par",
+                EngineFinish::Stop,
+            )),
+            [(r#"{"city": "Par"}"#.to_string(), Some(String::new()))]
+        );
+    }
+
+    #[test]
+    fn under_the_row_any_finish_but_stop_leaves_the_call_cut() {
+        // A driver hands a stop sequence that matched inside the call over as `Other`: the row
+        // does not take it for the stop token, and the call keeps what arrived, open.
+        for finish in [
+            EngineFinish::Other("stop".to_string()),
+            EngineFinish::Length,
+            EngineFinish::Abort,
+        ] {
+            let events = run(glm().closes_at_stop("call"), LAST_CALL, finish);
+            assert_eq!(
+                calls(&events),
+                [(
+                    r#"{"city": "Paris", "days": 3"#.to_string(),
+                    Some(String::new())
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn the_row_closes_a_call_of_another_syntax_the_same_way() {
+        let tagged = || qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine));
+        let output = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n";
+        let closed = run(tagged().closes_at_stop("calls"), output, EngineFinish::Stop);
+        assert_eq!(
+            calls(&closed),
+            [(r#"{"city": "Paris"}"#.to_string(), Some(String::new()))]
+        );
+        assert_eq!(bytes(&closed), output);
+        let cut = run(tagged(), output, EngineFinish::Stop);
+        assert_eq!(
+            calls(&cut),
+            [(r#"{"city": "Paris""#.to_string(), Some(String::new()))]
+        );
     }
 }

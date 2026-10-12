@@ -128,6 +128,15 @@ fn glm() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::glm(), keyed_tools()))
 }
 
+/// The GLM table where the stream's stop closes the last call, as when a family's last call ends
+/// with a stop token the stop decoder hides.
+fn glm_closed_at_stop() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        formats::glm().closes_at_stop("call"),
+        keyed_tools(),
+    ))
+}
+
 fn iquest() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::iquest(), keyed_tools()))
 }
@@ -213,6 +222,11 @@ const FORMATS: &[Subject] = &[
         name: "glm",
         new: glm,
         outputs: GLM_OUTPUTS,
+    },
+    Subject {
+        name: "glm, closed at stop",
+        new: glm_closed_at_stop,
+        outputs: GLM_STOPPED_OUTPUTS,
     },
     Subject {
         name: "iquest",
@@ -482,6 +496,21 @@ const GLM_OUTPUTS: &[&str] = &[
     "<think></think>Hello!",
     "The syntax is:\n\n```\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris\
      </arg_value></tool_call>\n```\n\nThat is all.",
+    "",
+];
+
+/// GLM's outputs, and last calls whose closing marker a stop token would be: in a string, in an
+/// integer, between two parameters and inside a key.
+const GLM_STOPPED_OUTPUTS: &[&str] = &[
+    "<think>plan</think>Sure.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris\
+     </arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call><tool_call>get_weather\
+     </tool_call>",
+    "<think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Par",
+    "<think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>\
+     <arg_key>days</arg_key><arg_value>3",
+    "<think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>",
+    "<think></think><tool_call>get_weather<arg_key>ci",
+    "<think></think>Hello!",
     "",
 ];
 
