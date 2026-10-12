@@ -67,6 +67,10 @@ enum Script {
     SilentAfter(usize),
     /// Never returns from the call that opens the stream.
     NeverOpens,
+    /// Opens the stream this long after the call, then never writes to it.
+    OpensAfter(Duration),
+    /// Refuses the call that opens the stream (`unavailable`).
+    Refuses,
     /// Answers this many tokens and a completion at once.
     Answers(usize),
 }
@@ -178,6 +182,13 @@ impl TokenSpeedScheduler for ScriptedWorker {
             Script::SilentBeforeFirstToken => Box::pin(stream::pending()),
             Script::SilentAfter(n) => Box::pin(stream::iter(tokens(n)).chain(stream::pending())),
             Script::NeverOpens => std::future::pending().await,
+            Script::OpensAfter(after) => {
+                tokio::time::sleep(after).await;
+                Box::pin(stream::pending())
+            }
+            Script::Refuses => {
+                return Err(Status::unavailable("the scripted worker refuses the call"));
+            }
             Script::Answers(n) => {
                 let mut items = tokens(n);
                 let produced: Vec<u32> = TOKENS.iter().copied().cycle().take(n).collect();
@@ -326,6 +337,33 @@ fn regular_mode() -> RoutingMode {
     RoutingMode::Regular {
         worker_urls: vec![],
     }
+}
+
+fn pd_mode() -> RoutingMode {
+    RoutingMode::PrefillDecode {
+        prefill_urls: vec![],
+        decode_urls: vec![],
+        prefill_policy: None,
+        decode_policy: None,
+    }
+}
+
+/// A gRPC router over one prefill and one decode worker following their
+/// scripts, with the scripted workers to watch.
+async fn pd_bed(
+    prefill: Script,
+    decode: Script,
+) -> (
+    Arc<ScriptedWorker>,
+    Arc<ScriptedWorker>,
+    Box<dyn RouterTrait>,
+) {
+    let prefill = ScriptedWorker::new(prefill);
+    let decode = ScriptedWorker::new(decode);
+    let prefill_handle = worker_handle(prefill.serve().await, WorkerType::Prefill);
+    let decode_handle = worker_handle(decode.serve().await, WorkerType::Decode);
+    let router = router_over(&[prefill_handle, decode_handle], pd_mode()).await;
+    (prefill, decode, router)
 }
 
 fn tenant() -> TenantRequestMeta {
@@ -687,20 +725,8 @@ async fn a_worker_that_answers_in_time_is_untouched() {
 #[test]
 fn a_silent_decode_leg_is_timed_out_on_the_disaggregated_path() {
     let (outcome, rendered) = with_metrics(|| async {
-        let prefill = ScriptedWorker::new(Script::Answers(1));
-        let decode = ScriptedWorker::new(Script::SilentBeforeFirstToken);
-        let prefill_handle = worker_handle(prefill.serve().await, WorkerType::Prefill);
-        let decode_handle = worker_handle(decode.serve().await, WorkerType::Decode);
-        let router = router_over(
-            &[prefill_handle, decode_handle],
-            RoutingMode::PrefillDecode {
-                prefill_urls: vec![],
-                decode_urls: vec![],
-                prefill_policy: None,
-                decode_policy: None,
-            },
-        )
-        .await;
+        let (_prefill, _decode, router) =
+            pd_bed(Script::Answers(1), Script::SilentBeforeFirstToken).await;
         call(router.as_ref(), Api::Chat, true).await
     });
     assert_timeout_event(&outcome, Api::Chat);
@@ -730,5 +756,55 @@ fn a_silent_decode_leg_is_timed_out_on_the_disaggregated_path() {
         )
         .is_some_and(|line| line.ends_with(" 1")),
         "the request's outcome is one timeout:\n{rendered}"
+    );
+}
+
+/// A decode partner the request gives up on because its prefill failed to
+/// start is aborted at once: no KV handoff is coming, so there is nothing to
+/// defer the abort for, and the decode room is released with the failure.
+#[tokio::test]
+async fn the_decode_partner_of_a_prefill_that_failed_to_start_is_aborted_at_once() {
+    let (prefill, decode, router) = pd_bed(Script::Refuses, Script::SilentBeforeFirstToken).await;
+    let outcome = call(router.as_ref(), Api::Chat, true).await;
+    assert_ne!(
+        outcome.status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "the request fails with the prefill's refusal, not at the deadline: {}",
+        outcome.body
+    );
+    assert!(
+        decode.aborted_within(SLACK).await,
+        "the decode room is released with the prefill's failure, not after the deferred-abort wait"
+    );
+    assert_eq!(
+        prefill.aborts.load(Ordering::SeqCst),
+        0,
+        "nothing opened on the prefill, nothing to abort"
+    );
+}
+
+/// A decode leg whose call lands after the request's deadline, within the
+/// grace the retirement allows, is dropped with its abort deferred to its
+/// first item (its engine may be taking the prefill's KV handoff); the same
+/// late call on a regular worker is aborted as it lands.
+#[tokio::test]
+async fn a_decode_leg_that_lands_late_is_dropped_with_its_abort_deferred() {
+    let late = Script::OpensAfter(TIMEOUT + Duration::from_millis(400));
+    let (_prefill, decode, router) = pd_bed(Script::Answers(1), late).await;
+    let outcome = call(router.as_ref(), Api::Chat, true).await;
+    // No stream had opened at the deadline: the request is answered 504, not
+    // a stream that ends with the timeout event.
+    assert_timeout_response(&outcome);
+    assert!(
+        !decode.aborted_within(SLACK).await,
+        "the late decode stream keeps its room until its first item or the deferred-abort wait"
+    );
+
+    let (worker, _handle, router) = bed(late).await;
+    let outcome = call(router.as_ref(), Api::Chat, true).await;
+    assert_timeout_response(&outcome);
+    assert!(
+        worker.aborted_within(SLACK).await,
+        "a regular worker's late stream is aborted as it lands"
     );
 }
