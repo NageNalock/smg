@@ -347,7 +347,9 @@ impl Engine {
     /// # Panics
     ///
     /// A table [`Format::validate`] refuses: no state, a first state that emits reasoning, an
-    /// arguments state with no call syntax, a terminal with no text, an empty turn opener.
+    /// arguments state with no call syntax, a terminal with no text, an empty turn opener or
+    /// anchor, an opener beside anchors, a start row where the first state holds a call or an
+    /// opener replays the turn, or a stop, framing, trim or join row on a state it does not fit.
     /// Definitions are written in the crate, so that is a programming error.
     #[expect(
         clippy::panic,

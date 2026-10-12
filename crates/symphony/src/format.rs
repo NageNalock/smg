@@ -615,14 +615,14 @@ impl Format {
     }
 
     /// What every table must hold before an engine runs it: a state to start in, which does not
-    /// emit reasoning (a thought the output starts inside is entered by the prompt's replay, which
-    /// pushes `ReasoningStart`; an arguments state at the start has its call opened by the
-    /// engine), a call syntax when a state emits arguments, a text for every terminal, a turn
-    /// opener and turn anchors that are not empty and not both named, a start row only where a
-    /// turn's first byte is read from the first state and no opener replays it, a stop row only
-    /// for an arguments state, a framing row only for a state of content or wrapping, and a trim
-    /// or join row only for a state of content or reasoning that is not framing. The builder
-    /// keeps a row from naming what the table lacks; this checks the rest.
+    /// emit reasoning (a thought the output starts inside is entered by the prompt's replay or by
+    /// the start row, either of which pushes `ReasoningStart`; an arguments state at the start has
+    /// its call opened by the engine), a call syntax when a state emits arguments, a text for
+    /// every terminal, a turn opener and turn anchors that are not empty and not both named, a
+    /// start row only where a turn's first byte is read from the first state and no opener replays
+    /// it, a stop row only for an arguments state, a framing row only for a state of content or
+    /// wrapping, and a trim or join row only for a state of content or reasoning that is not
+    /// framing. The builder keeps a row from naming what the table lacks; this checks the rest.
     pub fn validate(&self) -> Result<(), String> {
         let Some(first) = self.states.first() else {
             return Err(format!("format {}: a table with no state", self.name));
