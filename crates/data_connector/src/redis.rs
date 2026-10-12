@@ -1343,15 +1343,11 @@ impl ResponseStorage for RedisResponseStorage {
             return Ok(Vec::new());
         }
 
-        // Three fields per member, not the whole hash (whose input can be
-        // large): the object, when it was created, and the input the record
-        // builder parses; the reaper re-reads the whole record of the few it
-        // closes.
-        let fields = [
-            sr.col("raw_response"),
-            sr.col("created_at"),
-            sr.col("input"),
-        ];
+        // Two fields per member, not the whole hash (whose input can run to
+        // megabytes): the object and when it was created; the record builder
+        // reads a missing input as empty, and the reaper re-reads the whole
+        // record of the few it closes.
+        let fields = [sr.col("raw_response"), sr.col("created_at")];
         let mut pipe = redis::pipe();
         for id in &ids {
             pipe.cmd("HMGET")

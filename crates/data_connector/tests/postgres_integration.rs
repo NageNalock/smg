@@ -1694,13 +1694,25 @@ async fn open_background_responses_are_listed_until_they_close() {
         reason = "the test drives its own connection for the one query it makes"
     )]
     let driver = tokio::spawn(connection);
-    let indexes = client
-        .query(
-            "SELECT indexdef FROM pg_indexes WHERE indexname = 'responses_open_background_idx'",
-            &[],
-        )
-        .await
-        .expect("pg_indexes");
+    // The index is built off the start-up path: waited for.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let indexes = loop {
+        let indexes = client
+            .query(
+                "SELECT indexdef FROM pg_indexes WHERE indexname = 'responses_open_background_idx'",
+                &[],
+            )
+            .await
+            .expect("pg_indexes");
+        if !indexes.is_empty() {
+            break indexes;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the open-background index is built within its time"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
     assert_eq!(indexes.len(), 1, "the open-background index exists");
     let indexdef: String = indexes[0].get(0);
     assert!(
@@ -1804,7 +1816,8 @@ async fn a_stored_object_with_a_nul_escape_is_stored_listed_and_moved_under_the_
         .all(|r| r.id != nul.id));
 
     // The listing is served by the partial index: with sequential scans off
-    // the planner must still find a plan, through the index.
+    // the planner must still find a plan, through the index. The index is
+    // built off the start-up path, so it is waited for.
     let (client, connection) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
         .await
         .expect("connect");
@@ -1813,23 +1826,71 @@ async fn a_stored_object_with_a_nul_escape_is_stored_listed_and_moved_under_the_
         reason = "the test drives its own connection for the queries it makes"
     )]
     let driver = tokio::spawn(connection);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let valid = client
+            .query(
+                "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+                 WHERE c.relname = 'responses_open_background_idx'",
+                &[],
+            )
+            .await
+            .expect("pg_index");
+        if valid.iter().any(|row| row.get::<_, bool>(0)) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the open-background index is built within its time"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     client
         .batch_execute("SET enable_seqscan = off")
         .await
         .expect("set");
-    let plan = client
-        .query(
-            "EXPLAIN SELECT id FROM responses WHERE \
-             replace(raw_response::text, '\\u0000', '\\u0020')::json->>'status' \
-             IN ('queued', 'in_progress') AND \
-             replace(raw_response::text, '\\u0000', '\\u0020')::json->>'background' = 'true' AND \
-             replace(raw_response::text, '\\u0000', '\\u0020')::json->>'_lease' IS NOT NULL \
-             ORDER BY created_at ASC LIMIT 1024",
-            &[],
-        )
-        .await
-        .expect("explain");
-    let plan: Vec<String> = plan.iter().map(|row| row.get::<_, String>(0)).collect();
+    // The plan is read until it uses the index: a build another test's
+    // start left running (its task is gone with that test's runtime, the
+    // server finishes or drops the index on its own) can be replacing it
+    // while this test runs.
+    let plan = loop {
+        let plan = client
+            .query(
+                "EXPLAIN SELECT id FROM responses WHERE \
+                 replace(raw_response::text, '\\u0000', '\\u0020')::json->>'status' \
+                 IN ('queued', 'in_progress') AND \
+                 replace(raw_response::text, '\\u0000', '\\u0020')::json->>'background' = 'true' AND \
+                 replace(raw_response::text, '\\u0000', '\\u0020')::json->>'_lease' IS NOT NULL \
+                 ORDER BY created_at ASC LIMIT 1024",
+                &[],
+            )
+            .await
+            .expect("explain");
+        let plan: Vec<String> = plan.iter().map(|row| row.get::<_, String>(0)).collect();
+        if plan
+            .iter()
+            .any(|line| line.contains("responses_open_background_idx"))
+        {
+            break plan;
+        }
+        if std::time::Instant::now() >= deadline {
+            let state = client
+                .query(
+                    "SELECT i.indisvalid, i.indisready FROM pg_index i \
+                     JOIN pg_class c ON c.oid = i.indexrelid \
+                     WHERE c.relname = 'responses_open_background_idx'",
+                    &[],
+                )
+                .await
+                .expect("pg_index");
+            let state: Vec<(bool, bool)> = state
+                .iter()
+                .map(|row| (row.get::<_, bool>(0), row.get::<_, bool>(1)))
+                .collect();
+            panic!("the listing's plan never used the index; index (valid, ready) = {state:?}; plan = {plan:?}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    };
     assert!(
         plan.iter()
             .any(|line| line.contains("responses_open_background_idx")),
