@@ -799,8 +799,10 @@ impl Format {
             .unwrap_or_else(|| unknown("terminal", name, &self.name))
     }
 
-    /// The terminals' texts, in the order the engine's scanner numbers them.
-    pub(crate) fn terminal_texts(&self) -> impl Iterator<Item = &str> {
+    /// The terminals' texts, in the order the engine's scanner numbers them: the markers the
+    /// table's rows move on, and those it ignores. Whoever learns the table's [`Layout`] from a
+    /// rendering reads them to tell a marker from the text the layout writes around it.
+    pub fn terminal_texts(&self) -> impl Iterator<Item = &str> {
         self.terminals.iter().map(|terminal| terminal.text.as_str())
     }
 
@@ -854,8 +856,10 @@ impl Format {
             .map(|transition| (transition.from, transition.on, transition.to))
     }
 
-    /// The call syntax, for a format with an arguments state.
-    pub(crate) fn call_syntax(&self) -> Option<&CallSyntax> {
+    /// The call syntax, for a format with an arguments state: how the model writes a call there.
+    /// For a call given as data it is the shape's patterns, which whoever compiled the table reads
+    /// again to learn the table's [`Layout`] from a rendering of the model's chat template.
+    pub fn call_syntax(&self) -> Option<&CallSyntax> {
         self.calls.as_ref()
     }
 
