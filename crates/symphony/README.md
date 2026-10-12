@@ -72,6 +72,9 @@ and a client that wants the raw text back can have it.
   XML tree, Kimi K3's XTML; and the value reader that turns a value's text into the JSON the
   request's tools declare.
 - `pythonic`: calls written as Python, `name(key=value)`.
+- `shape`: a call's parts given as data, as a template's own patterns write them: linear patterns
+  (literals, runs of a class of characters, `\b`, optional literals) and the ways a value ends,
+  checked for what a stream can decide.
 - `grammar`: the structural-tag derivation and its per-syntax spellings (`keyed`, `xtml`,
   `tagged`, `pythonic`, and `xml` for MiniMax's; the JSON, compact keyed, DSML and xLAM list
   spellings in the module itself), with the argument shapes a JSON schema pins (`schema`).
