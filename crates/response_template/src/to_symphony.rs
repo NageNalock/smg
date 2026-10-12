@@ -31,14 +31,26 @@
 //! - **Stops.** The texts of the tokens the model stops on are not fed to a stream. A close of the
 //!   outside text that is one adds no row: the stream's stop ends the message. Every marker that
 //!   is one is named a stop token of the table.
+//! - **Tool calls.** A `tool_calls` field that repeats is a state whose text is a call, a symphony
+//!   call given as data ([`CallSyntax::Shaped`]). An open's marker is the region's terminal, and
+//!   what follows it in the pattern is the call's header, which captures the tool's name when the
+//!   transform names it by a group of the open (or the transform writes the name itself). A
+//!   close's marker leaves the region, and what comes before it is the call's trailer. Every
+//!   alternative of an open shares one header, and of a close one trailer. The stream's stop
+//!   closes a call, as transformers closes a region at the end of the text whatever its close; a
+//!   stream cut for length leaves the call cut.
+//! - **Tagged parameters.** `xml-inline` arguments are parameters found as `finditer` finds the
+//!   tag pattern: the tag, from its first literal through its value, which must be one way through
+//!   the pattern, and the ways the value ends after it, each the text the match takes and then,
+//!   last, a lookahead, so that a value may end at its closing tag or where the next tag begins.
+//!   A value's text reads by the template's `value_parser`.
 //! - **Values.** The table reads its calls' values with [`TRANSFORMERS`], the crate's own port of
 //!   transformers' typing.
 //!
 //! Everything else is refused by name ([`Refusals`], each with a stable [`Construct`] code), and
 //! the compile goes on after a refused construct, so that one compile lists every construct a
-//! template uses that no table reads. Tool calls are refused in this version: their arguments are
-//! not lowered yet ([`Construct::TaggedParameters`], [`Construct::JsonArguments`],
-//! [`Construct::JsonEnvelope`]).
+//! template uses that no table reads. Calls whose arguments are JSON are not lowered yet
+//! ([`Construct::JsonArguments`], [`Construct::JsonEnvelope`]), nor are key-value lines.
 
 mod lower;
 mod refusal;
@@ -47,12 +59,18 @@ mod values;
 use std::fmt::Write as _;
 
 use serde_json::Value;
-use symphony::{shape::Slot, Emits, Format};
+use symphony::{
+    shape::{
+        self, Arguments, CallShape, Dialect, End, NameSource, ShapeError, Slot, ValueParser,
+        HOLD_CAP,
+    },
+    CallSyntax, Emits, Format,
+};
 
 use self::{
     lower::{
-        anchor_literals, literals, lower, pattern, split_close, split_open, Branches, Captures,
-        Item,
+        anchor_literals, describe, literals, lower, lower_tag, pattern, split_close, split_open,
+        word, Branches, Captures, Item,
     },
     refusal::Refused,
 };
@@ -61,7 +79,7 @@ pub use self::{
     values::{Transformers, TRANSFORMERS},
 };
 use crate::{
-    content_parsers::{placeholder, ContentParser},
+    content_parsers::{placeholder, Content, ContentParser},
     py,
     pyre::Node,
     response_templates::{Delimiter, ResponseTemplate, ResponseTemplateField, Template},
@@ -499,7 +517,10 @@ impl Compiler<'_> {
         }
     }
 
-    /// The tool calls. Their arguments are not lowered yet: every form is refused by name, with
+    /// The tool calls: a state whose text is a call, entered on each of the open's markers and
+    /// left on each of the close's, and the call's shape: what follows an open's marker (the
+    /// header, which may name the tool), the arguments, and what comes before a close's marker
+    /// (the trailer). Tagged parameters are lowered; every other form is refused by name, with
     /// what else the field uses that no table reads.
     fn calls(&mut self, field: &ResponseTemplateField) {
         let scope = scope(field);
@@ -527,11 +548,17 @@ impl Compiler<'_> {
                 }
             }
         };
-        if let Some(named) = &named {
-            let arguments = arguments(field, named);
-            self.refuse(&scope, arguments);
-        }
         let content = &field.content;
+        let arguments = match (&named, content.parser) {
+            (Some(Named::Group(_) | Named::Literal(_)), ContentParser::XmlInline) => {
+                self.params(&scope, content)
+            }
+            (Some(named), parser) => {
+                self.refuse(&scope, unlowered(parser, named));
+                None
+            }
+            (None, _) => None,
+        };
         if content.parser == ContentParser::Json && content.json_dialect() {
             self.refuse(
                 &scope,
@@ -547,14 +574,157 @@ impl Compiler<'_> {
                 Refused::new(Construct::MergeDuplicates, "merge_duplicates"),
             );
         }
-        self.call_delimiters(field, named.as_ref());
+        let state = self.table.states.len();
+        self.table.states.push(State {
+            name: format!("{state}:{}", field.name),
+            field: Some(field.name.clone()),
+            emits: Emits::Arguments,
+            framing: false,
+            trims: false,
+        });
+        let header = self.call_open(field, named.as_ref(), state);
+        let close = self.call_close(field, state);
+        let (Some(named), Some((arguments, described, clean)), Some(header), Some(trailer)) =
+            (named, arguments, header, close)
+        else {
+            return;
+        };
+        let shape = CallShape {
+            header: pattern(&header),
+            name: match named {
+                Named::Literal(name) => NameSource::Literal(name.into()),
+                Named::Group(_) | Named::Envelope => NameSource::Header,
+            },
+            arguments,
+            trailer: pattern(&trailer),
+            word: word(),
+            hold_cap: u32::try_from(HOLD_CAP).unwrap_or(u32::MAX),
+        };
+        if let Err(error) = shape.check() {
+            if let Some(refused) = shape_refusal(error) {
+                self.refuse(&scope, refused);
+            }
+            return;
+        }
+        if !clean {
+            return;
+        }
+        let mut summary = format!("header [{}] {described}", describe(&header));
+        if !trailer.is_empty() {
+            let _ = write!(summary, " trailer [{}]", describe(&trailer));
+        }
+        self.table.calls = Some(Calls {
+            state,
+            shape,
+            summary,
+        });
     }
 
-    /// What a call's open and close use that no table reads, and whether the open captures the
-    /// transform's name.
-    fn call_delimiters(&mut self, field: &ResponseTemplateField, named: Option<&Named>) {
+    /// Tagged parameters (`xml-inline`): the tag pattern lowered into the tag, from its first
+    /// literal through its value, and the ways the value ends, each split at its lookahead; the
+    /// values read by the template's `value_parser`. With them, a short description for the
+    /// summary, and whether they lowered with nothing refused (when they did not, they are there
+    /// as far as they lowered, for the call's own checks).
+    fn params(&mut self, scope: &str, content: &Content) -> Option<(Arguments, String, bool)> {
+        let values = match value_parser(content.value_parser()) {
+            Ok(values) => Some(values),
+            Err(refused) => {
+                self.refuse(scope, refused);
+                None
+            }
+        };
+        let Some(regex) = content.tag_regex() else {
+            self.refuse(
+                scope,
+                Refused::new(
+                    Construct::TagPattern,
+                    "no tag pattern that this crate's reader runs",
+                ),
+            );
+            return None;
+        };
+        let group = |name: &str| {
+            regex
+                .names
+                .iter()
+                .find(|(named, _)| named == name)
+                .map(|(_, number)| *number)
+        };
+        let (Some(key), Some(value)) = (group("key"), group("value")) else {
+            self.refuse(
+                scope,
+                Refused::new(
+                    Construct::TagPattern,
+                    "a tag pattern without a key group or a value group",
+                ),
+            );
+            return None;
+        };
+        let captures = Captures(vec![(key, Slot::Key), (value, Slot::Value)]);
+        let (tag, refused) = lower_tag(regex, &captures, value);
+        let mut clean = refused.is_empty() && values.is_some();
+        self.refuse_all(scope, refused);
+        let tag = tag?;
+        let mut refuse = |detail: String| {
+            self.refuse(scope, Refused::new(Construct::TagPattern, detail));
+            clean = false;
+        };
+        if !matches!(tag.tag.first(), Some(Item::Lit(_))) {
+            refuse("a tag that does not begin with literal text".to_owned());
+        }
+        if let Err(error) = pattern(&tag.tag).check() {
+            refuse(format!("the tag: {error}"));
+        }
+        let ends: Vec<End> = tag
+            .ends
+            .iter()
+            .map(|end| End {
+                consume: pattern(&end.consume),
+                ahead: pattern(&end.ahead),
+            })
+            .collect();
+        for (index, end) in ends.iter().enumerate() {
+            if let Err(error) = end.check() {
+                refuse(format!("value's end {index}: {error}"));
+            }
+        }
+        let (values, parser) = values.unwrap_or((ValueParser::Raw, String::new()));
+        let described_ends: Vec<String> = tag
+            .ends
+            .iter()
+            .map(|end| {
+                let mut way = describe(&end.consume);
+                if !end.ahead.is_empty() {
+                    let _ = write!(way, " (?={})", describe(&end.ahead));
+                }
+                format!("[{}]", way.trim_start())
+            })
+            .collect();
+        let described = format!(
+            "params [{}] ends [{}] values {parser}",
+            describe(&tag.tag),
+            described_ends.join(" ")
+        );
+        let arguments = Arguments::Params {
+            tag: pattern(&tag.tag),
+            ends: ends.into(),
+            values,
+        };
+        Some((arguments, described, clean))
+    }
+
+    /// The markers of a call's open into `state`, with what follows them, the header, which every
+    /// alternative must share; the open's name group, which the transform reads, is the header's
+    /// captured name. Whitespace before a marker is taken from the outside, which trims it.
+    fn call_open(
+        &mut self,
+        field: &ResponseTemplateField,
+        named: Option<&Named>,
+        state: usize,
+    ) -> Option<Vec<Item>> {
         let scope = scope(field);
-        let captures = match (named, field.open.as_ref().and_then(|d| d.regex.as_ref())) {
+        let open = field.open.as_ref()?;
+        let captures = match (named, open.regex.as_ref()) {
             (Some(Named::Group(group)), Some(regex)) => {
                 let numbers: Vec<usize> = regex
                     .names
@@ -588,55 +758,132 @@ impl Compiler<'_> {
             }
             _ => Captures::default(),
         };
-        if let Some(open) = &field.open {
-            match branches(open, &captures) {
-                Ok(branches) => {
-                    for branch in &branches {
-                        match split_open(branch) {
-                            Ok(open) => {
-                                if let Err(error) = pattern(&open.header).check() {
-                                    self.refuse(
-                                        &scope,
-                                        Refused::new(
-                                            Construct::UnboundedHeaderRun,
-                                            format!("the header after {:?}: {error}", open.marker),
-                                        ),
-                                    );
-                                }
-                            }
-                            Err(refused) => self.refuse(&scope, refused),
-                        }
-                    }
+        let branches = match branches(open, &captures) {
+            Ok(branches) => branches,
+            Err(refused) => {
+                self.refuse_all(&scope, refused);
+                return None;
+            }
+        };
+        let mut header: Option<Vec<Item>> = None;
+        let mut markers = Vec::new();
+        for branch in &branches {
+            let open = match split_open(branch) {
+                Ok(open) => open,
+                Err(refused) => {
+                    self.refuse(&scope, refused);
+                    continue;
                 }
-                Err(refused) => self.refuse_all(&scope, refused),
+            };
+            if let Err(error) = pattern(&open.header).check() {
+                self.refuse(
+                    &scope,
+                    Refused::new(
+                        Construct::UnboundedHeaderRun,
+                        format!("the header after {:?}: {error}", open.marker),
+                    ),
+                );
+            }
+            if self.slack_beside(&scope, &open.slack, 0, "before the open") {
+                self.slack_before
+                    .push((0, open.slack.clone(), scope.clone(), open.marker.clone()));
+            }
+            match &header {
+                None => header = Some(open.header.clone()),
+                Some(first) if *first != open.header => self.refuse(
+                    &scope,
+                    Refused::new(
+                        Construct::CallAlternatives,
+                        format!(
+                            "the open {:?} is followed by another header than the first",
+                            open.marker
+                        ),
+                    ),
+                ),
+                Some(_) => {}
+            }
+            markers.push(open.marker);
+        }
+        self.alternative_order(&scope, &markers);
+        for marker in &markers {
+            let on = self.table.terminal(marker);
+            if let Some(to) = self.table.row(0, on, state) {
+                let other = self.table.states[to].field.clone().unwrap_or_default();
+                self.refuse(
+                    &scope,
+                    Refused::new(
+                        Construct::SharedOpenMarker,
+                        format!("the open {marker:?} also opens {other:?}"),
+                    ),
+                );
             }
         }
-        if let Some(close) = &field.close {
-            match branches(close, &Captures::default()) {
-                Ok(branches) => {
-                    for branch in &branches {
-                        match split_close(branch) {
-                            Ok(close) => {
-                                if let Err(error) = pattern(&close.trailer).check() {
-                                    self.refuse(
-                                        &scope,
-                                        Refused::new(
-                                            Construct::UnboundedHeaderRun,
-                                            format!(
-                                                "the trailer before {:?}: {error}",
-                                                close.marker
-                                            ),
-                                        ),
-                                    );
-                                }
-                            }
-                            Err(refused) => self.refuse(&scope, refused),
-                        }
-                    }
-                }
-                Err(refused) => self.refuse_all(&scope, refused),
+        header
+    }
+
+    /// The markers of a call's close out of `state` into the outside, and what comes before them,
+    /// the trailer, which every alternative must share. Whitespace after a marker that is not a
+    /// stop text is taken from the outside, which trims it. With no close, the call is open to
+    /// the end of the output, where the stream's stop closes it, as it closes every call.
+    fn call_close(&mut self, field: &ResponseTemplateField, state: usize) -> Option<Vec<Item>> {
+        let scope = scope(field);
+        let Some(close) = &field.close else {
+            return Some(Vec::new());
+        };
+        let branches = match branches(close, &Captures::default()) {
+            Ok(branches) => branches,
+            Err(refused) => {
+                self.refuse_all(&scope, refused);
+                return None;
             }
+        };
+        let mut trailer: Option<Vec<Item>> = None;
+        let mut markers = Vec::new();
+        for branch in &branches {
+            let close = match split_close(branch) {
+                Ok(close) => close,
+                Err(refused) => {
+                    self.refuse(&scope, refused);
+                    continue;
+                }
+            };
+            if let Err(error) = pattern(&close.trailer).check() {
+                self.refuse(
+                    &scope,
+                    Refused::new(
+                        Construct::UnboundedHeaderRun,
+                        format!("the trailer before {:?}: {error}", close.marker),
+                    ),
+                );
+            }
+            // A stream never shows what follows a stop text.
+            let stop = self.stops.contains(&close.marker.as_str());
+            if !stop && self.slack_beside(&scope, &close.slack, 0, "after the close") {
+                self.slack_after
+                    .push((0, close.slack.clone(), scope.clone()));
+            }
+            match &trailer {
+                None => trailer = Some(close.trailer.clone()),
+                Some(first) if *first != close.trailer => self.refuse(
+                    &scope,
+                    Refused::new(
+                        Construct::CallAlternatives,
+                        format!(
+                            "the close {:?} follows another trailer than the first",
+                            close.marker
+                        ),
+                    ),
+                ),
+                Some(_) => {}
+            }
+            markers.push(close.marker);
         }
+        self.alternative_order(&scope, &markers);
+        for marker in &markers {
+            let on = self.table.terminal(marker);
+            self.table.row(state, on, 0);
+        }
+        Some(trailer.unwrap_or_default())
     }
 
     /// `defaults` other than the role: a default with a value for the thought, the content or the
@@ -722,9 +969,9 @@ enum Named {
     Envelope,
 }
 
-/// Why a call's arguments, written as `field`'s content, are not lowered: no form is yet.
-fn arguments(field: &ResponseTemplateField, named: &Named) -> Refused {
-    match (field.content.parser, named) {
+/// Why a call's arguments, written with `parser` and named as `named` says, are not lowered.
+fn unlowered(parser: ContentParser, named: &Named) -> Refused {
+    match (parser, named) {
         (ContentParser::Json, Named::Envelope) => Refused::new(
             Construct::JsonEnvelope,
             "a call as one JSON object holding its name and arguments",
@@ -735,7 +982,7 @@ fn arguments(field: &ResponseTemplateField, named: &Named) -> Refused {
         ),
         (ContentParser::XmlInline, _) => Refused::new(
             Construct::TaggedParameters,
-            "arguments as tagged parameters",
+            "tagged parameters that name the call themselves",
         ),
         (ContentParser::KvLines, _) => {
             Refused::new(Construct::KeyValueLines, "arguments as key-value lines")
@@ -748,6 +995,91 @@ fn arguments(field: &ResponseTemplateField, named: &Named) -> Refused {
             "tool calls whose content is a text or a number: a call needs a name and arguments",
         ),
     }
+}
+
+/// The parser a tagged value's text reads with, as a call shape holds it, and a short
+/// description of it; refused when it is itself structured.
+fn value_parser(content: Option<&Content>) -> Result<(ValueParser, String), Refused> {
+    let Some(content) = content else {
+        return Ok((ValueParser::Raw, "raw".to_owned()));
+    };
+    let strip = content.strips();
+    let stripped = |name: &str| {
+        if strip {
+            name.to_owned()
+        } else {
+            format!("{name}(strip: false)")
+        }
+    };
+    Ok(match content.parser {
+        ContentParser::Text => (ValueParser::Text { strip }, stripped("text")),
+        ContentParser::Int => (ValueParser::Int, "int".to_owned()),
+        ContentParser::Float => (ValueParser::Float, "float".to_owned()),
+        ContentParser::Bool => (ValueParser::Bool { strip }, stripped("bool")),
+        ContentParser::Json => {
+            let (bare_keys, delims, allow_non_json) = content.json_args();
+            let mut args = Vec::new();
+            if bare_keys {
+                args.push("unquoted keys".to_owned());
+            }
+            if !delims.is_empty() {
+                args.push(format!("string delims {delims:?}"));
+            }
+            if allow_non_json {
+                args.push("allow_non_json".to_owned());
+            }
+            if !strip {
+                args.push("strip: false".to_owned());
+            }
+            let described = if args.is_empty() {
+                "json".to_owned()
+            } else {
+                format!("json({})", args.join(", "))
+            };
+            let parser = ValueParser::Json {
+                dialect: Dialect {
+                    bare_keys,
+                    string_delims: delims
+                        .iter()
+                        .map(|(open, close)| (open.as_str().into(), close.as_str().into()))
+                        .collect(),
+                },
+                allow_non_json,
+                strip,
+            };
+            (parser, described)
+        }
+        ContentParser::XmlInline | ContentParser::KvLines => {
+            return Err(Refused::new(
+                Construct::NestedValueParser,
+                "a value parser that is itself structured",
+            ))
+        }
+    })
+}
+
+/// Why a call shape that the lowering built does not run, by the construct that makes it so;
+/// `None` for what the lowering has refused already, checking the header, the trailer, the tag and
+/// each way a value ends on its own (a pattern a stream cannot run, a tag with no literal first).
+fn shape_refusal(error: ShapeError) -> Option<Refused> {
+    let construct = match &error {
+        ShapeError::Pattern { .. } | ShapeError::NoTrigger => return None,
+        ShapeError::NoName => Construct::HeaderName,
+        ShapeError::ReadsPastTheText(_) | ShapeError::TrailerReadsTheEnd(_) => {
+            Construct::EndBeforeTrailer
+        }
+        ShapeError::Capture { .. } | ShapeError::Uncaptured(_) | ShapeError::NoEnds => {
+            Construct::TagPattern
+        }
+        ShapeError::NoEnvelope
+        | ShapeError::NamedTwice
+        | ShapeError::Dialect
+        | ShapeError::EnvelopePath(_) => Construct::Table,
+    };
+    Some(Refused::new(
+        construct,
+        format!("the call's shape: {error}"),
+    ))
 }
 
 /// The name a call transform reads: `{"function": {"name": ..., "arguments": "{content}"}}`, the
@@ -809,13 +1141,23 @@ struct State {
     trims: bool,
 }
 
-/// The table as it is built: markers by text, states, rows `(from, marker, to)`, anchors.
+/// The tool calls of a table: their state, the shape of a call, and a short description of the
+/// shape.
+struct Calls {
+    state: usize,
+    shape: CallShape,
+    summary: String,
+}
+
+/// The table as it is built: markers by text, states, rows `(from, marker, to)`, anchors, and the
+/// tool calls.
 #[derive(Default)]
 struct Table {
     terminals: Vec<String>,
     states: Vec<State>,
     rows: Vec<(usize, usize, usize)>,
     anchors: Vec<String>,
+    calls: Option<Calls>,
 }
 
 impl Table {
@@ -962,6 +1304,14 @@ impl Table {
         for anchor in &self.anchors {
             format = format.turn_anchor(anchor);
         }
+        if let Some(calls) = &self.calls {
+            // The stream's stop is the end of the text, where transformers closes the region
+            // whatever its close: a call open there is closed, not cut. A stream cut for length
+            // leaves it cut.
+            format = format
+                .calls(CallSyntax::Shaped(shape::intern(calls.shape.clone())))
+                .closes_at_stop(&self.states[calls.state].name);
+        }
         format.stop_tokens(stops.iter().copied())
     }
 
@@ -994,6 +1344,9 @@ impl Table {
             }
             if index > 0 {
                 let _ = write!(out, " in {:?} out {:?}", markers(true), markers(false));
+            }
+            if let Some(calls) = self.calls.as_ref().filter(|calls| calls.state == index) {
+                let _ = write!(out, " {}", calls.summary);
             }
             let dropped: Vec<&str> = self
                 .rows

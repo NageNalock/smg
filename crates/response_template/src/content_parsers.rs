@@ -5,6 +5,8 @@
 
 use serde_json::{Map, Value};
 
+#[cfg(feature = "symphony")]
+use crate::pyre::Regex;
 use crate::{
     error::{LoadError, PyError, PyErrorKind, PyResult, Taint, Unsupported},
     py::{self, JsonError},
@@ -54,6 +56,9 @@ pub(crate) struct Content {
     allow_non_json: bool,
     /// `None`: transformers raises `ValueError` on every close.
     tag_pattern: Option<Pattern>,
+    /// The tag pattern as the `regex` module reads it, for the compile.
+    #[cfg(feature = "symphony")]
+    tag_regex: Option<Regex>,
     value_parser: Option<Box<Content>>,
     merge_duplicates: bool,
     line_sep: String,
@@ -70,6 +75,8 @@ impl Content {
             unquoted_keys: false,
             allow_non_json: false,
             tag_pattern: None,
+            #[cfg(feature = "symphony")]
+            tag_regex: None,
             value_parser: None,
             merge_duplicates: false,
             line_sep: String::new(),
@@ -115,6 +122,27 @@ impl Content {
         self.merge_duplicates
     }
 
+    /// `xml-inline`'s `tag_pattern` as the `regex` module reads it, when there is one that this
+    /// crate runs.
+    #[cfg(feature = "symphony")]
+    pub(crate) fn tag_regex(&self) -> Option<&Regex> {
+        self.tag_regex.as_ref()
+    }
+
+    /// The parser a tagged value's text reads with (`value_parser`), when the template names one.
+    #[cfg(feature = "symphony")]
+    pub(crate) fn value_parser(&self) -> Option<&Self> {
+        self.value_parser.as_deref()
+    }
+
+    /// `json`'s dialect and fallback: whether keys may be bare (`unquoted_keys`), the delimiters
+    /// of its own strings (`string_delims`), and whether text that is not JSON reads as `text`
+    /// (`allow_non_json`).
+    #[cfg(feature = "symphony")]
+    pub(crate) fn json_args(&self) -> (bool, &[(String, String)], bool) {
+        (self.unquoted_keys, &self.string_delims, self.allow_non_json)
+    }
+
     /// Check the `content_args` the parser reads (`None` when absent).
     pub(crate) fn new(parser: ContentParser, args: Option<&Value>) -> Result<Self, Unsupported> {
         let empty = Map::new();
@@ -146,7 +174,14 @@ impl Content {
                 content.merge_duplicates = flag("merge_duplicates", false);
                 content.tag_pattern = match args.get("tag_pattern") {
                     None | Some(Value::Null) => None,
-                    Some(Value::String(source)) => Some(tag_pattern(source)?),
+                    Some(Value::String(source)) => {
+                        let pattern = tag_pattern(source)?;
+                        #[cfg(feature = "symphony")]
+                        {
+                            content.tag_regex = Regex::parse(source).ok();
+                        }
+                        Some(pattern)
+                    }
                     Some(_) => return Err(Unsupported::ContentArgs("tag_pattern")),
                 };
                 content.value_parser = value_parser(args.get("value_parser"))?;

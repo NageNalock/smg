@@ -252,14 +252,34 @@ the stream.
   is dropped with it. A close of the outside text that is a stop text adds no
   row, and another close of it drops its marker. Every marker that is a stop
   text is named a stop token of the table.
+- A `tool_calls` field that repeats, with tagged parameters (`xml-inline`),
+  becomes a state whose text is a call, read by symphony's call syntax given as
+  data (`CallSyntax::Shaped`). An open's marker enters the state, and what
+  follows it in the pattern is the call's header, which captures the tool's
+  name when the transform names it by a group of the open (the transform may
+  also write the name itself). A close's marker leaves the state, and what comes
+  before it is the call's trailer (`</function>\s*` before `</tool_call>`). The
+  alternatives of an open share one header, and those of a close one trailer.
+  The stream's stop closes a call, as transformers closes a region at the end
+  of the text whatever its close: the parameters that ended are the call's
+  arguments, also when a close came without its trailer.
+- The tag pattern lowers into the tag, from its first literal through its
+  value, which must be one way through the pattern, and the ways the value ends
+  after it, in the order the pattern tries them: each is the text the match
+  takes and then, last, a lookahead, so that a value may end at its closing tag
+  or where the next tag begins. Parameters are found as `finditer` finds them,
+  each written when its value ends, its text read by the template's
+  `value_parser`. In a call with a trailer, a value's end must end with a
+  literal the trailer cannot read, since the call's text ends where the trailer
+  begins (`EndBeforeTrailer` otherwise).
 - Values of calls read with `to_symphony::TRANSFORMERS`, this crate's port of
   `_sub_parse`, `_coerce`, `_schema_types` and `_coerce_tool_calls`, the code
   `parse_response` runs.
 
-Tool calls are not lowered yet: a template with a `tool_calls` field is refused
-(`Construct::TaggedParameters`, `JsonArguments` or `JsonEnvelope`). Everything
-the compile does not lower is refused by name: `Refusals` lists every construct
-the template uses, each with a stable `Construct` code, and the compile goes on
+Calls whose arguments are JSON, or key-value lines, are not lowered yet
+(`Construct::JsonArguments`, `JsonEnvelope`, `KeyValueLines`). Everything the
+compile does not lower is refused by name: `Refusals` lists every construct the
+template uses, each with a stable `Construct` code, and the compile goes on
 after a refused construct to find the rest. `tests/corpus.tsv` pins the outcome
 for the public templates of `tests/fixtures/compiled/`, and
 `tests/to_symphony.tsv` for every template of `tests/fixtures/hf/` that loads.
@@ -276,10 +296,17 @@ session that shows one, and the test checks each listed code by undoing it:
 - X3: a stop text is not fed to the table; a region it closes closes at the
   stream's stop, and a stop text transformers keeps as text is not in the
   message.
-- X5: where transformers raises, the table's events are defined.
+- X5: where transformers raises, the table's events are defined. A call the
+  stream cut short (for length, or with any finish but the model's stop) is
+  reported cut: its arguments' object is left open, and the text of a parameter
+  the cut left unfinished is `Malformed`, where transformers closes the region
+  at the end of the text.
 - X6: fields other than the thought, the content and the calls are dropped.
 - X9: with no anchor in the prompt, reading starts at the output, where
   transformers reads the whole prompt as the message's start.
+
+A session that gives a marker back (an open whose header does not match, a
+close without its trailer) is never listed: it reads as transformers does.
 
 ## Parity tests
 

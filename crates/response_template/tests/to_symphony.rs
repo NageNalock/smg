@@ -266,7 +266,78 @@ fn each_construct_no_table_reads_is_refused_by_name() {
         (
             Construct::TaggedParameters,
             call(json!({
+                "open": "<c>", "close": "</c>", "repeats": true, "content": "xml-inline",
+                "content_args": {"tag_pattern": "<k=(?P<key>\\w+)>(?P<value>.*?)</k>"},
+                "transform": {"function": "{content}"},
+            })),
+        ),
+        (
+            // A tag pattern this crate's reader does not run (a lookbehind).
+            Construct::TagPattern,
+            call(json!({
                 "open_pattern": "<c>(?P<name>\\w+)>", "close": "</c>", "repeats": true,
+                "content": "xml-inline",
+                "content_args": {"tag_pattern": "<k=(?P<key>\\w+)>(?P<value>.*?)(?<=x)</k>"},
+                "transform": named,
+            })),
+        ),
+        (
+            // A value with nothing after it to end it.
+            Construct::TagPattern,
+            call(json!({
+                "open_pattern": "<c>(?P<name>\\w+)>", "close": "</c>", "repeats": true,
+                "content": "xml-inline",
+                "content_args": {"tag_pattern": "<k=(?P<key>\\w+)>(?P<value>.*?)"},
+                "transform": named,
+            })),
+        ),
+        (
+            // A greedy value of any character, which only the call's end decides.
+            Construct::TagPattern,
+            call(json!({
+                "open_pattern": "<c>(?P<name>\\w+)>", "close": "</c>", "repeats": true,
+                "content": "xml-inline",
+                "content_args": {"tag_pattern": "<k=(?P<key>\\w+)>(?P<value>.*)</k>"},
+                "transform": named,
+            })),
+        ),
+        (
+            // No literal to find a parameter by.
+            Construct::TagPattern,
+            call(json!({
+                "open_pattern": "<c>(?P<name>\\w+)>", "close": "</c>", "repeats": true,
+                "content": "xml-inline",
+                "content_args": {"tag_pattern": "(?P<key>\\w+)=(?P<value>.*?);"},
+                "transform": named,
+            })),
+        ),
+        (
+            // A value that ends where the next tag begins, in a call with text before its
+            // closing marker.
+            Construct::EndBeforeTrailer,
+            call(json!({
+                "open": "<c>", "close_pattern": "</f>\\s*</c>", "repeats": true,
+                "content": "xml-inline",
+                "content_args": {"tag_pattern": "<k=(?P<key>\\w+)>(?P<value>.*?)(?:</k>|(?=<k=))"},
+                "transform": {"function": {"name": "f", "arguments": "{content}"}},
+            })),
+        ),
+        (
+            Construct::NestedValueParser,
+            call(json!({
+                "open_pattern": "<c>(?P<name>\\w+)>", "close": "</c>", "repeats": true,
+                "content": "xml-inline",
+                "content_args": {
+                    "tag_pattern": "<k=(?P<key>\\w+)>(?P<value>.*?)</k>",
+                    "value_parser": {"name": "kv-lines"},
+                },
+                "transform": named,
+            })),
+        ),
+        (
+            Construct::CallAlternatives,
+            call(json!({
+                "open_pattern": "(?:<c>(?P<name>\\w+)>|<d>)", "close": "</c>", "repeats": true,
                 "content": "xml-inline",
                 "content_args": {"tag_pattern": "<k=(?P<key>\\w+)>(?P<value>.*?)</k>"},
                 "transform": named,

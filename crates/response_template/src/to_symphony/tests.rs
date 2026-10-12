@@ -3,19 +3,19 @@
 //!
 //! symphony's `tests/fixtures/shape/` records, with `regex` 2026.9.10, the module's `\w`, `\s` and
 //! `\d` tables, and what `match` gives for every pattern a call shape runs in the public response
-//! templates (the header after a call's marker and the text before its closing marker) at every
-//! prefix of a set of texts. These tests read those recordings: the classes the lowering resolves
-//! are the module's, and each recorded header or trailer, lowered here from its source, answers
-//! as the module does.
+//! templates (the header after a call's marker, the text before its closing marker, and a
+//! parameter's tag with the ways its value ends) at every prefix of a set of texts. These tests
+//! read those recordings: the classes the lowering resolves are the module's, and each recorded
+//! pattern, lowered here from its source, answers as the module does.
 
 use std::{fs, path::PathBuf};
 
 use serde::Deserialize;
-use symphony::shape::{Atom, Class, Matcher, Slot, Verdict};
+use symphony::shape::{Atom, Class, End, Matcher, Slot, Verdict};
 
 use super::lower::{
-    anchor_literals, chars, lower, pattern, split_close, split_open, Branches, Captures, Chars,
-    Item,
+    anchor_literals, chars, lower, lower_tag, pattern, split_close, split_open, Branches, Captures,
+    Chars, EndItems, Item, Tag,
 };
 use crate::{pyre::Regex, to_symphony::refusal::Construct};
 
@@ -140,11 +140,11 @@ fn captures(regex: &Regex) -> Captures {
 
 fn answer(
     text: &str,
-    pattern: &symphony::shape::Pattern,
+    (pattern, ends): (&symphony::shape::Pattern, &[End]),
     word: &Class,
     before: Option<char>,
 ) -> Option<Answer> {
-    let mut matcher = Matcher::new(pattern, &[], word, before).hold_cap(None);
+    let mut matcher = Matcher::new(pattern, ends, word, before).hold_cap(None);
     let _ = matcher.feed(text);
     match matcher.finish() {
         Verdict::Matched(found) => {
@@ -162,35 +162,65 @@ fn answer(
     }
 }
 
-/// Every header and trailer of a public template that symphony's recordings hold, and the
-/// abstract patterns beside them, lowered here from the recorded source, answers as the `regex`
-/// module does: for each text and each of its prefixes, whether it matches, where the match ends
-/// and what it captures. The parameters' patterns, whose values end by an alternation, are not
-/// lowered by this compile yet.
+/// The ends of a lowered tag as the matcher runs them.
+fn ends(tag: &Tag) -> Vec<End> {
+    tag.ends
+        .iter()
+        .map(|end| End {
+            consume: pattern(&end.consume),
+            ahead: pattern(&end.ahead),
+        })
+        .collect()
+}
+
+/// A recorded pattern lowered from its source: a header or a trailer as one pattern, a parameter's
+/// tag with the ways its value ends.
+fn lowered_recording(recorded: &Recorded) -> (symphony::shape::Pattern, Vec<End>) {
+    let regex = Regex::parse(&recorded.source).unwrap();
+    let captures = captures(&regex);
+    let value = regex
+        .names
+        .iter()
+        .find(|(name, _)| name == "value")
+        .map(|(_, number)| *number);
+    if let Some(value) = value {
+        let (tag, refused) = lower_tag(&regex, &captures, value);
+        assert_eq!(refused, [], "{}", recorded.id);
+        let tag = tag.unwrap();
+        return (pattern(&tag.tag), ends(&tag));
+    }
+    let branches =
+        lower(&regex, &captures).unwrap_or_else(|refused| panic!("{}: {refused:?}", recorded.id));
+    let [branch] = branches.as_slice() else {
+        panic!("{}: {} alternatives", recorded.id, branches.len());
+    };
+    (pattern(branch), Vec::new())
+}
+
+/// Every pattern of a public template's call that symphony's recordings hold (the header after a
+/// call's marker, the text before its closing marker, a parameter's tag with the ways its value
+/// ends), and the abstract patterns beside them, lowered here from the recorded source, answers as
+/// the `regex` module does: for each text and each of its prefixes, whether it matches, where the
+/// match ends, what it captures, and which of a value's ends closed it.
 #[test]
-fn lowered_headers_and_trailers_answer_as_the_regex_module_does() {
+fn lowered_call_patterns_answer_as_the_regex_module_does() {
     let word = escape("\\w").class();
-    let mut lowered = 0;
+    let (mut lowered, mut tags) = (0, 0);
     let mut answers = 0;
     for line in shape_fixture("regex.jsonl").lines() {
         let recorded: Recorded = serde_json::from_str(line).unwrap();
-        if recorded.source.contains("(?P<value>") {
-            continue;
-        }
-        let regex = Regex::parse(&recorded.source).unwrap();
-        let branches = lower(&regex, &captures(&regex))
-            .unwrap_or_else(|refused| panic!("{}: {refused:?}", recorded.id));
-        let [branch] = branches.as_slice() else {
-            panic!("{}: {} alternatives", recorded.id, branches.len());
-        };
-        let pattern = pattern(branch);
+        let (pattern, ends) = lowered_recording(&recorded);
         assert_eq!(pattern.check(), Ok(()), "{}", recorded.id);
+        for end in &ends {
+            assert_eq!(end.check(), Ok(()), "{}", recorded.id);
+        }
         let before = recorded.before.as_deref().and_then(|b| b.chars().next());
         lowered += 1;
+        tags += usize::from(!ends.is_empty());
         for case in &recorded.cases {
             let text = case.text.as_str();
             assert_eq!(
-                answer(text, &pattern, &word, before),
+                answer(text, (&pattern, &ends), &word, before),
                 case.answer,
                 "{}: {text:?}",
                 recorded.id
@@ -199,14 +229,14 @@ fn lowered_headers_and_trailers_answer_as_the_regex_module_does() {
             let Some(prefixes) = &case.prefixes else {
                 continue;
             };
-            let ends: Vec<usize> = text
+            let upto: Vec<usize> = text
                 .char_indices()
                 .map(|(at, _)| at)
                 .chain([text.len()])
                 .collect();
-            for (&upto, expected) in ends.iter().zip(prefixes) {
+            for (&upto, expected) in upto.iter().zip(prefixes) {
                 assert_eq!(
-                    &answer(&text[..upto], &pattern, &word, before),
+                    &answer(&text[..upto], (&pattern, &ends), &word, before),
                     expected,
                     "{}: {:?} as the whole text",
                     recorded.id,
@@ -216,8 +246,129 @@ fn lowered_headers_and_trailers_answer_as_the_regex_module_does() {
             }
         }
     }
-    assert!(lowered >= 18, "{lowered} patterns lowered");
+    assert!(lowered >= 24, "{lowered} patterns lowered");
+    assert!(tags >= 6, "{tags} tags lowered");
     assert!(answers > 1000, "{answers} answers");
+}
+
+/// A tag pattern lowers into the tag through its value and the ways the value ends, in the order
+/// the module tries them, each split at its lookahead; what a tag cannot be is refused by name.
+#[test]
+fn a_tag_lowers_through_its_value_and_its_ends_split_at_their_lookahead() {
+    let tag = |source: &str| {
+        let regex = Regex::parse(source).unwrap();
+        let captures = captures(&regex);
+        let value = regex
+            .names
+            .iter()
+            .find(|(name, _)| name == "value")
+            .map(|(_, number)| *number)
+            .unwrap();
+        let (tag, refused) = lower_tag(&regex, &captures, value);
+        let refused: Vec<Construct> = refused.into_iter().map(|r| r.0).collect();
+        (tag, refused)
+    };
+    let lowered = |source: &str| {
+        let (tag, refused) = tag(source);
+        assert_eq!(refused, [], "{source}");
+        tag.unwrap()
+    };
+    let space = escape("\\s");
+    let slack = Item::Run {
+        chars: space,
+        min: 0,
+        max: None,
+        greedy: true,
+        capture: None,
+    };
+    let trimmed = lowered(r"<k=(?P<key>\w+)>\s*(?P<value>.*?)\s*(?:</k>|(?=<k=|<m>))");
+    assert_eq!(trimmed.tag.len(), 5);
+    assert_eq!(trimmed.tag[0], lit("<k="));
+    assert!(matches!(
+        trimmed.tag[4],
+        Item::Run {
+            capture: Some(Slot::Value),
+            greedy: false,
+            ..
+        }
+    ));
+    assert_eq!(
+        trimmed.ends,
+        [
+            EndItems {
+                consume: vec![slack.clone(), lit("</k>")],
+                ahead: Vec::new(),
+            },
+            EndItems {
+                consume: vec![slack.clone()],
+                ahead: vec![lit("<k=")],
+            },
+            EndItems {
+                consume: vec![slack],
+                ahead: vec![lit("<m>")],
+            },
+        ],
+        "a lookahead's alternatives are ends of their own, after what the match takes"
+    );
+    // Groups that capture nothing around the value flatten; literals merge across them.
+    let grouped = lowered(r"(?:<k (?P<key>\w+)>)(?:(?P<value>.*?))(?:</k>)\n");
+    assert_eq!(grouped.tag[0], lit("<k "));
+    assert_eq!(
+        grouped.ends,
+        [EndItems {
+            consume: vec![lit("</k>\n")],
+            ahead: Vec::new(),
+        }]
+    );
+    // A value with nothing after it has an empty end, which no stream can run.
+    let open = lowered(r"<k=(?P<key>\w+)>(?P<value>.*?)");
+    assert_eq!(open.ends, [EndItems::default()]);
+    assert!(ends(&open)[0].check().is_err());
+    // A way the lowering refuses is left out of the ends; the others stay.
+    let (dollar, refused) = tag(r"<k=(?P<key>\w+)>(?P<value>.*?)(?:</k>|(?=<k=|$))");
+    assert_eq!(refused, [Construct::EndOfText]);
+    assert_eq!(dollar.unwrap().ends.len(), 2);
+    let refused = |source: &str| -> Vec<Construct> {
+        let (_, refused) = tag(source);
+        assert!(!refused.is_empty(), "{source} lowered");
+        refused
+    };
+    for (source, construct) in [
+        (
+            r"<k=(?P<key>\w+)>(?:a(?P<value>.*?)|b)</k>",
+            Construct::TagPattern,
+        ),
+        (
+            r"(?:<k=|<j=)(?P<key>\w+)>(?P<value>.*?)</k>",
+            Construct::TagPattern,
+        ),
+        (
+            r"<k=(?P<key>\w+)>(?P<value>.*?)(?=<k=)(?=<k)",
+            Construct::LookAhead,
+        ),
+        (
+            r"<k=(?P<key>\w+)>(?P<value>.*?)(?=<k=)x",
+            Construct::LookAhead,
+        ),
+        (
+            r"<k=(?P<key>\w+)(?=>)>(?P<value>.*?)</k>",
+            Construct::LookAhead,
+        ),
+        (
+            r"<k=(?P<key>\w+)>(?P<value>.*?)(?:</k>|(?!<k=))",
+            Construct::NegativeLookAround,
+        ),
+        (
+            r"(?i)<k=(?P<key>\w+)>(?P<value>.*?)</k>",
+            Construct::InlineFlags,
+        ),
+    ] {
+        assert!(
+            refused(source).contains(&construct),
+            "{source}: {:?}",
+            refused(source)
+        );
+    }
 }
 
 fn lit(text: &str) -> Item {

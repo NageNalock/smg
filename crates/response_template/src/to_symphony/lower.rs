@@ -7,6 +7,11 @@
 //! literal, `\b` into a boundary. An alternation lowers into alternatives, each linear, in the
 //! order the `regex` module tries them. Anything else is refused by name, and the walk goes on, so
 //! that one pass names every construct a pattern uses that no table reads.
+//!
+//! A parameter's tag pattern (`xml-inline`) lowers the same way from its start through its value,
+//! which must be one way through the pattern. What follows the value lowers into the ways the
+//! value ends, in the order the module tries them: each is the pieces the match takes, then, at
+//! most once and last, a lookahead (`(?=...)`), whose own alternatives are ways of their own.
 
 use std::sync::OnceLock;
 
@@ -91,6 +96,49 @@ impl Chars {
     pub(super) fn class(&self) -> Class {
         Class::new(self.ranges.iter().copied(), self.negated)
     }
+
+    /// The set, written short for a summary: `.`, a class escape whose table it is (`\w`, `\S`,
+    /// ...), or its ranges in brackets (the count of ranges when there are many).
+    fn describe(&self) -> String {
+        let members = self.members();
+        if members == [('\0', char::MAX)] {
+            return ".".to_owned();
+        }
+        let [word, space, digit] = tables();
+        for (table, plain, negated) in [
+            (word, "\\w", "\\W"),
+            (space, "\\s", "\\S"),
+            (digit, "\\d", "\\D"),
+        ] {
+            if members == *table {
+                return plain.to_owned();
+            }
+            if members == Self::complement(table) {
+                return negated.to_owned();
+            }
+        }
+        let hat = if self.negated { "^" } else { "" };
+        if self.ranges.len() > 8 {
+            return format!("[{hat}{} ranges]", self.ranges.len());
+        }
+        let one = |c: char| match c {
+            '\\' | ']' | '^' | '-' => format!("\\{c}"),
+            c if c.is_ascii_graphic() || c == ' ' => c.to_string(),
+            c => c.escape_default().to_string(),
+        };
+        let ranges: String = self
+            .ranges
+            .iter()
+            .map(|&(lo, hi)| {
+                if lo == hi {
+                    one(lo)
+                } else {
+                    format!("{}-{}", one(lo), one(hi))
+                }
+            })
+            .collect();
+        format!("[{hat}{ranges}]")
+    }
 }
 
 /// The character after `c`, skipping the surrogates no text holds.
@@ -134,6 +182,11 @@ fn tables() -> &'static [Vec<(char, char)>; 3] {
             table(pyre::is_digit),
         ]
     })
+}
+
+/// The `regex` module's `\w`, as a symphony class: the word characters `\b` reads.
+pub(super) fn word() -> Class {
+    Chars::new(escape_ranges(Escape::Word), false).class()
 }
 
 /// The ranges a class escape holds.
@@ -237,6 +290,40 @@ impl Item {
         }
     }
 
+    /// The piece, written short for a summary: a literal as a quoted string, a run as its class
+    /// and its repeat (named `NAME`, `KEY` or `VALUE` when captured), `\b`, `(?:LIT)?`.
+    pub(super) fn describe(&self) -> String {
+        match self {
+            Self::Lit(text) => format!("{text:?}"),
+            Self::Maybe(text) => format!("({text:?})?"),
+            Self::Boundary => "\\b".to_owned(),
+            Self::Run {
+                chars,
+                min,
+                max,
+                greedy,
+                capture,
+            } => {
+                let repeat = match (min, max) {
+                    (0, None) => "*".to_owned(),
+                    (1, None) => "+".to_owned(),
+                    (0, Some(1)) => "?".to_owned(),
+                    (min, None) => format!("{{{min},}}"),
+                    (min, Some(max)) if min == max => format!("{{{min}}}"),
+                    (min, Some(max)) => format!("{{{min},{max}}}"),
+                };
+                let lazy = if *greedy { "" } else { "?" };
+                let run = format!("{}{repeat}{lazy}", chars.describe());
+                match capture {
+                    Some(Slot::Name) => format!("NAME({run})"),
+                    Some(Slot::Key) => format!("KEY({run})"),
+                    Some(Slot::Value) => format!("VALUE({run})"),
+                    None => run,
+                }
+            }
+        }
+    }
+
     /// Whether this piece of whitespace can take `c`.
     pub(super) fn takes(&self, c: char) -> bool {
         match self {
@@ -250,6 +337,15 @@ impl Item {
 /// Pieces as a symphony pattern.
 pub(super) fn pattern(items: &[Item]) -> Pattern {
     Pattern(items.iter().map(Item::atom).collect())
+}
+
+/// Pieces, written short for a summary, one after another.
+pub(super) fn describe(items: &[Item]) -> String {
+    items
+        .iter()
+        .map(Item::describe)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A pattern's alternatives, each a sequence of pieces, in the order the `regex` module tries
@@ -655,4 +751,214 @@ pub(super) fn anchor_literals(branches: &Branches) -> Result<Vec<String>, Refuse
         }
     }
     Ok(out)
+}
+
+/// A parameter's tag pattern, lowered: the tag, from its first piece through its value, and each
+/// way the value ends, in the order the `regex` module tries them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Tag {
+    pub(super) tag: Vec<Item>,
+    pub(super) ends: Vec<EndItems>,
+}
+
+/// One way a value ends: the pieces the match takes, then the pieces it looks ahead at.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct EndItems {
+    pub(super) consume: Vec<Item>,
+    pub(super) ahead: Vec<Item>,
+}
+
+/// A way a value ends as it is lowered: its pieces so far, and whether it has looked ahead, after
+/// which nothing more can be part of it.
+#[derive(Clone, Debug, Default)]
+struct Way {
+    end: EndItems,
+    looked: bool,
+}
+
+/// Lower a tag pattern, capturing the groups `captures` names (its key and its value, group
+/// `value`): the pieces through the value, which must be one way through the pattern, and the
+/// ways the value ends after it. Every construct the lowering does not take is listed; a way it
+/// refuses is left out of the ends, and the tag is there when the pieces through the value
+/// lowered, so that what is left can still be checked.
+pub(super) fn lower_tag(
+    regex: &Regex,
+    captures: &Captures,
+    value: usize,
+) -> (Option<Tag>, Vec<Refused>) {
+    let mut refused = Vec::new();
+    if !regex.flags.is_empty() {
+        refused.push(Refused::new(
+            Construct::InlineFlags,
+            format!("inline flags (?{})", regex.flags),
+        ));
+    }
+    let mut sequence = Vec::new();
+    flatten(&regex.node, &mut sequence);
+    let at = sequence
+        .iter()
+        .position(|node| matches!(node, Node::Group(Some(group), _) if *group == value));
+    let Some(at) = at else {
+        refused.push(Refused::new(
+            Construct::TagPattern,
+            "a value that is not captured in every match, outside alternatives and repeats",
+        ));
+        return (None, refused);
+    };
+    let mut lowering = Lowering {
+        captures,
+        refused: &mut refused,
+    };
+    let before = lowering.refused.len();
+    let mut branches = vec![Vec::new()];
+    for node in &sequence[..=at] {
+        branches = lowering.node(node, branches);
+    }
+    let lowered = lowering.refused.len() == before;
+    if branches.len() > 1 {
+        lowering.refuse(
+            Construct::TagPattern,
+            "alternatives that differ before the value",
+        );
+    }
+    let mut ways = vec![Way::default()];
+    for node in &sequence[at + 1..] {
+        ways = lowering.end(node, ways);
+    }
+    let tag = match branches.as_slice() {
+        [tag] if lowered => Some(Tag {
+            tag: tag.clone(),
+            ends: ways.into_iter().map(|way| way.end).collect(),
+        }),
+        _ => None,
+    };
+    (tag, refused)
+}
+
+/// The nodes `node` matches one after another, through concatenations and the groups that
+/// capture nothing around them.
+fn flatten<'n>(node: &'n Node, out: &mut Vec<&'n Node>) {
+    match node {
+        Node::Cat(nodes) => nodes.iter().for_each(|node| flatten(node, out)),
+        Node::Group(None, inner) => flatten(inner, out),
+        other => out.push(other),
+    }
+}
+
+/// The alternatives of `node`, through the groups that capture nothing around them: a lookahead's
+/// own alternatives, each a way a value may end.
+fn alternatives(node: &Node) -> Vec<&Node> {
+    match node {
+        Node::Group(None, inner) => alternatives(inner),
+        Node::Cat(nodes) => match nodes.as_slice() {
+            [only] => alternatives(only),
+            _ => vec![node],
+        },
+        Node::Alt(nodes) => nodes.iter().flat_map(alternatives).collect(),
+        other => vec![other],
+    }
+}
+
+/// `items` followed by `piece`, a literal merged into a literal before it.
+fn joined(mut items: Vec<Item>, piece: &[Item]) -> Vec<Item> {
+    for item in piece {
+        match (items.last_mut(), item) {
+            (Some(Item::Lit(before)), Item::Lit(text)) => before.push_str(text),
+            _ => items.push(item.clone()),
+        }
+    }
+    items
+}
+
+impl Lowering<'_> {
+    /// The ways a value ends after `node`: each of `ways` followed by each way through `node`, a
+    /// lookahead last in a way. A way through a construct the lowering refuses is left out.
+    fn end(&mut self, node: &Node, ways: Vec<Way>) -> Vec<Way> {
+        match node {
+            Node::Cat(nodes) => nodes.iter().fold(ways, |ways, node| self.end(node, ways)),
+            Node::Group(None, inner) => self.end(inner, ways),
+            Node::Alt(alternatives) => {
+                let mut out = Vec::new();
+                for way in ways {
+                    for alternative in alternatives {
+                        out.extend(self.end(alternative, vec![way.clone()]));
+                    }
+                    if out.len() > MAX_ALTERNATIVES {
+                        break;
+                    }
+                }
+                self.capped(out)
+            }
+            Node::Around {
+                behind: false,
+                negated: false,
+                node: inner,
+            } => {
+                let ways = self.not_looked(ways, "a lookahead after a lookahead");
+                let mut looks = Vec::new();
+                for alternative in alternatives(inner) {
+                    let before = self.refused.len();
+                    let lowered = self.node(alternative, vec![Vec::new()]);
+                    if self.refused.len() == before {
+                        looks.extend(lowered);
+                    }
+                }
+                let out = ways
+                    .into_iter()
+                    .flat_map(|way| {
+                        looks.iter().map(move |look| Way {
+                            end: EndItems {
+                                consume: way.end.consume.clone(),
+                                ahead: look.clone(),
+                            },
+                            looked: true,
+                        })
+                    })
+                    .collect();
+                self.capped(out)
+            }
+            other => {
+                let ways =
+                    self.not_looked(ways, "a lookahead with more of the value's end after it");
+                let before = self.refused.len();
+                let pieces = self.node(other, vec![Vec::new()]);
+                if self.refused.len() > before {
+                    return Vec::new();
+                }
+                let out = ways
+                    .into_iter()
+                    .flat_map(|way| {
+                        pieces.iter().map(move |piece| Way {
+                            end: EndItems {
+                                consume: joined(way.end.consume.clone(), piece),
+                                ahead: Vec::new(),
+                            },
+                            looked: false,
+                        })
+                    })
+                    .collect();
+                self.capped(out)
+            }
+        }
+    }
+
+    /// At most [`MAX_ALTERNATIVES`] ways; more are refused.
+    fn capped(&mut self, mut ways: Vec<Way>) -> Vec<Way> {
+        if ways.len() > MAX_ALTERNATIVES {
+            self.refuse(
+                Construct::Alternation,
+                format!("more than {MAX_ALTERNATIVES} ways a value ends"),
+            );
+            ways.truncate(MAX_ALTERNATIVES);
+        }
+        ways
+    }
+
+    /// The ways that have not looked ahead; the others are refused, once, as `what`.
+    fn not_looked(&mut self, ways: Vec<Way>, what: &str) -> Vec<Way> {
+        if ways.iter().any(|way| way.looked) {
+            self.refuse(Construct::LookAhead, what);
+        }
+        ways.into_iter().filter(|way| !way.looked).collect()
+    }
 }

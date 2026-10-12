@@ -7,7 +7,9 @@
 //!   every place (for an output of at most 2 KiB) and around every marker, and thirty seeded
 //!   plans. A session whose message differs is listed in `to_symphony_differs.tsv` with the codes
 //!   of the documented differences that explain it, each checked by undoing it; a difference none
-//!   explains fails, and so does a listed session that reads as transformers does.
+//!   explains fails, and so does a listed session that reads as transformers does. A session that
+//!   gives a marker back (an open whose header does not match, a close without its trailer) reads
+//!   exactly as transformers does, with no difference listed.
 //! - At every chunking the table keeps symphony's contract: every byte of the output in exactly
 //!   one event, in order; what it says the same whatever the chunking; a call's arguments a JSON
 //!   prefix after every fragment; every token counted once, in the event that carries its first
@@ -39,7 +41,8 @@ use smg_response_template::{
     load_response_template, Event as RegionEvent, ResponseParser, ResponseTemplate,
 };
 use symphony::{
-    adapt, Declared, Engine, EngineFinish, Event, Events, Format, Input, Parser, TokenSpan,
+    adapt, Declared, Engine, EngineFinish, Event, Events, Format, Input, MalformedReason, Parser,
+    TokenSpan,
 };
 
 /// The compiled tables of a fixture directory by template id, each with the literal text of its
@@ -196,6 +199,42 @@ struct Message {
     calls: Vec<(String, Value)>,
 }
 
+/// The message a client folds from the events, with every call the stream cut closed: its
+/// arguments' object closed and the text the cut gave back, which no parameter took, left out.
+/// `None` when the stream cut no call.
+fn closed(events: &[Event]) -> Option<Message> {
+    let kept: Vec<Event> = events
+        .iter()
+        .filter(|event| {
+            !matches!(
+                event,
+                Event::Malformed {
+                    why: MalformedReason::UnterminatedRegion,
+                    ..
+                }
+            )
+        })
+        .cloned()
+        .collect();
+    let mut message = ours(&kept);
+    let mut cut = false;
+    for (_, arguments) in &mut message.calls {
+        let Value::String(text) = arguments else {
+            continue;
+        };
+        let whole = if text.is_empty() {
+            "{}".to_owned()
+        } else {
+            format!("{text}}}")
+        };
+        if let Ok(value) = serde_json::from_str::<Value>(&whole) {
+            *arguments = value;
+            cut = true;
+        }
+    }
+    cut.then_some(message)
+}
+
 fn ours(events: &[Event]) -> Message {
     let message = adapt::chat::message(0, events).message;
     Message {
@@ -243,11 +282,13 @@ fn theirs(message: &Value) -> Message {
 }
 
 /// A session to replay: its id, prompt, output (without the stop text), how it ended, its tools,
-/// and transformers' message (`None` where transformers raised).
+/// transformers' message (`None` where transformers raised), and what it covers.
 #[derive(Clone)]
 struct Session {
     id: String,
     template: String,
+    /// What the session was recorded to cover (`give-back`, `cut`, ...).
+    covers: Vec<String>,
     prompt: String,
     output: String,
     /// The stop text transformers was fed after the output, which the stream does not show.
@@ -268,6 +309,13 @@ fn public_sessions() -> Vec<Session> {
         .map(|row| Session {
             id: row["id"].as_str().unwrap().to_owned(),
             template: row["template"].as_str().unwrap().to_owned(),
+            covers: row["covers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
             prompt: row["prompt"].as_str().unwrap().to_owned(),
             output: row["output"].as_str().unwrap().to_owned(),
             stop: row["stop"].as_str().unwrap_or_default().to_owned(),
@@ -299,6 +347,7 @@ fn fixture_sessions() -> Vec<Session> {
             Session {
                 id: row["id"].as_str().unwrap().to_owned(),
                 template: row["template"].as_str().unwrap().to_owned(),
+                covers: Vec::new(),
                 prompt: row["prefix"].as_str().unwrap_or_default().to_owned(),
                 output: row["text"].as_str().unwrap().to_owned(),
                 stop: String::new(),
@@ -371,23 +420,21 @@ fn replay_sessions(
         if theirs.as_ref() == Some(&ours) {
             continue;
         }
-        if theirs.is_none() {
-            differs.insert(
-                format!("{corpus}\t{}", session.id),
-                ("X5".to_owned(), format!("ours   {ours:?}\ntheirs raised")),
-            );
-            continue;
-        }
-        let code = explain(session, format, template.as_ref(), theirs.as_ref())
-            .unwrap_or_else(|| "unlisted".to_owned());
         let readings = match &theirs {
             Some(theirs) => format!("ours   {ours:?}\ntheirs {theirs:?}"),
             None => format!("ours   {ours:?}\ntheirs raised"),
         };
-        differs.insert(
-            format!("{corpus}\t{}", session.id),
-            (code.to_owned(), readings),
-        );
+        // A marker given back reads exactly as transformers reads it: no documented difference
+        // explains a session that covers one.
+        let code = if session.covers.iter().any(|covered| covered == "give-back") {
+            "unlisted".to_owned()
+        } else if theirs.is_none() {
+            "X5".to_owned()
+        } else {
+            explain(session, format, template.as_ref(), theirs.as_ref())
+                .unwrap_or_else(|| "unlisted".to_owned())
+        };
+        differs.insert(format!("{corpus}\t{}", session.id), (code, readings));
     }
     assert!(
         replayed > 0,
@@ -411,6 +458,11 @@ fn replay_sessions(
 /// - X1: a field that does not repeat was written more than once; the table keeps every stay
 ///   where transformers keeps the last. The table reads what the template's reader closes in
 ///   each field, joined.
+/// - X5: the stream was cut for length inside a call, which the table reports cut (its arguments'
+///   object left open, the text of a parameter the cut left unfinished malformed), where
+///   transformers closes the region at the end of the text. With each cut call closed and that
+///   text left out, it reads as transformers reads it. The stream's stop closes every call, so
+///   this never explains a session that stopped.
 fn explain(
     session: &Session,
     format: &Format,
@@ -448,15 +500,22 @@ fn explain(
                 ""
             };
             let output = format!("{shifted}{}{stop}", session.output);
-            let read = ours(&run(
+            let events = run(
                 format,
                 &session.declared,
                 prompt,
                 &output,
                 &[],
                 &session.end,
-            ));
+            );
+            let read = ours(&events);
             if read == *theirs {
+                return Some(codes.join(" "));
+            }
+            if !matches!(session.end, EngineFinish::Stop)
+                && closed(&events).as_ref() == Some(theirs)
+            {
+                codes.push("X5");
                 return Some(codes.join(" "));
             }
             let moved = Session {

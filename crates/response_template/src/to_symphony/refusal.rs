@@ -20,11 +20,13 @@ pub enum Construct {
     /// An open that is a lookahead as a whole (`(?=[\s\S]*?</think>)`): it matches before any
     /// text of its own, which a table reads only by guessing the region from the start.
     ZeroWidthOpen,
-    /// Any other lookahead.
+    /// Any other lookahead: one in a delimiter, before a tagged value, or with more after it in
+    /// the way a value ends.
     LookAhead,
     /// `^` or `\A` (the `(?:^|<think>)` open of a region the output may start in).
     StartOfText,
-    /// `$`, `\Z` or `\z` (the `|$` alternative of a close).
+    /// `$`, `\Z` or `\z` (the `|$` alternative of a close, or a value that ends where the call's
+    /// text ends).
     EndOfText,
     /// `\B`.
     NotWordBoundary,
@@ -44,7 +46,8 @@ pub enum Construct {
     /// An alternation the lowering cannot spell as several markers: more than 32 alternatives, or
     /// one inside a captured group.
     Alternation,
-    /// A captured group that the transform reads and that is not one run of a class.
+    /// A captured group that the transform reads, or a tag pattern's key or value, that is not
+    /// one run of a class.
     Capture,
     /// A start anchor pattern that is not a finite set of literals.
     AnchorNotFinite,
@@ -98,7 +101,8 @@ pub enum Construct {
     JsonEnvelope,
     /// JSON written in a dialect (`unquoted_keys`, `string_delims`).
     JsonDialect,
-    /// Arguments as tagged parameters (`xml-inline`). Not lowered yet.
+    /// Tagged parameters (`xml-inline`) in a call that the parameters name themselves
+    /// (`"function": "{content}"`): the call's name would be a parameter's value.
     TaggedParameters,
     /// Arguments as `key: value` lines (`kv-lines`).
     KeyValueLines,
@@ -116,6 +120,22 @@ pub enum Construct {
     MarkerInsideMarker,
     /// The assembled table does not pass the table's own check.
     Table,
+    /// A tag pattern of tagged parameters that does not lower into one tag a stream runs: none
+    /// that this crate's reader runs, a tag that does not begin with literal text, a key or a
+    /// value that the tag does not capture exactly once, alternatives that differ before the
+    /// value, a value with nothing after it, or a greedy run of any character with no bound.
+    TagPattern,
+    /// In a call with text before its closing marker (a trailer), a value's end that reads past
+    /// itself (a lookahead, or a run, a `\b` or an optional literal at its end), or whose last
+    /// literal the trailer could read: the call's text ends where the trailer begins, which only
+    /// the closing marker shows, so such an end could not be decided as the text arrives.
+    EndBeforeTrailer,
+    /// A value parser that is itself structured (`xml-inline` or `kv-lines`): a tagged value
+    /// reads as one value.
+    NestedValueParser,
+    /// A call's open whose alternatives differ after their markers, or a close whose alternatives
+    /// differ before theirs: a call reads with one header and one trailer.
+    CallAlternatives,
 }
 
 impl Construct {
@@ -166,6 +186,10 @@ impl Construct {
             Self::SharedOpenMarker => "SharedOpenMarker",
             Self::MarkerInsideMarker => "MarkerInsideMarker",
             Self::Table => "Table",
+            Self::TagPattern => "TagPattern",
+            Self::EndBeforeTrailer => "EndBeforeTrailer",
+            Self::NestedValueParser => "NestedValueParser",
+            Self::CallAlternatives => "CallAlternatives",
         }
     }
 }
