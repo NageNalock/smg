@@ -24,13 +24,17 @@
 //!   it.
 //! - [`Pattern::check`] refuses a pattern that a stream could decide only at the end of the
 //!   output.
+//! - An [`Interner`] keeps one copy of each distinct value for the life of the process, so a table
+//!   built at run time can hold its shapes as `&'static` data and stay `Copy`.
 //!
 //! [`formats`]: crate::formats
 
 mod class;
+mod intern;
 mod matcher;
 
 pub use class::Class;
+pub use intern::Interner;
 pub use matcher::{Match, Matcher, Verdict, HOLD_CAP};
 
 /// A linear pattern: its atoms, matched one after another from the start of the text it is run

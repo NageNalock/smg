@@ -74,8 +74,9 @@ and a client that wants the raw text back can have it.
 - `pythonic`: calls written as Python, `name(key=value)`.
 - `shape`: a call's parts given as data, as a template's own patterns write them: linear patterns
   (literals, runs of a class of characters, `\b`, optional literals) and the ways a value ends,
-  checked for what a stream can decide; and a matcher that runs them over the output as it
-  arrives and answers as Python's `regex` module does for the whole text.
+  checked for what a stream can decide; a matcher that runs them over the output as it arrives
+  and answers as Python's `regex` module does for the whole text; and an interner that keeps a
+  shape built at run time `'static`.
 - `grammar`: the structural-tag derivation and its per-syntax spellings (`keyed`, `xtml`,
   `tagged`, `pythonic`, and `xml` for MiniMax's; the JSON, compact keyed, DSML and xLAM list
   spellings in the module itself), with the argument shapes a JSON schema pins (`schema`).
