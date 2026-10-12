@@ -4,7 +4,10 @@
 //! `response_template` in its `tokenizer_config.json`; this crate loads the
 //! template and parses model output with it, returning what transformers
 //! returns, value for value. A template this crate would not parse exactly as
-//! transformers does is refused when it loads (`LoadError::Unsupported`).
+//! transformers does is refused when it loads (`LoadError::Unsupported`);
+//! `read_response_template` reads every template transformers loads, its
+//! patterns as the `regex` module reads them, and says whether this crate
+//! runs it.
 //!
 //! Portions are ported from Hugging Face transformers (Apache-2.0). The files
 //! follow its layout (`response_templates.rs`, `response_parser.rs`,
@@ -27,4 +30,4 @@ mod unit_tests;
 
 pub use error::{LoadError, ParseError, PyErrorKind, Unsupported};
 pub use response_parser::{parse_response, Event, Message, ResponseParser};
-pub use response_templates::{load_response_template, ResponseTemplate};
+pub use response_templates::{load_response_template, read_response_template, ResponseTemplate};

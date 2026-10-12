@@ -10,9 +10,9 @@ use serde_json::{Map, Value};
 
 use crate::{
     content_parsers::process_field,
-    error::{ParseError, PyError, PyErrorKind, PyResult, Taint},
+    error::{LoadError, ParseError, PyError, PyErrorKind, PyResult, Taint},
     py::{self, JsonError},
-    pyre::{Found, Match, Memo},
+    pyre::{Found, Match, Memo, Pattern},
     response_templates::{Delimiter, ResponseTemplate, ResponseTemplateField},
 };
 
@@ -176,6 +176,8 @@ enum Kind {
 impl ResponseParser {
     /// transformers: `ResponseParser(template, prefix=prefix, tools=tools)`.
     /// `prefix` is the chat prompt sent before generation; pass `""` to opt out.
+    /// A template this crate's parser does not run
+    /// ([`ResponseTemplate::unsupported`]) is `ParseError::Unsupported`.
     pub fn new(
         template: &ResponseTemplate,
         prefix: &str,
@@ -191,6 +193,12 @@ impl ResponseParser {
         truncated: &str,
         tools: &[Value],
     ) -> Result<Self, ParseError> {
+        if let Some(LoadError::Unsupported { scope, feature }) = template.unsupported() {
+            return Err(ParseError::Unsupported {
+                scope: scope.clone(),
+                feature: feature.clone(),
+            });
+        }
         let mut parser = Self::unprimed(template, tools);
         parser.prime(truncated)?;
         Ok(parser)
@@ -469,12 +477,14 @@ impl ResponseParser {
         watch
     }
 
-    fn delimiter(&self, kind: Kind, field: usize) -> Option<&Delimiter> {
+    /// The delimiter and its pattern as the matcher runs it.
+    fn delimiter(&self, kind: Kind, field: usize) -> Option<(&Delimiter, &Pattern)> {
         let field = &self.spec.0.fields[field];
-        match kind {
+        let delimiter = match kind {
             Kind::Open => field.open.as_ref(),
             Kind::Close => field.close.as_ref(),
-        }
+        }?;
+        Some((delimiter, delimiter.pattern.as_ref()?))
     }
 
     /// transformers: `_scan`. The earliest delimiter that can be committed now
@@ -490,22 +500,18 @@ impl ResponseParser {
         let mut best: Option<(Kind, usize, Match)> = None;
         let mut hold_start = self.buffer.len();
         for &(kind, field) in watch {
-            let Some(delimiter) = self.delimiter(kind, field) else {
+            let Some((delimiter, pattern)) = self.delimiter(kind, field) else {
                 continue;
             };
             let memo = &mut memos[field][usize::from(kind == Kind::Close)];
             let found = if eos {
-                delimiter
-                    .pattern
+                pattern
                     .search(&self.buffer, self.pos, memo)
                     .map(Found::Complete)
             } else {
-                match delimiter
-                    .pattern
-                    .search_partial(&self.buffer, self.pos, memo)
-                {
+                match pattern.search_partial(&self.buffer, self.pos, memo) {
                     Some(Found::Partial(start)) if start < floor => {
-                        delimiter.pattern.search_partial(&self.buffer, floor, memo)
+                        pattern.search_partial(&self.buffer, floor, memo)
                     }
                     found => found,
                 }
@@ -590,9 +596,8 @@ impl ResponseParser {
         let spec = self.spec.clone();
         let f = &spec.0.fields[field];
         self.current = Some(field);
-        self.captures = match &f.open {
-            Some(open) => open
-                .pattern
+        self.captures = match f.open.as_ref().and_then(|open| open.pattern.as_ref()) {
+            Some(pattern) => pattern
                 .groupdict(&self.buffer, m)
                 .into_iter()
                 .filter_map(|(name, value)| Some((name.to_owned(), value?.to_owned())))

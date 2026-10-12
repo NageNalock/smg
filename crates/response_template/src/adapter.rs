@@ -8,7 +8,10 @@
 //! of a call once its region is open, when the template's opener captures it.
 //! A region that fails to parse is content.
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::{
+    borrow::Cow,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+};
 
 use serde_json::Value;
 
@@ -27,21 +30,25 @@ const TOOL_CALLS: &str = "tool_calls";
 /// Why smg's parsers do not use a template.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
-pub struct Unsuitable(&'static str);
+pub struct Unsuitable(Cow<'static, str>);
 
-/// Whether smg's parsers can use `template`: it has a reasoning or a
-/// `tool_calls` field, and its reasoning and `content` values are strings.
+/// Whether smg's parsers can use `template`: this crate's parser runs it
+/// ([`ResponseTemplate::unsupported`]), it has a reasoning or a `tool_calls`
+/// field, and its reasoning and `content` values are strings.
 pub fn check(template: &ResponseTemplate) -> Result<(), Unsuitable> {
+    if let Some(refusal) = template.unsupported() {
+        return Err(Unsuitable(refusal.to_string().into()));
+    }
     let spec = &template.0;
     let field = |name: &str| spec.fields.iter().find(|f| f.name == name);
     if REASONING.iter().all(|name| field(name).is_some()) {
         return Err(Unsuitable(
-            "both a `thinking` and a `reasoning_content` field",
+            "both a `thinking` and a `reasoning_content` field".into(),
         ));
     }
     if field(TOOL_CALLS).is_none() && REASONING.iter().all(|name| field(name).is_none()) {
         return Err(Unsuitable(
-            "no `thinking`, `reasoning_content` or `tool_calls` field",
+            "no `thinking`, `reasoning_content` or `tool_calls` field".into(),
         ));
     }
     for name in [REASONING[0], REASONING[1], CONTENT] {
@@ -57,7 +64,7 @@ pub fn check(template: &ResponseTemplate) -> Result<(), Unsuitable> {
                 .is_some_and(|v| !v.is_string() && !v.is_null())
         {
             return Err(Unsuitable(
-                "a `thinking`, `reasoning_content` or `content` value that is not a string",
+                "a `thinking`, `reasoning_content` or `content` value that is not a string".into(),
             ));
         }
     }
@@ -117,9 +124,8 @@ fn name_group(template: &ResponseTemplate) -> Option<String> {
     let function = field.transform.as_ref()?.get("function")?;
     function.get("arguments")?;
     let group = content_parsers::placeholder(function.get("name")?.as_str()?)?;
-    let named = group != CONTENT
-        && !group.contains('.')
-        && open.pattern.group_names().any(|name| name == group);
+    let named =
+        group != CONTENT && !group.contains('.') && open.group_names().any(|name| name == group);
     named.then(|| group.to_owned())
 }
 

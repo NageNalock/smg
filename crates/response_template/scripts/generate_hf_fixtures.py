@@ -2917,6 +2917,37 @@ LOOKAHEAD_HAYSTACKS = [
 ]
 
 
+# Class escapes, escapes and characters the module reads as literals, each
+# checked in both uses since the reader takes the module's whole syntax.
+ESCAPE_ROWS = (
+    r"""
+\d \d+ \D+ \W+ \S+ [\s\S] [^\S]+ [\d\s]+ [\W\s]+ [^\d\W]+ [\s-a]+ [a-\s]+ [\w--\d]+ [\d-z]+
+[a-\d]+ x\t \r\n \x41 \u00e9 \U0001F4A1 \0 \012 [\0-\x1f]+ [\x41-\x5a]+ \a\f\v [\b]+ a{x}
+<t>{ \{"name" {"name" a} ]a []a]+ [^]a]+ [a|b]+ [a^b]+ [[a]]+ (?#c)a \Aa a\z (a)\1
+(?P<n>a)(?P=n) \D{2,3} \S{2} \N \p \g
+""".split()
+    + ["(?x) a b", "\\ ", "é{2}"]
+    # A class escape and its complement make any character, also negated: the
+    # module's set optimisation (`SetUnion.optimise`) drops the negation.
+    + r"[^\s\S] [^a\d\D]+ [\w\Wa]".split()
+    # `\g` before a name outside ASCII, which the module reads as a reference
+    # (`(a)\g<١>` is `(a)\1`) or rejects. A fuzzy test, which the module never
+    # resolves and compiles only when the setting allows errors, and then only
+    # as a character or a set.
+    + r"\g<é> (a)\g<١> a{e<=0:\1}b a{e<=1:\b} (a)b{e<=1:\1}".split()
+)
+ESCAPE_HAYSTACKS = [
+    "",
+    "a1\u0663 \xb2\tB\r\nZé_\U0001f4a1",
+    "\x00\x07\x08\x0b\x0c\x1c\xa0\u3000x",
+    "12 345 6789",
+    'a{x} {"name" <t>{ a} ]a [a] a|b^',
+    "x\ta\r\nAé\U0001f4a1 Npg",
+    NEWER_WORD + "\U00016d70\U0001ccf1\U0001d7ce",
+    "aa ab",
+]
+
+
 def lazy_family_patterns() -> list[str]:
     """Lazy repeats of one character in open/close patterns, in the positions
     the port supports and others: the `regex` module's partial matches follow
@@ -3085,6 +3116,11 @@ def build_regex_rows(
         hays = LOOKAHEAD_HAYSTACKS + fragment_haystacks(pattern, rng, 4)
         for role in ("delimiter", "finditer"):
             rows.append(regex_row(pattern, hays, role))
+    # What the matcher runs since the reader takes the module's whole syntax,
+    # after every row recorded before.
+    for pattern in ESCAPE_ROWS:
+        for role in ("delimiter", "finditer"):
+            rows.append(regex_row(pattern, ESCAPE_HAYSTACKS, role))
     return rows
 
 
@@ -3428,7 +3464,8 @@ def _ranges(codepoints) -> list[list[int]]:
 
 def build_table_rows() -> list[dict]:
     """The character classes the port reproduces, as code point ranges: the
-    `regex` module's `\\w` and `\\s`, `str.isspace()`, and `str.isdecimal()`."""
+    `regex` module's `\\w` and `\\s`, `str.isspace()`, `str.isdecimal()`,
+    and the module's `\\d`."""
     import regex
 
     def regex_class(pattern: str) -> list[int]:
@@ -3449,6 +3486,7 @@ def build_table_rows() -> list[dict]:
             "name": "str_isdecimal",
             "ranges": _ranges(c for c in code_points if chr(c).isdecimal()),
         },
+        {"kind": "table", "name": "regex_digit", "ranges": _ranges(regex_class(r"\d"))},
     ]
 
 

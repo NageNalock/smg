@@ -12,6 +12,9 @@ events for the same chunks.
 A template this crate would not parse exactly as transformers does is refused
 when it loads (`LoadError::Unsupported`, naming the construct), never parsed
 differently. Callers can then fall back to another parser.
+`read_response_template` reads every template transformers loads, its patterns
+as the `regex` module reads them, also one this crate does not run;
+`ResponseTemplate::unsupported` then names what it does not run.
 
 ## API
 
@@ -20,11 +23,11 @@ differently. Callers can then fall back to another parser.
 | `ResponseParser(template, prefix=..., tools=...)` | `ResponseParser::new(&template, prefix, &tools)` |
 | `.initial_events`, `.feed(text)`, `.finalize()` | `initial_events()`, `feed(text)`, `finalize(self)` |
 | `parse_response(text, template, prefix=..., tools=...)` | `parse_response(text, &template, prefix, &tools)` |
-| `load_response_template(dict)` | `load_response_template(&serde_json::Value)` |
+| `load_response_template(dict)` | `load_response_template(&serde_json::Value)`; `read_response_template` also returns a template this crate does not run (`ResponseTemplate::unsupported`) |
 | `ResponseTemplate.truncate_past_last_anchor` | `ResponseTemplate::truncate_past_last_anchor` |
 | event dicts / message dict | `Event` (serializes to the same dicts) / `Message` |
 | `ValueError` while loading | `LoadError::Invalid` |
-| exceptions while parsing | `ParseError` (`Content { kind, .. }` names the Python class) |
+| exceptions while parsing | `ParseError` (`Content { kind, .. }` names the Python class; `Unsupported` for a template this crate does not run) |
 
 `ResponseTemplate::last_anchor_end` gives where the last start anchor of a text
 ends, or `None` without one, where `truncate_past_last_anchor` keeps the whole
@@ -121,48 +124,66 @@ Where smg's use differs from `transformers serve` by design:
 
 ## Regular expressions
 
-transformers compiles patterns with the `regex` module, and streaming depends on
-its `search(..., partial=True)`, whose results come from the module's matcher
-rather than from the pattern's language. `pyre.rs` parses the constructs used
-by the templates of transformers' tests and of `transformers serve` and by the
-public checkpoint shapes the parity fixtures record, plus positive classes,
-ranges in classes and `\w` and `\s` in classes (as in tool-name patterns like
-`[A-Za-z_][A-Za-z0-9_]*` or `[\w.-]+`) and lookahead in tag patterns (as in
-a parameter whose closing tag may be left out), and runs them on a
-backtracking matcher that reproduces those results.
-Supported:
+transformers compiles patterns with the `regex` module (`regex.compile(pattern,
+regex.DOTALL)`, version 0 behaviour), and streaming depends on its
+`search(..., partial=True)`, whose results come from the module's matcher
+rather than from the pattern's language.
 
-- literal characters other than `{`, `}` and `]`, `\` before ASCII
-  punctuation, `\n`;
-- `.` (transformers sets `DOTALL`), `\w`, `\s` (with the `regex` module's
-  Unicode tables), `[...]` and `[^...]` of literal characters, ranges of
-  them, `\w` and `\s` (`-` is literal only as the last item; `[`, `]`, `&`,
-  `|`, `~` and a `^` other than the first are not taken there);
-- `^`, `$`, `\Z`, `\b`;
-- `(?:...)`, `(?P<name>...)`, alternation;
-- `*`, `+`, `?` after one character, `?` after a group; `*?` after one
-  character, in open and close patterns only as `.*?` before a literal, or
-  after another item and before `\b` and a literal (other positions change
-  what a partial search reports);
-- `\1` to `\9` in start anchors and tag patterns;
+`pyre/parse.rs` ports the module's parser (`_regex_core.py`) and reads a
+pattern into a tree of every construct the module reads: literals and every
+escape, classes with ranges, class escapes and POSIX classes, assertions,
+every kind of group, look-around, backreferences, quantifiers of any item
+(greedy, lazy and possessive, `{m,n}` included), inline flags (a verbose
+pattern is read as verbose), fuzzy settings, group calls, conditionals and
+verbs. It rejects what the module rejects. It does not read Unicode properties
+in braces (`\p{...}`), named characters (`\N{...}`), POSIX classes other than
+the 14 POSIX names, group names outside ASCII, a group inside a group of the
+same name, version 1 behaviour (`(?V1)`), or groups nested more than 100 deep
+(the module takes up to 198; a template must not be able to exhaust the
+stack): a template with one of these in an open, close or start anchor pattern
+is refused when it is read.
+
+`pyre.rs` runs a tree on a backtracking matcher that reproduces the module's
+results. It runs:
+
+- literal characters and escapes of them (`\n`, `\t`, `\x41`, `\u00e9`,
+  `\012`, ...), also `{`, `}` and `]` where the module reads them as
+  literals;
+- `.`, `\w`, `\W`, `\s`, `\S`, `\d`, `\D` (with the module's Unicode
+  tables), and classes of characters, ranges of them and class escapes, read
+  as the module reads them (`[\s-a]` is `\s`, `-` and `a`; `[\b]` is a
+  backspace; `[[a]]` is `[` or `a`, then `]`; a class with a class escape
+  and its complement is any character, also when negated: `[^\s\S]` matches
+  every character);
+- `^`, `\A`, `$`, `\Z`, `\z`, `\b`;
+- groups, named or not, `(?:...)`, alternation, comments, and inline flags
+  that change nothing a match returns (`s`, `u`, `x`, `f`, `V0`);
+- `*`, `+` and `?` after one character, and `?` after a group;
+- `*?` after one character, in open and close patterns only as `.*?` before
+  a literal, or after another item and before `\b` and a literal (other
+  positions change what a partial search reports);
+- backreferences in start anchors and tag patterns;
 - `(?=...)` without groups or backreferences in it, in start anchors and tag
   patterns (they are only used with `finditer`, never searched partially).
 
-Anything else is refused, for example lookahead in open and close patterns,
-negative lookahead and lookbehind, inline flags, `{m,n}` and
-`{`, `}` or `]` that Python reads as literal characters, possessive and other
-lazy quantifiers, escapes such as `\d` or `\t`, a `-` next to `\w` or `\s` in a
-class other than as its last item (the `regex` module reads it as a literal,
-Python's `re` rejects it), unnamed groups, backreferences in open and close
-patterns, and groups nested more than 100 deep (the `regex` module takes up to
-198; a template must not be able to exhaust the stack). So are alternatives two
-of which can end in a negated class of one character, also before an empty
-group (the `regex` module drops empty groups, merges such alternatives into one
-class and matches `[^a]|[^b]` and `[^a](?:)|[^b]` as `[^ab]`), and a
-backreference inside an optional group (the module does not retry the group
-where it failed before, even when the group it refers to has changed since).
+The matcher refuses everything else, naming it: lookahead in open and close
+patterns, negative lookahead and lookbehind, inline flags that change a match
+(`i`, `m`, `w`, `a`, `L`, `-s`, and the global `b`, `e`, `p`, `r`), possessive
+quantifiers, counted repeats, lazy quantifiers other than `*?`, repeats of
+groups and assertions, `*?` in other positions of open and close patterns, `\B`,
+`\m`, `\M`, `\G`, `\K`, `\X`, `\R`, `\h`, Unicode properties and POSIX classes,
+atomic groups, branch reset groups, conditionals, group calls, fuzzy settings,
+verbs, and backreferences in open and close patterns. So are alternatives two of
+which can end in a negated class of one character, also before an empty group
+(the module drops empty groups, merges such alternatives into one class and
+matches `[^a]|[^b]` and `[^a](?:)|[^b]` as `[^ab]`), and a backreference inside
+an optional group (the module does not retry the group where it failed before,
+even when the group it refers to has changed since).
 
 ## Other templates refused when they load
+
+`read_response_template` reads these too; `ResponseTemplate::unsupported`
+names the reason.
 
 - A start anchor or tag pattern that can match the empty string, or a field
   whose open and close patterns can both match it (transformers can loop
@@ -206,7 +227,9 @@ built-ins and character tables the port reproduces. The tests
 replay each session whole, at every two-way split and in recorded chunkings,
 and compare values and event traces. `tests/unsupported.tsv` lists the
 recorded templates transformers accepts and this crate refuses, with the
-reason; the test fails when that changes in either direction.
+reason; the test fails when that changes in either direction. Every template
+transformers accepts is read, except those the reader does not read, and every
+regex row's pattern is read exactly when the `regex` module compiles it.
 
 The fixtures are regenerated by hand, and CI only replays them in the crate's
 tests. They are pinned to transformers 5.18.0 (tag v5.18.0, commit

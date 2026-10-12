@@ -1,7 +1,7 @@
 //! Content parsers and transforms, ported from transformers'
-//! `content_parsers.py`. `content_args` are checked when the template loads:
-//! shapes transformers would only fail on while parsing, or read through
-//! Python's dynamic typing, are refused as `Unsupported::ContentArgs`.
+//! `content_parsers.py`. `content_args` are checked when the template is
+//! read: shapes transformers would only fail on while parsing, or read
+//! through Python's dynamic typing, are refused as `Unsupported::ContentArgs`.
 
 use serde_json::{Map, Value};
 
@@ -61,6 +61,22 @@ pub(crate) struct Content {
 }
 
 impl Content {
+    /// The parser without `content_args`.
+    pub(crate) fn plain(parser: ContentParser) -> Self {
+        Self {
+            parser,
+            strip: true,
+            string_delims: Vec::new(),
+            unquoted_keys: false,
+            allow_non_json: false,
+            tag_pattern: None,
+            value_parser: None,
+            merge_duplicates: false,
+            line_sep: String::new(),
+            kv_sep: String::new(),
+        }
+    }
+
     /// Check the `content_args` the parser reads (`None` when absent).
     pub(crate) fn new(parser: ContentParser, args: Option<&Value>) -> Result<Self, Unsupported> {
         let empty = Map::new();
@@ -76,16 +92,8 @@ impl Content {
             Some(_) => Err(Unsupported::ContentArgs(key)),
         };
         let mut content = Self {
-            parser,
             strip: flag("strip", true),
-            string_delims: Vec::new(),
-            unquoted_keys: false,
-            allow_non_json: false,
-            tag_pattern: None,
-            value_parser: None,
-            merge_duplicates: false,
-            line_sep: String::new(),
-            kv_sep: String::new(),
+            ..Self::plain(parser)
         };
         match parser {
             ContentParser::Json => {
