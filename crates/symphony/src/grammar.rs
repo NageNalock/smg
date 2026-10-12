@@ -5,8 +5,9 @@
 //! [`Grammar`] is Symphony's own tree, in the shape the engines' structural-tag format takes
 //! (xgrammar's, which the serving engines accept): a `triggered_tags` of per-tool `tag`s, each a
 //! `begin`, a content grammar and an `end`; `sequence`, `or`, `star`, `plus` and `optional` to
-//! compose; `const_string`, `any_text`, `regex` and `json_schema` as leaves. [`Grammar::to_json`]
-//! writes it as the engine reads it, and [`Grammar::payload`] wraps it as the request carries it.
+//! compose; `const_string`, `any_text`, `regex`, `json_schema` and `token` as leaves.
+//! [`Grammar::to_json`] writes it as the engine reads it, and [`Grammar::payload`] wraps it as the
+//! request carries it.
 //!
 //! [`Format::grammar`] derives the tree from the table. A region of the table (a call, a block of
 //! calls, the thought, the answer) is opened by the terminal of a row into its state and closed
@@ -75,6 +76,12 @@
 //! gets it written first, its opener, its text and its close, where the prompt has not opened it;
 //! every other table leaves the thought to the model, as gpt-oss's template leaves its analysis
 //! channel.
+//!
+//! A marker that is one token of the model's vocabulary ([`Format::marker_tokens`]: a terminal, a
+//! structural token, one of the syntax's own tags ([`CallSyntax::tag_texts`]), or a token inside
+//! one) is written as that token ([`Grammar::Token`]) wherever a tag writes it inside a tag or
+//! between tags, so the model cannot spell it in ordinary tokens there; a tag's begin and end and
+//! its triggers stay text, as the engines' `triggered_tags` takes them.
 
 use std::collections::VecDeque;
 
@@ -83,8 +90,7 @@ use serde_json::{json, Value};
 
 use crate::{
     format::{CallSyntax, Emits, Format},
-    gemma::STRING as GEMMA_STRING,
-    tagged::{assembler::TAGS as TAGGED_TAGS, dsml, keyed::Tags as KeyedTags},
+    tagged::{dsml, keyed::Tags as KeyedTags},
 };
 
 mod attributed;
@@ -123,6 +129,9 @@ pub enum Grammar {
     Plus(Box<Grammar>),
     /// `begin`, the content, `end`.
     Tag(Tag),
+    /// One token of the model's vocabulary, by its text: a marker written as that token, never
+    /// spelled in others ([`Format::marker_tokens`]).
+    Token(String),
     /// Free text until one of `triggers` opens a tag; with `at_least_one`, at least one tag, the
     /// first at once; with `stop_after_first`, nothing after the first tag.
     TriggeredTags {
@@ -194,6 +203,7 @@ impl Grammar {
             Self::Star(content) => json!({"type": "star", "content": content.to_json()}),
             Self::Plus(content) => json!({"type": "plus", "content": content.to_json()}),
             Self::Tag(tag) => tag.to_json(),
+            Self::Token(token) => json!({"type": "token", "token": token}),
             Self::TriggeredTags {
                 triggers,
                 tags,
@@ -235,7 +245,7 @@ impl Grammar {
     /// long string weighing its length), since the definitions attached to it are copied with it.
     pub(crate) fn nodes(&self) -> usize {
         1 + match self {
-            Self::ConstString(_) | Self::AnyText { .. } | Self::Regex(_) => 0,
+            Self::ConstString(_) | Self::AnyText { .. } | Self::Regex(_) | Self::Token(_) => 0,
             Self::JsonSchema { schema, .. } => json_nodes(schema) / 4,
             Self::Sequence(elements) | Self::Or(elements) => elements.iter().map(Self::nodes).sum(),
             Self::Optional(content) | Self::Star(content) | Self::Plus(content) => content.nodes(),
@@ -245,6 +255,89 @@ impl Grammar {
             }
         }
     }
+}
+
+/// `grammar` with each of `tokens`, marker texts the longest first, written as a token element
+/// where it stands in a constant string; a tag keeps its begin and end, and a tag list its
+/// separator.
+fn bound(grammar: Grammar, tokens: &[String]) -> Grammar {
+    let in_tag = |tag: Tag| Tag {
+        content: Box::new(bound(*tag.content, tokens)),
+        ..tag
+    };
+    let all = |elements: Vec<Grammar>| -> Vec<Grammar> {
+        elements
+            .into_iter()
+            .map(|element| bound(element, tokens))
+            .collect()
+    };
+    match grammar {
+        Grammar::ConstString(text) => split_tokens(text, tokens),
+        Grammar::Sequence(elements) => Grammar::Sequence(all(elements)),
+        Grammar::Or(elements) => Grammar::Or(all(elements)),
+        Grammar::Optional(content) => Grammar::Optional(Box::new(bound(*content, tokens))),
+        Grammar::Star(content) => Grammar::Star(Box::new(bound(*content, tokens))),
+        Grammar::Plus(content) => Grammar::Plus(Box::new(bound(*content, tokens))),
+        Grammar::Tag(tag) => Grammar::Tag(in_tag(tag)),
+        Grammar::TriggeredTags {
+            triggers,
+            tags,
+            at_least_one,
+            stop_after_first,
+        } => Grammar::TriggeredTags {
+            triggers,
+            tags: tags.into_iter().map(in_tag).collect(),
+            at_least_one,
+            stop_after_first,
+        },
+        Grammar::TagsWithSeparator {
+            tags,
+            separator,
+            at_least_one,
+            stop_after_first,
+        } => Grammar::TagsWithSeparator {
+            tags: tags.into_iter().map(in_tag).collect(),
+            separator,
+            at_least_one,
+            stop_after_first,
+        },
+        leaf @ (Grammar::AnyText { .. }
+        | Grammar::Regex(_)
+        | Grammar::JsonSchema { .. }
+        | Grammar::Token(_)) => leaf,
+    }
+}
+
+/// `text` as constant strings and tokens: each of `tokens` where it stands, leftmost first and of
+/// two at one place the longer; `text` as it is when it holds none.
+fn split_tokens(text: String, tokens: &[String]) -> Grammar {
+    if !tokens.iter().any(|token| text.contains(token.as_str())) {
+        return Grammar::ConstString(text);
+    }
+    let mut pieces: Vec<Grammar> = Vec::new();
+    let mut plain = String::new();
+    let mut rest = text.as_str();
+    while let Some(first) = rest.chars().next() {
+        if let Some(token) = tokens.iter().find(|token| rest.starts_with(token.as_str())) {
+            if !plain.is_empty() {
+                pieces.push(Grammar::ConstString(std::mem::take(&mut plain)));
+            }
+            pieces.push(Grammar::Token(token.clone()));
+            rest = &rest[token.len()..];
+        } else {
+            plain.push(first);
+            rest = &rest[first.len_utf8()..];
+        }
+    }
+    if !plain.is_empty() {
+        pieces.push(Grammar::ConstString(plain));
+    }
+    if pieces.len() == 1 {
+        if let Some(piece) = pieces.pop() {
+            return piece;
+        }
+    }
+    Grammar::Sequence(pieces)
 }
 
 /// `written` with `stop_after_first` set when the tags stop after the first: the key is left out
@@ -521,6 +614,7 @@ impl Format {
             CallSyntax::Shaped(_) => return None,
         };
         self.led(calls, options.reasoning_open, prefixed)
+            .map(|grammar| self.bounded(grammar))
     }
 
     /// The structural tag for an answer that is JSON `schema` accepts (`response_format`
@@ -547,7 +641,9 @@ impl Format {
                 "" => answer,
                 end => Grammar::Sequence(vec![answer, Grammar::ConstString(end.to_string())]),
             };
-            return self.led(answer, reasoning_open, true);
+            return self
+                .led(answer, reasoning_open, true)
+                .map(|grammar| self.bounded(grammar));
         }
         // The model starts in its thought when the prompt opened it, and otherwise in the turn's
         // own state, which a thought written first also closes back to.
@@ -565,6 +661,7 @@ impl Format {
             reasoning_open,
             false,
         )
+        .map(|grammar| self.bounded(grammar))
     }
 
     /// `body` after what the model writes before it. With the prompt's thought open, the prefix
@@ -624,21 +721,24 @@ impl Format {
             .filter(|text| !kept.contains(text))
             .map(str::to_string)
             .collect();
-        let inner: &[&str] = match self.call_syntax() {
-            Some(CallSyntax::Keyed(tags)) => &[
-                tags.key_open,
-                tags.key_close,
-                tags.value_open,
-                tags.value_close,
-            ],
-            Some(CallSyntax::Dsml) => &[dsml::PARAMETER_OPEN, dsml::PARAMETER_CLOSE],
-            Some(CallSyntax::Attributed(tags)) => &[tags.parameter_open, tags.parameter_close],
-            Some(CallSyntax::Tagged(..)) => &TAGGED_TAGS,
-            Some(CallSyntax::Gemma) => &[GEMMA_STRING],
-            _ => &[],
-        };
+        let inner = self
+            .call_syntax()
+            .map(CallSyntax::tag_texts)
+            .unwrap_or_default();
         excludes.extend(inner.iter().map(|tag| tag.to_string()));
         excludes
+    }
+
+    /// `grammar` with every marker that is one token ([`Format::marker_tokens`]) written as that
+    /// token where it stands in a constant string: inside a tag's content and between tags. A
+    /// tag's begin and end, its triggers, a separator and the texts free text excludes stay
+    /// strings, as the engines take them. Without such markers, `grammar` as it is.
+    fn bounded(&self, grammar: Grammar) -> Grammar {
+        let tokens = self.marker_token_texts();
+        if tokens.is_empty() {
+            return grammar;
+        }
+        bound(grammar, tokens)
     }
 
     /// The JSON family: each call is the call markers around one JSON object whose `name` is the
@@ -2622,6 +2722,249 @@ mod tests {
                 "calls": [{"name": "get_weather", "arguments": {"city": "Paris"}}],
             })
         );
+    }
+
+    /// Every node of `payload` of `kind`, depth first.
+    fn nodes_of<'v>(payload: &'v Value, kind: &str, out: &mut Vec<&'v Value>) {
+        match payload {
+            Value::Object(map) => {
+                if map.get("type").and_then(Value::as_str) == Some(kind) {
+                    out.push(payload);
+                }
+                for member in map.values() {
+                    nodes_of(member, kind, out);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    nodes_of(item, kind, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `grammar` with every token written back as its text: each constant string a marker
+    /// token cut apart joined again, so a bounded tag compares with the tag without tokens.
+    fn unbound(grammar: Grammar) -> Grammar {
+        let in_tag = |tag: Tag| Tag {
+            content: Box::new(unbound(*tag.content)),
+            ..tag
+        };
+        match grammar {
+            Grammar::Token(text) => Grammar::ConstString(text),
+            Grammar::Sequence(elements) => {
+                let cut = elements.iter().any(|e| matches!(e, Grammar::Token(_)))
+                    && elements
+                        .iter()
+                        .all(|e| matches!(e, Grammar::Token(_) | Grammar::ConstString(_)));
+                if cut {
+                    let mut text = String::new();
+                    for element in elements {
+                        if let Grammar::Token(piece) | Grammar::ConstString(piece) = element {
+                            text.push_str(&piece);
+                        }
+                    }
+                    return Grammar::ConstString(text);
+                }
+                Grammar::Sequence(elements.into_iter().map(unbound).collect())
+            }
+            Grammar::Or(elements) => Grammar::Or(elements.into_iter().map(unbound).collect()),
+            Grammar::Optional(content) => Grammar::Optional(Box::new(unbound(*content))),
+            Grammar::Star(content) => Grammar::Star(Box::new(unbound(*content))),
+            Grammar::Plus(content) => Grammar::Plus(Box::new(unbound(*content))),
+            Grammar::Tag(tag) => Grammar::Tag(in_tag(tag)),
+            Grammar::TriggeredTags {
+                triggers,
+                tags,
+                at_least_one,
+                stop_after_first,
+            } => Grammar::TriggeredTags {
+                triggers,
+                tags: tags.into_iter().map(in_tag).collect(),
+                at_least_one,
+                stop_after_first,
+            },
+            Grammar::TagsWithSeparator {
+                tags,
+                separator,
+                at_least_one,
+                stop_after_first,
+            } => Grammar::TagsWithSeparator {
+                tags: tags.into_iter().map(in_tag).collect(),
+                separator,
+                at_least_one,
+                stop_after_first,
+            },
+            other => other,
+        }
+    }
+
+    #[test]
+    fn a_marker_that_is_one_token_is_written_as_that_token_inside_a_tag() {
+        // Gemma 4's string delimiter is one token of its vocabulary: inside each call's tag,
+        // every string stands between that token, not its spelling in other tokens; the tag's
+        // begin and end, the trigger and the prefix's excludes stay text, as the engines take
+        // them. Written back as text, the tag is the one without tokens.
+        let tools = weather_tools();
+        let plain = formats::gemma4();
+        let bounded = formats::gemma4().marker_tokens(["<|\"|>", "<|tool_call>", "<tool_call|>"]);
+        for (at_least_one, reasoning_open, one_call) in [
+            (true, false, false),
+            (true, true, false),
+            (false, false, true),
+        ] {
+            let options = Options {
+                at_least_one,
+                reasoning_open,
+                one_call,
+            };
+            let before = plain.grammar_for(&tools, options).expect("a grammar");
+            let after = bounded.grammar_for(&tools, options).expect("a grammar");
+            assert_eq!(unbound(after.clone()), before);
+            let payload = after.payload();
+            let (mut tokens, mut strings) = (Vec::new(), Vec::new());
+            nodes_of(&payload, "token", &mut tokens);
+            nodes_of(&payload, "const_string", &mut strings);
+            assert!(!tokens.is_empty());
+            assert!(tokens.iter().all(|token| token["token"] == "<|\"|>"));
+            assert!(strings
+                .iter()
+                .all(|string| !string["value"].as_str().unwrap_or("").contains("<|\"|>")));
+            let tags = if reasoning_open {
+                &payload["format"]["elements"][1]
+            } else {
+                &payload["format"]
+            };
+            assert_eq!(tags["triggers"], value!(["<|tool_call>"]));
+            assert_eq!(tags["tags"][0]["begin"], "<|tool_call>call:get_weather{");
+        }
+        // The answer holds no marker, and is the same.
+        assert_eq!(answer(&bounded, true), answer(&plain, true));
+    }
+
+    #[test]
+    fn a_token_inside_a_longer_marker_is_cut_out_of_it() {
+        // DeepSeek V4.1's block opener begins with one token, `<｜DSML｜`: the opener, written
+        // before the invokes, takes that token and the rest as text; the close, which does not
+        // hold it, stays text, and the invokes' tags keep their begins and ends.
+        let tools = weather_tools();
+        let plain = formats::deepseek_v4_1();
+        let bounded = formats::deepseek_v4_1().marker_tokens(["<｜DSML｜"]);
+        let grammar = bounded.grammar(&tools, true, false).expect("a grammar");
+        assert_eq!(
+            Some(unbound(grammar.clone())),
+            plain.grammar(&tools, true, false)
+        );
+        let payload = grammar.payload();
+        assert_eq!(
+            payload["format"]["elements"][0],
+            value!({"type": "sequence", "elements": [
+                {"type": "const_string", "value": "\n\n"},
+                {"type": "token", "token": "<｜DSML｜"},
+                {"type": "const_string", "value": " calls>\n"},
+            ]})
+        );
+        assert_eq!(
+            payload["format"]["elements"][2],
+            value!({"type": "const_string", "value": "</｜DSML｜ calls>"})
+        );
+        assert_eq!(
+            payload["format"]["elements"][1]["tags"][0]["begin"],
+            "<｜DSML｜ invoke name=\"get_weather\">\n"
+        );
+        // Kimi K3's tags are made of its structural tokens: every argument tag inside a call
+        // writes them as tokens, and the block's ways in stay text.
+        let kimi = formats::kimi_k3().marker_tokens(["<|open|>", "<|close|>", "<|sep|>"]);
+        let grammar = kimi.grammar(&tools, true, true).expect("a grammar");
+        assert_eq!(
+            Some(unbound(grammar.clone())),
+            formats::kimi_k3().grammar(&tools, true, true)
+        );
+        let payload = grammar.payload();
+        let mut tokens = Vec::new();
+        nodes_of(&payload, "token", &mut tokens);
+        assert!(tokens.iter().any(|token| token["token"] == "<|sep|>"));
+        assert_eq!(
+            payload["format"]["triggers"],
+            value!([
+                "<|open|>tools<|sep|>",
+                "<|close|>think<|sep|>",
+                "<|close|>response<|sep|>"
+            ])
+        );
+    }
+
+    #[test]
+    fn the_marker_tokens_are_the_tables_own_the_longest_first() {
+        // A token no marker holds is no marker's; the empty text is none; of two, the longer is
+        // tried first, so a token inside a longer one never cuts it.
+        let format = formats::kimi_k3().marker_tokens([
+            "<|sep|>",
+            "hello",
+            "",
+            "<|open|>",
+            "<|close|>message<|sep|>",
+            "<|sep|>",
+        ]);
+        assert_eq!(
+            format.marker_token_texts(),
+            ["<|close|>message<|sep|>", "<|open|>", "<|sep|>"]
+        );
+        assert!(formats::kimi_k3().marker_token_texts().is_empty());
+        // The syntax's own tags count: Gemma 4's string delimiter is no terminal.
+        assert_eq!(
+            formats::gemma4()
+                .marker_tokens(["<|\"|>"])
+                .marker_token_texts(),
+            ["<|\"|>"]
+        );
+    }
+
+    #[test]
+    fn every_syntax_says_its_inner_tags() {
+        use crate::{pythonic::Dialect, tagged::attributed::Tags as AttributedTags};
+        assert_eq!(
+            CallSyntax::Tagged(
+                crate::tagged::Spelling::Json,
+                crate::tagged::Placement::OwnLine
+            )
+            .tag_texts(),
+            ["<function=", "<parameter=", "</parameter>", "</function>"]
+        );
+        assert_eq!(
+            CallSyntax::Keyed(KeyedTags::PLAIN).tag_texts(),
+            ["<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>"]
+        );
+        assert_eq!(
+            CallSyntax::Dsml.tag_texts(),
+            [dsml::PARAMETER_OPEN, dsml::PARAMETER_CLOSE]
+        );
+        assert_eq!(
+            CallSyntax::Attributed(AttributedTags::MINIMAX_M2).tag_texts(),
+            ["<parameter name=\"", "</parameter>"]
+        );
+        assert_eq!(
+            CallSyntax::Xtml.tag_texts(),
+            [
+                "<|open|>argument key=\"",
+                "<|close|>argument<|sep|>",
+                "<|sep|>"
+            ]
+        );
+        assert_eq!(CallSyntax::Gemma.tag_texts(), ["<|\"|>"]);
+        assert_eq!(
+            CallSyntax::NamedJson("<|content_invoke_tool_json|>").tag_texts(),
+            ["<|content_invoke_tool_json|>"]
+        );
+        for syntax in [
+            CallSyntax::Json,
+            CallSyntax::JsonList,
+            CallSyntax::Xml,
+            CallSyntax::Pythonic(Dialect::OLMO3),
+        ] {
+            assert!(syntax.tag_texts().is_empty(), "{syntax:?}");
+        }
     }
 
     #[test]

@@ -102,10 +102,11 @@
 
 use crate::{
     engine::is_strip_space,
+    gemma,
     markers::{Piece, Scanner},
     pythonic,
     shape::{CallShape, ValueRead, Values},
-    tagged::{self, keyed},
+    tagged::{self, dsml, keyed, xtml},
 };
 
 /// How the model writes a call between the call markers.
@@ -180,6 +181,34 @@ pub enum CallSyntax {
     Shaped(&'static CallShape),
 }
 
+impl CallSyntax {
+    /// The tags the syntax writes inside a call besides the table's terminals: the markers a
+    /// grammar writes inside a call's region, which free text before a call may not write, and
+    /// which a client that shows a call as text has to strip. JSON, Python and xLAM's list have
+    /// none, their calls being their own text, and neither has MiniMax M3's XML tree, whose
+    /// element tags are the arguments' keys.
+    pub fn tag_texts(&self) -> Vec<&'static str> {
+        match self {
+            Self::Tagged(..) => tagged::assembler::TAGS.to_vec(),
+            Self::Dsml => vec![dsml::PARAMETER_OPEN, dsml::PARAMETER_CLOSE],
+            Self::Keyed(tags) => vec![
+                tags.key_open,
+                tags.key_close,
+                tags.value_open,
+                tags.value_close,
+            ],
+            Self::Attributed(tags) => vec![tags.parameter_open, tags.parameter_close],
+            Self::Xtml => xtml::TAGS.to_vec(),
+            Self::NamedJson(marker) => vec![*marker],
+            Self::Gemma => vec![gemma::STRING],
+            // A shaped call's tags are its shape's literals; no grammar is derived for one yet.
+            Self::Json | Self::Pythonic(_) | Self::JsonList | Self::Xml | Self::Shaped(_) => {
+                Vec::new()
+            }
+        }
+    }
+}
+
 /// What the text inside a state is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Emits {
@@ -220,6 +249,7 @@ pub struct Format {
     /// How a shaped call's values read.
     values: Values,
     thinks_first: bool,
+    marker_tokens: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -298,6 +328,7 @@ impl Format {
             joiners: Vec::new(),
             values: Values::inferred(),
             thinks_first: false,
+            marker_tokens: Vec::new(),
         }
     }
 
@@ -515,6 +546,45 @@ impl Format {
     /// Whether the template writes the thought before every call and answer.
     pub(crate) fn writes_thought_first(&self) -> bool {
         self.thinks_first
+    }
+
+    /// The texts among `tokens` (the model's vocabulary's added tokens, by their text) that the
+    /// table's markers are made of: a terminal, a structural token or one of the call syntax's
+    /// tags that is one token, or a token inside one (`<|open|>` in Kimi K3's tags). The
+    /// structural tags write each as that token wherever they write it inside a tag or between
+    /// tags, so the model cannot spell it in ordinary tokens there; a tag's own begin and end and
+    /// its triggers stay text. Parsing does not change. It reads the markers the table has when
+    /// it is called, so it comes after the rows, and called again it replaces the set.
+    #[must_use]
+    pub fn marker_tokens<T: AsRef<str>>(mut self, tokens: impl IntoIterator<Item = T>) -> Self {
+        let mut markers: Vec<&str> = self
+            .terminals
+            .iter()
+            .map(|terminal| terminal.text.as_str())
+            .chain(self.structural_tokens.iter().map(String::as_str))
+            .collect();
+        let tags = self
+            .calls
+            .map(|syntax| syntax.tag_texts())
+            .unwrap_or_default();
+        markers.extend(tags);
+        let mut kept: Vec<String> = tokens
+            .into_iter()
+            .map(|token| token.as_ref().to_string())
+            .filter(|token| {
+                !token.is_empty() && markers.iter().any(|marker| marker.contains(token.as_str()))
+            })
+            .collect();
+        // The longest first, so a token inside a longer one is never taken for part of it.
+        kept.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        kept.dedup();
+        self.marker_tokens = kept;
+        self
+    }
+
+    /// The marker texts that are one token each, the longest first.
+    pub(crate) fn marker_token_texts(&self) -> &[String] {
+        &self.marker_tokens
     }
 
     /// The turn opener, if the table names one.

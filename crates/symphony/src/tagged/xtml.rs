@@ -70,7 +70,8 @@ pub const CALL_CLOSE: &str = "<|close|>call<|sep|>";
 const ARGUMENT_OPEN: usize = 0;
 const ARGUMENT_CLOSE: usize = 1;
 const SEP: usize = 2;
-const TAGS: [&str; 3] = [
+/// The argument tags inside a call, and the separator that ends an argument's opening tag.
+pub(crate) const TAGS: [&str; 3] = [
     "<|open|>argument key=\"",
     "<|close|>argument<|sep|>",
     "<|sep|>",
