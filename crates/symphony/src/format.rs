@@ -45,6 +45,14 @@
 //!   held until more text in the stay shows it was inside the text, or the stay ends and drops it.
 //!   Whitespace is what Python's `str.strip` removes: Unicode's white space and the separators
 //!   U+001C to U+001F.
+//! - A **join row** names a content or reasoning state whose stays the template joins with a text
+//!   (Hugging Face's `join`): a later stay shows the joiner first, so the stays read as one value
+//!   with the joiner between them. A stay of the turn's own state counts once its first byte
+//!   arrives, as an implicit field opens; a stay of any other state counts from the row that
+//!   enters it, as a field with an opener does, even when nothing follows. The joiner is the one
+//!   text an event shows that the model did not write: `Events::text` holds it where the stay it
+//!   joins starts, and a table without the row conserves the output byte for byte. With no row,
+//!   or an empty joiner, stays follow one another as they are.
 //! - The **stop tokens** are the terminals that are tokens the engine stops on (Harmony's
 //!   `<|call|>`): the stop decoder hides them, so the engine never reads one, and a constraint
 //!   derived from the table can end a region one of them closes with no text of its own, since
@@ -185,6 +193,8 @@ pub struct Format {
     framing: Vec<usize>,
     /// The states whose stays are trimmed.
     trimmed: Vec<usize>,
+    /// The states whose stays are joined, each with its joiner.
+    joiners: Vec<(usize, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -243,6 +253,7 @@ impl Format {
             stop_tokens: Vec::new(),
             framing: Vec::new(),
             trimmed: Vec::new(),
+            joiners: Vec::new(),
         }
     }
 
@@ -345,6 +356,17 @@ impl Format {
         if !self.trimmed.contains(&state) {
             self.trimmed.push(state);
         }
+        self
+    }
+
+    /// A later stay of `state`, a content or reasoning state, shows `text` first: the template
+    /// joins the stays with it (see the join row in [`crate::format`]). Naming the state again
+    /// replaces its joiner. The state must already be in the table.
+    #[must_use]
+    pub fn joins(mut self, state: &str, text: &str) -> Self {
+        let state = self.state_named(state);
+        self.joiners.retain(|&(joined, _)| joined != state);
+        self.joiners.push((state, text.to_string()));
         self
     }
 
@@ -584,6 +606,14 @@ impl Format {
         self.trimmed.contains(&index)
     }
 
+    /// The text that joins the stays of state `index`, if the table names one.
+    pub(crate) fn joiner(&self, index: usize) -> Option<&str> {
+        self.joiners
+            .iter()
+            .find(|&&(state, _)| state == index)
+            .map(|(_, text)| text.as_str())
+    }
+
     /// What every table must hold before an engine runs it: a state to start in, which does not
     /// emit reasoning (a thought the output starts inside is entered by the prompt's replay, which
     /// pushes `ReasoningStart`; an arguments state at the start has its call opened by the
@@ -591,8 +621,8 @@ impl Format {
     /// opener and turn anchors that are not empty and not both named, a start row only where a
     /// turn's first byte is read from the first state and no opener replays it, a stop row only
     /// for an arguments state, a framing row only for a state of content or wrapping, and a trim
-    /// row only for a state of content or reasoning that is not framing. The builder keeps a row
-    /// from naming what the table lacks; this checks the rest.
+    /// or join row only for a state of content or reasoning that is not framing. The builder
+    /// keeps a row from naming what the table lacks; this checks the rest.
     pub fn validate(&self) -> Result<(), String> {
         let Some(first) = self.states.first() else {
             return Err(format!("format {}: a table with no state", self.name));
@@ -673,17 +703,19 @@ impl Format {
                 self.name, state.name, state.emits
             ));
         }
-        for &index in &self.trimmed {
+        let trimmed = self.trimmed.iter().map(|&index| (index, "trimmed"));
+        let joined = self.joiners.iter().map(|&(index, _)| (index, "joined"));
+        for (index, row) in trimmed.chain(joined) {
             let state = &self.states[index];
             if matches!(state.emits, Emits::Arguments | Emits::Wrapper) {
                 return Err(format!(
-                    "format {}: state {:?} is trimmed, but it emits {:?}",
+                    "format {}: state {:?} is {row}, but it emits {:?}",
                     self.name, state.name, state.emits
                 ));
             }
             if self.is_framing(index) {
                 return Err(format!(
-                    "format {}: state {:?} is trimmed, but its text is framing",
+                    "format {}: state {:?} is {row}, but its text is framing",
                     self.name, state.name
                 ));
             }
@@ -1016,6 +1048,41 @@ mod tests {
     #[should_panic(expected = "format t: no state named \"answer\"")]
     fn a_trim_row_for_a_state_the_table_lacks_is_a_programming_error() {
         let _ = two_states().trims("answer");
+    }
+
+    #[test]
+    fn a_join_row_names_a_state_of_content_or_reasoning_that_is_not_framing() {
+        let format = Format::new("joined")
+            .state("content", Emits::Content)
+            .state("thought", Emits::Reasoning)
+            .state("between", Emits::Wrapper)
+            .state("outside", Emits::Content)
+            .framing("outside")
+            .joins("content", "|")
+            .joins("thought", "\n")
+            .joins("content", "");
+        assert_eq!(
+            format.joiner(0),
+            Some(""),
+            "a state named again takes the later joiner"
+        );
+        assert_eq!(format.joiner(1), Some("\n"));
+        assert_eq!(format.joiner(2), None);
+        assert!(format.validate().is_ok());
+        assert_eq!(
+            format.clone().joins("between", "|").validate(),
+            Err("format joined: state \"between\" is joined, but it emits Wrapper".to_string())
+        );
+        assert_eq!(
+            format.joins("outside", "|").validate(),
+            Err("format joined: state \"outside\" is joined, but its text is framing".to_string())
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "format t: no state named \"answer\"")]
+    fn a_join_row_for_a_state_the_table_lacks_is_a_programming_error() {
+        let _ = two_states().joins("answer", "|");
     }
 
     #[test]

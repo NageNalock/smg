@@ -224,6 +224,34 @@ fn gemma4_template() -> Box<dyn Parser> {
     ))
 }
 
+/// Inkling's messages, spelled from transformers v5.18.0's `tests/utils/test_chat_parsing.py`
+/// (`inkling_template`): each message is a thought, an answer or a call after its own marker, all
+/// of them closed by `<|end_message|>`, and nothing is kept outside them; the thoughts and the
+/// answers repeat, joined with `""` (no row) and not stripped (no trim row).
+fn inkling_template() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        Format::new("inkling template")
+            .terminal("thought", "<|content_thinking|>")
+            .terminal("answer", "<|content_text|>")
+            .terminal("call", "<|content_invoke_tool_json|>")
+            .terminal("end", "<|end_message|>")
+            .state("outside", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("content", Emits::Content)
+            .state("calls", Emits::Arguments)
+            .transition("outside", "thought", "reasoning")
+            .transition("outside", "answer", "content")
+            .transition("outside", "call", "calls")
+            .transition("reasoning", "end", "outside")
+            .transition("content", "end", "outside")
+            .transition("calls", "end", "outside")
+            .calls(CallSyntax::Json)
+            .framing("outside")
+            .turn_anchor("<|message_model|>"),
+        Declared::default(),
+    ))
+}
+
 fn iquest() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::iquest(), keyed_tools()))
 }
@@ -329,6 +357,11 @@ const FORMATS: &[Subject] = &[
         name: "gemma 4 template, trimmed",
         new: gemma4_template,
         outputs: GEMMA4_TEMPLATE_OUTPUTS,
+    },
+    Subject {
+        name: "inkling template, framed",
+        new: inkling_template,
+        outputs: INKLING_TEMPLATE_OUTPUTS,
     },
     Subject {
         name: "iquest",
@@ -659,6 +692,21 @@ const GEMMA4_TEMPLATE_OUTPUTS: &[&str] = &[
     "<|channel>thought\nPlan <|tool_call>call:f{}<tool_call|> more<channel|>Done",
     " \n\t ",
     "Sure.\n<|tool_call>call:get_weather{city:<|\"|>Par",
+    "",
+];
+
+/// Inkling's messages: transformers' streaming fixture and multi-message test for the template,
+/// two answers with spaces at their edges, text outside the messages around an author's name, a
+/// call cut short, and nothing.
+const INKLING_TEMPLATE_OUTPUTS: &[&str] = &[
+    "<|content_thinking|>Consider the weather.<|end_message|><|message_model|><|content_thinking|> \
+     Tokyo, probably.<|end_message|><|message_model|><|content_text|>Checking now.<|end_message|>\
+     <|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":\
+     {\"city\":\"Tokyo\"}}<|end_message|><|content_model_end_sampling|>",
+    "<|content_text|> A <|end_message|><|message_model|><|content_text|> B <|end_message|>",
+    "stray <|message_model|>author<|content_text|>Hi<|end_message|> tail",
+    "<|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":\
+     {\"city\":\"To",
     "",
 ];
 
