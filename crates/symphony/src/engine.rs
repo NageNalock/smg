@@ -35,6 +35,10 @@
 //!   no bytes. One cut for length, aborted, or ended with any finish but `Stop` is cut as before;
 //!   a driver hands a stop sequence of the request's that matched inside the call over as such a
 //!   finish, so that it never completes the call (the stop row in [`crate::format`]).
+//! - A table can say that the template discards the text of a state ([`Format::framing`]):
+//!   Hugging Face's null sink, the space around a response template's fields. Every byte of text
+//!   there, a terminal with no row from the state and what the scanner held at the end included,
+//!   is `Dropped { Wrapper }` at every finish; the state's rows still move the engine.
 //! - With the tagged syntax, a value's type comes from the request's tools ([`Declared`]): a
 //!   declared string streams, every other value is written at its close. A call to a function the
 //!   request did not declare has every value inferred.
@@ -335,6 +339,13 @@ impl Engine {
     }
 
     fn text(&mut self, text: &str, out: &mut Events) {
+        if self.format.is_framing(self.state) {
+            out.push(Event::Dropped {
+                text: self.tokens.text(text),
+                why: DropReason::Wrapper,
+            });
+            return;
+        }
         match self.emits() {
             Emits::Content => out.push_content(self.tokens.text(text)),
             Emits::Reasoning => {
@@ -802,6 +813,138 @@ mod tests {
                 )]
             );
         }
+    }
+
+    /// Muse Glimmer's messages, spelled from the response template of
+    /// `meta-models/Muse-Glimmer-30B` (its `tokenizer_config.json`): a thought addressed to the
+    /// model itself, an answer addressed to the user, and nothing kept outside them. The calls are
+    /// left out here.
+    fn muse(framing: bool) -> Format {
+        let format = Format::new("muse")
+            .terminal("thought", "to=self<|message|>")
+            .terminal("answer", "to=user<|message|>")
+            .terminal("eot", "<|eot|>")
+            .terminal("eom", "<|eom|>")
+            .state("outside", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("content", Emits::Content)
+            .transition("outside", "thought", "reasoning")
+            .transition("outside", "answer", "content")
+            .transition("reasoning", "eom", "outside")
+            .transition("content", "eot", "outside")
+            .transition("content", "eom", "outside");
+        if framing {
+            format.framing("outside")
+        } else {
+            format
+        }
+    }
+
+    /// The text of the events of one kind: content, reasoning, dropped as wrapping, and malformed.
+    fn kinds(events: &[Event]) -> [String; 4] {
+        let mut kinds: [String; 4] = Default::default();
+        for event in events {
+            let (kind, text) = match event {
+                Event::Content(text) => (0, text),
+                Event::Reasoning(text) => (1, text),
+                Event::Dropped {
+                    text,
+                    why: DropReason::Wrapper,
+                } => (2, text),
+                Event::Malformed { text, .. } => (3, text),
+                _ => continue,
+            };
+            kinds[kind].push_str(&text.text);
+        }
+        kinds
+    }
+
+    #[test]
+    fn a_framing_state_drops_its_text_and_its_rows_still_move_the_engine() {
+        let output = " junk <|eom|>to=self<|message|>Plan.<|eom|><|start|>assistant \
+                      to=user<|message|>It is sunny.<|eot|> after";
+        for finish in [
+            EngineFinish::Stop,
+            EngineFinish::Length,
+            EngineFinish::Abort,
+        ] {
+            let events = run(muse(true), output, finish.clone());
+            let [content, reasoning, dropped, malformed] = kinds(&events);
+            assert_eq!(content, "It is sunny.", "{finish:?}");
+            assert_eq!(reasoning, "Plan.", "{finish:?}");
+            assert_eq!(
+                dropped,
+                " junk <|eom|>to=self<|message|><|eom|><|start|>assistant to=user<|message|>\
+                 <|eot|> after",
+                "{finish:?}: the text outside, a terminal with no row there and the markers"
+            );
+            assert_eq!(malformed, "", "{finish:?}");
+            assert_eq!(bytes(&events), output);
+            // Without the row the text outside is the answer's.
+            let [content, ..] = kinds(&run(muse(false), output, finish.clone()));
+            assert_eq!(
+                content, " junk <|eom|><|start|>assistant It is sunny. after",
+                "{finish:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn what_the_scanner_held_in_a_framing_state_is_dropped_at_every_finish() {
+        // A marker the end cut short, and text that only looked like the start of one.
+        for (output, held) in [
+            (
+                "to=self<|message|>Plan.<|eom|><|start|>assistant to=us",
+                "to=us",
+            ),
+            ("to=user<|message|>Hi<|eot|>to=", "to="),
+        ] {
+            for finish in [
+                EngineFinish::Stop,
+                EngineFinish::Length,
+                EngineFinish::Abort,
+                EngineFinish::Other("stop_sequence".to_string()),
+            ] {
+                let events = run(muse(true), output, finish.clone());
+                let [_, _, dropped, malformed] = kinds(&events);
+                assert!(
+                    dropped.ends_with(held),
+                    "{output:?} {finish:?}: {dropped:?}"
+                );
+                assert_eq!(malformed, "", "{output:?} {finish:?}");
+                assert_eq!(bytes(&events), output);
+            }
+        }
+    }
+
+    #[test]
+    fn a_framing_wrapper_state_drops_what_it_would_report() {
+        let wrapped = |framing: bool| {
+            let format = Format::new("wrapped")
+                .terminal("open", "<a>")
+                .terminal("close", "</a>")
+                .state("between", Emits::Wrapper)
+                .state("inside", Emits::Content)
+                .transition("between", "open", "inside")
+                .transition("inside", "close", "between");
+            if framing {
+                format.framing("between")
+            } else {
+                format
+            }
+        };
+        let output = "x <a>kept</a> y";
+        let [content, _, dropped, malformed] =
+            kinds(&run(wrapped(true), output, EngineFinish::Stop));
+        assert_eq!(
+            [content, dropped, malformed],
+            ["kept".to_string(), "x <a></a> y".to_string(), String::new()]
+        );
+        let [_, _, _, malformed] = kinds(&run(wrapped(false), output, EngineFinish::Stop));
+        assert_eq!(
+            malformed, "xy",
+            "without the row the wrapping's text is reported"
+        );
     }
 
     #[test]

@@ -31,6 +31,12 @@
 //!   knows a stop sequence ended the stream hands the end over as another finish
 //!   (`EngineFinish::Other`), and the call stays cut, since a stop sequence never completes a
 //!   call.
+//! - A **framing row** names a content or wrapper state whose text the template discards: the
+//!   space around a response template's fields, which Hugging Face's parser drops (its null sink),
+//!   or a field the API has no place for. Every byte of text there, a terminal with no row from
+//!   the state included, is `Dropped { Wrapper }`, and so is what the scanner still held there
+//!   when the stream ended, at every finish: neither the client nor `Malformed` sees it. The
+//!   state's rows move the engine as before.
 //! - The **stop tokens** are the terminals that are tokens the engine stops on (Harmony's
 //!   `<|call|>`): the stop decoder hides them, so the engine never reads one, and a constraint
 //!   derived from the table can end a region one of them closes with no text of its own, since
@@ -141,6 +147,8 @@ pub struct Format {
     stop_closes: Vec<usize>,
     /// The texts of the tokens the engine stops on that are terminals.
     stop_tokens: Vec<String>,
+    /// The states whose text the template discards.
+    framing: Vec<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,6 +195,7 @@ impl Format {
             structural_tokens: Vec::new(),
             stop_closes: Vec::new(),
             stop_tokens: Vec::new(),
+            framing: Vec::new(),
         }
     }
 
@@ -265,6 +274,18 @@ impl Format {
     pub fn closes_at_stop(mut self, state: &str) -> Self {
         let state = self.state_named(state);
         self.stop_closes.push(state);
+        self
+    }
+
+    /// The template discards the text in `state`, a content or wrapper state: every byte of it is
+    /// `Dropped { Wrapper }`, held bytes included, at every finish (see the framing row in
+    /// [`crate::format`]). The state must already be in the table.
+    #[must_use]
+    pub fn framing(mut self, state: &str) -> Self {
+        let state = self.state_named(state);
+        if !self.framing.contains(&state) {
+            self.framing.push(state);
+        }
         self
     }
 
@@ -399,12 +420,18 @@ impl Format {
         self.stop_closes.contains(&index)
     }
 
+    /// Whether the template discards the text in state `index`.
+    pub(crate) fn is_framing(&self, index: usize) -> bool {
+        self.framing.contains(&index)
+    }
+
     /// What every table must hold before an engine runs it: a state to start in, which does not
     /// emit reasoning (a thought the output starts inside is entered by the prompt's replay, which
     /// pushes `ReasoningStart`; an arguments state at the start has its call opened by the
     /// engine), a call syntax when a state emits arguments, a text for every terminal, a turn
-    /// opener that is not empty, and a stop row only for an arguments state. The builder keeps a
-    /// row from naming what the table lacks; this checks the rest.
+    /// opener that is not empty, a stop row only for an arguments state, and a framing row only
+    /// for a state of content or wrapping. The builder keeps a row from naming what the table
+    /// lacks; this checks the rest.
     pub fn validate(&self) -> Result<(), String> {
         let Some(first) = self.states.first() else {
             return Err(format!("format {}: a table with no state", self.name));
@@ -449,6 +476,17 @@ impl Format {
             return Err(format!(
                 "format {}: a stop closes state {:?}, which holds no call",
                 self.name, state.name
+            ));
+        }
+        if let Some(state) = self
+            .framing
+            .iter()
+            .map(|&index| &self.states[index])
+            .find(|state| matches!(state.emits, Emits::Reasoning | Emits::Arguments))
+        {
+            return Err(format!(
+                "format {}: state {:?} is framing, but it emits {:?}",
+                self.name, state.name, state.emits
             ));
         }
         Ok(())
@@ -541,6 +579,41 @@ mod tests {
     #[should_panic(expected = "format t: no state named \"call\"")]
     fn a_stop_row_for_a_state_the_table_lacks_is_a_programming_error() {
         let _ = two_states().closes_at_stop("call");
+    }
+
+    #[test]
+    fn a_framing_row_names_a_state_of_content_or_wrapping() {
+        let format = Format::new("framing")
+            .terminal("open", "<call>")
+            .state("outside", Emits::Content)
+            .state("between", Emits::Wrapper)
+            .state("thought", Emits::Reasoning)
+            .state("call", Emits::Arguments)
+            .transition("outside", "open", "call")
+            .calls(CallSyntax::Json)
+            .framing("outside")
+            .framing("between")
+            .framing("outside");
+        assert_eq!(format.framing, [0, 1], "a state named twice is kept once");
+        assert!(format.is_framing(0));
+        assert!(format.is_framing(1));
+        assert!(!format.is_framing(2));
+        assert!(!format.is_framing(3));
+        assert!(format.validate().is_ok());
+        assert_eq!(
+            format.clone().framing("thought").validate(),
+            Err("format framing: state \"thought\" is framing, but it emits Reasoning".to_string())
+        );
+        assert_eq!(
+            format.framing("call").validate(),
+            Err("format framing: state \"call\" is framing, but it emits Arguments".to_string())
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "format t: no state named \"outside\"")]
+    fn a_framing_row_for_a_state_the_table_lacks_is_a_programming_error() {
+        let _ = two_states().framing("outside");
     }
 
     #[test]

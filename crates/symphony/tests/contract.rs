@@ -33,8 +33,8 @@ use symphony::{
     formats,
     json::PartialJson,
     tagged::{Placement, Spelling},
-    CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, FinishReason, Input,
-    MalformedReason, ParseError, Parser, TokenSpan,
+    CallSyntax, Declared, DropReason, Emits, Engine, EngineFinish, Event, Events, FinishReason,
+    Format, Input, MalformedReason, ParseError, Parser, TokenSpan,
 };
 
 /// A subject under test: how to make its parser, and the outputs it is checked over.
@@ -137,6 +137,29 @@ fn glm_closed_at_stop() -> Box<dyn Parser> {
     ))
 }
 
+/// Muse Glimmer's messages, spelled from the response template of `meta-models/Muse-Glimmer-30B`
+/// (its `tokenizer_config.json`): a thought addressed to the model itself, an answer addressed to
+/// the user, and nothing kept outside them. The calls are left out.
+fn muse_messages() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        Format::new("muse messages")
+            .terminal("thought", "to=self<|message|>")
+            .terminal("answer", "to=user<|message|>")
+            .terminal("eot", "<|eot|>")
+            .terminal("eom", "<|eom|>")
+            .state("outside", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("content", Emits::Content)
+            .transition("outside", "thought", "reasoning")
+            .transition("outside", "answer", "content")
+            .transition("reasoning", "eom", "outside")
+            .transition("content", "eot", "outside")
+            .transition("content", "eom", "outside")
+            .framing("outside"),
+        Declared::default(),
+    ))
+}
+
 fn iquest() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::iquest(), keyed_tools()))
 }
@@ -227,6 +250,11 @@ const FORMATS: &[Subject] = &[
         name: "glm, closed at stop",
         new: glm_closed_at_stop,
         outputs: GLM_STOPPED_OUTPUTS,
+    },
+    Subject {
+        name: "muse messages, framed",
+        new: muse_messages,
+        outputs: MUSE_OUTPUTS,
     },
     Subject {
         name: "iquest",
@@ -511,6 +539,17 @@ const GLM_STOPPED_OUTPUTS: &[&str] = &[
     "<think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>",
     "<think></think><tool_call>get_weather<arg_key>ci",
     "<think></think>Hello!",
+    "",
+];
+
+/// Muse Glimmer's messages: a thought and an answer with the turn's opener written between them,
+/// text outside every message, a message cut short, a marker cut short, and nothing.
+const MUSE_OUTPUTS: &[&str] = &[
+    "to=self<|message|>Plan the answer.<|eom|><|start|>assistant to=user<|message|>It is sunny.",
+    " junk to=user<|message|>\nHi\n<|eot|> more junk",
+    "to=self<|message|>Only a thought.",
+    "to=self<|message|>Plan.<|eom|><|start|>assistant to=us",
+    "Text outside every message, <|eom|> and to=user without its marker.",
     "",
 ];
 
