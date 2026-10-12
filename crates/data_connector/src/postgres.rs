@@ -330,12 +330,21 @@ enum IndexBuild {
 /// The class of the advisory lock the builder of the open-background index
 /// holds for the build (session-level, tried, never waited for); the lock's
 /// second key is the hash of the index name qualified by the schema the
-/// store writes to, resolved on the server (`owner` folded to lower case as
-/// the unquoted DDL is, else `current_schema()`), so two stores sharing one
+/// store writes to (`owner` folded as the server folds the unquoted DDL,
+/// else `current_schema()` on the server), so two stores sharing one
 /// database under different schemas build their own index at the same
 /// time, two spellings of one schema share the key, and one gateway per
 /// schema builds.
 const POSTGRES_INDEX_BUILD_LOCK_CLASS: i32 = 0x736D_6778;
+
+/// The schema owner as the server stores the schema the unquoted DDL
+/// created: folded to lower case the way identifiers are folded (`A`-`Z`
+/// only; the owner is ASCII by validation, and `lower()` on the server would
+/// follow the database's collation instead). `None` leaves the lookup to
+/// `current_schema()`.
+fn folded_owner(schema: &SchemaConfig) -> Option<String> {
+    schema.owner.as_deref().map(str::to_ascii_lowercase)
+}
 
 /// Builds the open-background index on one connection of `pool`, under the
 /// build lock, with the statement timeout lifted for the build; see
@@ -351,10 +360,10 @@ async fn build_open_background_index(
         .get()
         .await
         .map_err(|e| format!("no connection for the index build: {}", describe_error(&e)))?;
-    let owner = schema.owner.as_deref();
+    let owner = folded_owner(schema);
     let locked: bool = client
         .query_one(
-            "SELECT pg_try_advisory_lock($1, hashtext(COALESCE(lower($2), current_schema()) || '.' || $3))",
+            "SELECT pg_try_advisory_lock($1, hashtext(COALESCE($2, current_schema()) || '.' || $3))",
             &[&POSTGRES_INDEX_BUILD_LOCK_CLASS, &owner, &OPEN_BACKGROUND_INDEX],
         )
         .await
@@ -386,7 +395,7 @@ async fn build_open_background_index(
     .await;
     if let Err(e) = client
         .execute(
-            "SELECT pg_advisory_unlock($1, hashtext(COALESCE(lower($2), current_schema()) || '.' || $3))",
+            "SELECT pg_advisory_unlock($1, hashtext(COALESCE($2, current_schema()) || '.' || $3))",
             &[
                 &POSTGRES_INDEX_BUILD_LOCK_CLASS,
                 &owner,
@@ -429,8 +438,7 @@ async fn index_exists(
 }
 
 /// Whether an index named `name` exists in the schema the store writes to
-/// (`owner` folded to lower case, as the unquoted DDL that created the
-/// schema's objects was by the server, else `current_schema()`); with
+/// ([`folded_owner`], else `current_schema()` on the server); with
 /// `valid_only`, an INVALID one (an interrupted concurrent build) does not
 /// count.
 async fn index_exists_on_client(
@@ -444,9 +452,9 @@ async fn index_exists_on_client(
             "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
              JOIN pg_index i ON i.indexrelid = c.oid \
              WHERE c.relkind = 'i' AND c.relname = $1 \
-             AND n.nspname = COALESCE(lower($2), current_schema()) \
+             AND n.nspname = COALESCE($2, current_schema()) \
              AND (i.indisvalid OR NOT $3)",
-            &[&name, &schema.owner.as_deref(), &valid_only],
+            &[&name, &folded_owner(schema), &valid_only],
         )
         .await
         .map_err(|e| format!("failed to look the index {name} up: {}", describe_error(&e)))?;
@@ -467,9 +475,9 @@ async fn drop_invalid_index(
         .query(
             "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE c.relname = $1 AND n.nspname = COALESCE(lower($2), current_schema()) \
+             WHERE c.relname = $1 AND n.nspname = COALESCE($2, current_schema()) \
              AND NOT i.indisvalid",
-            &[&name, &schema.owner.as_deref()],
+            &[&name, &folded_owner(schema)],
         )
         .await
         .map_err(|e| describe_error(&e))?;
