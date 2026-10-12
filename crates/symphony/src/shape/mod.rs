@@ -1,12 +1,14 @@
-//! Call shapes as data: the patterns a template writes around a call's parts.
+//! Call shapes as data: the patterns a template writes around a call's parts, and a matcher that
+//! runs them while the output streams.
 //!
 //! A table under [`formats`] spells a family's markers as terminals and leaves what lies between
 //! them to the assembler its call syntax names. A model whose template publishes its own reader, a
 //! Hugging Face response template, says more of the call, as regular expressions: what follows the
 //! call's marker and names the tool (`<function=(?P<name>[^>\n]+)>`), a parameter's tag with its
 //! key and its value (`<parameter=(?P<key>\w+)>\s*(?P<value>.*?)\s*</parameter>`), what comes
-//! before the call's closing marker (`</function>\s*`). This module holds such expressions as data,
-//! so that a call syntax can be given as data rather than written as one more assembler.
+//! before the call's closing marker (`</function>\s*`). This module holds such expressions as data
+//! and runs them over text as it arrives, so that a call syntax can be given as data rather than
+//! written as one more assembler.
 //!
 //! - A [`Pattern`] is linear: [`Atom`]s matched one after another, each a literal, a run of one
 //!   [`Class`] of characters (greedy or lazy, bounded or not, captured as the tool's name, a key or
@@ -16,14 +18,20 @@
 //! - A [`Class`] is a set of characters as ranges. Whoever lowers a template resolves `\w`, `\s`
 //!   and `\d` into ranges with the template's own dialect, so the crate holds no character
 //!   tables.
+//! - A [`Matcher`] runs a pattern, with its ends, over text as it arrives. Its answer is the one
+//!   Python's `regex` module gives for the whole text (`match` under `DOTALL`, the dialect response
+//!   templates are written in), and it gives it as soon as no continuation of the text can change
+//!   it.
 //! - [`Pattern::check`] refuses a pattern that a stream could decide only at the end of the
 //!   output.
 //!
 //! [`formats`]: crate::formats
 
 mod class;
+mod matcher;
 
 pub use class::Class;
+pub use matcher::{Match, Matcher, Verdict, HOLD_CAP};
 
 /// A linear pattern: its atoms, matched one after another from the start of the text it is run
 /// over.
