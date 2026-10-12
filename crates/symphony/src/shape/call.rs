@@ -19,8 +19,10 @@
 //!   one where its pattern failed. A header holds at most the shape's cap of bytes undecided; past
 //!   it, it is no match.
 //! - **The arguments** follow: one JSON value ([`json::Arguments`], the model's bytes streamed as
-//!   fragments) or one object that names the call ([`json::Assembler`]). What comes after them is
-//!   the trailer, or text that belongs to no part of the call.
+//!   fragments), one object that names the call ([`json::Assembler`]), or tagged parameters, read
+//!   as `finditer` reads them, each written as a JSON member when its value ends. What comes after
+//!   a value or an object is the trailer, or text that belongs to no part of the call; between
+//!   parameters it is skipped.
 //! - **The trailer** is checked when a closing terminal comes ([`Assembler::closes`]): the region
 //!   closes there only when the trailer ends right before the terminal, starting no earlier than
 //!   the end of what the arguments took, and the earliest such start is the trailer's
@@ -41,11 +43,13 @@
 //!
 //! [`CallSyntax::Shaped`]: crate::CallSyntax::Shaped
 
+use super::params::Params;
 use crate::{
     engine::TEXT_AFTER_THE_OBJECT,
     event::{DropReason, Event, Events, MalformedReason, Text},
     json,
     shape::{Arguments, CallShape, Match, Matcher, NameSource, Slot, Suffix, Verdict},
+    tagged::Declared,
 };
 
 const TEXT_AFTER_THE_ARGUMENTS: &str = "text after a call's arguments";
@@ -81,14 +85,24 @@ enum Stage {
     /// when the engine has moved into it.
     Matched { held: String, found: Match },
     /// The call has started: its arguments, and what follows them.
-    Body(Box<Body>),
+    Body(Body),
     /// The call has ended.
     Done,
 }
 
-/// A started call.
+/// A started call: its arguments, and what follows them.
 #[derive(Clone, Debug)]
-struct Body {
+enum Body {
+    /// One JSON value or one object.
+    Value(Box<Value>),
+    /// Tagged parameters, which keep their own trailer's search, since the text after the last
+    /// parameter moves with every parameter.
+    Params(Box<Params>),
+}
+
+/// Arguments written as one JSON value or one object, and what follows them.
+#[derive(Clone, Debug)]
+struct Value {
     reader: Reader,
     /// The last character the call took, which a `\b` at the start of the trailer reads.
     before: Option<char>,
@@ -212,84 +226,74 @@ impl Assembler {
         let end = found.end();
         let header = &held[..end];
         let before = header.chars().next_back().or(self.before);
-        let reader = match &self.shape.arguments {
-            Arguments::Envelope { .. } => {
-                if !header.is_empty() {
-                    out.push(Event::Dropped {
-                        text: Text::uncounted(header),
-                        why: DropReason::Wrapper,
-                    });
-                }
-                Reader::Envelope(json::Assembler::new(self.index, self.id.clone()))
-            }
-            Arguments::Json(_) => {
-                let name = match &self.shape.name {
-                    NameSource::Literal(name) => name.to_string(),
-                    NameSource::Header | NameSource::Body => found
-                        .span(Slot::Name)
-                        .map(|span| held[span].to_string())
-                        .unwrap_or_default(),
-                };
-                out.push(Event::ToolCallStart {
-                    index: self.index,
-                    id: self.id.clone(),
-                    name,
-                    source: Text::uncounted(header),
+        let shape = self.shape;
+        if let Arguments::Envelope { .. } = &shape.arguments {
+            if !header.is_empty() {
+                out.push(Event::Dropped {
+                    text: Text::uncounted(header),
+                    why: DropReason::Wrapper,
                 });
-                Reader::Json(json::Arguments::new(self.index))
             }
+            let reader = Reader::Envelope(json::Assembler::new(self.index, self.id.clone()));
+            self.stage = Stage::Body(Body::Value(Box::new(Value::new(reader, before))));
+            return held[end..].to_string();
+        }
+        let name = match &shape.name {
+            NameSource::Literal(name) => name.to_string(),
+            NameSource::Header | NameSource::Body => found
+                .span(Slot::Name)
+                .map(|span| held[span].to_string())
+                .unwrap_or_default(),
         };
-        self.stage = Stage::Body(Box::new(Body {
-            reader,
-            before,
-            after: String::new(),
-            tail: None,
-            trailer_at: None,
-        }));
+        out.push(Event::ToolCallStart {
+            index: self.index,
+            id: self.id.clone(),
+            name: name.clone(),
+            source: Text::uncounted(header),
+        });
+        let body = match &shape.arguments {
+            Arguments::Params { tag, ends } => Body::Params(Box::new(Params::new(
+                self.index,
+                shape,
+                (tag, ends),
+                name,
+                before,
+            ))),
+            Arguments::Json(_) | Arguments::Envelope { .. } => Body::Value(Box::new(Value::new(
+                Reader::Json(json::Arguments::new(self.index)),
+                before,
+            ))),
+        };
+        self.stage = Stage::Body(body);
         held[end..].to_string()
     }
 
     /// Whether the call has started: whether its `ToolCallStart` has been pushed.
     pub fn started(&self) -> bool {
         match &self.stage {
-            Stage::Body(body) => match &body.reader {
-                Reader::Json(_) => true,
-                Reader::Envelope(assembler) => assembler.started(),
+            Stage::Body(body) => match body {
+                Body::Value(value) => match &value.reader {
+                    Reader::Json(_) => true,
+                    Reader::Envelope(assembler) => assembler.started(),
+                },
+                Body::Params(_) => true,
             },
             Stage::Header(_) | Stage::Matched { .. } | Stage::Done => false,
         }
     }
 
-    /// Append the next bytes of the call, after its start, and push the events they complete.
-    /// Every byte is the call's until the engine closes the region.
-    pub fn feed(&mut self, bytes: &str, out: &mut Events) {
+    /// Append the next bytes of the call, after its start, and push the events they complete,
+    /// a parameter's value typed by `declared`. Every byte is the call's until the engine closes
+    /// the region.
+    pub fn feed(&mut self, bytes: &str, declared: &Declared, out: &mut Events) {
         let shape = self.shape;
         let Stage::Body(body) = &mut self.stage else {
             return;
         };
-        let mut rest = bytes;
-        if !body.reader.over() {
-            let taken = match &mut body.reader {
-                Reader::Json(arguments) => arguments.feed(rest, out),
-                Reader::Envelope(assembler) => assembler.feed(rest, out),
-            };
-            if let Some(last) = rest[..taken].chars().next_back() {
-                body.before = Some(last);
-            }
-            rest = &rest[taken..];
-            if !body.reader.over() {
-                return;
-            }
+        match body {
+            Body::Value(value) => value.feed(shape, bytes, out),
+            Body::Params(params) => params.feed(bytes, declared, out),
         }
-        if shape.trailer.0.is_empty() {
-            wrapping(rest, &body.reader.surplus(), out);
-            return;
-        }
-        let tail = body.tail.get_or_insert_with(|| {
-            Suffix::new(&shape.trailer, &shape.word, body.before).hold_cap(Some(shape.cap()))
-        });
-        tail.feed(rest);
-        body.after.push_str(rest);
     }
 
     /// Whether the region closes at `terminal`, a closing terminal that just came (empty for the
@@ -301,40 +305,127 @@ impl Assembler {
         let Stage::Body(body) = &mut self.stage else {
             return true;
         };
-        let at = if shape.trailer.0.is_empty() {
-            Some(body.after.len())
-        } else {
-            let next = terminal.chars().next();
-            match &mut body.tail {
-                Some(tail) => tail.start(next),
-                // Nothing has come after the arguments: only a trailer that matches no text can
-                // end here.
-                None => Suffix::new(&shape.trailer, &shape.word, body.before)
-                    .hold_cap(Some(shape.cap()))
-                    .start(next),
-            }
-        };
-        body.trailer_at = at;
-        at.is_some()
+        match body {
+            Body::Value(value) => value.closes(shape, terminal),
+            Body::Params(params) => params.closes(terminal),
+        }
     }
 
     /// The region closed at `terminal` (empty for the stream's stop), which [`closes`] said it
-    /// does: the call ends. Bytes after the arguments and before the trailer are dropped where
-    /// they are whitespace and malformed otherwise; the trailer and the terminal are the end's
+    /// does: the call ends. Bytes after a value or an object and before the trailer are dropped
+    /// where they are whitespace and malformed otherwise, and parameters still undecided are
+    /// decided as at the end of the call's text; the trailer and the terminal are the end's
     /// source. Returns whether the terminal was taken so; when the arguments' own object named the
     /// call, its close was the call's end, and the trailer and the terminal are the region's.
     ///
     /// [`closes`]: Self::closes
-    pub fn close(mut self, terminal: &str, out: &mut Events) -> bool {
+    pub fn close(mut self, terminal: &str, declared: &Declared, out: &mut Events) -> bool {
         let Stage::Body(body) = std::mem::replace(&mut self.stage, Stage::Done) else {
             return false;
         };
-        let Body {
+        let trailer = match body {
+            Body::Value(value) => match value.close(out) {
+                Some(trailer) => trailer,
+                None => return false,
+            },
+            Body::Params(params) => params.close(declared, out),
+        };
+        out.push(Event::ToolCallEnd {
+            index: self.index,
+            source: Text::uncounted(format!("{trailer}{terminal}")),
+        });
+        true
+    }
+
+    /// The stream was cut inside the region: the call ends with what arrived, not closed for the
+    /// client. What was held after a value or an object comes back as `Malformed` with
+    /// `UnterminatedRegion`, its whitespace dropped; parameters still undecided are decided as at
+    /// the end of what arrived, and the bytes no parameter took come back the same way.
+    pub fn finish(mut self, declared: &Declared, out: &mut Events) {
+        let Stage::Body(body) = std::mem::replace(&mut self.stage, Stage::Done) else {
+            return;
+        };
+        let ends = match body {
+            Body::Value(value) => value.finish(out),
+            Body::Params(params) => {
+                params.finish(declared, out);
+                true
+            }
+        };
+        if ends {
+            out.push(Event::ToolCallEnd {
+                index: self.index,
+                source: Text::default(),
+            });
+        }
+    }
+}
+
+impl Value {
+    fn new(reader: Reader, before: Option<char>) -> Self {
+        Self {
+            reader,
+            before,
+            after: String::new(),
+            tail: None,
+            trailer_at: None,
+        }
+    }
+
+    fn feed(&mut self, shape: &'static CallShape, bytes: &str, out: &mut Events) {
+        let mut rest = bytes;
+        if !self.reader.over() {
+            let taken = match &mut self.reader {
+                Reader::Json(arguments) => arguments.feed(rest, out),
+                Reader::Envelope(assembler) => assembler.feed(rest, out),
+            };
+            if let Some(last) = rest[..taken].chars().next_back() {
+                self.before = Some(last);
+            }
+            rest = &rest[taken..];
+            if !self.reader.over() {
+                return;
+            }
+        }
+        if shape.trailer.0.is_empty() {
+            wrapping(rest, &self.reader.surplus(), out);
+            return;
+        }
+        let tail = self.tail.get_or_insert_with(|| {
+            Suffix::new(&shape.trailer, &shape.word, self.before).hold_cap(Some(shape.cap()))
+        });
+        tail.feed(rest);
+        self.after.push_str(rest);
+    }
+
+    fn closes(&mut self, shape: &'static CallShape, terminal: &str) -> bool {
+        let at = if shape.trailer.0.is_empty() {
+            Some(self.after.len())
+        } else {
+            let next = terminal.chars().next();
+            match &mut self.tail {
+                Some(tail) => tail.start(next),
+                // Nothing has come after the arguments: only a trailer that matches no text can
+                // end here.
+                None => Suffix::new(&shape.trailer, &shape.word, self.before)
+                    .hold_cap(Some(shape.cap()))
+                    .start(next),
+            }
+        };
+        self.trailer_at = at;
+        at.is_some()
+    }
+
+    /// The region closed: the bytes after the arguments and before the trailer are classified,
+    /// and the trailer is returned for the call's end; or, for an object that named the call and
+    /// ended it at its close, the trailer is the region's wrapping and nothing is returned.
+    fn close(self, out: &mut Events) -> Option<String> {
+        let Self {
             reader,
             after,
             trailer_at,
             ..
-        } = *body;
+        } = self;
         let at = trailer_at.unwrap_or(after.len());
         let (between, trailer) = after.split_at(at);
         let surplus = reader.surplus();
@@ -356,34 +447,25 @@ impl Assembler {
                     why: DropReason::Wrapper,
                 });
             }
-            return false;
+            return None;
         }
-        out.push(Event::ToolCallEnd {
-            index: self.index,
-            source: Text::uncounted(format!("{trailer}{terminal}")),
-        });
-        true
+        Some(trailer.to_string())
     }
 
-    /// The stream was cut inside the region: the call ends with what arrived, not closed for the
-    /// client, and what was held after its arguments comes back as `Malformed` with
-    /// `UnterminatedRegion`, its whitespace dropped.
-    pub fn finish(mut self, out: &mut Events) {
-        let Stage::Body(body) = std::mem::replace(&mut self.stage, Stage::Done) else {
-            return;
-        };
-        match body.reader {
+    /// The stream was cut: what was held after the arguments is malformed, and the call's end is
+    /// the caller's to push, unless the arguments' object ended the call. Returns whether the
+    /// caller ends it.
+    fn finish(self, out: &mut Events) -> bool {
+        match self.reader {
             Reader::Json(mut arguments) => {
                 arguments.finish(out);
-                wrapping(&body.after, &MalformedReason::UnterminatedRegion, out);
-                out.push(Event::ToolCallEnd {
-                    index: self.index,
-                    source: Text::default(),
-                });
+                wrapping(&self.after, &MalformedReason::UnterminatedRegion, out);
+                true
             }
             Reader::Envelope(assembler) => {
                 assembler.finish(out);
-                wrapping(&body.after, &MalformedReason::UnterminatedRegion, out);
+                wrapping(&self.after, &MalformedReason::UnterminatedRegion, out);
+                false
             }
         }
     }
@@ -424,8 +506,7 @@ mod tests {
         format::{CallSyntax, Emits, Format},
         input::{EngineFinish, Input, TokenSpan},
         parser::Parser,
-        shape::{intern, Atom, Class, Dialect, Path, Pattern},
-        tagged::Declared,
+        shape::{intern, Atom, Class, Dialect, End, Path, Pattern, ShapeError},
     };
 
     fn word() -> Class {
@@ -554,11 +635,22 @@ mod tests {
     /// The events of `output` after `prompt`, the same whole, cut once at every place and a
     /// character at a time, every byte accounted for.
     fn run_after(format: &Format, prompt: &str, output: &str, finish: EngineFinish) -> Vec<Event> {
+        run_declared(format, &Declared::default(), prompt, output, finish)
+    }
+
+    /// [`run_after`] for a request whose tools are `declared`.
+    fn run_declared(
+        format: &Format,
+        declared: &Declared,
+        prompt: &str,
+        output: &str,
+        finish: EngineFinish,
+    ) -> Vec<Event> {
         let starts: Vec<usize> = output.char_indices().map(|(at, _)| at).skip(1).collect();
         let mut plans: Vec<Vec<usize>> = vec![vec![], starts.clone()];
         plans.extend(starts.iter().map(|&cut| vec![cut]));
         let mut runs = plans.iter().map(|cuts| {
-            let mut engine = Engine::new(format.clone(), Declared::default());
+            let mut engine = Engine::new(format.clone(), declared.clone());
             let mut out = Events::new();
             engine
                 .feed(
@@ -1021,6 +1113,377 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn word_run(capture: Option<Slot>) -> Atom {
+        Atom::Run {
+            class: word(),
+            min: 1,
+            max: None,
+            greedy: true,
+            capture,
+        }
+    }
+
+    fn value() -> Atom {
+        Atom::Run {
+            class: Class::any(),
+            min: 0,
+            max: None,
+            greedy: false,
+            capture: Some(Slot::Value),
+        }
+    }
+
+    fn spaces() -> Atom {
+        Atom::Run {
+            class: space(),
+            min: 0,
+            max: None,
+            greedy: true,
+            capture: None,
+        }
+    }
+
+    fn ends_at(
+        consume: impl IntoIterator<Item = Atom>,
+        ahead: impl IntoIterator<Item = Atom>,
+    ) -> End {
+        End {
+            consume: Pattern(consume.into_iter().collect()),
+            ahead: Pattern(ahead.into_iter().collect()),
+        }
+    }
+
+    /// Parameters on abstract tags: `<k=KEY>` and the value, ended by `ends`, in a call named
+    /// `f` by the template, with `trailer` before its closing terminal.
+    fn tagged(ends: Vec<End>, trailer: Pattern) -> &'static CallShape {
+        intern(CallShape {
+            header: Pattern::default(),
+            name: NameSource::Literal("f".into()),
+            arguments: Arguments::Params {
+                tag: Pattern([lit("<k="), word_run(Some(Slot::Key)), lit(">"), value()].into()),
+                ends: ends.into(),
+            },
+            trailer,
+            word: word(),
+            hold_cap: 64,
+        })
+    }
+
+    fn closed_by_tag() -> Vec<End> {
+        vec![ends_at([lit("</k>")], [])]
+    }
+
+    fn member(json: &str, source: &str) -> Event {
+        Event::ToolCallArguments {
+            index: 0,
+            json: json.to_string(),
+            source: Text::uncounted(source),
+        }
+    }
+
+    fn closed() -> Event {
+        Event::ToolCallArguments {
+            index: 0,
+            json: "}".to_string(),
+            source: Text::default(),
+        }
+    }
+
+    #[test]
+    fn each_parameter_is_written_when_its_value_ends_and_text_between_is_skipped() {
+        let format = table(tagged(closed_by_tag(), Pattern::default()));
+        assert_eq!(
+            run(&format, "<c>junk<k=a>1</k> mid <k=b>x y</k>tail</c>"),
+            [
+                wrapper("<c>"),
+                start("f", ""),
+                wrapper("junk"),
+                member("{\"a\": 1", "<k=a>1</k>"),
+                wrapper(" mid "),
+                member(", \"b\": \"x y\"", "<k=b>x y</k>"),
+                wrapper("tail"),
+                closed(),
+                end("</c>"),
+                finish(1),
+            ]
+        );
+        assert_eq!(
+            run(&format, "<c></c>"),
+            [
+                wrapper("<c>"),
+                start("f", ""),
+                member("{}", ""),
+                end("</c>"),
+                finish(1),
+            ],
+            "a call with no parameter has an empty object"
+        );
+    }
+
+    #[test]
+    fn a_tag_that_does_not_match_is_passed_over_from_its_next_character() {
+        let format = table(tagged(closed_by_tag(), Pattern::default()));
+        assert_eq!(
+            run(&format, "<c><k=a b>1</k><k=c>2</k></c>"),
+            [
+                wrapper("<c>"),
+                start("f", ""),
+                wrapper("<k=a b>1</k>"),
+                member("{\"c\": 2}", "<k=c>2</k>"),
+                end("</c>"),
+                finish(1),
+            ]
+        );
+        assert_eq!(
+            run(&format, "<c><k=a>1<k=b>2</k></c>"),
+            [
+                wrapper("<c>"),
+                start("f", ""),
+                member("{\"a\": \"1<k=b>2\"}", "<k=a>1<k=b>2</k>"),
+                end("</c>"),
+                finish(1),
+            ],
+            "without a lookahead end, the first tag's value runs to the first close"
+        );
+    }
+
+    #[test]
+    fn a_value_ends_where_the_next_tag_begins_when_an_end_looks_ahead_at_it() {
+        let ends = vec![ends_at([lit("</k>")], []), ends_at([], [lit("<k=")])];
+        let format = table(tagged(ends, Pattern::default()));
+        assert_eq!(
+            run(&format, "<c><k=a>1<k=b>2</k></c>"),
+            [
+                wrapper("<c>"),
+                start("f", ""),
+                member("{\"a\": 1, \"b\": 2}", "<k=a>1<k=b>2</k>"),
+                end("</c>"),
+                finish(1),
+            ],
+            "the first value ends before the next tag, which the lookahead does not take"
+        );
+        assert_eq!(
+            run(&format, "<c><k=a>1<k=b>2</c>"),
+            [
+                wrapper("<c>"),
+                start("f", ""),
+                member("{\"a\": 1", "<k=a>1"),
+                wrapper("<k=b>2"),
+                closed(),
+                end("</c>"),
+                finish(1),
+            ],
+            "the last value never ends: no parameter, as at the end of the call's text"
+        );
+    }
+
+    #[test]
+    fn a_key_written_twice_is_written_again_and_values_are_typed_by_the_tools() {
+        let format = table(tagged(closed_by_tag(), Pattern::default()));
+        assert_eq!(
+            run(&format, "<c><k=a>1</k><k=a>2</k></c>"),
+            [
+                wrapper("<c>"),
+                start("f", ""),
+                member("{\"a\": 1, \"a\": 2}", "<k=a>1</k><k=a>2</k>"),
+                end("</c>"),
+                finish(1),
+            ]
+        );
+        let declared = Declared::of(&[openai_protocol::common::Tool {
+            tool_type: "function".to_string(),
+            function: openai_protocol::common::Function {
+                name: "f".to_string(),
+                description: None,
+                parameters: serde_json::json!({"type": "object", "properties": {
+                    "s": {"type": "string"},
+                    "n": {"type": "integer"},
+                }}),
+                strict: None,
+                extra: Default::default(),
+            },
+        }]);
+        let events = run_declared(
+            &format,
+            &declared,
+            "",
+            "<c><k=s>5</k><k=n>5</k><k=x>5</k></c>",
+            EngineFinish::Stop,
+        );
+        assert_eq!(
+            events[2],
+            member(
+                "{\"s\": \"5\", \"n\": 5, \"x\": 5}",
+                "<k=s>5</k><k=n>5</k><k=x>5</k>"
+            ),
+            "a declared string is its text; anything else is read as the tagged tables read it"
+        );
+    }
+
+    #[test]
+    fn a_cut_call_decides_what_it_holds_at_the_end_and_stays_open() {
+        let ends = vec![ends_at([lit("</k>"), spaces()], [])];
+        let format = table(tagged(ends, Pattern::default()));
+        let events = run_after(&format, "", "<c><k=a>1</k>  <k=b>2", EngineFinish::Length);
+        assert_eq!(
+            events,
+            [
+                wrapper("<c>"),
+                start("f", ""),
+                member("{\"a\": 1", "<k=a>1</k>  "),
+                Event::Malformed {
+                    text: Text::uncounted("<k=b>2"),
+                    why: MalformedReason::UnterminatedRegion,
+                },
+                end(""),
+                Event::Finish {
+                    reason: crate::event::FinishReason::Length,
+                    tool_calls: 1,
+                    reasoning_tokens: 0,
+                },
+            ],
+            "the parameter whose end waited for more whitespace is whole at the end"
+        );
+        let stopped = table(tagged(closed_by_tag(), Pattern::default())).closes_at_stop("call");
+        assert_eq!(
+            run(&stopped, "<c><k=a>1</k>"),
+            [
+                wrapper("<c>"),
+                start("f", ""),
+                member("{\"a\": 1}", "<k=a>1</k>"),
+                end(""),
+                finish(1),
+            ],
+            "the stream's stop closes the call and its object"
+        );
+    }
+
+    #[test]
+    fn parameters_end_where_the_trailer_begins() {
+        let format = table(tagged(closed_by_tag(), closing_f()));
+        assert_eq!(
+            run(&format, "<c><k=a>1</k>\n</f>\n</c>"),
+            [
+                wrapper("<c>"),
+                start("f", ""),
+                member("{\"a\": 1", "<k=a>1</k>"),
+                wrapper("\n</f>\n"),
+                closed(),
+                end("</c>"),
+                finish(1),
+            ],
+            "the trailer's bytes were passed over as they came"
+        );
+        assert_eq!(
+            run(&format, "<c><k=a>1</c><k=b>2</k></f></c>"),
+            [
+                wrapper("<c>"),
+                start("f", ""),
+                member("{\"a\": \"1</c><k=b>2\"", "<k=a>1</c><k=b>2</k>"),
+                wrapper("</f>"),
+                closed(),
+                end("</c>"),
+                finish(1),
+            ],
+            "a close the trailer does not end at is the call's text"
+        );
+        assert_eq!(
+            run(&format, "<c><k=a>1</f></c>"),
+            [
+                wrapper("<c>"),
+                start("f", ""),
+                wrapper("<k=a>1"),
+                member("{}", ""),
+                end("</f></c>"),
+                finish(1),
+            ],
+            "a value the trailer cut short is no parameter; the trailer's bytes are the end's"
+        );
+    }
+
+    #[test]
+    fn a_parameters_shape_is_checked() {
+        let check = |ends: Vec<End>, trailer: Pattern| {
+            CallShape {
+                header: Pattern::default(),
+                name: NameSource::Literal("f".into()),
+                arguments: Arguments::Params {
+                    tag: Pattern([lit("<k="), word_run(Some(Slot::Key)), lit(">"), value()].into()),
+                    ends: ends.into(),
+                },
+                trailer,
+                word: word(),
+                hold_cap: 64,
+            }
+            .check()
+        };
+        assert_eq!(check(closed_by_tag(), closing_f()), Ok(()));
+        assert_eq!(
+            check(Vec::new(), Pattern::default()),
+            Err(ShapeError::NoEnds)
+        );
+        let ahead = vec![ends_at([lit("</k>")], []), ends_at([], [lit("<k=")])];
+        assert_eq!(check(ahead.clone(), Pattern::default()), Ok(()));
+        assert_eq!(
+            check(ahead, closing_f()),
+            Err(ShapeError::ReadsPastTheText(1)),
+            "a lookahead could read the trailer, which ends the call's text"
+        );
+        let spaced = vec![ends_at([lit("</k>"), spaces()], [])];
+        assert_eq!(check(spaced.clone(), Pattern::default()), Ok(()));
+        assert_eq!(
+            check(spaced, closing_f()),
+            Err(ShapeError::ReadsPastTheText(0)),
+            "a run after the close reads past it, where the trailer may begin"
+        );
+        assert_eq!(
+            check(closed_by_tag(), Pattern([lit(">!")].into())),
+            Err(ShapeError::TrailerReadsTheEnd(0)),
+            "the trailer could begin inside the close"
+        );
+        let skipping = Pattern(
+            [
+                Atom::Run {
+                    class: Class::any(),
+                    min: 0,
+                    max: None,
+                    greedy: false,
+                    capture: None,
+                },
+                lit("</f>"),
+            ]
+            .into(),
+        );
+        assert_eq!(
+            check(closed_by_tag(), skipping),
+            Err(ShapeError::TrailerReadsTheEnd(0)),
+            "the trailer could begin before the close and read it whole"
+        );
+        let shape = |tag: Vec<Atom>| CallShape {
+            header: Pattern::default(),
+            name: NameSource::Literal("f".into()),
+            arguments: Arguments::Params {
+                tag: Pattern(tag.into()),
+                ends: closed_by_tag().into(),
+            },
+            trailer: Pattern::default(),
+            word: word(),
+            hold_cap: 64,
+        };
+        assert_eq!(
+            shape(vec![word_run(Some(Slot::Key)), lit(">"), value()]).check(),
+            Err(ShapeError::NoTrigger)
+        );
+        assert_eq!(
+            shape(vec![lit("<k>"), value()]).check(),
+            Err(ShapeError::Uncaptured(Slot::Key))
+        );
+        assert_eq!(
+            shape(vec![lit("<k="), word_run(Some(Slot::Key)), lit(">")]).check(),
+            Err(ShapeError::Uncaptured(Slot::Value))
+        );
     }
 
     #[test]

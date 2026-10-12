@@ -77,9 +77,10 @@ and a client that wants the raw text back can have it.
   checked for what a stream can decide; a matcher that runs them over the output as it arrives
   and answers as Python's `regex` module does for the whole text, and a search that finds where
   the text before a closing marker starts; an interner that keeps a shape built at run time
-  `'static`; and the call they make up, its header after the region's marker, its arguments and
-  its trailer before the closing marker, with the assembler that reads it: a marker whose header
-  does not match opens no call and is given back to the state it came in.
+  `'static`; and the call they make up, its header after the region's marker, its arguments (one
+  JSON value, an object that names the call, or tagged parameters found as `finditer` finds them)
+  and its trailer before the closing marker, with the assembler that reads it: a marker whose
+  header does not match opens no call and is given back to the state it came in.
 - `grammar`: the structural-tag derivation and its per-syntax spellings (`keyed`, `xtml`,
   `tagged`, `pythonic`, and `xml` for MiniMax's; the JSON, compact keyed, DSML and xLAM list
   spellings in the module itself), with the argument shapes a JSON schema pins (`schema`).

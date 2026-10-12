@@ -32,9 +32,11 @@
 //!
 //! A [`CallShape`] puts the patterns together into a call: the header after the region's
 //! terminal, which may capture the tool's name, the way the arguments are written
-//! ([`Arguments`]), and the trailer before the region's closing terminal. A table holds one as
-//! [`CallSyntax::Shaped`], [`intern`]ed, and the shape's [`Assembler`] turns a call written so
-//! into its events, giving back to the engine the bytes of a header that did not match.
+//! ([`Arguments`]: one JSON value, an object that names the call, or tagged parameters, each a
+//! tag with its key and its value and the ends a value may have), and the trailer before the
+//! region's closing terminal. A table holds one as [`CallSyntax::Shaped`], [`intern`]ed, and the
+//! shape's [`Assembler`] turns a call written so into its events, giving back to the engine the
+//! bytes of a header that did not match.
 //!
 //! [`formats`]: crate::formats
 //! [`CallSyntax::Shaped`]: crate::CallSyntax::Shaped
@@ -43,12 +45,14 @@ mod call;
 mod class;
 mod intern;
 mod matcher;
+mod params;
 
 use std::fmt;
 
 pub use call::{Assembler, Header};
 pub use class::Class;
 pub use intern::Interner;
+use matcher::reads_through;
 pub use matcher::{Match, Matcher, Suffix, Verdict, HOLD_CAP};
 
 /// A linear pattern: its atoms, matched one after another from the start of the text it is run
@@ -236,6 +240,13 @@ pub enum Arguments {
         name: Path,
         arguments: Path,
     },
+    /// Tagged parameters (`content: xml-inline`): each a `tag` that begins with a literal, runs
+    /// through the parameter's key and value, captured as [`Slot::Key`] and [`Slot::Value`], and
+    /// ends with the first of `ends` that matches (`\s*</parameter>`, or a lookahead at the next
+    /// parameter's tag). A parameter counts once its end matched, as a regular expression's
+    /// `finditer` finds it; text between parameters is skipped, and each value is written as JSON
+    /// when its parameter ends.
+    Params { tag: Pattern, ends: Box<[End]> },
 }
 
 /// The JSON a template writes: plain JSON, or a dialect of it, keys left bare and strings between
@@ -279,14 +290,20 @@ const ARGUMENTS_KEYS: [&str; 3] = ["arguments", "parameters", "args"];
 pub enum Part {
     Header,
     Trailer,
+    /// A parameter's tag.
+    Tag,
+    /// A value's end, by its place in the list.
+    End(usize),
 }
 
 impl fmt::Display for Part {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Header => "header",
-            Self::Trailer => "trailer",
-        })
+        match self {
+            Self::Header => formatter.write_str("header"),
+            Self::Trailer => formatter.write_str("trailer"),
+            Self::Tag => formatter.write_str("parameter's tag"),
+            Self::End(index) => write!(formatter, "value's end {index}"),
+        }
     }
 }
 
@@ -316,13 +333,37 @@ pub enum ShapeError {
     /// `tool_name` and the arguments from `arguments`, `parameters` or `args`, each at the top.
     #[error("an envelope path the envelope reader does not take: {0:?}")]
     EnvelopePath(Path),
+    /// A parameter's tag that does not begin with a literal: the reader finds parameters by the
+    /// text they begin with.
+    #[error("a parameter's tag that does not begin with a literal")]
+    NoTrigger,
+    /// A parameter's tag that does not capture `slot` once.
+    #[error("a parameter's tag that does not capture its {0:?}")]
+    Uncaptured(Slot),
+    /// Parameters with no way for a value to end.
+    #[error("parameters with no end for a value")]
+    NoEnds,
+    /// A value's end that reads past what it matches (a lookahead, or anything but a literal at
+    /// its end: a `\b`, a run, an optional literal) in a call with a trailer: the trailer may turn
+    /// out to begin there, where the call's text ends, so the end could not be decided as the
+    /// bytes arrive.
+    #[error("value's end {0} reads past itself, where the trailer may begin")]
+    ReadsPastTheText(usize),
+    /// A value's end whose last literal the trailer could read, from inside it or from before it,
+    /// in a call with a trailer: the call's text ends where the trailer begins, so the end could be
+    /// the trailer's text, and the parameter none.
+    #[error("the trailer could read value's end {0}, where the call's text ends")]
+    TrailerReadsTheEnd(usize),
 }
 
 impl CallShape {
     /// Whether a stream can run the shape: the header and the trailer pass [`Pattern::check`]; the
     /// header captures only the name and the trailer nothing; the name comes from where the shape
     /// says, the header capturing it, or an envelope naming the call and nothing else doing so;
-    /// the JSON is plain; and an envelope's paths are ones its reader takes.
+    /// the JSON is plain; an envelope's paths are ones its reader takes; and parameters are found
+    /// by the literal their tag begins with, the tag captures the key and the value once each,
+    /// there is an end for a value, each end passes [`End::check`] and captures nothing, and with a
+    /// trailer every end is decided by a last literal the trailer cannot read.
     pub fn check(&self) -> Result<(), ShapeError> {
         for (part, pattern) in [(Part::Header, &self.header), (Part::Trailer, &self.trailer)] {
             pattern
@@ -363,7 +404,72 @@ impl CallShape {
                 Ok(())
             }
             Arguments::Json(_) => Ok(()),
+            Arguments::Params { tag, ends } => self.check_params(tag, ends),
         }
+    }
+
+    fn check_params(&self, tag: &Pattern, ends: &[End]) -> Result<(), ShapeError> {
+        tag.check().map_err(|error| ShapeError::Pattern {
+            part: Part::Tag,
+            error,
+        })?;
+        if !matches!(tag.0.first(), Some(Atom::Lit(_))) {
+            return Err(ShapeError::NoTrigger);
+        }
+        if let Some(slot) = tag.captures().find(|&slot| slot == Slot::Name) {
+            return Err(ShapeError::Capture {
+                part: Part::Tag,
+                slot,
+            });
+        }
+        for slot in [Slot::Key, Slot::Value] {
+            if !tag.captures().any(|captured| captured == slot) {
+                return Err(ShapeError::Uncaptured(slot));
+            }
+        }
+        if ends.is_empty() {
+            return Err(ShapeError::NoEnds);
+        }
+        for (index, end) in ends.iter().enumerate() {
+            let part = Part::End(index);
+            end.check()
+                .map_err(|error| ShapeError::Pattern { part, error })?;
+            let captured = end.consume.captures().chain(end.ahead.captures()).next();
+            if let Some(slot) = captured {
+                return Err(ShapeError::Capture { part, slot });
+            }
+            if !self.trailer.0.is_empty() {
+                self.check_end_before_trailer(index, end)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// With a trailer, the call's text ends where the trailer begins, which only the closing
+    /// terminal shows, and a parameter is written once its end matched: so an end must be decided
+    /// by its own last character, the end of a literal, with nothing looked ahead at, and the
+    /// trailer must not be able to read that literal, from inside it or from before it, or a
+    /// parameter written could be text the trailer takes.
+    fn check_end_before_trailer(&self, index: usize, end: &End) -> Result<(), ShapeError> {
+        let last = match end.consume.0.last() {
+            Some(Atom::Lit(last)) if end.ahead.0.is_empty() => last,
+            _ => return Err(ShapeError::ReadsPastTheText(index)),
+        };
+        let (trailer, word) = (&self.trailer, &self.word);
+        let inside = last.char_indices().skip(1).any(|(at, _)| {
+            let before = last[..at].chars().next_back();
+            reads_through(trailer, word, before, &last[at..], false)
+        });
+        // Begun before it, the trailer reads the literal after a character of any kind: none, and
+        // a word's, for a `\b`.
+        let a_word = ['a', 'A', '0', '_'].into_iter().find(|&c| word.contains(c));
+        let whole = std::iter::once(None)
+            .chain(a_word.map(Some))
+            .any(|before| reads_through(trailer, word, before, last, true));
+        if inside || whole {
+            return Err(ShapeError::TrailerReadsTheEnd(index));
+        }
+        Ok(())
     }
 
     /// The cap on what a header or a trailer holds undecided, in bytes.

@@ -274,7 +274,7 @@ impl Call {
                 text.len()
             }
             Self::Shaped(assembler) => {
-                assembler.feed(text, out);
+                assembler.feed(text, declared, out);
                 text.len()
             }
         }
@@ -308,7 +308,7 @@ impl Call {
     /// block ended, and leaves it open when the stream was cut; the DSML one takes the invoke's
     /// closing tag, and only that terminal, as `ToolCallEnd`'s bytes; the keyed one takes the
     /// call's closing marker.
-    fn end(self, closed: Closed, terminal: &str, out: &mut Events) -> bool {
+    fn end(self, closed: Closed, terminal: &str, declared: &Declared, out: &mut Events) -> bool {
         match (self, closed) {
             (Self::Json(assembler), _) => assembler.finish(out),
             (Self::Tagged(assembler), Closed::ByMarker) => assembler.close(out),
@@ -376,8 +376,10 @@ impl Call {
             (Self::Gemma(assembler), Closed::ByEnd) => assembler.finish(out),
             // A shaped call takes its region's closing terminal, after its trailer, as its end;
             // one whose arguments' object named it ended at the object's close.
-            (Self::Shaped(assembler), Closed::ByMarker) => return assembler.close(terminal, out),
-            (Self::Shaped(assembler), Closed::ByEnd) => assembler.finish(out),
+            (Self::Shaped(assembler), Closed::ByMarker) => {
+                return assembler.close(terminal, declared, out);
+            }
+            (Self::Shaped(assembler), Closed::ByEnd) => assembler.finish(declared, out),
         }
         false
     }
@@ -901,7 +903,7 @@ impl Engine {
             return false;
         };
         let mut finished = Events::new();
-        let taken = call.end(closed, terminal, &mut finished);
+        let taken = call.end(closed, terminal, &self.declared, &mut finished);
         if closed == Closed::ByMarker {
             let mut renamed = Events::new();
             for event in finished.drain() {

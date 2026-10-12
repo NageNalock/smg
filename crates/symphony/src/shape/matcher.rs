@@ -508,6 +508,45 @@ impl<'p> Suffix<'p> {
     }
 }
 
+/// Whether some way through `pattern` reads every character of `text`, priorities aside: from the
+/// pattern's start, or, `anywhere`, from any place inside it, as a match that began before the
+/// text would. `before` is the character before the text, which a `\b` reads.
+pub(crate) fn reads_through(
+    pattern: &Pattern,
+    word: &Class,
+    before: Option<char>,
+    text: &str,
+    anywhere: bool,
+) -> bool {
+    let mut machine = Machine::new(compile(pattern, &[]), word);
+    let starts = if anywhere { machine.program.len() } else { 1 };
+    let mut threads: Vec<Thread> = (0..starts)
+        .map(|pc| Thread {
+            pc,
+            ..Thread::at_start(0)
+        })
+        .collect();
+    let (mut at, mut before) = (0, before);
+    for next in text.chars() {
+        machine.follow(&threads, Next::Known(Some(next)), before, at);
+        threads = machine
+            .leaves
+            .iter()
+            .filter(|thread| machine.reads(thread, next))
+            .map(|thread| Thread {
+                pc: thread.pc + 1,
+                ..*thread
+            })
+            .collect();
+        if threads.is_empty() {
+            return false;
+        }
+        at += next.len_utf8();
+        before = Some(next);
+    }
+    true
+}
+
 /// The program for `pattern` and its `ends`: the pattern, then each end in turn, its consumed part,
 /// the mark, the part looked ahead at and the match.
 fn compile<'p>(pattern: &'p Pattern, ends: &'p [End]) -> Vec<Op<'p>> {
@@ -1074,6 +1113,25 @@ mod tests {
         assert_eq!(suffix(&starts_a_word, Some(' '), "x", None), Some(0));
         assert_eq!(suffix(&starts_a_word, None, "ax", None), None);
         assert_eq!(suffix(&starts_a_word, None, " x", None), Some(1));
+    }
+
+    #[test]
+    fn a_pattern_reads_through_a_text_from_its_start_or_from_inside_it() {
+        let word = word();
+        let trailer = pattern([lit("</f>"), run(&space(), 0, None, true)]);
+        assert!(reads_through(&trailer, &word, None, "</f> \n", false));
+        assert!(!reads_through(&trailer, &word, None, "f>", false));
+        assert!(
+            reads_through(&trailer, &word, None, "f>", true),
+            "from inside its literal"
+        );
+        assert!(!reads_through(&trailer, &word, None, "</k>", true));
+        assert!(!reads_through(&trailer, &word, None, "</f>x", true));
+        let skipping = pattern([run(&Class::any(), 0, None, false), lit("</f>")]);
+        assert!(reads_through(&skipping, &word, None, "</k>", false));
+        let starts_a_word = pattern([Atom::Boundary, lit("x")]);
+        assert!(!reads_through(&starts_a_word, &word, Some('a'), "x", false));
+        assert!(reads_through(&starts_a_word, &word, Some(' '), "x", false));
     }
 
     #[test]

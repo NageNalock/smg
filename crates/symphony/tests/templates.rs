@@ -24,10 +24,11 @@ mod common;
 use std::{fs, path::PathBuf};
 
 use common::{bytes_of, chunkings, replay_after};
-use serde_json::Value;
+use openai_protocol::common::{Function, Tool};
+use serde_json::{json, Value};
 use symphony::{
     adapt,
-    shape::{self, Arguments, Atom, CallShape, Class, Dialect, NameSource, Pattern, Slot},
+    shape::{self, Arguments, Atom, CallShape, Class, Dialect, End, NameSource, Pattern, Slot},
     CallSyntax, Declared, Emits, Engine, EngineFinish, Format, Parser,
 };
 
@@ -219,31 +220,207 @@ fn inkling() -> Format {
         .stop_tokens(["<|content_model_end_sampling|>"])
 }
 
+fn run(class: Class, min: u16, greedy: bool, capture: Option<Slot>) -> Atom {
+    Atom::Run {
+        class,
+        min,
+        max: None,
+        greedy,
+        capture,
+    }
+}
+
+fn none_of(chars: &str) -> Class {
+    Class::new(chars.chars().map(|c| (c, c)), true)
+}
+
+/// Python `regex`'s `\s`, as `tests/fixtures/shape/classes.json` records it.
+#[expect(
+    clippy::panic,
+    clippy::expect_used,
+    reason = "a fixture that cannot be read ends the test with its path"
+)]
+fn python_space() -> Class {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shape/classes.json");
+    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let tables: Value = serde_json::from_str(&text).expect("classes.json");
+    let ranges = tables["space"]
+        .as_array()
+        .expect("the space table")
+        .iter()
+        .map(|range| {
+            let mut chars = range.as_str().expect("a range").chars();
+            match (chars.next(), chars.next(), chars.next()) {
+                (Some(first), Some(last), None) => (first, last),
+                _ => panic!("a range is two characters: {range}"),
+            }
+        });
+    Class::new(ranges, false)
+}
+
 /// The response template of `meta-models/Muse-Glimmer-30B` (its `tokenizer_config.json`): the turn
 /// after `<|start|>assistant`, a thought addressed to the model itself, an answer addressed to the
-/// user, both stripped, and nothing kept outside them. Its calls take a header with attributes,
-/// which no call syntax here reads yet, so they are left out. `<|end_of_text|>` and `<|eot|>` are
-/// the stop tokens (its `generation_config.json`); `<|eom|>` ends a message inside the turn, and
-/// the model goes on after it.
+/// user, both stripped, and nothing kept outside them. A call's open,
+/// `<atem:invoke\b[^>]*?\bname="(?P<name>[^"]+)">`, is the terminal `<atem:invoke` and a header
+/// that skips other attributes and names the tool; its close is `</atem:invoke>`; its parameters
+/// are tags read as `finditer` reads `<atem:parameter\b[^>]*?\bname="(?P<key>[^"]+)"[^>]*?>`,
+/// then the value up to `</atem:parameter>`. The template reads a value as JSON where it is JSON
+/// and as text otherwise, which the values here read the same as the crate's own reading does.
+/// `<|end_of_text|>` and `<|eot|>` are the stop tokens (its `generation_config.json`); `<|eom|>`
+/// ends a message inside the turn, and the model goes on after it.
 fn muse() -> Format {
+    let word = python_word();
+    let any = Class::any();
+    let shape = shape::intern(CallShape {
+        header: Pattern(
+            [
+                Atom::Boundary,
+                run(none_of(">"), 0, false, None),
+                Atom::Boundary,
+                Atom::Lit("name=\"".into()),
+                run(none_of("\""), 1, true, Some(Slot::Name)),
+                Atom::Lit("\">".into()),
+            ]
+            .into(),
+        ),
+        name: NameSource::Header,
+        arguments: Arguments::Params {
+            tag: Pattern(
+                [
+                    Atom::Lit("<atem:parameter".into()),
+                    Atom::Boundary,
+                    run(none_of(">"), 0, false, None),
+                    Atom::Boundary,
+                    Atom::Lit("name=\"".into()),
+                    run(none_of("\""), 1, true, Some(Slot::Key)),
+                    Atom::Lit("\"".into()),
+                    run(none_of(">"), 0, false, None),
+                    Atom::Lit(">".into()),
+                    run(any, 0, false, Some(Slot::Value)),
+                ]
+                .into(),
+            ),
+            ends: [End {
+                consume: Pattern([Atom::Lit("</atem:parameter>".into())].into()),
+                ahead: Pattern::default(),
+            }]
+            .into(),
+        },
+        trailer: Pattern::default(),
+        word,
+        hold_cap: 8192,
+    });
     Format::new("muse glimmer template")
         .terminal("thought", "to=self<|message|>")
         .terminal("answer", "to=user<|message|>")
         .terminal("eot", "<|eot|>")
         .terminal("eom", "<|eom|>")
+        .terminal("call_open", "<atem:invoke")
+        .terminal("call_close", "</atem:invoke>")
         .state("outside", Emits::Content)
         .state("reasoning", Emits::Reasoning)
         .state("content", Emits::Content)
+        .state("call", Emits::Arguments)
         .transition("outside", "thought", "reasoning")
         .transition("outside", "answer", "content")
         .transition("reasoning", "eom", "outside")
         .transition("content", "eot", "outside")
         .transition("content", "eom", "outside")
+        .transition("outside", "call_open", "call")
+        .transition("call", "call_close", "outside")
+        .calls(CallSyntax::Shaped(shape))
         .framing("outside")
         .turn_anchor("<|start|>assistant")
         .trims("reasoning")
         .trims("content")
         .stop_tokens(["<|end_of_text|>", "<|eot|>"])
+}
+
+/// transformers v5.18.0's `transformers serve` template for Qwen 3.5 (`qwen3_5` in
+/// `src/transformers/cli/serving/utils.py`): the turn after `<|im_start|>assistant\n`, a thought
+/// between `<think>` and `</think>`, and the content outside them, stripped, which the stop ends.
+/// A call's open, `\s*<tool_call>\s*<function=(?P<name>[^>\n]+)>`, is the terminal `<tool_call>`
+/// after the content's whitespace and a header that names the tool; its close,
+/// `</function>\s*</tool_call>`, is the trailer `</function>\s*` and the terminal `</tool_call>`;
+/// its parameters are tags read as `finditer` reads `<parameter=(?P<key>[^>\n]+)>\s*`, then the
+/// value up to `\s*</parameter>`, each value the text, typed by the request's tools.
+/// `<|im_end|>` and `<|endoftext|>` are the stop tokens.
+fn serve_qwen3_5() -> Format {
+    let space = python_space();
+    let name = none_of(">\n");
+    let shape = shape::intern(CallShape {
+        header: Pattern(
+            [
+                run(space.clone(), 0, true, None),
+                Atom::Lit("<function=".into()),
+                run(name.clone(), 1, true, Some(Slot::Name)),
+                Atom::Lit(">".into()),
+            ]
+            .into(),
+        ),
+        name: NameSource::Header,
+        arguments: Arguments::Params {
+            tag: Pattern(
+                [
+                    Atom::Lit("<parameter=".into()),
+                    run(name, 1, true, Some(Slot::Key)),
+                    Atom::Lit(">".into()),
+                    run(space.clone(), 0, true, None),
+                    run(Class::any(), 0, false, Some(Slot::Value)),
+                ]
+                .into(),
+            ),
+            ends: [End {
+                consume: Pattern(
+                    [
+                        run(space.clone(), 0, true, None),
+                        Atom::Lit("</parameter>".into()),
+                    ]
+                    .into(),
+                ),
+                ahead: Pattern::default(),
+            }]
+            .into(),
+        },
+        trailer: Pattern([Atom::Lit("</function>".into()), run(space, 0, true, None)].into()),
+        word: python_word(),
+        hold_cap: 8192,
+    });
+    Format::new("qwen 3.5 serve template")
+        .terminal("think_open", "<think>")
+        .terminal("think_close", "</think>")
+        .terminal("call_open", "<tool_call>")
+        .terminal("call_close", "</tool_call>")
+        .state("content", Emits::Content)
+        .state("reasoning", Emits::Reasoning)
+        .state("call", Emits::Arguments)
+        .transition("content", "think_open", "reasoning")
+        .transition("reasoning", "think_close", "content")
+        .transition("content", "call_open", "call")
+        .transition("call", "call_close", "content")
+        .calls(CallSyntax::Shaped(shape))
+        .turn_anchor("<|im_start|>assistant\n")
+        .trims("content")
+        .trims("reasoning")
+        .stop_tokens(["<|im_end|>", "<|endoftext|>"])
+}
+
+/// The tools the Qwen 3.5 cases' requests declare: one weather tool, its city a string and its
+/// days an integer.
+fn weather() -> Declared {
+    Declared::of(&[Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: "get_weather".to_string(),
+            description: None,
+            parameters: json!({"type": "object", "properties": {
+                "city": {"type": "string"},
+                "days": {"type": "integer"},
+            }}),
+            strict: None,
+            extra: Default::default(),
+        },
+    }])
 }
 
 /// The gpt-oss test template's cases. With the stop token's text fed, as transformers feeds it,
@@ -543,8 +720,60 @@ const INKLING: &[Case] = &[
 ];
 
 /// The Muse Glimmer template's cases: a thought then an answer, text outside the messages, and a
-/// thought alone.
+/// thought alone; then calls: after a thought, with attributes beside the names and text between
+/// the parameters, an invoke without a name (no call: text outside the messages), two calls the
+/// second without parameters, and a parameter tag whose name runs on, which no parameter begins.
 const MUSE: &[Case] = &[
+    Case {
+        prompt: "<|start|>user<|message|>Weather?<|eot|><|start|>assistant",
+        output: "to=self<|message|>Plan.<|eom|><|start|>assistant<atem:invoke \
+                 name=\"get_weather\"><atem:parameter name=\"city\">Paris</atem:parameter>\
+                 <atem:parameter name=\"days\">3</atem:parameter></atem:invoke>",
+        finish: EngineFinish::Stop,
+        reasoning: Some("Plan."),
+        content: None,
+        calls: &[("get_weather", "{\"city\": \"Paris\", \"days\": 3}")],
+    },
+    Case {
+        prompt: "<|start|>assistant",
+        output: "<atem:invoke id=\"1\" name=\"lookup\"><atem:parameter type=\"string\" \
+                 name=\"q\">x y</atem:parameter> <atem:parameter name=\"ids\">[1, 2]\
+                 </atem:parameter></atem:invoke>",
+        finish: EngineFinish::Stop,
+        reasoning: None,
+        content: None,
+        calls: &[("lookup", "{\"q\": \"x y\", \"ids\": [1, 2]}")],
+    },
+    Case {
+        prompt: "<|start|>assistant",
+        output: "<atem:invoke id=\"1\">text</atem:invoke> to=user<|message|>Hi<|eot|>",
+        finish: EngineFinish::Stop,
+        reasoning: None,
+        content: Some("Hi"),
+        calls: &[],
+    },
+    Case {
+        prompt: "<|start|>assistant",
+        output: "<atem:invoke name=\"f\"><atem:parameter name=\"o\">{\"a\": true}\
+                 </atem:parameter><atem:parameter name=\"p\">plain words</atem:parameter>\
+                 </atem:invoke><atem:invoke name=\"g\"></atem:invoke>",
+        finish: EngineFinish::Stop,
+        reasoning: None,
+        content: None,
+        calls: &[
+            ("f", "{\"o\": {\"a\": true}, \"p\": \"plain words\"}"),
+            ("g", "{}"),
+        ],
+    },
+    Case {
+        prompt: "<|start|>assistant",
+        output: "<atem:invoke name=\"f\"><atem:parameters name=\"x\">1</atem:parameter>\
+                 <atem:parameter name=\"y\">2</atem:parameter></atem:invoke>",
+        finish: EngineFinish::Stop,
+        reasoning: None,
+        content: None,
+        calls: &[("f", "{\"y\": 2}")],
+    },
     Case {
         prompt: "<|start|>user<|message|>Weather?<|eot|><|start|>assistant",
         output: "to=self<|message|>Plan the answer.<|eom|><|start|>assistant to=user<|message|>It \
@@ -572,16 +801,116 @@ const MUSE: &[Case] = &[
     },
 ];
 
+/// The Qwen 3.5 serve template's cases, the requests declaring the weather tool: a thought, an
+/// answer and a call; two calls; a `</tool_call>` without `</function>` before it, which is the
+/// call's text, so the call closes at the later one; a call marker with no function after it,
+/// which is the answer's text; text between parameters and spaces around a value; a name with a
+/// space; a key written twice (the last value stands); a value that never ends before the call
+/// closes; and a thought the prompt opened, with an empty value and a value on two lines.
+const SERVE_QWEN3_5: &[Case] = &[
+    Case {
+        prompt: "<|im_start|>user\nWeather?<|im_end|>\n<|im_start|>assistant\n",
+        output: "<think>\nThe user wants the weather.\n</think>\n\nLet me check.\n<tool_call>\n\
+                 <function=get_weather>\n<parameter=city>\nParis\n</parameter>\n\
+                 <parameter=days>\n3\n</parameter>\n</function>\n</tool_call>",
+        finish: EngineFinish::Stop,
+        reasoning: Some("The user wants the weather."),
+        content: Some("Let me check."),
+        calls: &[("get_weather", "{\"city\": \"Paris\", \"days\": 3}")],
+    },
+    Case {
+        prompt: "<|im_start|>assistant\n",
+        output: "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n\
+                 </function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n\
+                 <parameter=city>\nRome\n</parameter>\n</function>\n</tool_call>",
+        finish: EngineFinish::Stop,
+        reasoning: None,
+        content: None,
+        calls: &[
+            ("get_weather", "{\"city\": \"Paris\"}"),
+            ("get_weather", "{\"city\": \"Rome\"}"),
+        ],
+    },
+    Case {
+        prompt: "<|im_start|>assistant\n",
+        output: "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n\
+                 </tool_call>\nMore text</function></tool_call>",
+        finish: EngineFinish::Stop,
+        reasoning: None,
+        content: None,
+        calls: &[("get_weather", "{\"city\": \"Paris\"}")],
+    },
+    Case {
+        prompt: "<|im_start|>assistant\n",
+        output: "<tool_call>\nnot a function</tool_call>Hi",
+        finish: EngineFinish::Stop,
+        reasoning: None,
+        content: Some("<tool_call>\nnot a function</tool_call>Hi"),
+        calls: &[],
+    },
+    Case {
+        prompt: "<|im_start|>assistant\n",
+        output: "<tool_call>\n<function=get_weather>\nnoise <parameter=city>  Paris  </parameter> \
+                 junk <parameter=days>4</parameter></function>\n</tool_call>",
+        finish: EngineFinish::Stop,
+        reasoning: None,
+        content: None,
+        calls: &[("get_weather", "{\"city\": \"Paris\", \"days\": 4}")],
+    },
+    Case {
+        prompt: "<|im_start|>assistant\n",
+        output: "<tool_call>\n<function=get weather>\n<parameter=city>\nParis\n</parameter>\n\
+                 </function>\n</tool_call>",
+        finish: EngineFinish::Stop,
+        reasoning: None,
+        content: None,
+        calls: &[("get weather", "{\"city\": \"Paris\"}")],
+    },
+    Case {
+        prompt: "<|im_start|>assistant\n",
+        output: "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n\
+                 <parameter=city>\nRome\n</parameter>\n</function>\n</tool_call>",
+        finish: EngineFinish::Stop,
+        reasoning: None,
+        content: None,
+        calls: &[("get_weather", "{\"city\": \"Rome\"}")],
+    },
+    Case {
+        prompt: "<|im_start|>assistant\n",
+        output: "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</function>\n\
+                 </tool_call>",
+        finish: EngineFinish::Stop,
+        reasoning: None,
+        content: None,
+        calls: &[("get_weather", "{}")],
+    },
+    Case {
+        prompt: "<|im_start|>assistant\n<think>\n",
+        output: "plan\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=days>\n\
+                 </parameter>\n<parameter=city>\nNew\nYork\n</parameter>\n</function>\n\
+                 </tool_call>",
+        finish: EngineFinish::Stop,
+        reasoning: Some("plan"),
+        content: None,
+        calls: &[("get_weather", "{\"days\": \"\", \"city\": \"New\\nYork\"}")],
+    },
+];
+
 /// Replays `case` through `format` at every chunking, and checks that the message is the
 /// recorded one at each and that the events account for the output's bytes.
+fn check(name: &str, format: &Format, case: &Case) {
+    check_declared(name, format, case, &Declared::default());
+}
+
+/// [`check`] for a request whose tools are `declared`.
 #[expect(
     clippy::panic,
     clippy::expect_used,
     reason = "a check that fails fails the test that runs it"
 )]
-fn check(name: &str, format: &Format, case: &Case) {
+fn check_declared(name: &str, format: &Format, case: &Case, declared: &Declared) {
     for (plan, cuts) in chunkings(case.output, usize::MAX) {
-        let mut parser = Engine::new(format.clone(), Declared::default());
+        let mut parser = Engine::new(format.clone(), declared.clone());
         let events = replay_after(
             &mut parser as &mut dyn Parser,
             case.prompt,
@@ -666,6 +995,14 @@ fn muse_glimmer_template_reads_as_hugging_face_reads_it() {
 }
 
 #[test]
+fn qwen3_5_serve_template_reads_as_hugging_face_reads_it() {
+    let (format, declared) = (serve_qwen3_5(), weather());
+    for case in SERVE_QWEN3_5 {
+        check_declared("qwen 3.5 serve", &format, case, &declared);
+    }
+}
+
+#[test]
 fn a_field_written_twice_reads_as_both_stays() {
     // The content's own close between two stays, in a stream that does not stop on it: Hugging
     // Face's parser keeps the last stay ("there"); a stream has sent the first by then, so the
@@ -692,6 +1029,7 @@ fn every_table_here_is_valid_and_names_its_stop_tokens() {
         (ernie(), &[][..]),
         (inkling(), &[][..]),
         (muse(), &["<|eot|>"][..]),
+        (serve_qwen3_5(), &[][..]),
     ] {
         assert_eq!(format.validate(), Ok(()), "{}", format.name());
         for stop in stops {

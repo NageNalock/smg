@@ -32,7 +32,9 @@ use serde_json::json as value;
 use symphony::{
     formats,
     json::PartialJson,
-    shape::{self, Arguments, Atom, CallShape, Class, Dialect, NameSource, Path, Pattern, Slot},
+    shape::{
+        self, Arguments, Atom, CallShape, Class, Dialect, End, NameSource, Path, Pattern, Slot,
+    },
     tagged::{Placement, Spelling},
     CallSyntax, Declared, DropReason, Emits, Engine, EngineFinish, Event, Events, FinishReason,
     Format, Input, MalformedReason, ParseError, Parser, TokenSpan,
@@ -382,6 +384,192 @@ fn gpt_oss_template() -> Box<dyn Parser> {
     ))
 }
 
+fn space() -> Class {
+    Class::new([('\t', '\r'), (' ', ' ')], false)
+}
+
+fn none_of(chars: &str) -> Class {
+    Class::new(chars.chars().map(|c| (c, c)), true)
+}
+
+fn ends_at(consume: impl IntoIterator<Item = Atom>, ahead: impl IntoIterator<Item = Atom>) -> End {
+    End {
+        consume: Pattern(consume.into_iter().collect()),
+        ahead: Pattern(ahead.into_iter().collect()),
+    }
+}
+
+/// transformers v5.18.0's `transformers serve` template for Qwen 3.5 (`qwen3_5` in
+/// `src/transformers/cli/serving/utils.py`): a thought, the content outside it stripped, and calls
+/// opened by `<tool_call>` and the header `\s*<function=(?P<name>[^>\n]+)>`, closed by the
+/// trailer `</function>\s*` and `</tool_call>`, their parameters tags with a key and a value up
+/// to `\s*</parameter>`, typed by the request's tools.
+fn qwen3_5_serve_shaped() -> Box<dyn Parser> {
+    let name = none_of(">\n");
+    let shape = shape::intern(CallShape {
+        header: Pattern(
+            [
+                run(space(), 0, true, None),
+                Atom::Lit("<function=".into()),
+                run(name.clone(), 1, true, Some(Slot::Name)),
+                Atom::Lit(">".into()),
+            ]
+            .into(),
+        ),
+        name: NameSource::Header,
+        arguments: Arguments::Params {
+            tag: Pattern(
+                [
+                    Atom::Lit("<parameter=".into()),
+                    run(name, 1, true, Some(Slot::Key)),
+                    Atom::Lit(">".into()),
+                    run(space(), 0, true, None),
+                    run(Class::any(), 0, false, Some(Slot::Value)),
+                ]
+                .into(),
+            ),
+            ends: [ends_at(
+                [
+                    run(space(), 0, true, None),
+                    Atom::Lit("</parameter>".into()),
+                ],
+                [],
+            )]
+            .into(),
+        },
+        trailer: Pattern([Atom::Lit("</function>".into()), run(space(), 0, true, None)].into()),
+        word: word(),
+        hold_cap: 8192,
+    });
+    Box::new(Engine::new(
+        Format::new("qwen 3.5 serve template")
+            .terminal("think_open", "<think>")
+            .terminal("think_close", "</think>")
+            .terminal("call_open", "<tool_call>")
+            .terminal("call_close", "</tool_call>")
+            .state("content", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("call", Emits::Arguments)
+            .transition("content", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "content")
+            .transition("content", "call_open", "call")
+            .transition("call", "call_close", "content")
+            .calls(CallSyntax::Shaped(shape))
+            .turn_anchor("<|im_start|>assistant\n")
+            .trims("content")
+            .trims("reasoning"),
+        keyed_tools(),
+    ))
+}
+
+/// The response template of `meta-models/Muse-Glimmer-30B` (its `tokenizer_config.json`) with its
+/// calls: the terminal `<atem:invoke`, a header that skips other attributes and names the tool, and
+/// parameter tags that do the same for their keys, each value up to `</atem:parameter>`.
+fn muse_shaped() -> Box<dyn Parser> {
+    let skip = || run(none_of(">"), 0, false, None);
+    let shape = shape::intern(CallShape {
+        header: Pattern(
+            [
+                Atom::Boundary,
+                skip(),
+                Atom::Boundary,
+                Atom::Lit("name=\"".into()),
+                run(none_of("\""), 1, true, Some(Slot::Name)),
+                Atom::Lit("\">".into()),
+            ]
+            .into(),
+        ),
+        name: NameSource::Header,
+        arguments: Arguments::Params {
+            tag: Pattern(
+                [
+                    Atom::Lit("<atem:parameter".into()),
+                    Atom::Boundary,
+                    skip(),
+                    Atom::Boundary,
+                    Atom::Lit("name=\"".into()),
+                    run(none_of("\""), 1, true, Some(Slot::Key)),
+                    Atom::Lit("\"".into()),
+                    skip(),
+                    Atom::Lit(">".into()),
+                    run(Class::any(), 0, false, Some(Slot::Value)),
+                ]
+                .into(),
+            ),
+            ends: [ends_at([Atom::Lit("</atem:parameter>".into())], [])].into(),
+        },
+        trailer: Pattern::default(),
+        word: word(),
+        hold_cap: 8192,
+    });
+    Box::new(Engine::new(
+        Format::new("muse glimmer template")
+            .terminal("thought", "to=self<|message|>")
+            .terminal("answer", "to=user<|message|>")
+            .terminal("eot", "<|eot|>")
+            .terminal("eom", "<|eom|>")
+            .terminal("call_open", "<atem:invoke")
+            .terminal("call_close", "</atem:invoke>")
+            .state("outside", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("content", Emits::Content)
+            .state("call", Emits::Arguments)
+            .transition("outside", "thought", "reasoning")
+            .transition("outside", "answer", "content")
+            .transition("reasoning", "eom", "outside")
+            .transition("content", "eot", "outside")
+            .transition("content", "eom", "outside")
+            .transition("outside", "call_open", "call")
+            .transition("call", "call_close", "outside")
+            .calls(CallSyntax::Shaped(shape))
+            .framing("outside")
+            .turn_anchor("<|start|>assistant")
+            .trims("reasoning")
+            .trims("content"),
+        Declared::default(),
+    ))
+}
+
+/// Parameters on abstract tags: a call named by the template, its parameters `<k=KEY>` and a
+/// value that ends at `</k>` or where the next parameter's tag begins.
+fn params_tags() -> Box<dyn Parser> {
+    let shape = shape::intern(CallShape {
+        header: Pattern::default(),
+        name: NameSource::Literal("f".into()),
+        arguments: Arguments::Params {
+            tag: Pattern(
+                [
+                    Atom::Lit("<k=".into()),
+                    run(word(), 1, true, Some(Slot::Key)),
+                    Atom::Lit(">".into()),
+                    run(Class::any(), 0, false, Some(Slot::Value)),
+                ]
+                .into(),
+            ),
+            ends: [
+                ends_at([Atom::Lit("</k>".into())], []),
+                ends_at([], [Atom::Lit("<k=".into())]),
+            ]
+            .into(),
+        },
+        trailer: Pattern::default(),
+        word: word(),
+        hold_cap: 8192,
+    });
+    Box::new(Engine::new(
+        Format::new("parameters on abstract tags")
+            .terminal("call_open", "<c>")
+            .terminal("call_close", "</c>")
+            .state("content", Emits::Content)
+            .state("call", Emits::Arguments)
+            .transition("content", "call_open", "call")
+            .transition("call", "call_close", "content")
+            .calls(CallSyntax::Shaped(shape))
+            .closes_at_stop("call"),
+        Declared::default(),
+    ))
+}
+
 /// Calls given as data on abstract tags: a region between `<c>` and `</c>` beside a thought
 /// between `<t>` and `</t>`, each call named by a `<n=NAME>` header, its arguments one JSON value,
 /// and `</f>` with the whitespace after it as the trailer, which the stream's stop may end too.
@@ -543,6 +731,75 @@ const FORMATS: &[Subject] = &[
         new: shaped_tags,
         outputs: SHAPED_TAGS_OUTPUTS,
     },
+    Subject {
+        name: "qwen 3.5 serve template, its calls as a shape",
+        new: qwen3_5_serve_shaped,
+        outputs: QWEN3_5_SERVE_OUTPUTS,
+    },
+    Subject {
+        name: "muse glimmer template, its calls as a shape",
+        new: muse_shaped,
+        outputs: MUSE_CALLS_OUTPUTS,
+    },
+    Subject {
+        name: "parameters on abstract tags",
+        new: params_tags,
+        outputs: PARAMS_TAGS_OUTPUTS,
+    },
+];
+
+/// The Qwen 3.5 serve template: a thought, an answer and a call; two calls; a close without the
+/// trailer; a marker with no function; text between parameters; a value that never ends; values
+/// across lines and empty; calls cut in a value, in a tag and in the header; and nothing.
+const QWEN3_5_SERVE_OUTPUTS: &[&str] = &[
+    "<think>\nThe user wants the weather.\n</think>\n\nLet me check.\n<tool_call>\n\
+     <function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n\
+     </parameter>\n</function>\n</tool_call>",
+    "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n\
+     </tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n</parameter>\n\
+     </function>\n</tool_call>",
+    "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</tool_call>\n\
+     More text</function></tool_call>",
+    "<tool_call>\nnot a function</tool_call>Hi",
+    "<tool_call>\n<function=get_weather>\nnoise <parameter=city>  Paris  </parameter> junk \
+     <parameter=days>4</parameter></function>\n</tool_call>",
+    "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</function>\n</tool_call>",
+    "<tool_call>\n<function=get_weather>\n<parameter=days>\n</parameter>\n<parameter=city>\n\
+     New\nYork\n</parameter>\n</function>\n</tool_call>",
+    "<tool_call>\n<function=get_weather>\n<parameter=city>\nPar",
+    "<tool_call>\n<function=get_weather>\n<parame",
+    "<tool_call>\n<fun",
+    "",
+];
+
+/// Muse Glimmer's calls: after a thought, with attributes and text between parameters, an invoke
+/// without a name, two calls, a tag whose name runs on, a call cut short, and nothing.
+const MUSE_CALLS_OUTPUTS: &[&str] = &[
+    "to=self<|message|>Plan.<|eom|><|start|>assistant<atem:invoke name=\"get_weather\">\
+     <atem:parameter name=\"city\">Paris</atem:parameter><atem:parameter name=\"days\">3\
+     </atem:parameter></atem:invoke>",
+    "<atem:invoke id=\"1\" name=\"lookup\"><atem:parameter type=\"string\" name=\"q\">x y\
+     </atem:parameter> <atem:parameter name=\"ids\">[1, 2]</atem:parameter></atem:invoke>",
+    "<atem:invoke id=\"1\">text</atem:invoke> to=user<|message|>Hi<|eot|>",
+    "<atem:invoke name=\"f\"></atem:invoke><atem:invoke name=\"g\"><atem:parameter \
+     name=\"o\">{\"a\": true}</atem:parameter></atem:invoke>",
+    "<atem:invoke name=\"f\"><atem:parameters name=\"x\">1</atem:parameter></atem:invoke>",
+    "<atem:invoke name=\"f\"><atem:parameter name=\"q\">cut",
+    "",
+];
+
+/// Parameters on abstract tags: values ended by their close and by the next tag, text between
+/// them, a tag that does not match, a key written twice, calls cut in a value and in a tag, a
+/// call the stop closes, and nothing.
+const PARAMS_TAGS_OUTPUTS: &[&str] = &[
+    "<c><k=a>1<k=b>2</k></c>",
+    "Hi <c>junk<k=a>1</k> mid <k=b>x y</k>tail</c> bye",
+    "<c><k=a b>1</k><k=c>[1, 2]</k></c>",
+    "<c><k=a>1</k><k=a>2</k></c>",
+    "<c><k=a>1<k=b>2",
+    "<c><k=",
+    "<c><k=a>{\"x\": [1, {\"y\": null}]}</k>",
+    "",
 ];
 
 /// The gpt-oss test template: a thought and a call the stop closes, a call cut short, a header
