@@ -349,6 +349,12 @@ Anything else gives no layout, with a stable code (`NoLayout::code`), and the
 table then has no structural tag for its calls. Only calls given as tagged
 parameters have a layout.
 
+`scripts/record_chat_template_renders.py` records two public chat templates'
+renderings of the probe with transformers 5.18.0 in
+`tests/fixtures/chat_templates/`. `tests/layout.rs` learns the layouts of Muse
+Glimmer and Qwen 3.5 from them, and `tests/layouts.tsv` pins the outcome for
+every pair of a response template and a chat template the recordings name.
+
 ## Parity tests
 
 `scripts/generate_hf_fixtures.py` runs transformers itself and records what it

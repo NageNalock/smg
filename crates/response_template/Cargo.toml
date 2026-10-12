@@ -39,5 +39,9 @@ required-features = ["symphony"]
 name = "to_symphony_parity"
 required-features = ["symphony"]
 
+[[test]]
+name = "layout"
+required-features = ["symphony"]
+
 [lints]
 workspace = true
