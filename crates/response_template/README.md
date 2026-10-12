@@ -256,6 +256,14 @@ cargo test -p smg-response-template --features adapter
 `--extra-cases FILE --out DIR` records local cases and `--fuzz N --out DIR`
 random ones; run the tests on them with `RESPONSE_TEMPLATE_HF_FIXTURES=DIR`.
 
+`--compiled --sources DIR` records `tests/fixtures/compiled/`: the public
+templates a compiled table is read against (transformers' tests, built-ins and
+TRL's templates, and the templates of two Hub checkpoints, each read from a
+named source at a pinned revision; `--fetch-sources DIR` downloads the pinned
+files), sessions of each with transformers' whole-text reading, and how
+transformers types a call's values (`values.jsonl`), which
+`tests/to_symphony.rs` checks the value reader of a symphony table against.
+
 To move to a newer transformers: update the pins in the generator (its
 docstring and `PINNED_*`) and here, regenerate, review the fixture diff, adjust
 the port, and update `TRANSFORMERS_VERSION` in `tests/hf_parity.rs`.

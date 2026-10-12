@@ -133,6 +133,30 @@ pub(crate) fn coerce(raw: &str, types: &[String], taint: &mut Taint) -> PyResult
     Ok(Value::String(raw.to_owned()))
 }
 
+/// transformers: the cast of one argument in `_coerce_tool_calls`, by the
+/// non-empty `types` of its schema: a string with `_coerce`, and each string
+/// of a list when the types hold no array.
+pub(crate) fn coerce_argument(
+    argument: &mut Value,
+    types: &[String],
+    taint: &mut Taint,
+) -> PyResult<()> {
+    match argument {
+        Value::String(s) => *argument = coerce(s, types, taint)?,
+        // Duplicate keys collected by `merge_duplicates`; a list for a
+        // parameter that can be an array is already its value.
+        Value::Array(items) if !types.iter().any(|t| t == "array") => {
+            for item in items {
+                if let Value::String(s) = item {
+                    *item = coerce(s, types, taint)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// transformers: `ResponseParser`, a streaming parser with a response template.
 ///
 /// Feed model output with [`feed`](Self::feed) and finish with
@@ -725,19 +749,7 @@ impl ResponseParser {
             if types.is_empty() {
                 continue;
             }
-            match argument {
-                Value::String(s) => *argument = coerce(s, &types, taint)?,
-                // Duplicate keys collected by `merge_duplicates`; a list for a
-                // parameter that can be an array is already its value.
-                Value::Array(items) if !types.iter().any(|t| t == "array") => {
-                    for item in items {
-                        if let Value::String(s) = item {
-                            *item = coerce(s, &types, taint)?;
-                        }
-                    }
-                }
-                _ => {}
-            }
+            coerce_argument(argument, &types, taint)?;
         }
         Ok(())
     }

@@ -77,6 +77,25 @@ impl Content {
         }
     }
 
+    /// A value parser as a compiled table reads a tagged value with it: `parser`, its `strip`,
+    /// and for `json` its dialect and whether text that is not JSON reads as text.
+    #[cfg(feature = "symphony")]
+    pub(crate) fn value(
+        parser: ContentParser,
+        strip: bool,
+        unquoted_keys: bool,
+        allow_non_json: bool,
+        string_delims: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            strip,
+            string_delims,
+            unquoted_keys,
+            allow_non_json,
+            ..Self::plain(parser)
+        }
+    }
+
     /// Check the `content_args` the parser reads (`None` when absent).
     pub(crate) fn new(parser: ContentParser, args: Option<&Value>) -> Result<Self, Unsupported> {
         let empty = Map::new();

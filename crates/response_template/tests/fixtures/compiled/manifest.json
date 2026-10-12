@@ -18,13 +18,255 @@
   "CohereLabs/North-Micro-Vision-Instruct@fa548d9aa62c1220bfd21fc6cfc465f1bd2a1a40/tokenizer_config.json": "kjzqzqwjvhpyxxhq",
   "huggingface/trl@d9b9f39b54324b272df051de7852e18761040edd/trl/chat_template_utils.py": "nystwqjpkjvsmjvg"
  },
- "generator": "jwnrmpwvqtyykxjp",
+ "generator": "wrkrxrzzsytphygw",
  "counts": {
   "templates": 8,
   "sessions": 239,
   "streamed": 2,
-  "tool_sets": 1
+  "tool_sets": 1,
+  "values": {
+   "coerce": 810,
+   "coerce_tool_calls": 9,
+   "sub_parse": 588
+  }
  },
+ "value_schemas": {
+  "int": {
+   "type": "integer"
+  },
+  "num": {
+   "type": "number"
+  },
+  "bool": {
+   "type": "boolean"
+  },
+  "obj": {
+   "type": "object"
+  },
+  "arr": {
+   "type": "array"
+  },
+  "nstr": {
+   "type": [
+    "string",
+    "null"
+   ]
+  },
+  "nint": {
+   "type": [
+    "integer",
+    "null"
+   ]
+  },
+  "union": {
+   "type": [
+    "string",
+    "number",
+    "null"
+   ]
+  },
+  "sib": {
+   "type": [
+    "string",
+    "integer",
+    "boolean"
+   ]
+  },
+  "anyof": {
+   "anyOf": [
+    {
+     "type": "array"
+    },
+    {
+     "type": "object"
+    },
+    {
+     "type": "integer"
+    }
+   ]
+  },
+  "opt": {
+   "type": "string",
+   "nullable": true
+  },
+  "str": {
+   "type": "string"
+  },
+  "oneof": {
+   "oneOf": [
+    {
+     "type": "number"
+    },
+    {
+     "type": "boolean"
+    }
+   ]
+  },
+  "oneof-null": {
+   "oneOf": [
+    {
+     "type": "null"
+    },
+    {
+     "type": "integer"
+    }
+   ]
+  },
+  "ref": {
+   "$ref": "#/$defs/count"
+  },
+  "allof": {
+   "allOf": [
+    {
+     "type": "integer"
+    },
+    {
+     "minimum": 0
+    }
+   ]
+  },
+  "enum": {
+   "enum": [
+    1,
+    2,
+    3
+   ]
+  },
+  "const": {
+   "const": 5
+  }
+ },
+ "value_tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "f",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "int": {
+       "type": "integer"
+      },
+      "num": {
+       "type": "number"
+      },
+      "bool": {
+       "type": "boolean"
+      },
+      "obj": {
+       "type": "object"
+      },
+      "arr": {
+       "type": "array"
+      },
+      "nstr": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "nint": {
+       "type": [
+        "integer",
+        "null"
+       ]
+      },
+      "union": {
+       "type": [
+        "string",
+        "number",
+        "null"
+       ]
+      },
+      "sib": {
+       "type": [
+        "string",
+        "integer",
+        "boolean"
+       ]
+      },
+      "anyof": {
+       "anyOf": [
+        {
+         "type": "array"
+        },
+        {
+         "type": "object"
+        },
+        {
+         "type": "integer"
+        }
+       ]
+      },
+      "opt": {
+       "type": "string",
+       "nullable": true
+      },
+      "str": {
+       "type": "string"
+      },
+      "oneof": {
+       "oneOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "boolean"
+        }
+       ]
+      },
+      "oneof-null": {
+       "oneOf": [
+        {
+         "type": "null"
+        },
+        {
+         "type": "integer"
+        }
+       ]
+      },
+      "ref": {
+       "$ref": "#/$defs/count"
+      },
+      "allof": {
+       "allOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "minimum": 0
+        }
+       ]
+      },
+      "enum": {
+       "enum": [
+        1,
+        2,
+        3
+       ]
+      },
+      "const": {
+       "const": 5
+      }
+     },
+     "$defs": {
+      "count": {
+       "type": "integer"
+      }
+     }
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "g",
+    "parameters": {
+     "type": "object"
+    }
+   }
+  }
+ ],
  "templates": [
   {
    "id": "hub/muse-glimmer",

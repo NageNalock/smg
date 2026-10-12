@@ -5231,6 +5231,176 @@ def check_compiled_cases(templates: list[tuple]) -> None:
             raise SystemExit(f"{case['id']}: the output holds the stop {inside[0]!r}")
 
 
+# How a compiled table types a call's values, recorded through transformers'
+# own functions: `_coerce(text, _schema_types(schema))` for every schema and
+# text below (the schemas `_schema_types` reads and four it does not), a tagged
+# value's text through `_sub_parse` with each value parser, and arguments
+# through `_coerce_tool_calls` (strings, and lists whose strings it casts where
+# the schema has no array).
+VALUE_SCHEMAS = {
+    "int": {"type": "integer"},
+    "num": {"type": "number"},
+    "bool": {"type": "boolean"},
+    "obj": {"type": "object"},
+    "arr": {"type": "array"},
+    "nstr": {"type": ["string", "null"]},
+    "nint": {"type": ["integer", "null"]},
+    "union": {"type": ["string", "number", "null"]},
+    "sib": {"type": ["string", "integer", "boolean"]},
+    "anyof": {"anyOf": [{"type": "array"}, {"type": "object"}, {"type": "integer"}]},
+    "opt": {"type": "string", "nullable": True},
+    "str": {"type": "string"},
+    "oneof": {"oneOf": [{"type": "number"}, {"type": "boolean"}]},
+    "oneof-null": {"oneOf": [{"type": "null"}, {"type": "integer"}]},
+    "ref": {"$ref": "#/$defs/count"},
+    "allof": {"allOf": [{"type": "integer"}, {"minimum": 0}]},
+    "enum": {"enum": [1, 2, 3]},
+    "const": {"const": 5},
+}
+VALUE_TEXTS = [
+    "3",
+    " 5 ",
+    "3.0",
+    "007",
+    "+5",
+    "-0",
+    "1_000",
+    "1__0",
+    "_1",
+    "1e2",
+    "1E-2",
+    ".5",
+    "5.",
+    "-.5e1",
+    "1e400",
+    "inf",
+    "nan",
+    "-Infinity",
+    "1e",
+    "1.5",
+    "12345678901234567890123",
+    "0.1",
+    "1e22",
+    "true",
+    " TRUE ",
+    "1",
+    "0",
+    "False",
+    "yes",
+    "null",
+    " null ",
+    "None",
+    "none",
+    "NULL",
+    "[1]",
+    " [1, 2] ",
+    "{}",
+    '{"a": 1}',
+    "[1",
+    '"x"',
+    "abc",
+    "",
+    " ",
+    "\u00a05\u00a0",
+    "\u001c5",
+]
+VALUE_PARSERS = [
+    None,
+    {"name": "text"},
+    {"name": "text", "args": {"strip": False}},
+    {"name": "json"},
+    {"name": "json", "args": {"allow_non_json": True}},
+    {"name": "json", "args": {"allow_non_json": True, "strip": False}},
+    {"name": "json", "args": {"unquoted_keys": True}},
+    {"name": "json", "args": {"string_delims": [['<|"|>', '<|"|>']]}},
+    {"name": "int"},
+    {"name": "float"},
+    {"name": "bool"},
+    {"name": "bool", "args": {"strip": False}},
+]
+VALUE_PARSER_TEXTS = [
+    *VALUE_TEXTS,
+    "\n Paris \n",
+    "{a: 1, b: [2]}",
+    '{a:<|"|>x, y<|"|>}',
+    '{"a": "<|"|>x<|"|>"}',
+]
+VALUE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "f",
+            "parameters": {
+                "type": "object",
+                "properties": dict(VALUE_SCHEMAS),
+                "$defs": {"count": {"type": "integer"}},
+            },
+        },
+    },
+    {"type": "function", "function": {"name": "g", "parameters": {"type": "object"}}},
+]
+VALUE_CALLS = [
+    {"function": {"name": "f", "arguments": {k: "5" for k in VALUE_SCHEMAS}}},
+    {"function": {"name": "f", "arguments": {k: " null " for k in VALUE_SCHEMAS}}},
+    {"function": {"name": "f", "arguments": {k: "[1, 2]" for k in VALUE_SCHEMAS}}},
+    {"function": {"name": "f", "arguments": {k: "TRUE" for k in VALUE_SCHEMAS}}},
+    {"function": {"name": "f", "arguments": {"int": 5, "num": [1], "str": {"a": "1"}, "x": "1"}}},
+    {
+        "function": {
+            "name": "f",
+            "arguments": {k: ["5", " null ", "TRUE", "[1, 2]", 7, None] for k in VALUE_SCHEMAS},
+        }
+    },
+    {
+        "function": {
+            "name": "f",
+            "arguments": {k: [["5"], {"a": "5"}, "1.5", "x"] for k in VALUE_SCHEMAS},
+        }
+    },
+    {"function": {"name": "g", "arguments": {"int": "5"}}},
+    {"function": {"name": "h", "arguments": {"int": "5"}}},
+]
+
+
+def compiled_values() -> list[dict]:
+    from transformers.utils.chat_parsing import content_parsers as cp
+    from transformers.utils.chat_parsing import response_parser as rp
+
+    rows = []
+    for key, schema in VALUE_SCHEMAS.items():
+        for text in VALUE_TEXTS:
+            rows.append(
+                {
+                    "kind": "coerce",
+                    "schema": key,
+                    "text": text,
+                    **_py_call(lambda t, s: rp._coerce(t, rp._schema_types(s)), text, schema),
+                }
+            )
+    for parser in VALUE_PARSERS:
+        for text in VALUE_PARSER_TEXTS:
+            rows.append(
+                {
+                    "kind": "sub_parse",
+                    "value_parser": parser,
+                    "text": text,
+                    **_py_call(cp._sub_parse, text, parser),
+                }
+            )
+    reader = rp.ResponseParser(
+        {"start_anchor": "a", "fields": {"b": {}}}, prefix="", tools=VALUE_TOOLS
+    )
+    for call in VALUE_CALLS:
+        rows.append(
+            {
+                "kind": "coerce_tool_calls",
+                "value": tag(call),
+                **_py_call(reader._coerce_tool_calls, copy.deepcopy(call)),
+            }
+        )
+    return rows
+
+
 def compiled_self_check(files: dict[str, str], revisions: set[str]) -> None:
     """The recordings are public: no dates, and no long hex run other than a
     pinned source revision."""
@@ -5289,6 +5459,7 @@ def generate_compiled(src: Path, sources: Path) -> dict[str, str]:
     with Hooks():
         for case in CASES_COMPILED:
             sessions.append(record_compiled_session(case, specs[case["template"]]))
+    values = compiled_values()
 
     per_template = []
     for row in template_rows:
@@ -5332,7 +5503,10 @@ def generate_compiled(src: Path, sources: Path) -> dict[str, str]:
             "sessions": len(sessions),
             "streamed": sum(t["streamed"] for t in per_template),
             "tool_sets": len(TOOL_SETS),
+            "values": dict(sorted(Counter(row["kind"] for row in values).items())),
         },
+        "value_schemas": VALUE_SCHEMAS,
+        "value_tools": VALUE_TOOLS,
         "templates": per_template,
         "digest": "sha256 of the canonical JSON, first 8 bytes, nibbles as " + DIGEST_LETTERS,
         "license": (
@@ -5350,6 +5524,7 @@ def generate_compiled(src: Path, sources: Path) -> dict[str, str]:
         + "\n",
     }
     files.update(shards("sessions", sessions))
+    files["values.jsonl"] = jsonl(values)
     compiled_self_check(files, {v[1] for v in PINNED_FILES.values()})
     return files
 

@@ -9,6 +9,9 @@
 //! patterns as the `regex` module reads them, and says whether this crate
 //! runs it.
 //!
+//! With the `symphony` feature, `to_symphony` types a call's values for a
+//! table of smg's symphony parser as transformers types them.
+//!
 //! Portions are ported from Hugging Face transformers (Apache-2.0). The files
 //! follow its layout (`response_templates.rs`, `response_parser.rs`,
 //! `content_parsers.rs`); the README maps each transformers name to its Rust
@@ -25,6 +28,8 @@ mod response_templates;
 #[cfg(test)]
 #[path = "../tests/common/mod.rs"]
 mod test_fixtures;
+#[cfg(feature = "symphony")]
+pub mod to_symphony;
 #[cfg(test)]
 mod unit_tests;
 
