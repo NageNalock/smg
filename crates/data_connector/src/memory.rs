@@ -383,6 +383,26 @@ impl ResponseStorage for MemoryResponseStorage {
         }
     }
 
+    async fn update_response_object_if_open(
+        &self,
+        id: &ResponseId,
+        raw_response: serde_json::Value,
+    ) -> ResponseResult<ConditionalStore> {
+        // The check and the write under the one lock; the rest of the record
+        // (its identifier, model, input) stays as it was stored.
+        let mut store = self.store.write();
+        match store.responses.get_mut(id) {
+            None => Ok(ConditionalStore::Missing),
+            Some(current) if current.is_closed() => {
+                Ok(ConditionalStore::Closed(Box::new(current.clone())))
+            }
+            Some(current) => {
+                current.raw_response = raw_response;
+                Ok(ConditionalStore::Stored)
+            }
+        }
+    }
+
     async fn get_response(
         &self,
         response_id: &ResponseId,
@@ -930,6 +950,56 @@ mod tests {
             1,
             "one record, one index entry"
         );
+    }
+
+    #[tokio::test]
+    async fn a_transition_moves_the_stored_object_and_keeps_the_rest_of_the_record() {
+        let store = MemoryResponseStorage::new();
+        let mut response = StoredResponse::new(None);
+        response.id = ResponseId::from("resp_1");
+        response.safety_identifier = Some("user-1".to_string());
+        response.model = Some("m".to_string());
+        response.raw_response = json!({"id": "resp_1", "background": true, "status": "queued"});
+        assert!(matches!(
+            store
+                .update_response_object_if_open(
+                    &ResponseId::from("resp_1"),
+                    json!({"id": "resp_1", "status": "in_progress"})
+                )
+                .await
+                .unwrap(),
+            ConditionalStore::Missing
+        ));
+        store.store_response(response).await.unwrap();
+        assert!(matches!(
+            store
+                .update_response_object_if_open(
+                    &ResponseId::from("resp_1"),
+                    json!({"id": "resp_1", "background": true, "status": "cancelled"})
+                )
+                .await
+                .unwrap(),
+            ConditionalStore::Stored
+        ));
+        let stored = store
+            .get_response(&ResponseId::from("resp_1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.raw_response["status"], "cancelled");
+        assert_eq!(stored.safety_identifier.as_deref(), Some("user-1"));
+        assert_eq!(stored.model.as_deref(), Some("m"));
+        let ConditionalStore::Closed(current) = store
+            .update_response_object_if_open(
+                &ResponseId::from("resp_1"),
+                json!({"id": "resp_1", "status": "completed"}),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("a cancelled record is closed");
+        };
+        assert_eq!(current.raw_response["status"], "cancelled");
     }
 
     #[tokio::test]

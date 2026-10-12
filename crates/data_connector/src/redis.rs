@@ -1138,6 +1138,58 @@ impl ResponseStorage for RedisResponseStorage {
         }
     }
 
+    async fn update_response_object_if_open(
+        &self,
+        id: &ResponseId,
+        raw_response: Value,
+    ) -> ResponseResult<ConditionalStore> {
+        let sr = &self.store.schema.responses;
+        if sr.is_skipped("raw_response") {
+            // No object field: nothing a transition could move.
+            return Ok(ConditionalStore::Stored);
+        }
+        let key = self.response_key(&id.0);
+        let json_raw_response = serde_json::to_string(&raw_response)?;
+        let mut conn = self
+            .store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        // The same script as the full store, with the object's field alone.
+        let script = redis::Script::new(&store_if_open_script());
+        let outcome: String = script
+            .key(&key)
+            .arg(sr.col("raw_response"))
+            .arg(sr.col("raw_response"))
+            .arg(&json_raw_response)
+            .invoke_async(&mut conn)
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        match outcome.as_str() {
+            "stored" => {
+                // The open set and the output-item keys follow the object.
+                let mut moved = StoredResponse::new(None);
+                moved.id = id.clone();
+                moved.raw_response = raw_response;
+                let mut pipe = redis::pipe();
+                self.index_writes(&mut pipe, &key, &moved);
+                pipe.query_async::<()>(&mut conn)
+                    .await
+                    .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+                Ok(ConditionalStore::Stored)
+            }
+            "closed" => {
+                drop(conn);
+                Ok(match self.get_response(id).await? {
+                    Some(current) => ConditionalStore::Closed(Box::new(current)),
+                    None => ConditionalStore::Missing,
+                })
+            }
+            _ => Ok(ConditionalStore::Missing),
+        }
+    }
+
     async fn get_response(
         &self,
         response_id: &ResponseId,
@@ -1291,11 +1343,22 @@ impl ResponseStorage for RedisResponseStorage {
             return Ok(Vec::new());
         }
 
+        // Three fields per member, not the whole hash (whose input can be
+        // large): the object, when it was created, and the input the record
+        // builder parses; the reaper re-reads the whole record of the few it
+        // closes.
+        let fields = [
+            sr.col("raw_response"),
+            sr.col("created_at"),
+            sr.col("input"),
+        ];
         let mut pipe = redis::pipe();
         for id in &ids {
-            pipe.hgetall(self.response_key(id));
+            pipe.cmd("HMGET")
+                .arg(self.response_key(id))
+                .arg(&fields[..]);
         }
-        let maps: Vec<HashMap<String, String>> = pipe
+        let values: Vec<Vec<Option<String>>> = pipe
             .query_async(&mut conn)
             .await
             .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
@@ -1304,8 +1367,13 @@ impl ResponseStorage for RedisResponseStorage {
         // build) or closed by one that did not maintain the set leaves it.
         let mut open = Vec::new();
         let mut stale = Vec::new();
-        for (id, map) in ids.iter().zip(maps) {
-            if map.is_empty() {
+        for (id, got) in ids.iter().zip(values) {
+            let map: HashMap<String, String> = fields
+                .iter()
+                .zip(got)
+                .filter_map(|(field, value)| value.map(|value| (field.to_string(), value)))
+                .collect();
+            if !map.contains_key(sr.col("raw_response")) {
                 stale.push(id.clone());
                 continue;
             }

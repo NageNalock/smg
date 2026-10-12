@@ -1592,6 +1592,44 @@ impl ResponseStorage for OracleResponseStorage {
         })
     }
 
+    async fn update_response_object_if_open(
+        &self,
+        id: &ResponseId,
+        raw_response: Value,
+    ) -> Result<ConditionalStore, ResponseStorageError> {
+        let read_back = id.clone();
+        let id_str = id.0.clone();
+        let json_raw_response = serde_json::to_string(&raw_response)?;
+        let schema = self.store.schema.clone();
+        let updated = self
+            .store
+            .execute(move |conn| {
+                let s = &schema.responses;
+                if s.is_skipped("raw_response") {
+                    // No object column: nothing a transition could move.
+                    return Ok(1);
+                }
+                let table = s.qualified_table(schema.owner.as_deref());
+                let open = oracle_open_predicate(s.col("raw_response"));
+                let (sql, binds) =
+                    update_if_open_sql(&table, &[s.col("id"), s.col("raw_response")], Some(&open));
+                let params: Vec<&dyn ToSql> = vec![&id_str, &json_raw_response];
+                let named: Vec<(&str, &dyn ToSql)> =
+                    binds.iter().map(String::as_str).zip(params).collect();
+                let stmt = conn.execute_named(&sql, &named).map_err(map_oracle_error)?;
+                stmt.row_count().map_err(map_oracle_error)
+            })
+            .await
+            .map_err(ResponseStorageError::StorageError)?;
+        if updated > 0 {
+            return Ok(ConditionalStore::Stored);
+        }
+        Ok(match self.get_response(&read_back).await? {
+            Some(current) => ConditionalStore::Closed(Box::new(current)),
+            None => ConditionalStore::Missing,
+        })
+    }
+
     async fn get_response(
         &self,
         response_id: &ResponseId,

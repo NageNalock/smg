@@ -17,10 +17,12 @@
 //!
 //! The stored record is the shared truth, also between gateways that share a
 //! store: a status only moves forward ([`set_stored_status`] never rewrites a
-//! terminal record: every transition, the lease renewal and the terminal
-//! object are one conditional write of the store,
-//! `ResponseStorage::store_response_if_open`, refused once the record is
-//! closed), the runner reads the record while the work runs and drops the
+//! terminal record: every transition and the lease renewal are one
+//! conditional write of the stored object alone,
+//! `ResponseStorage::update_response_object_if_open`, and the terminal
+//! object the work persists one conditional write of the row,
+//! `ResponseStorage::store_response_if_open`, both refused once the record
+//! is closed), the runner reads the record while the work runs and drops the
 //! work once the record was closed elsewhere, and every way a run can end
 //! leaves a terminal record ([`drive`]): the object the work stored, `failed`
 //! with the error of a work that answered one, ended without storing a
@@ -434,15 +436,17 @@ async fn transition(
 ) -> Result<Transition, ResponseStorageError> {
     let update = async {
         let response_id = ResponseId::from(id);
-        let Some(mut stored) = storage.get_response(&response_id).await? else {
+        let Some(stored) = storage.get_response(&response_id).await? else {
             return Ok(Transition::Missing);
         };
         if is_terminal(stored.raw_response["status"].as_str().unwrap_or("")) {
             return Ok(Transition::Terminal(stored.raw_response));
         }
-        stored.raw_response = next(stored.raw_response);
-        let raw = stored.raw_response.clone();
-        match storage.store_response_if_open(stored).await? {
+        let raw = next(stored.raw_response);
+        match storage
+            .update_response_object_if_open(&response_id, raw.clone())
+            .await?
+        {
             ConditionalStore::Stored => Ok(Transition::Moved(raw)),
             ConditionalStore::Closed(current) => Ok(Transition::Terminal(current.raw_response)),
             ConditionalStore::Missing => Ok(Transition::Missing),
@@ -989,7 +993,11 @@ async fn watch_stored_status(
                     continue;
                 }
                 with_lease(&mut stored.raw_response, &lease);
-                let write = async { storage.store_response_if_open(stored).await };
+                let write = async {
+                    storage
+                        .update_response_object_if_open(&ResponseId::from(id), stored.raw_response)
+                        .await
+                };
                 let written = match request_context.clone() {
                     Some(ctx) => with_request_context(ctx, write).await,
                     None => write.await,
@@ -1101,10 +1109,12 @@ enum Lost {
 
 /// Closes the record under `id` as `failed` with [`lost_gateway_error`] if,
 /// re-read now, it is still open under a lease expired at `now`: the listing
-/// the reaper works from is a snapshot, and an owner whose renewal lands
-/// between the listing and this write keeps its response. The write is the
+/// the reaper works from is a snapshot, and an owner whose renewal landed
+/// between the listing and this re-read keeps its response. The write is the
 /// conditional one of every transition, refused if the record closed
-/// meanwhile.
+/// meanwhile; a renewal that lands between the re-read and the write (one
+/// store round trip, by an owner already more than two thirds of the TTL
+/// late) is overwritten by the close, which is what the lease promises.
 async fn close_lost(
     storage: &Arc<dyn ResponseStorage>,
     id: &str,
@@ -1112,7 +1122,7 @@ async fn close_lost(
     request_context: Option<StorageRequestContext>,
 ) -> Result<Lost, ResponseStorageError> {
     let update = async {
-        let Some(mut stored) = storage
+        let Some(stored) = storage
             .get_response(&ResponseId::from(id))
             .await?
         else {
@@ -1125,14 +1135,13 @@ async fn close_lost(
         else {
             return Ok(Lost::Renewed);
         };
-        stored.raw_response = with_status(
+        let raw = with_status(
             stored.raw_response,
             "failed",
             Some(lost_gateway_error(&lease)),
         );
-        let raw = stored.raw_response.clone();
         match storage
-            .store_response_if_open(stored)
+            .update_response_object_if_open(&ResponseId::from(id), raw.clone())
             .await?
         {
             ConditionalStore::Stored => Ok(Lost::Closed(lease, raw)),
@@ -1631,6 +1640,21 @@ mod tests {
             Ok(outcome)
         }
 
+        async fn update_response_object_if_open(
+            &self,
+            id: &ResponseId,
+            raw_response: Value,
+        ) -> Result<ConditionalStore, ResponseStorageError> {
+            let outcome = self
+                .inner
+                .update_response_object_if_open(id, raw_response)
+                .await?;
+            if matches!(outcome, ConditionalStore::Stored) {
+                self.stores.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(outcome)
+        }
+
         async fn get_response(
             &self,
             response_id: &ResponseId,
@@ -1794,6 +1818,18 @@ mod tests {
             self.reached.notify_one();
             self.gate.notified().await;
             self.inner.store_response_if_open(response).await
+        }
+
+        async fn update_response_object_if_open(
+            &self,
+            id: &ResponseId,
+            raw_response: Value,
+        ) -> Result<ConditionalStore, ResponseStorageError> {
+            self.reached.notify_one();
+            self.gate.notified().await;
+            self.inner
+                .update_response_object_if_open(id, raw_response)
+                .await
         }
 
         async fn get_response(
@@ -2134,6 +2170,16 @@ mod tests {
             response: StoredResponse,
         ) -> Result<ConditionalStore, ResponseStorageError> {
             self.inner.store_response_if_open(response).await
+        }
+
+        async fn update_response_object_if_open(
+            &self,
+            id: &ResponseId,
+            raw_response: Value,
+        ) -> Result<ConditionalStore, ResponseStorageError> {
+            self.inner
+                .update_response_object_if_open(id, raw_response)
+                .await
         }
 
         async fn get_response(

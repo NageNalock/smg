@@ -679,6 +679,33 @@ pub trait ResponseStorage: Send + Sync {
         }
     }
 
+    /// Moves the stored object of the record under `id` to `raw_response`
+    /// unless the record has reached a terminal status or is missing: the
+    /// write of a status transition (`in_progress`, a lease renewal,
+    /// `cancelled`, `failed`, the reaper's close), which changes the object
+    /// alone. The columns written when the record was created (the request's
+    /// context, a hook's extra columns) are left as they are: the reaper runs
+    /// under no request, and must not reset them. A storage hook that refuses
+    /// writes without a request context refuses the reaper's close too.
+    ///
+    /// The default reads the record and writes it whole through
+    /// [`Self::store_response_if_open`]; every backend of this crate
+    /// overrides it with one conditional write of the object's column.
+    async fn update_response_object_if_open(
+        &self,
+        id: &ResponseId,
+        raw_response: Value,
+    ) -> ResponseResult<ConditionalStore> {
+        match self.get_response(id).await? {
+            None => Ok(ConditionalStore::Missing),
+            Some(current) if current.is_closed() => Ok(ConditionalStore::Closed(Box::new(current))),
+            Some(mut current) => {
+                current.raw_response = raw_response;
+                self.store_response_if_open(current).await
+            }
+        }
+    }
+
     /// Get a response by ID
     async fn get_response(
         &self,

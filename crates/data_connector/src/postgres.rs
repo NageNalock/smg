@@ -219,11 +219,15 @@ impl PostgresStore {
                     describe_error(&e)
                 )
             })?;
-        // Each response index in a savepoint of its own: one that cannot be
-        // created (the safety-identifier column may be missing, a stored
-        // object may defeat the open-background index's expression) leaves
-        // the others in place.
-        for index_ddl in PostgresResponseStorage::index_ddls(schema) {
+        // Only when the index is missing: `CREATE INDEX IF NOT EXISTS` takes
+        // a share lock on the table even when it then does nothing, and a
+        // gateway starting while another one builds the open-background index
+        // concurrently (below) would wait for that build, which waits for this
+        // transaction: a deadlock Postgres resolves by failing one start.
+        let safety_index_missing = !index_exists(&tx, schema, SAFETY_INDEX).await?;
+        if let Some(index_ddl) =
+            PostgresResponseStorage::index_ddl(schema).filter(|_| safety_index_missing)
+        {
             let index = tx.savepoint("response_index").await.map_err(|e| {
                 format!("failed to open the index savepoint: {}", describe_error(&e))
             })?;
@@ -236,8 +240,7 @@ impl PostgresStore {
                 })?,
                 Err(e) => {
                     tracing::warn!(
-                        index_ddl,
-                        "response index not created: {}",
+                        "response index not created (the safety_identifier column may be missing): {}",
                         describe_error(&e)
                     );
                     index.rollback().await.map_err(|e| {
@@ -255,8 +258,98 @@ impl PostgresStore {
                 "failed to commit the schema bootstrap: {}",
                 describe_error(&e)
             )
-        })
+        })?;
+
+        // The partial index behind the reaper's listing of the open background
+        // records is built CONCURRENTLY, outside the transaction (it cannot run
+        // inside one) and after it: a plain build takes a share lock on the
+        // table that blocks every write from every gateway for as long as it
+        // parses each stored object, which on an existing table of some size
+        // is the upgrade's rollout. The concurrent build lets the writes
+        // through; it is cheap once the index exists, and a failure is not
+        // fatal: the listing then scans the table. An INVALID leftover of an
+        // interrupted build is dropped first, as Postgres would keep it.
+        if let Some(index_ddl) = open_background_index_sql(schema) {
+            let name = OPEN_BACKGROUND_INDEX;
+            match drop_invalid_index(&client, schema, name).await {
+                Ok(true) => tracing::warn!(
+                    index = name,
+                    "dropped an invalid leftover of an interrupted index build"
+                ),
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    index = name,
+                    "could not check the index for an invalid leftover: {e}"
+                ),
+            }
+            if let Err(e) = client.batch_execute(&index_ddl).await {
+                tracing::warn!(
+                    index = name,
+                    "open-background index not created (the reaper's listing scans the table): {}",
+                    describe_error(&e)
+                );
+            }
+        }
+        Ok(())
     }
+}
+
+/// The name of the partial index behind the reaper's listing.
+const OPEN_BACKGROUND_INDEX: &str = "responses_open_background_idx";
+
+/// The name of the index on the safety identifier.
+const SAFETY_INDEX: &str = "responses_safety_idx";
+
+/// Whether an index named `name` exists in the schema the store writes to.
+async fn index_exists(
+    client: &impl deadpool_postgres::GenericClient,
+    schema: &SchemaConfig,
+    name: &str,
+) -> Result<bool, String> {
+    let rows = client
+        .query(
+            "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind = 'i' AND c.relname = $1 \
+             AND n.nspname = COALESCE($2, current_schema())",
+            &[&name, &schema.owner.as_deref()],
+        )
+        .await
+        .map_err(|e| format!("failed to look the index {name} up: {}", describe_error(&e)))?;
+    Ok(!rows.is_empty())
+}
+
+/// Drops the index `name` of the responses table when it exists but is not
+/// valid and no session is building it (a `CREATE INDEX CONCURRENTLY` that
+/// was interrupted leaves such an index behind, and `IF NOT EXISTS` would
+/// then keep it; one still being built by another gateway is left to it).
+/// `Ok(true)` when one was dropped.
+async fn drop_invalid_index(
+    client: &tokio_postgres::Client,
+    schema: &SchemaConfig,
+    name: &str,
+) -> Result<bool, String> {
+    let rows = client
+        .query(
+            "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+             WHERE c.relname = $1 AND NOT i.indisvalid \
+             AND NOT EXISTS (SELECT 1 FROM pg_stat_progress_create_index p \
+                             WHERE p.index_relid = i.indexrelid)",
+            &[&name],
+        )
+        .await
+        .map_err(|e| describe_error(&e))?;
+    if rows.is_empty() {
+        return Ok(false);
+    }
+    let qualified = match schema.owner.as_deref() {
+        Some(owner) => format!("{owner}.\"{name}\""),
+        None => name.to_string(),
+    };
+    client
+        .batch_execute(&format!("DROP INDEX CONCURRENTLY IF EXISTS {qualified};"))
+        .await
+        .map_err(|e| describe_error(&e))?;
+    Ok(true)
 }
 
 impl Clone for PostgresStore {
@@ -1115,24 +1208,21 @@ impl PostgresResponseStorage {
         )
     }
 
-    /// The response indexes, created by the bootstrap after the migrations,
-    /// each in a savepoint of its own: the index on the safety identifier (a
-    /// legacy table gains the column in v1) unless the column is skipped, and
-    /// the partial index behind the reaper's listing of the open background
-    /// records ([`open_background_index_sql`]) unless the stored object's
-    /// column is skipped.
-    pub(crate) fn index_ddls(schema: &SchemaConfig) -> Vec<String> {
+    /// The index on the safety identifier, created by the bootstrap after
+    /// the migrations (a legacy table gains the column in v1), unless the
+    /// column is skipped. The partial index behind the reaper's listing
+    /// ([`open_background_index_sql`]) is built after the bootstrap's
+    /// transaction, concurrently.
+    pub(crate) fn index_ddl(schema: &SchemaConfig) -> Option<String> {
         let s = &schema.responses;
-        let mut ddls = Vec::new();
-        if !s.is_skipped("safety_identifier") {
-            let table = s.qualified_table(schema.owner.as_deref());
-            ddls.push(format!(
-                "CREATE INDEX IF NOT EXISTS responses_safety_idx ON {table} ({});",
-                s.col("safety_identifier")
-            ));
+        if s.is_skipped("safety_identifier") {
+            return None;
         }
-        ddls.extend(open_background_index_sql(schema));
-        ddls
+        let table = s.qualified_table(schema.owner.as_deref());
+        Some(format!(
+            "CREATE INDEX IF NOT EXISTS responses_safety_idx ON {table} ({});",
+            s.col("safety_identifier")
+        ))
     }
 
     /// The index behind [`ResponseStorage::delete_unstored_older_than`]: the
@@ -1296,9 +1386,10 @@ fn open_status_condition(col_raw: &str) -> String {
 /// gateway's reaper runs reads the few open rows instead of scanning the
 /// table. Postgres evaluates the key and the predicate on every INSERT and
 /// UPDATE of the table once the index exists, hence [`json_field_text`]: an
-/// object with a `\u0000` escape stores as it did without the index. Created
-/// by the bootstrap after the migrations, in a savepoint of its own like the
-/// identifier index. `None` when the schema skips the column.
+/// object with a `\u0000` escape stores as it did without the index. Built
+/// CONCURRENTLY by the bootstrap once its transaction has committed, so the
+/// writes of an existing table are not held behind the build (see
+/// `PostgresStore::bootstrap`). `None` when the schema skips the column.
 fn open_background_index_sql(schema: &SchemaConfig) -> Option<String> {
     let s = &schema.responses;
     if s.is_skipped("raw_response") {
@@ -1307,7 +1398,7 @@ fn open_background_index_sql(schema: &SchemaConfig) -> Option<String> {
     let table = s.qualified_table(schema.owner.as_deref());
     let col_raw = s.col("raw_response");
     Some(format!(
-        "CREATE INDEX IF NOT EXISTS responses_open_background_idx ON {table} \
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS {OPEN_BACKGROUND_INDEX} ON {table} \
          (({})) WHERE {};",
         json_field_text(col_raw, "status"),
         open_status_condition(col_raw)
@@ -1666,6 +1757,46 @@ impl ResponseStorage for PostgresResponseStorage {
         })
     }
 
+    async fn update_response_object_if_open(
+        &self,
+        id: &ResponseId,
+        raw_response: Value,
+    ) -> ResponseResult<ConditionalStore> {
+        let s = &self.store.schema.responses;
+        if s.is_skipped("raw_response") {
+            // No object column: nothing a transition could move.
+            return Ok(ConditionalStore::Stored);
+        }
+        let table = s.qualified_table(self.store.schema.owner.as_deref());
+        let col_raw = s.col("raw_response");
+        let sql = update_if_open_sql(
+            &table,
+            &[s.col("id"), col_raw],
+            Some(&open_predicate(col_raw)),
+        );
+        let client = self
+            .store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        let store_err =
+            |e: tokio_postgres::Error| ResponseStorageError::StorageError(e.to_string());
+        let stmt = client.prepare_cached(&sql).await.map_err(store_err)?;
+        let rows = client
+            .execute(&stmt, &[&id.0, &raw_response])
+            .await
+            .map_err(store_err)?;
+        if rows > 0 {
+            return Ok(ConditionalStore::Stored);
+        }
+        drop(client);
+        Ok(match self.get_response(id).await? {
+            Some(current) => ConditionalStore::Closed(Box::new(current)),
+            None => ConditionalStore::Missing,
+        })
+    }
+
     async fn get_response(
         &self,
         response_id: &ResponseId,
@@ -1931,25 +2062,18 @@ mod tests {
         assert!(
             PostgresResponseStorage::table_ddl(&schema).contains("safety_identifier VARCHAR(128)")
         );
-        let ddls = PostgresResponseStorage::index_ddls(&schema);
-        assert_eq!(ddls.len(), 2, "{ddls:?}");
         assert_eq!(
-            ddls[0],
-            "CREATE INDEX IF NOT EXISTS responses_safety_idx ON responses (safety_identifier);"
-        );
-        assert_eq!(
-            Some(&ddls[1]),
-            open_background_index_sql(&schema).as_ref(),
-            "the open-background index is the second statement"
+            PostgresResponseStorage::index_ddl(&schema).as_deref(),
+            Some(
+                "CREATE INDEX IF NOT EXISTS responses_safety_idx ON responses (safety_identifier);"
+            )
         );
         let mut skipped = SchemaConfig::default();
         skipped
             .responses
             .skip_columns
             .insert("safety_identifier".to_string());
-        let ddls = PostgresResponseStorage::index_ddls(&skipped);
-        assert_eq!(ddls.len(), 1, "{ddls:?}");
-        assert!(ddls[0].contains("responses_open_background_idx"));
+        assert!(PostgresResponseStorage::index_ddl(&skipped).is_none());
         // The links index is a statement of its own, run after the migrations.
         assert_eq!(
             PostgresConversationItemStorage::index_ddl(&schema),
@@ -1966,7 +2090,7 @@ mod tests {
         let schema = SchemaConfig::default();
         assert_eq!(
             open_background_index_sql(&schema).unwrap(),
-            "CREATE INDEX IF NOT EXISTS responses_open_background_idx ON responses \
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS responses_open_background_idx ON responses \
              ((replace(raw_response::text, '\\u0000', '\\u0020')::json->>'status')) \
              WHERE replace(raw_response::text, '\\u0000', '\\u0020')::json->>'status' \
              IN ('queued', 'in_progress');"

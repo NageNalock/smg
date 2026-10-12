@@ -491,6 +491,45 @@ impl ResponseStorage for HookedResponseStorage {
         Ok(result)
     }
 
+    /// A status transition: the store hooks run as for a store, the
+    /// after-hook only when the object was written, with the id as its
+    /// result; the record's other columns are not rewritten, so a hook that
+    /// supplies none (the reaper runs under no request) resets nothing.
+    async fn update_response_object_if_open(
+        &self,
+        id: &ResponseId,
+        raw_response: serde_json::Value,
+    ) -> ResponseResult<ConditionalStore> {
+        let payload = serde_json::json!({ "id": id, "raw_response": raw_response });
+        let id_json = serde_json::to_value(id).unwrap_or_default();
+        let extra = run_before(
+            &*self.hook,
+            StorageOperation::StoreResponse,
+            &payload,
+            ResponseStorageError::StorageError,
+        )
+        .await?;
+
+        let result = with_extra_columns(
+            extra.clone(),
+            self.inner.update_response_object_if_open(id, raw_response),
+        )
+        .await?;
+
+        if matches!(result, ConditionalStore::Stored) {
+            run_after(
+                &*self.hook,
+                StorageOperation::StoreResponse,
+                &payload,
+                &id_json,
+                &extra,
+            )
+            .await;
+        }
+
+        Ok(result)
+    }
+
     async fn get_response(
         &self,
         response_id: &ResponseId,
@@ -1522,6 +1561,56 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.raw_response["status"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn hooked_transition_runs_the_store_hooks_and_moves_the_object_alone() {
+        let inner = Arc::new(MemoryResponseStorage::new());
+        let hook = Arc::new(MockHook::new());
+        let hooked = HookedResponseStorage::new(inner, hook.clone());
+
+        let mut stored = StoredResponse::new(None);
+        stored.id = ResponseId::from("resp_1");
+        stored.safety_identifier = Some("user-1".to_string());
+        stored.raw_response = json!({"background": true, "status": "queued"});
+        hooked.store_response(stored).await.unwrap();
+        assert!(matches!(
+            hooked
+                .update_response_object_if_open(
+                    &ResponseId::from("resp_1"),
+                    json!({"background": true, "status": "failed"})
+                )
+                .await
+                .unwrap(),
+            ConditionalStore::Stored
+        ));
+        assert!(matches!(
+            hooked
+                .update_response_object_if_open(
+                    &ResponseId::from("resp_1"),
+                    json!({"background": true, "status": "completed"})
+                )
+                .await
+                .unwrap(),
+            ConditionalStore::Closed(current) if current.raw_response["status"] == "failed"
+        ));
+        assert_eq!(hook.before_calls(), 3, "each attempt runs the before-hook");
+        assert_eq!(
+            hook.after_results(),
+            vec![json!("resp_1"), json!("resp_1")],
+            "the after-hook runs for the two writes, with the id"
+        );
+        let stored = hooked
+            .get_response(&ResponseId::from("resp_1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.raw_response["status"], "failed");
+        assert_eq!(
+            stored.safety_identifier.as_deref(),
+            Some("user-1"),
+            "the rest of the record stays"
+        );
     }
 
     #[tokio::test]

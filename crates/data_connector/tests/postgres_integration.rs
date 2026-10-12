@@ -38,9 +38,9 @@ use std::{
 
 use chrono::{TimeDelta, Utc};
 use data_connector::{
-    create_storage, ConditionalStore, ConversationItemId, HistoryBackend, ListParams,
-    NewConversation, NewConversationItem, PostgresConfig, SchemaConfig, SortOrder, StorageBundle,
-    StorageFactoryConfig, StoredResponse, TableConfig,
+    create_storage, with_extra_columns, ColumnDef, ConditionalStore, ConversationItemId,
+    HistoryBackend, ListParams, NewConversation, NewConversationItem, PostgresConfig, SchemaConfig,
+    SortOrder, StorageBundle, StorageFactoryConfig, StoredResponse, TableConfig,
 };
 use serde_json::json;
 use tokio::task::JoinSet;
@@ -1841,6 +1841,103 @@ async fn a_stored_object_with_a_nul_escape_is_stored_listed_and_moved_under_the_
     for stored in [&nul, &literal, &no_lease] {
         storage.delete_response(&stored.id).await.expect("delete");
     }
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_transition_keeps_the_columns_written_when_the_record_was_created() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    // A database of its own: its responses table carries an extra column a
+    // storage hook fills from the request's context.
+    let scratch = ScratchDatabase::create(&db_url, "extra")
+        .await
+        .expect("scratch database");
+    let mut schema = SchemaConfig {
+        auto_migrate: true,
+        ..Default::default()
+    };
+    schema.responses.extra_columns.insert(
+        "team".to_string(),
+        ColumnDef {
+            sql_type: "VARCHAR(64)".to_string(),
+            default_value: None,
+        },
+    );
+    let postgres_cfg = PostgresConfig {
+        db_url: scratch.url.clone(),
+        pool_max: 4,
+        schema: Some(schema),
+    };
+    let bundle = create_storage(StorageFactoryConfig {
+        backend: &HistoryBackend::Postgres,
+        oracle: None,
+        postgres: Some(&postgres_cfg),
+        redis: None,
+        hook: None,
+    })
+    .await
+    .expect("create storage");
+    let storage = bundle.response_storage.clone();
+
+    // The record is created under the request's context: the hook's column
+    // is written with it.
+    let mut stored = StoredResponse::new(None);
+    let id = stored.id.clone();
+    stored.raw_response = json!({
+        "id": id.0, "status": "queued", "background": true,
+        "_lease": {"owner": "gw_a", "expires_at": 1},
+    });
+    with_extra_columns(
+        std::collections::HashMap::from([("team".to_string(), json!("acme"))]),
+        storage.store_response(stored),
+    )
+    .await
+    .expect("store");
+
+    // The reaper's close: no request context, the stored object alone moves.
+    let mut raw = storage
+        .get_response(&id)
+        .await
+        .expect("get")
+        .expect("stored")
+        .raw_response;
+    raw["status"] = json!("failed");
+    assert!(matches!(
+        storage
+            .update_response_object_if_open(&id, raw)
+            .await
+            .expect("transition"),
+        ConditionalStore::Stored
+    ));
+
+    let (client, connection) = tokio_postgres::connect(&scratch.url, tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test drives its own connection for the one query it makes"
+    )]
+    let driver = tokio::spawn(connection);
+    let row = client
+        .query_one(
+            "SELECT team, raw_response->>'status' FROM responses WHERE id = $1",
+            &[&id.0],
+        )
+        .await
+        .expect("the row");
+    assert_eq!(
+        row.get::<_, Option<String>>(0).as_deref(),
+        Some("acme"),
+        "the column written at creation survives the transition"
+    );
+    assert_eq!(row.get::<_, Option<String>>(1).as_deref(), Some("failed"));
+    drop(client);
+    let _ = driver.await;
+    drop(storage);
+    drop(bundle);
+    scratch.drop().await;
 }
 
 #[tokio::test]
