@@ -17,7 +17,9 @@
 //!   leaving one ends it, so `calls + call_open = calls` ends the call that was open and starts
 //!   the next. The terminal itself is `Dropped { Wrapper }` on a transition.
 //! - The **call syntax** says how the model writes a call inside an arguments state, and the
-//!   assembler for it. A format with no arguments state has none.
+//!   assembler for it: a family's, or a call given as data ([`CallSyntax::Shaped`]), whose
+//!   terminal opens a call only when the header after it matches. A format with no arguments
+//!   state has none.
 //! - An **ignored terminal** is a spelling the engine drops wherever it stands, a call's arguments
 //!   included, without moving: the separator token MiniMax M3's template writes before every tag.
 //!   No transition can name it.
@@ -94,6 +96,7 @@
 
 use crate::{
     pythonic,
+    shape::CallShape,
     tagged::{self, keyed},
 };
 
@@ -156,6 +159,15 @@ pub enum CallSyntax {
     /// terminals that enter and leave the state are the call's own markers, and the call's end
     /// carries the closing one.
     Gemma,
+    /// A call given as data, as a response template writes one: what follows the region's
+    /// terminal (the header, which may capture the tool's name), how the arguments are written,
+    /// and what comes after them before the region's closing terminal (see
+    /// [`CallShape`]). The terminal that enters the state opens a call only when the header after
+    /// it matches; otherwise it is the text of the state it came in. A closing terminal closes the
+    /// region only where the trailer ends right before it, and is the call's end; otherwise it is
+    /// the call's text. The shape is [`intern`](crate::shape::intern)ed, so the syntax stays
+    /// `Copy`.
+    Shaped(&'static CallShape),
 }
 
 /// What the text inside a state is.
@@ -621,8 +633,11 @@ impl Format {
     /// every terminal, a turn opener and turn anchors that are not empty and not both named, a
     /// start row only where a turn's first byte is read from the first state and no opener replays
     /// it, a stop row only for an arguments state, a framing row only for a state of content or
-    /// wrapping, and a trim or join row only for a state of content or reasoning that is not
-    /// framing. The builder keeps a row from naming what the table lacks; this checks the rest.
+    /// wrapping, a trim or join row only for a state of content or reasoning that is not framing,
+    /// and, for a shaped call, a shape a stream can run, opened only through its terminal (the
+    /// turn does not start in its state), no terminal the table ignores, and, when its header is
+    /// not empty, no row into its state from a state that holds a call. The builder keeps a row
+    /// from naming what the table lacks; this checks the rest.
     pub fn validate(&self) -> Result<(), String> {
         let Some(first) = self.states.first() else {
             return Err(format!("format {}: a table with no state", self.name));
@@ -720,7 +735,52 @@ impl Format {
                 ));
             }
         }
+        if let Some(CallSyntax::Shaped(shape)) = self.calls {
+            self.validate_shaped(shape)?;
+        }
         Ok(())
+    }
+
+    /// What a table with a shaped call must hold besides: a shape a stream can run, every call
+    /// opened by a terminal (a shaped call opens through its terminal and its header, so the
+    /// output does not start in one, nor does a start row lead into one), no terminal the table
+    /// ignores (a shaped call has no place to keep one among the bytes it holds), and, when the
+    /// header is not empty, no row from a state that holds a call into one: a terminal whose
+    /// header does not match is the text of the state it came in, which a closed call cannot take.
+    fn validate_shaped(&self, shape: &CallShape) -> Result<(), String> {
+        if let Err(why) = shape.check() {
+            return Err(format!("format {}: the call's shape: {why}", self.name));
+        }
+        let calls = |index: usize| self.states[index].emits == Emits::Arguments;
+        let anchored = self.anchors.iter().any(|anchor| calls(anchor.state));
+        if calls(0) || self.start.is_some_and(calls) || anchored {
+            return Err(format!(
+                "format {}: a shaped call opens through its terminal, but the turn may start in \
+                 one",
+                self.name
+            ));
+        }
+        if let Some(terminal) = self.terminals.iter().find(|terminal| terminal.ignored) {
+            return Err(format!(
+                "format {}: terminal {:?} is ignored, which a shaped call cannot keep in place",
+                self.name, terminal.name
+            ));
+        }
+        if shape.header.0.is_empty() {
+            return Ok(());
+        }
+        match self
+            .transitions
+            .iter()
+            .find(|row| calls(row.from) && calls(row.to))
+        {
+            Some(row) => Err(format!(
+                "format {}: a row from {:?} into {:?}, both holding calls, but the call's header \
+                 may not match, and then its terminal is the text of a state that holds none",
+                self.name, self.states[row.from].name, self.states[row.to].name
+            )),
+            None => Ok(()),
+        }
     }
 }
 
@@ -1108,6 +1168,106 @@ mod tests {
             "a stop named before its terminal is not one yet"
         );
         assert!(format.validate().is_ok());
+    }
+
+    /// A shape on abstract tags, its header `<n=NAME>` when `header`, empty otherwise.
+    fn shape(header: bool) -> CallShape {
+        use crate::shape::{Arguments, Atom, Class, Dialect, NameSource, Pattern, Slot};
+        let word = Class::new([('a', 'z')], false);
+        let (header, name) = if header {
+            let atoms = [
+                Atom::Lit("<n=".into()),
+                Atom::Run {
+                    class: word.clone(),
+                    min: 1,
+                    max: None,
+                    greedy: true,
+                    capture: Some(Slot::Name),
+                },
+                Atom::Lit(">".into()),
+            ];
+            (Pattern(atoms.into()), NameSource::Header)
+        } else {
+            (Pattern::default(), NameSource::Literal("f".into()))
+        };
+        CallShape {
+            header,
+            name,
+            arguments: Arguments::Json(Dialect::default()),
+            trailer: Pattern::default(),
+            word,
+            hold_cap: 64,
+        }
+    }
+
+    fn shaped(header: bool) -> CallSyntax {
+        CallSyntax::Shaped(crate::shape::intern(shape(header)))
+    }
+
+    #[test]
+    fn a_shaped_call_opens_from_a_state_that_holds_none() {
+        let table = |syntax: CallSyntax| {
+            Format::new("shaped")
+                .terminal("open", "<c>")
+                .terminal("close", "</c>")
+                .state("content", Emits::Content)
+                .state("call", Emits::Arguments)
+                .transition("content", "open", "call")
+                .transition("call", "close", "content")
+                .calls(syntax)
+        };
+        assert!(table(shaped(true)).validate().is_ok());
+        assert_eq!(
+            table(shaped(true))
+                .transition("call", "open", "call")
+                .validate(),
+            Err(
+                "format shaped: a row from \"call\" into \"call\", both holding calls, but the \
+                 call's header may not match, and then its terminal is the text of a state that \
+                 holds none"
+                    .to_string()
+            )
+        );
+        assert!(
+            table(shaped(false))
+                .transition("call", "open", "call")
+                .validate()
+                .is_ok(),
+            "a call with no header always opens at its terminal"
+        );
+        assert_eq!(
+            table(shaped(true)).ignores("sep", "|").validate(),
+            Err(
+                "format shaped: terminal \"sep\" is ignored, which a shaped call cannot keep in \
+                 place"
+                    .to_string()
+            )
+        );
+        for starts_in_a_call in [
+            table(shaped(true)).starts_in("call"),
+            table(shaped(true)).turn_anchor_starting_in("<turn>", "call"),
+        ] {
+            assert_eq!(
+                starts_in_a_call.validate(),
+                Err(
+                    "format shaped: a shaped call opens through its terminal, but the turn may \
+                     start in one"
+                        .to_string()
+                )
+            );
+        }
+        let unnamed = CallSyntax::Shaped(crate::shape::intern(CallShape {
+            name: crate::shape::NameSource::Body,
+            ..shape(true)
+        }));
+        assert_eq!(
+            table(unnamed).validate(),
+            Err(
+                "format shaped: the call's shape: the name comes from the arguments, which are \
+                 no envelope"
+                    .to_string()
+            )
+        );
     }
 
     #[test]

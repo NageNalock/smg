@@ -50,6 +50,14 @@
 //!   joiner first, as the state's text with no tokens. A stay of the turn's own state counts once
 //!   its first byte arrives, a stay of any other state from the row that enters it; stays the
 //!   prompt's replay saw count too.
+//! - A call given as data ([`CallSyntax::Shaped`]) opens only when the header after its terminal
+//!   matches: the engine holds the terminal and every byte after it, and takes no row, until the
+//!   header decides. A header that cannot match gives the terminal back: its first character is
+//!   the text of the state it came in, and the rest, with every byte the header read, is scanned
+//!   again from there, as a regular expression's search goes on after the place its pattern
+//!   failed at. None of those bytes was emitted, so the tokens are still counted in the output's
+//!   order. A closing terminal closes a shaped call only where the call's trailer ends right
+//!   before it, the stream's stop too; any other is the call's text.
 //! - With the tagged syntax, a value's type comes from the request's tools ([`Declared`]): a
 //!   declared string streams, every other value is written at its close. A call to a function the
 //!   request did not declare has every value inferred.
@@ -84,6 +92,8 @@
 //!
 //! [`Declared`]: crate::tagged::Declared
 
+use std::collections::VecDeque;
+
 use crate::{
     event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
     format::{CallSyntax, Emits, Format},
@@ -92,7 +102,7 @@ use crate::{
     json,
     markers::{Piece, Scanner},
     parser::{ParseError, Parser},
-    pythonic,
+    pythonic, shape,
     tagged::{self, Declared},
     tokens::Ledger,
 };
@@ -131,6 +141,23 @@ pub struct Engine {
     stay: Stay,
     /// The joined states with a stay in this turn: the next stay of one shows its joiner.
     joined: Vec<usize>,
+    /// A shaped call whose terminal arrived and whose header is still being read.
+    pending: Option<Pending>,
+}
+
+/// A terminal whose row enters a shaped call, pending the call's header: nothing the row does has
+/// been done, and every byte after the terminal is the header's until it decides. A header that
+/// matches takes the row; one that cannot gives the terminal and its bytes back.
+#[derive(Debug)]
+struct Pending {
+    /// The terminal, by its index.
+    terminal: usize,
+    /// The state the row leaves: the engine's, or, for the turn's first piece, the state the turn
+    /// starts in, which is taken only when the header matches.
+    from: usize,
+    /// The call's state, where the row leads.
+    to: usize,
+    call: shape::Assembler,
 }
 
 /// The stay in a state, from the row that entered it to the row that leaves it, as trimming and
@@ -172,6 +199,7 @@ enum Call {
     Attributed(tagged::attributed::Assembler),
     NamedJson(json::named::Assembler),
     Gemma(gemma::Assembler),
+    Shaped(shape::Assembler),
 }
 
 impl Call {
@@ -199,6 +227,12 @@ impl Call {
                 Self::NamedJson(json::named::Assembler::new(index, id, marker))
             }
             Some(CallSyntax::Gemma) => Self::Gemma(gemma::Assembler::new(index, id)),
+            // A shaped call opens through its terminal's header, which the engine reads before it
+            // enters the call's state with that assembler; a table that validates enters the
+            // state no other way.
+            Some(CallSyntax::Shaped(shape)) => {
+                Self::Shaped(shape::Assembler::new(index, id, shape, None))
+            }
         }
     }
 
@@ -239,6 +273,19 @@ impl Call {
                 assembler.feed(text, out);
                 text.len()
             }
+            Self::Shaped(assembler) => {
+                assembler.feed(text, out);
+                text.len()
+            }
+        }
+    }
+
+    /// Whether the region closes at `terminal`: always, but for a shaped call, whose trailer must
+    /// end right before it.
+    fn closes(&mut self, terminal: &str) -> bool {
+        match self {
+            Self::Shaped(assembler) => assembler.closes(terminal),
+            _ => true,
         }
     }
 
@@ -327,6 +374,10 @@ impl Call {
                 return true;
             }
             (Self::Gemma(assembler), Closed::ByEnd) => assembler.finish(out),
+            // A shaped call takes its region's closing terminal, after its trailer, as its end;
+            // one whose arguments' object named it ended at the object's close.
+            (Self::Shaped(assembler), Closed::ByMarker) => return assembler.close(terminal, out),
+            (Self::Shaped(assembler), Closed::ByEnd) => assembler.finish(out),
         }
         false
     }
@@ -349,8 +400,10 @@ impl Engine {
     /// A table [`Format::validate`] refuses: no state, a first state that emits reasoning, an
     /// arguments state with no call syntax, a terminal with no text, an empty turn opener or
     /// anchor, an opener beside anchors, a start row where the first state holds a call or an
-    /// opener replays the turn, or a stop, framing, trim or join row on a state it does not fit.
-    /// Definitions are written in the crate, so that is a programming error.
+    /// opener replays the turn, a stop, framing, trim or join row on a state it does not fit, or
+    /// a shaped call a stream cannot run, or one a table cannot open through its terminal (see
+    /// [`Format::validate`]). Definitions are written in the crate, so that is a programming
+    /// error; a shape built at run time is checked before its table is.
     #[expect(
         clippy::panic,
         reason = "a table the crate wrote that fails its own check is a programming error"
@@ -373,6 +426,7 @@ impl Engine {
             at_turn_start,
             stay: Stay::default(),
             joined: Vec::new(),
+            pending: None,
         };
         // A table whose output starts inside a call (a bare list of calls, with no marker before
         // it) opens the call here, since no terminal will.
@@ -386,7 +440,103 @@ impl Engine {
         self.format.emits(self.state)
     }
 
-    fn take(&mut self, piece: Piece, out: &mut Events) {
+    /// Takes the pieces in order. A shaped call's header that decides hands back bytes to read
+    /// again: what followed the header when it matched, the terminal from its second character on
+    /// when it did not. They are scanned afresh, and so are the pieces after them until the new
+    /// scan stands where the old one cut the text with nothing held, from which on the two cut it
+    /// alike; at the end of the stream everything is scanned to the end, and a header still
+    /// undecided is decided once nothing more comes.
+    fn run(&mut self, pieces: Vec<Piece>, at_end: bool, out: &mut Events) {
+        let mut queue = VecDeque::from(pieces);
+        loop {
+            while let Some(piece) = queue.pop_front() {
+                let again = match piece {
+                    Piece::Text(text) if at_end && self.cut_tag(&text) => {
+                        self.drop_cut_tag(&text, out);
+                        None
+                    }
+                    piece => self.take(piece, out),
+                };
+                if let Some(again) = again {
+                    self.scan_again(again, &mut queue, at_end);
+                }
+            }
+            if !at_end {
+                return;
+            }
+            let Some(again) = self.decide_at_end(out) else {
+                return;
+            };
+            self.scan_again(again, &mut queue, true);
+        }
+    }
+
+    /// The bytes a piece stands for.
+    fn piece_text<'p>(&'p self, piece: &'p Piece) -> &'p str {
+        match piece {
+            Piece::Text(text) => text,
+            Piece::Marker(index) => self.format.terminal_text(*index),
+        }
+    }
+
+    /// Scans `text` afresh, before the pieces in `queue`, and puts what it gives at the queue's
+    /// front. The queued pieces follow it, scanned again too while the new scan holds a possible
+    /// terminal at their edge: once it holds nothing where the old scan began a piece, both cut
+    /// what follows alike, since a scan from a piece's start reads nothing before it. When the
+    /// queue runs out first, what the old scanner held comes after them, and the new scanner takes
+    /// its place; at the end of the stream it is finished.
+    fn scan_again(&mut self, text: String, queue: &mut VecDeque<Piece>, at_end: bool) {
+        let mut scanner = Scanner::new(self.format.terminal_texts());
+        let mut pieces = scanner.feed(&text);
+        while !scanner.held().is_empty() {
+            let Some(piece) = queue.pop_front() else {
+                break;
+            };
+            pieces.extend(scanner.feed(self.piece_text(&piece)));
+        }
+        if queue.is_empty() {
+            pieces.extend(scanner.feed(self.scanner.held()));
+            if at_end {
+                pieces.extend(scanner.finish());
+                self.scanner = Scanner::new(self.format.terminal_texts());
+            } else {
+                self.scanner = scanner;
+            }
+        }
+        for piece in pieces.into_iter().rev() {
+            queue.push_front(piece);
+        }
+    }
+
+    /// Takes one piece, and says what to read again when a shaped call's header decided.
+    fn take(&mut self, piece: Piece, out: &mut Events) -> Option<String> {
+        if self.pending.is_some() {
+            let text = self.piece_text(&piece).to_string();
+            return self.read_header(&text, out);
+        }
+        if let Piece::Marker(index) = piece {
+            let leaves = self.format.next(self.state, index).is_some();
+            if leaves && self.emits() == Emits::Arguments {
+                let terminal = self.format.terminal_text(index).to_string();
+                if !self.call_closes(&terminal) {
+                    // The trailer does not end at the terminal: it closes nothing and is the
+                    // call's text, as the template's closing pattern reads past it.
+                    self.text(&terminal, out);
+                    return None;
+                }
+            }
+            if let Some(pending) = self.pending_call(index) {
+                self.pending = Some(pending);
+                return self.read_header("", out);
+            }
+        }
+        self.place(piece, out);
+        None
+    }
+
+    /// Takes one piece where the turn and the table put it: the turn's first piece decides where
+    /// the turn starts, then text is the state's and a terminal moves the engine or is text.
+    fn place(&mut self, piece: Piece, out: &mut Events) {
         if self.at_turn_start {
             if let Some(state) = self.opening(self.state, &piece) {
                 self.at_turn_start = false;
@@ -400,6 +550,106 @@ impl Engine {
             Piece::Text(text) => self.text(&text, out),
             Piece::Marker(index) => self.terminal(index, out),
         }
+    }
+
+    /// Whether the call open in this state closes at `terminal`, a terminal with a row out of it:
+    /// a shaped call's trailer must end right before the terminal.
+    fn call_closes(&mut self, terminal: &str) -> bool {
+        self.call.as_mut().is_none_or(|call| call.closes(terminal))
+    }
+
+    /// A shaped call pending its header, when terminal `index` has a row into the call's state from
+    /// this state, or, as the turn's first piece, from the state the turn starts in: the header is
+    /// read before anything the row does, the turn's start included.
+    fn pending_call(&self, index: usize) -> Option<Pending> {
+        let Some(&CallSyntax::Shaped(shape)) = self.format.call_syntax() else {
+            return None;
+        };
+        let from = if self.at_turn_start {
+            self.opening(self.state, &Piece::Marker(index))?
+        } else {
+            self.state
+        };
+        let to = self.format.next(from, index)?;
+        if self.format.emits(to) != Emits::Arguments {
+            return None;
+        }
+        let terminal = self.format.terminal_text(index);
+        let id = format!("call_{}", self.calls);
+        let call = shape::Assembler::new(self.calls, id, shape, terminal.chars().next_back());
+        Some(Pending {
+            terminal: index,
+            from,
+            to,
+            call,
+        })
+    }
+
+    /// Reads the next bytes after a shaped call's terminal into its header, and takes the row or
+    /// gives the bytes back once the header decides. Returns what to read again then.
+    fn read_header(&mut self, bytes: &str, out: &mut Events) -> Option<String> {
+        let pending = self.pending.as_mut()?;
+        match pending.call.header(bytes) {
+            shape::Header::Pending => None,
+            shape::Header::Matched => Some(self.open_shaped(out)),
+            shape::Header::Failed => Some(self.give_back(out)),
+        }
+    }
+
+    /// At the end of the stream: a header still being read is decided by the bytes it has.
+    fn decide_at_end(&mut self, out: &mut Events) -> Option<String> {
+        let pending = self.pending.as_mut()?;
+        match pending.call.header_end() {
+            shape::Header::Pending => None,
+            shape::Header::Matched => Some(self.open_shaped(out)),
+            shape::Header::Failed => Some(self.give_back(out)),
+        }
+    }
+
+    /// The header matched: the turn starts where its first piece says, if the terminal is that
+    /// piece, the row is taken as any terminal's is, the call is entered with its assembler and
+    /// started, and what followed the header is handed back to read again inside the call.
+    fn open_shaped(&mut self, out: &mut Events) -> String {
+        let Some(Pending {
+            terminal,
+            from,
+            to,
+            call,
+        }) = self.pending.take()
+        else {
+            return String::new();
+        };
+        if self.at_turn_start {
+            self.at_turn_start = false;
+            if from != self.state {
+                self.enter(from, out);
+                self.join(from, out);
+            }
+        }
+        self.take_row(terminal, to, Some(Call::Shaped(call)), out);
+        let mut started = Events::new();
+        let again = match &mut self.call {
+            Some(Call::Shaped(call)) => call.start(&mut started),
+            _ => String::new(),
+        };
+        self.push_call_events(started, out);
+        again
+    }
+
+    /// The header cannot match: the terminal opened no call. Its first character is the text of
+    /// the state it came in, as a regular expression's search for the call's opening goes on after
+    /// it, and the rest of the terminal and every byte the header read are handed back to read
+    /// again. None of them was emitted, so the tokens are still counted in the output's order.
+    fn give_back(&mut self, out: &mut Events) -> String {
+        let Some(Pending { terminal, call, .. }) = self.pending.take() else {
+            return String::new();
+        };
+        let mut first = self.format.terminal_text(terminal).to_string();
+        first.push_str(&call.into_header_bytes());
+        let at = first.chars().next().map_or(0, char::len_utf8);
+        let again = first.split_off(at);
+        self.place(Piece::Text(first), out);
+        again
     }
 
     fn text(&mut self, text: &str, out: &mut Events) {
@@ -584,9 +834,15 @@ impl Engine {
             self.text(&text, out);
             return;
         };
-        // The call's remaining events come before the terminal that closed it, so the events'
-        // bytes stay in the output's order; a new call before the previous one closed finishes
-        // what arrived, then starts. A call syntax may take the terminal as the call's end.
+        self.take_row(index, next, None, out);
+    }
+
+    /// Takes the row that terminal `index` makes from this state into `next`, entering a call
+    /// state with `call` when it is given and with a new call of the syntax otherwise. The call's
+    /// remaining events come before the terminal that closed it, so the events' bytes stay in the
+    /// output's order; a new call before the previous one closed finishes what arrived, then
+    /// starts. A call syntax may take the terminal as the call's end.
+    fn take_row(&mut self, index: usize, next: usize, call: Option<Call>, out: &mut Events) {
         let terminal = self.format.terminal_text(index).to_string();
         self.end_stay(out);
         let taken =
@@ -597,7 +853,7 @@ impl Engine {
                 why: DropReason::Wrapper,
             });
         }
-        self.enter(next, out);
+        self.enter_with(next, call, out);
         // A stay of any state but the turn's own counts for its joiner from the row that enters it.
         if next != 0 {
             self.join(next, out);
@@ -606,6 +862,12 @@ impl Engine {
 
     /// Moves into state `next`, with the reasoning events and the call that come with the move.
     fn enter(&mut self, next: usize, out: &mut Events) {
+        self.enter_with(next, None, out);
+    }
+
+    /// Moves into state `next`, a call state entered with `call` when it is given and with a new
+    /// call of the syntax otherwise.
+    fn enter_with(&mut self, next: usize, call: Option<Call>, out: &mut Events) {
         let (from, to) = (self.emits(), self.format.emits(next));
         if from == Emits::Reasoning && to != Emits::Reasoning {
             out.push(Event::ReasoningEnd);
@@ -614,7 +876,7 @@ impl Engine {
             out.push(Event::ReasoningStart);
         }
         if to == Emits::Arguments {
-            self.open_call();
+            self.call = Some(call.unwrap_or_else(|| self.new_call()));
         }
         self.state = next;
         self.stay = Stay::default();
@@ -623,7 +885,11 @@ impl Engine {
     /// The next call takes the next free index; the index is spent only when a call starts, so a
     /// `<tool_call>` block that held no call does not count and does not leave a gap.
     fn open_call(&mut self) {
-        self.call = Some(Call::new(self.format.call_syntax().copied(), self.calls));
+        self.call = Some(self.new_call());
+    }
+
+    fn new_call(&self) -> Call {
+        Call::new(self.format.call_syntax().copied(), self.calls)
     }
 
     /// Ends the call region: the assembler closes what arrived, and the result says whether it took
@@ -751,40 +1017,45 @@ impl Engine {
         self.stay.begun = begun;
     }
 
+    /// Whether `text`, a piece at the end of the output, is a tag the end cut short: one that
+    /// begins with a whole structural token and is the beginning of a terminal the state has a
+    /// row for (`<|close|>message` with no `<|sep|>` after it), which the model cannot have
+    /// written as text. A shaped call's header still being read takes every byte.
+    fn cut_tag(&self, text: &str) -> bool {
+        self.pending.is_none() && self.format.is_cut_tag(self.state, text)
+    }
+
+    /// A tag the end cut short is dropped as the whole tag would have been. Inside a call the
+    /// assembler still holds the call's bytes, which came before the tail: the call ends first, so
+    /// every byte leaves in order.
+    fn drop_cut_tag(&mut self, text: &str, out: &mut Events) {
+        self.end_stay(out);
+        if self.emits() == Emits::Arguments {
+            self.close_call(Closed::ByEnd, "", out);
+        }
+        out.push(Event::Dropped {
+            text: self.tokens.text(text),
+            why: DropReason::Wrapper,
+        });
+    }
+
     fn end(&mut self, finish: EngineFinish, out: &mut Events) {
         let scanner = std::mem::replace(
             &mut self.scanner,
             Scanner::new(self.format.terminal_texts()),
         );
         // What the scanner held back as a possible terminal is text now that no more bytes come,
-        // except a tail that begins with a whole structural token and is the beginning of a
-        // terminal the state has a row for: a tag the end of the output cut short
-        // (`<|close|>message` with no `<|sep|>` after it), which the model cannot have written as
-        // text and which is dropped as the whole tag would have been. Inside a call the
-        // assembler still holds the call's bytes, which came before the tail: the call ends
-        // first, so every byte leaves in order.
-        for piece in scanner.finish() {
-            match piece {
-                Piece::Text(text) if self.format.is_cut_tag(self.state, &text) => {
-                    self.end_stay(out);
-                    if self.emits() == Emits::Arguments {
-                        self.close_call(Closed::ByEnd, "", out);
-                    }
-                    out.push(Event::Dropped {
-                        text: self.tokens.text(&text),
-                        why: DropReason::Wrapper,
-                    });
-                }
-                piece => self.take(piece, out),
-            }
-        }
+        // except a tag the end cut short.
+        self.run(scanner.finish(), true, out);
         self.end_stay(out);
         match self.emits() {
             Emits::Reasoning => out.push(Event::ReasoningEnd),
             Emits::Arguments => {
-                // The stop token that closes the call is hidden, so the call's end has no bytes.
+                // The stop token that closes the call is hidden, so the call's end has no bytes. A
+                // shaped call's trailer must end where the stream does.
                 let closed = if matches!(finish, EngineFinish::Stop)
                     && self.format.stop_closes(self.state)
+                    && self.call_closes("")
                 {
                     Closed::ByMarker
                 } else {
@@ -833,9 +1104,8 @@ impl Parser for Engine {
                 }
                 self.stage = Stage::Streaming;
                 self.tokens.note(text, spans);
-                for piece in self.scanner.feed(text) {
-                    self.take(piece, out);
-                }
+                let pieces = self.scanner.feed(text);
+                self.run(pieces, false, out);
                 Ok(())
             }
             Input::End { finish } => {

@@ -18,11 +18,16 @@
 //! for the whole text: a decision is taken only when no continuation can change it. The classes
 //! are built from the module's own `\w`, `\s` and `\d` tables, also recorded, and checked against
 //! the module's answer for a set of probe characters.
+//!
+//! The script also records where a region closes: for each trailer, the text before a call's
+//! closing marker, the start `search` gives for the trailer followed by the marker at the end of a
+//! text. [`Suffix`] must give that start at every chunking, and, fed a written text a character
+//! at a time, the start recorded for each prefix as it goes.
 
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use serde::Deserialize;
-use symphony::shape::{Atom, Class, End, Matcher, Pattern, Slot, Verdict};
+use symphony::shape::{Atom, Class, End, Matcher, Pattern, Slot, Suffix, Verdict};
 
 /// One pattern as the fixture recorded it.
 #[derive(Deserialize)]
@@ -42,6 +47,26 @@ struct Case {
     /// For a written text, the answer for each prefix of it, by its length in characters.
     #[serde(default)]
     prefixes: Option<Vec<Option<Answer>>>,
+}
+
+/// A trailer as the fixture recorded it: the marker after it, and where the region closes.
+#[derive(Deserialize)]
+struct Searched {
+    id: String,
+    source: String,
+    terminal: String,
+    before: Option<String>,
+    cases: Vec<Search>,
+}
+
+#[derive(Deserialize)]
+struct Search {
+    text: String,
+    /// Where the trailer starts when the marker comes at the end of the text.
+    start: Option<usize>,
+    /// For a written text, the start for each prefix of it, by its length in characters.
+    #[serde(default)]
+    prefixes: Option<Vec<Option<usize>>>,
 }
 
 /// A match, in bytes of the text: where it ends, what it captured, which end closed it.
@@ -435,6 +460,20 @@ fn lower(id: &str, c: &Classes) -> Lowered {
             ],
             [end([lit("</k>")], []), end([], [lit("<k=")])],
         ),
+        "trl-llama3/trailer" => lowered(r"\}", [lit("}")]),
+        "abstract/word-then-boundary" => lowered(r"\w+\b", [greedy(w, 1, None), Atom::Boundary]),
+        "abstract/boundary-before-a-word" => {
+            lowered(r"\s*\bz", [greedy(s, 0, None), Atom::Boundary, lit("z")])
+        }
+        "abstract/lazy-tag" => lowered(
+            r"<[^>]*?>\s*",
+            [
+                lit("<"),
+                lazy(&none_of(">"), 0, None),
+                lit(">"),
+                greedy(s, 0, None),
+            ],
+        ),
         "abstract/lookahead-end-trimmed" => lowered_with_ends(
             r"<k=(?P<key>\w+)>\s*(?P<value>.*?)(?:\s*</k>|\s*(?=<k=))",
             [
@@ -575,12 +614,7 @@ fn the_matcher_answers_as_the_regex_module_does_at_every_chunking() {
         for end in &lowered.ends {
             assert_eq!(end.check(), Ok(()), "{id}");
         }
-        let before = recorded.before.as_deref().map(|before| {
-            let mut chars = before.chars();
-            let c = chars.next().expect("one character before");
-            assert_eq!(chars.next(), None, "{id}: one character before");
-            c
-        });
+        let before = one_before(id, recorded.before.as_deref());
         patterns += 1;
         for case in &recorded.cases {
             let text = case.text.as_str();
@@ -627,4 +661,86 @@ fn the_matcher_answers_as_the_regex_module_does_at_every_chunking() {
     }
     println!("{patterns} patterns, {texts} texts, {replays} replays: every answer the module's");
     assert_eq!((patterns, texts), (24, 1_790), "the fixture as recorded");
+}
+
+/// The one character before a text, as the fixture writes it.
+#[expect(
+    clippy::expect_used,
+    reason = "a fixture with no character where one is written ends the test"
+)]
+fn one_before(id: &str, before: Option<&str>) -> Option<char> {
+    before.map(|before| {
+        let mut chars = before.chars();
+        let c = chars.next().expect("one character before");
+        assert_eq!(chars.next(), None, "{id}: one character before");
+        c
+    })
+}
+
+/// Feed `text` cut at `cuts` to a search, then ask where a match ending there starts.
+fn search(
+    lowered: &Lowered,
+    word: &Class,
+    before: Option<char>,
+    text: &str,
+    cuts: &[usize],
+    next: Option<char>,
+) -> Option<usize> {
+    let mut search = Suffix::new(&lowered.pattern, word, before).hold_cap(None);
+    let mut from = 0;
+    for &cut in cuts.iter().chain([&text.len()]) {
+        search.feed(&text[from..cut]);
+        from = cut;
+    }
+    search.start(next)
+}
+
+#[test]
+#[expect(
+    clippy::print_stdout,
+    reason = "the count of what was checked is test diagnostic output"
+)]
+fn the_search_finds_where_the_regex_module_closes_a_region_at_every_chunking() {
+    let tables = tables();
+    let classes = Classes::new(&tables);
+    let mut trailers = 0;
+    let mut texts = 0;
+    let mut asked = 0;
+    for line in fixture("search.jsonl").lines() {
+        let recorded: Searched = serde_json::from_str(line).expect("a recorded trailer");
+        let id = recorded.id.as_str();
+        let lowered = lower(id, &classes);
+        assert_eq!(
+            recorded.source, lowered.source,
+            "{id}: lowered from the recorded source"
+        );
+        assert_eq!(lowered.pattern.check(), Ok(()), "{id}");
+        let before = one_before(id, recorded.before.as_deref());
+        let next = recorded.terminal.chars().next();
+        trailers += 1;
+        for case in &recorded.cases {
+            let text = case.text.as_str();
+            texts += 1;
+            for cuts in plans(text) {
+                let got = search(&lowered, &classes.word, before, text, &cuts, next);
+                assert_eq!(got, case.start, "{id}: {text:?} cut at {cuts:?}");
+                asked += 1;
+            }
+            let Some(prefixes) = &case.prefixes else {
+                continue;
+            };
+            let mut suffix = Suffix::new(&lowered.pattern, &classes.word, before).hold_cap(None);
+            let mut chars = text.char_indices();
+            for expected in prefixes {
+                let read = chars.next();
+                assert_eq!(&suffix.start(next), expected, "{id}: {text:?} as it grows");
+                if let Some((at, c)) = read {
+                    suffix.feed(&text[at..at + c.len_utf8()]);
+                }
+                asked += 1;
+            }
+        }
+    }
+    println!("{trailers} trailers, {texts} texts, {asked} answers: every start the module's");
+    assert_eq!(trailers, 5, "the fixture as recorded");
 }

@@ -359,6 +359,10 @@ impl Format {
             CallSyntax::NamedJson(marker) => {
                 return self.named_json_calls(marker, &named, at_least_one);
             }
+            // A template's patterns do not say which text a run of whitespace or a skipped
+            // attribute stands for, and a tag must write only what the template renders: a shaped
+            // call's tag waits for the layout its chat template renders, so none is derived yet.
+            CallSyntax::Shaped(_) => return None,
         };
         if !reasoning_open {
             return Some(calls);

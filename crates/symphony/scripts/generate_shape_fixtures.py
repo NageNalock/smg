@@ -20,6 +20,13 @@ for every prefix taken as the whole text. Offsets are UTF-8 bytes. `tests/shape_
 the same patterns by hand and requires the matcher's answer to be the recorded one at every
 chunking.
 
+For the text before a call's closing marker, the trailer, it records where a region closes: the
+start of `regex.search` for the trailer followed by the marker at the end of the text (the
+marker's text appended and `\\Z` after it, or the trailer alone at the end for a marker that is a
+stop token, which the stream never shows), over written texts, every prefix of them, and seeded
+variations, in `search.jsonl`; `shape::Suffix` must give the same start, asked at the end of the
+text whatever the cuts, and asked after every character.
+
 It also records, from the same module, the ranges of `\\w`, `\\s` and `\\d` over every code point,
 which the test turns into the matcher's classes, and the membership of a set of probe characters
 in every class the patterns use.
@@ -437,6 +444,7 @@ SHARED = ' \t<>"=/az_0\xe9\u0301\xb2\xa0\x1c\x85\u2028\u4e2d\U0001d400\U0001f600
 VARIATIONS = 48
 RESPELLED = 24
 SEED = 2719
+SEARCH_SEED = 3145
 SLOTS = ("name", "key", "value")
 
 
@@ -578,6 +586,112 @@ def record_patterns():
     return "\n".join(lines) + "\n"
 
 
+# The trailers a call shape searches for before a region's closing marker, each with the marker
+# (empty for a stop token, whose text the stream never shows), the character before the text it
+# runs on, and its public source; and a few on abstract tags.
+SEARCHES = [
+    {
+        "id": "serve-qwen3_5/trailer",
+        "source": r"</function>\s*",
+        "terminal": "</tool_call>",
+        "before": ">",
+        "provenance": f"{SERVE} (qwen3_5)",
+        "texts": [
+            "\n</function>\n",
+            "</function>",
+            "</function> \t\n ",
+            "x</function>\n",
+            "</function>\n</function>\n",
+            "</function>x",
+            "",
+            "\n",
+            "</function",
+            "</function>\u2028\x85",
+            "</function>\xa0",
+        ],
+    },
+    {
+        "id": "trl-llama3/trailer",
+        "source": r"\}",
+        "terminal": "",
+        "before": '"',
+        "provenance": f"{TRL} (llama3_template)",
+        "texts": ["}", "}}", ' "x"}', "}\n", "", '{"a": 1}}', "} }"],
+    },
+    {
+        "id": "abstract/word-then-boundary",
+        "source": r"\w+\b",
+        "terminal": "<a>",
+        "before": " ",
+        "provenance": ABSTRACT,
+        "texts": ["ab", "a b", "ab ", "", "_9", "x\xb2", "e\u0301"],
+    },
+    {
+        "id": "abstract/boundary-before-a-word",
+        "source": r"\s*\bz",
+        "terminal": "z",
+        "before": "a",
+        "provenance": ABSTRACT,
+        "texts": ["z", " z", "az", "a z", "zz", "\nz"],
+    },
+    {
+        "id": "abstract/lazy-tag",
+        "source": r"<[^>]*?>\s*",
+        "terminal": "</a>",
+        "before": None,
+        "provenance": ABSTRACT,
+        "texts": ["<b>", "<b> <c>\n", "x<b", "<>", "<<b>>", "<b>x"],
+    },
+]
+
+
+def search_answer(pattern, terminal, before, text):
+    """The start, in bytes of `text`, of the earliest match of `pattern` that ends where `text`
+    ends, `terminal` after it; None when there is none."""
+    whole = (before or "") + text + terminal
+    at = len(before or "")
+    m = pattern.search(whole, at)
+    return None if m is None else utf8(text, m.start() - at)
+
+
+def record_searches():
+    rng = random.Random(SEARCH_SEED)
+    lines = []
+    for entry_ in SEARCHES:
+        source, terminal, before = entry_["source"], entry_["terminal"], entry_["before"]
+        pattern = regex.compile(f"(?:{source}){regex.escape(terminal)}\\Z", regex.DOTALL)
+        alphabet = sorted(set("".join(entry_["texts"]) + SHARED))
+        written = set(WORD.findall(" ".join(entry_["texts"])))
+        cases = []
+        for text in entry_["texts"]:
+            prefixes = [
+                search_answer(pattern, terminal, before, text[:upto])
+                for upto in range(len(text) + 1)
+            ]
+            cases.append({"text": text, "start": prefixes[-1], "prefixes": prefixes})
+        seen = set(entry_["texts"])
+        made = tries = 0
+        while made < VARIATIONS:
+            tries += 1
+            assert tries < 100_000, f"{entry_['id']}: too few distinct variations"
+            text = variation(rng, rng.choice(entry_["texts"]), alphabet)
+            if text in seen or not spelled_as_written(text, written):
+                continue
+            seen.add(text)
+            made += 1
+            cases.append({"text": text, "start": search_answer(pattern, terminal, before, text)})
+        line = {
+            "id": entry_["id"],
+            "source": source,
+            "terminal": terminal,
+            "before": before,
+            "provenance": entry_["provenance"],
+            "cases": cases,
+        }
+        lines.append(json.dumps(line, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+    return "\n".join(lines) + "\n"
+
+
 # Characters whose membership the test checks in every class: Latin-1 and the blocks after it,
 # then characters the dialects disagree on or that sit at a range's edge.
 PROBES = [chr(c) for c in range(0x300)] + [
@@ -686,7 +800,11 @@ def main():
             f"record with Python {PYTHON} and regex {REGEX_VERSION}, "
             f"not {sys.version} and {regex.__version__}"
         )
-    files = {OUT / "regex.jsonl": record_patterns(), OUT / "classes.json": record_classes()}
+    files = {
+        OUT / "regex.jsonl": record_patterns(),
+        OUT / "search.jsonl": record_searches(),
+        OUT / "classes.json": record_classes(),
+    }
     stale = [path for path, text in files.items() if not path.exists() or path.read_text() != text]
     if check:
         for path in stale:

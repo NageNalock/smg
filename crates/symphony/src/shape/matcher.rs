@@ -1,4 +1,5 @@
-//! The matcher: a [`Pattern`] run over text as it arrives, decided as soon as the text decides it.
+//! The matcher: a [`Pattern`] run over text as it arrives, decided as soon as the text decides it;
+//! and the same machine run as a search, for where a pattern that must end at a given place starts.
 
 use std::ops::Range;
 
@@ -70,8 +71,7 @@ impl Match {
 /// Fed past its answer, it keeps the text and gives the same answer.
 #[derive(Clone, Debug)]
 pub struct Matcher<'p> {
-    program: Vec<Op<'p>>,
-    word: &'p Class,
+    machine: Machine<'p>,
     cap: Option<usize>,
     /// Every byte fed.
     held: String,
@@ -86,14 +86,8 @@ pub struct Matcher<'p> {
     found: Option<Match>,
     /// The answer, once there is one: the match, or none.
     answer: Option<Option<Match>>,
-    /// Where the threads go next, in priority order: filled by [`follow`](Self::follow).
-    leaves: Vec<Thread>,
     /// Room the threads reuse, so that reading a character allocates nothing.
-    stack: Vec<Thread>,
     spare: Vec<Thread>,
-    /// The instructions [`follow`](Self::follow) has reached, by its generation.
-    visited: Vec<u32>,
-    generation: u32,
 }
 
 /// How many slots a match captures.
@@ -130,10 +124,13 @@ enum Op<'p> {
     Done(Option<usize>),
 }
 
-/// One alternative: where it is in the program, and what it has captured.
+/// One alternative: where it is in the program, where it started, and what it has captured.
 #[derive(Clone, Copy, Debug)]
 struct Thread {
     pc: usize,
+    /// Where its match starts: the start of the text for a matcher, the place it was started at
+    /// for a search.
+    start: usize,
     /// Where its match ends, once it has passed the mark.
     end: usize,
     /// Where each slot's run started.
@@ -141,13 +138,128 @@ struct Thread {
     spans: [Option<(usize, usize)>; SLOTS],
 }
 
-/// What [`Matcher::follow`] knows of the next character.
+impl Thread {
+    /// A thread at the program's start, its match starting at `start`.
+    fn at_start(start: usize) -> Self {
+        Self {
+            pc: 0,
+            start,
+            end: start,
+            open: [start; SLOTS],
+            spans: [None; SLOTS],
+        }
+    }
+}
+
+/// What [`Machine::follow`] knows of the next character.
 #[derive(Clone, Copy)]
 enum Next {
     /// This character, or the end of the text.
     Known(Option<char>),
     /// Not fed yet.
     Unknown,
+}
+
+/// A program, the word class its `\b` reads, and the room following its threads reuses, shared by
+/// [`Matcher`] and [`Suffix`].
+#[derive(Clone, Debug)]
+struct Machine<'p> {
+    program: Vec<Op<'p>>,
+    word: &'p Class,
+    /// Where the threads go next, in priority order: filled by [`follow`](Self::follow).
+    leaves: Vec<Thread>,
+    stack: Vec<Thread>,
+    /// The instructions [`follow`](Self::follow) has reached, by its generation.
+    visited: Vec<u32>,
+    generation: u32,
+}
+
+impl<'p> Machine<'p> {
+    fn new(program: Vec<Op<'p>>, word: &'p Class) -> Self {
+        let visited = vec![0; program.len()];
+        Self {
+            program,
+            word,
+            leaves: Vec::new(),
+            stack: Vec::new(),
+            visited,
+            generation: 0,
+        }
+    }
+
+    /// Follow every thread of `threads` through the instructions that read no character, and leave
+    /// in `leaves`, in priority order, where they arrive: at a character to read, at a match, and,
+    /// while the next character is unknown, at `\b`, which waits for it. `before` is the character
+    /// before `at`, the place the threads stand. An instruction is reached once, by the first
+    /// thread to get there: any later one would do the same from there, with less priority.
+    fn follow(&mut self, threads: &[Thread], next: Next, before: Option<char>, at: usize) {
+        self.generation = match self.generation.checked_add(1) {
+            Some(generation) => generation,
+            None => {
+                self.visited.fill(0);
+                1
+            }
+        };
+        self.leaves.clear();
+        for &start in threads {
+            self.stack.push(start);
+            while let Some(mut thread) = self.stack.pop() {
+                let pc = thread.pc;
+                if self.visited[pc] == self.generation {
+                    continue;
+                }
+                self.visited[pc] = self.generation;
+                match self.program[pc] {
+                    Op::Char(_) | Op::Class(_) | Op::Done(_) => self.leaves.push(thread),
+                    Op::Split(first, second) => {
+                        self.stack.push(Thread {
+                            pc: second,
+                            ..thread
+                        });
+                        self.stack.push(Thread {
+                            pc: first,
+                            ..thread
+                        });
+                    }
+                    Op::Jump(to) => self.stack.push(Thread { pc: to, ..thread }),
+                    Op::Boundary => match next {
+                        Next::Unknown => self.leaves.push(thread),
+                        Next::Known(after) => {
+                            let word = |c: Option<char>| c.is_some_and(|c| self.word.contains(c));
+                            if word(before) != word(after) {
+                                thread.pc += 1;
+                                self.stack.push(thread);
+                            }
+                        }
+                    },
+                    Op::Open(slot) => {
+                        thread.open[slot] = at;
+                        thread.pc += 1;
+                        self.stack.push(thread);
+                    }
+                    Op::Close(slot) => {
+                        thread.spans[slot] = Some((thread.open[slot], at));
+                        thread.pc += 1;
+                        self.stack.push(thread);
+                    }
+                    Op::Mark => {
+                        thread.end = at;
+                        thread.pc += 1;
+                        self.stack.push(thread);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether `thread`, at a leaf, reads `next`.
+    fn reads(&self, thread: &Thread, next: char) -> bool {
+        match self.program[thread.pc] {
+            Op::Char(expected) => expected == next,
+            Op::Class(class) => class.contains(next),
+            _ => false,
+        }
+    }
 }
 
 impl<'p> Matcher<'p> {
@@ -161,28 +273,16 @@ impl<'p> Matcher<'p> {
         word: &'p Class,
         before: Option<char>,
     ) -> Self {
-        let program = compile(pattern, ends);
-        let visited = vec![0; program.len()];
         Self {
-            program,
-            word,
+            machine: Machine::new(compile(pattern, ends), word),
             cap: Some(HOLD_CAP),
             held: String::new(),
             at: 0,
             before,
-            threads: vec![Thread {
-                pc: 0,
-                end: 0,
-                open: [0; SLOTS],
-                spans: [None; SLOTS],
-            }],
+            threads: vec![Thread::at_start(0)],
             found: None,
             answer: None,
-            leaves: Vec::new(),
-            stack: Vec::new(),
             spare: Vec::new(),
-            visited,
-            generation: 0,
         }
     }
 
@@ -245,21 +345,17 @@ impl<'p> Matcher<'p> {
     /// Read `next`: the answer, if the threads that read it leave one, or `None` once they have
     /// moved past it.
     fn step(&mut self, next: char) -> Option<Option<Match>> {
-        self.follow(Next::Known(Some(next)));
+        self.machine
+            .follow(&self.threads, Next::Known(Some(next)), self.before, self.at);
         let mut alive = std::mem::take(&mut self.spare);
         alive.clear();
-        for thread in &self.leaves {
-            let read = match self.program[thread.pc] {
-                Op::Char(expected) => expected == next,
-                Op::Class(class) => class.contains(next),
-                Op::Done(ending) => {
-                    // Every thread after this one comes after its match in priority: they are cut.
-                    self.found = Some(matched(thread, ending));
-                    break;
-                }
-                _ => false,
-            };
-            if read {
+        for thread in &self.machine.leaves {
+            if let Op::Done(ending) = self.machine.program[thread.pc] {
+                // Every thread after this one comes after its match in priority: they are cut.
+                self.found = Some(matched(thread, ending));
+                break;
+            }
+            if self.machine.reads(thread, next) {
                 alive.push(Thread {
                     pc: thread.pc + 1,
                     ..*thread
@@ -279,9 +375,10 @@ impl<'p> Matcher<'p> {
     /// The answer at the edge of the text fed, if no next character can change it: a thread
     /// that has reached the end of the pattern, with none before it still alive.
     fn at_edge(&mut self) -> Option<Option<Match>> {
-        self.follow(Next::Unknown);
-        match self.leaves.first() {
-            Some(thread) => match self.program[thread.pc] {
+        self.machine
+            .follow(&self.threads, Next::Unknown, self.before, self.at);
+        match self.machine.leaves.first() {
+            Some(thread) => match self.machine.program[thread.pc] {
                 Op::Done(ending) => Some(Some(matched(thread, ending))),
                 _ => None,
             },
@@ -292,80 +389,17 @@ impl<'p> Matcher<'p> {
     /// The answer at the end of the text: the first thread to reach the end of the pattern, or
     /// the match found before.
     fn at_end(&mut self) -> Option<Match> {
-        self.follow(Next::Known(None));
-        let done = self
-            .leaves
-            .iter()
-            .find_map(|thread| match self.program[thread.pc] {
-                Op::Done(ending) => Some(matched(thread, ending)),
-                _ => None,
-            });
+        self.machine
+            .follow(&self.threads, Next::Known(None), self.before, self.at);
+        let done =
+            self.machine
+                .leaves
+                .iter()
+                .find_map(|thread| match self.machine.program[thread.pc] {
+                    Op::Done(ending) => Some(matched(thread, ending)),
+                    _ => None,
+                });
         done.or_else(|| self.found.take())
-    }
-
-    /// Follow every thread through the instructions that read no character, and leave in
-    /// `leaves`, in priority order, where they arrive: at a character to read, at a match, and,
-    /// while the next character is unknown, at `\b`, which waits for it. An instruction is
-    /// reached once, by the first thread to get there: any later one would do the same from there,
-    /// with less priority.
-    fn follow(&mut self, next: Next) {
-        self.generation = match self.generation.checked_add(1) {
-            Some(generation) => generation,
-            None => {
-                self.visited.fill(0);
-                1
-            }
-        };
-        self.leaves.clear();
-        for &start in &self.threads {
-            self.stack.push(start);
-            while let Some(mut thread) = self.stack.pop() {
-                let pc = thread.pc;
-                if self.visited[pc] == self.generation {
-                    continue;
-                }
-                self.visited[pc] = self.generation;
-                match self.program[pc] {
-                    Op::Char(_) | Op::Class(_) | Op::Done(_) => self.leaves.push(thread),
-                    Op::Split(first, second) => {
-                        self.stack.push(Thread {
-                            pc: second,
-                            ..thread
-                        });
-                        self.stack.push(Thread {
-                            pc: first,
-                            ..thread
-                        });
-                    }
-                    Op::Jump(to) => self.stack.push(Thread { pc: to, ..thread }),
-                    Op::Boundary => match next {
-                        Next::Unknown => self.leaves.push(thread),
-                        Next::Known(after) => {
-                            let word = |c: Option<char>| c.is_some_and(|c| self.word.contains(c));
-                            if word(self.before) != word(after) {
-                                thread.pc += 1;
-                                self.stack.push(thread);
-                            }
-                        }
-                    },
-                    Op::Open(slot) => {
-                        thread.open[slot] = self.at;
-                        thread.pc += 1;
-                        self.stack.push(thread);
-                    }
-                    Op::Close(slot) => {
-                        thread.spans[slot] = Some((thread.open[slot], self.at));
-                        thread.pc += 1;
-                        self.stack.push(thread);
-                    }
-                    Op::Mark => {
-                        thread.end = self.at;
-                        thread.pc += 1;
-                        self.stack.push(thread);
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -374,6 +408,103 @@ fn matched(thread: &Thread, ending: Option<usize>) -> Match {
         end: thread.end,
         ending,
         spans: thread.spans,
+    }
+}
+
+/// A pattern searched for by where its match ends.
+///
+/// Fed a text as it arrives, a search starts the pattern at every place of it, and says, for the
+/// text fed so far, where the earliest match that ends exactly at its end starts, given the
+/// character that comes next, which a `\b` at the end reads. That is the start Python's `regex`
+/// module gives when it searches the text for the pattern followed by what comes next (under
+/// `DOTALL`, with that next part matched where the text ends): a region whose closing pattern is
+/// text before a marker (`</function>\s*` before `</tool_call>`) closes at the marker only where
+/// that text ends right at it, and the search says where it began. Of two matches ending there the
+/// one that starts first wins, as a search tries the places in order; which of the pattern's
+/// alternatives took the bytes does not matter, so nothing is captured.
+///
+/// Every thread keeps the place it started at. Of two threads at one place in the pattern only
+/// the one that started first is kept, since they would go on alike: so the search reads each
+/// character once and holds one thread per place in the pattern, whatever the text's length. A
+/// match longer than the cap, [`HOLD_CAP`] by default, is none: its threads are dropped once the
+/// text has run past it.
+#[derive(Clone, Debug)]
+pub struct Suffix<'p> {
+    machine: Machine<'p>,
+    cap: Option<usize>,
+    /// Bytes read so far.
+    at: usize,
+    /// The character before `at`; at the start, the one before the text.
+    before: Option<char>,
+    /// The threads alive at `at`, the earliest started first.
+    threads: Vec<Thread>,
+    /// Room the threads reuse.
+    spare: Vec<Thread>,
+}
+
+impl<'p> Suffix<'p> {
+    /// A search for `pattern` over a text whose first byte follows `before` (`None` at the start
+    /// of the output), with `word` the class `\b` reads. A match is at most [`HOLD_CAP`] bytes.
+    pub fn new(pattern: &'p Pattern, word: &'p Class, before: Option<char>) -> Self {
+        Self {
+            machine: Machine::new(compile(pattern, &[]), word),
+            cap: Some(HOLD_CAP),
+            at: 0,
+            before,
+            threads: Vec::new(),
+            spare: Vec::new(),
+        }
+    }
+
+    /// The same search, its matches at most `cap` bytes, or of any length with `None`.
+    #[must_use]
+    pub fn hold_cap(mut self, cap: Option<usize>) -> Self {
+        self.cap = cap;
+        self
+    }
+
+    /// Append the next bytes of the text.
+    pub fn feed(&mut self, text: &str) {
+        for next in text.chars() {
+            self.threads.push(Thread::at_start(self.at));
+            self.machine
+                .follow(&self.threads, Next::Known(Some(next)), self.before, self.at);
+            let mut alive = std::mem::take(&mut self.spare);
+            alive.clear();
+            let read = self.at + next.len_utf8();
+            let oldest = self.cap.map_or(0, |cap| read.saturating_sub(cap));
+            for thread in &self.machine.leaves {
+                // A thread at a match has nothing more to read; one that would make the match
+                // longer than the cap is no match.
+                if thread.start >= oldest && self.machine.reads(thread, next) {
+                    alive.push(Thread {
+                        pc: thread.pc + 1,
+                        ..*thread
+                    });
+                }
+            }
+            self.spare = std::mem::replace(&mut self.threads, alive);
+            self.at = read;
+            self.before = Some(next);
+        }
+    }
+
+    /// Where the earliest match that ends at the end of the text fed so far starts, in bytes of
+    /// that text, when `next` comes after it (`None`: the text ends there). A search may be asked
+    /// again after more bytes.
+    pub fn start(&mut self, next: Option<char>) -> Option<usize> {
+        let mut threads = std::mem::take(&mut self.spare);
+        threads.clear();
+        threads.extend_from_slice(&self.threads);
+        threads.push(Thread::at_start(self.at));
+        self.machine
+            .follow(&threads, Next::Known(next), self.before, self.at);
+        self.spare = threads;
+        self.machine
+            .leaves
+            .iter()
+            .find(|thread| matches!(self.machine.program[thread.pc], Op::Done(_)))
+            .map(|thread| thread.start)
     }
 }
 
@@ -860,6 +991,116 @@ mod tests {
         let mut matcher = Matcher::new(&empty, &[], &word, None);
         assert_eq!(matched(matcher.feed("")).end(), 0);
         assert_eq!(matched(verdict(&empty, &[], None, "abc")).end(), 0);
+    }
+
+    /// The start a search gives for `text` fed whole, cut once at every place, and a character at
+    /// a time, asked with `next` after it: one start, whatever the cuts, which this returns.
+    fn suffix(
+        pattern: &Pattern,
+        before: Option<char>,
+        text: &str,
+        next: Option<char>,
+    ) -> Option<usize> {
+        let word = word();
+        let starts: Vec<usize> = text.char_indices().map(|(at, _)| at).skip(1).collect();
+        let mut plans: Vec<Vec<usize>> = vec![vec![], starts.clone()];
+        plans.extend(starts.iter().map(|&cut| vec![cut]));
+        let mut found = plans.iter().map(|cuts| {
+            let mut search = Suffix::new(pattern, &word, before);
+            let mut from = 0;
+            for &cut in cuts.iter().chain([&text.len()]) {
+                search.feed(&text[from..cut]);
+                from = cut;
+            }
+            let start = search.start(next);
+            assert_eq!(
+                search.start(next),
+                start,
+                "asking again gives the same start"
+            );
+            start
+        });
+        let first = found.next().expect("the whole text is one plan");
+        for (other, cuts) in found.zip(plans.iter().skip(1)) {
+            assert_eq!(other, first, "cut at {cuts:?}");
+        }
+        first
+    }
+
+    #[test]
+    fn a_search_finds_the_earliest_start_of_a_match_that_ends_at_the_end() {
+        let trailer = pattern([lit("</f>"), run(&space(), 0, None, true)]);
+        assert_eq!(suffix(&trailer, None, "x</f>\n", Some('<')), Some(1));
+        assert_eq!(suffix(&trailer, None, "x</f>", Some('<')), Some(1));
+        assert_eq!(
+            suffix(&trailer, None, "</f> \n</f>\n", Some('<')),
+            Some(6),
+            "the first close is followed by more than whitespace"
+        );
+        assert_eq!(suffix(&trailer, None, "</f>x", Some('<')), None);
+        assert_eq!(suffix(&trailer, None, "", Some('<')), None);
+        let spaces = pattern([run(&space(), 0, None, true)]);
+        assert_eq!(
+            suffix(&spaces, None, "ab \n ", None),
+            Some(2),
+            "the run's earliest start"
+        );
+        assert_eq!(
+            suffix(&spaces, None, "ab", None),
+            Some(2),
+            "an empty match ends where it starts"
+        );
+        let lazy = pattern([lit("<"), run(&Class::any(), 0, None, false), lit(">")]);
+        assert_eq!(
+            suffix(&lazy, None, "<a> <b>", Some('!')),
+            Some(0),
+            "a lazy run may still take what a match needs to end here"
+        );
+    }
+
+    #[test]
+    fn a_word_boundary_at_the_end_of_a_search_reads_what_comes_next() {
+        let word = word();
+        let ends_a_word = pattern([captured(Slot::Name, &word, 1, None, true), Atom::Boundary]);
+        assert_eq!(suffix(&ends_a_word, None, "ab", Some('<')), Some(0));
+        assert_eq!(suffix(&ends_a_word, None, "ab", None), Some(0));
+        assert_eq!(
+            suffix(&ends_a_word, None, "ab", Some('c')),
+            None,
+            "the word goes on"
+        );
+        let starts_a_word = pattern([Atom::Boundary, lit("x")]);
+        assert_eq!(suffix(&starts_a_word, Some('a'), "x", None), None);
+        assert_eq!(suffix(&starts_a_word, Some(' '), "x", None), Some(0));
+        assert_eq!(suffix(&starts_a_word, None, "ax", None), None);
+        assert_eq!(suffix(&starts_a_word, None, " x", None), Some(1));
+    }
+
+    #[test]
+    fn a_search_drops_a_match_longer_than_its_cap() {
+        let word = word();
+        let tail = pattern([lit("<"), run(&word, 0, None, true)]);
+        let mut search = Suffix::new(&tail, &word, None).hold_cap(Some(4));
+        search.feed("<abc");
+        assert_eq!(search.start(None), Some(0), "four bytes");
+        search.feed("d");
+        assert_eq!(search.start(None), None, "five are past the cap");
+        let mut search = Suffix::new(&tail, &word, None).hold_cap(None);
+        search.feed(
+            &"<".to_string()
+                .chars()
+                .chain("a".repeat(HOLD_CAP).chars())
+                .collect::<String>(),
+        );
+        assert_eq!(search.start(None), Some(0), "no cap");
+        let mut search = Suffix::new(&tail, &word, None);
+        search.feed(
+            &"<".to_string()
+                .chars()
+                .chain("a".repeat(HOLD_CAP).chars())
+                .collect::<String>(),
+        );
+        assert_eq!(search.start(None), None, "the default cap");
     }
 
     #[test]

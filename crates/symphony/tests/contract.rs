@@ -32,6 +32,7 @@ use serde_json::json as value;
 use symphony::{
     formats,
     json::PartialJson,
+    shape::{self, Arguments, Atom, CallShape, Class, Dialect, NameSource, Path, Pattern, Slot},
     tagged::{Placement, Spelling},
     CallSyntax, Declared, DropReason, Emits, Engine, EngineFinish, Event, Events, FinishReason,
     Format, Input, MalformedReason, ParseError, Parser, TokenSpan,
@@ -297,6 +298,135 @@ fn plain() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::plain(), Declared::default()))
 }
 
+/// `\w` as these outputs need it: the ASCII letters, digits and `_` their names are written in.
+fn word() -> Class {
+    Class::new([('0', '9'), ('A', 'Z'), ('_', '_'), ('a', 'z')], false)
+}
+
+fn run(class: Class, min: u16, greedy: bool, capture: Option<Slot>) -> Atom {
+    Atom::Run {
+        class,
+        min,
+        max: None,
+        greedy,
+        capture,
+    }
+}
+
+/// The Qwen3 table with its calls given as data: one JSON object that names the call, right
+/// after the region's marker, as the hand-written JSON syntax reads it.
+fn qwen3_shaped() -> Box<dyn Parser> {
+    let shape = shape::intern(CallShape {
+        header: Pattern::default(),
+        name: NameSource::Body,
+        arguments: Arguments::Envelope {
+            dialect: Dialect::default(),
+            name: Path::new(["name"]),
+            arguments: Path::new(["arguments"]),
+        },
+        trailer: Pattern::default(),
+        word: word(),
+        hold_cap: 8192,
+    });
+    Box::new(Engine::new(
+        formats::qwen3(CallSyntax::Shaped(shape)),
+        Declared::default(),
+    ))
+}
+
+/// transformers v5.18.0's `tests/utils/test_chat_parsing.py` (`gpt_oss_template`): Harmony's
+/// analysis and final channels, nothing kept outside them, and the calls the commentary channel
+/// opens: `<|channel|>commentary to=functions.` is the terminal, `(?P<name>\w+).*?<\|message\|>`
+/// the header, the arguments one JSON value, and the stop token `<|call|>` the close.
+fn gpt_oss_template() -> Box<dyn Parser> {
+    let shape = shape::intern(CallShape {
+        header: Pattern(
+            [
+                run(word(), 1, true, Some(Slot::Name)),
+                run(Class::any(), 0, false, None),
+                Atom::Lit("<|message|>".into()),
+            ]
+            .into(),
+        ),
+        name: NameSource::Header,
+        arguments: Arguments::Json(Dialect::default()),
+        trailer: Pattern::default(),
+        word: word(),
+        hold_cap: 8192,
+    });
+    Box::new(Engine::new(
+        Format::new("gpt-oss test template")
+            .terminal("analysis", "<|channel|>analysis<|message|>")
+            .terminal("final", "<|channel|>final<|message|>")
+            .terminal("end", "<|end|>")
+            .terminal("call_open", "<|channel|>commentary to=functions.")
+            .terminal("call_close", "<|call|>")
+            .state("outside", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("content", Emits::Content)
+            .state("call", Emits::Arguments)
+            .transition("outside", "analysis", "reasoning")
+            .transition("outside", "final", "content")
+            .transition("reasoning", "end", "outside")
+            .transition("content", "end", "outside")
+            .transition("outside", "call_open", "call")
+            .transition("call", "call_close", "outside")
+            .calls(CallSyntax::Shaped(shape))
+            .framing("outside")
+            .closes_at_stop("call")
+            .turn_anchor("<|start|>assistant")
+            .trims("reasoning")
+            .trims("content")
+            .stop_tokens(["<|return|>", "<|endoftext|>", "<|call|>"]),
+        Declared::default(),
+    ))
+}
+
+/// Calls given as data on abstract tags: a region between `<c>` and `</c>` beside a thought
+/// between `<t>` and `</t>`, each call named by a `<n=NAME>` header, its arguments one JSON value,
+/// and `</f>` with the whitespace after it as the trailer, which the stream's stop may end too.
+fn shaped_tags() -> Box<dyn Parser> {
+    let shape = shape::intern(CallShape {
+        header: Pattern(
+            [
+                Atom::Lit("<n=".into()),
+                run(word(), 1, true, Some(Slot::Name)),
+                Atom::Lit(">".into()),
+            ]
+            .into(),
+        ),
+        name: NameSource::Header,
+        arguments: Arguments::Json(Dialect::default()),
+        trailer: Pattern(
+            [
+                Atom::Lit("</f>".into()),
+                run(Class::new([('\t', '\r'), (' ', ' ')], false), 0, true, None),
+            ]
+            .into(),
+        ),
+        word: word(),
+        hold_cap: 8192,
+    });
+    Box::new(Engine::new(
+        Format::new("shaped tags")
+            .terminal("think_open", "<t>")
+            .terminal("think_close", "</t>")
+            .terminal("call_open", "<c>")
+            .terminal("call_close", "</c>")
+            .state("content", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("call", Emits::Arguments)
+            .transition("content", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "content")
+            .transition("content", "call_open", "call")
+            .transition("reasoning", "call_open", "call")
+            .transition("call", "call_close", "content")
+            .calls(CallSyntax::Shaped(shape))
+            .closes_at_stop("call"),
+        Declared::default(),
+    ))
+}
+
 const FORMATS: &[Subject] = &[
     Subject {
         name: "qwen3",
@@ -398,6 +528,53 @@ const FORMATS: &[Subject] = &[
         new: plain,
         outputs: PLAIN_OUTPUTS,
     },
+    Subject {
+        name: "qwen3, its calls as a shape",
+        new: qwen3_shaped,
+        outputs: QWEN3_OUTPUTS,
+    },
+    Subject {
+        name: "gpt-oss test template, its calls as a shape",
+        new: gpt_oss_template,
+        outputs: GPT_OSS_OUTPUTS,
+    },
+    Subject {
+        name: "shaped calls on abstract tags",
+        new: shaped_tags,
+        outputs: SHAPED_TAGS_OUTPUTS,
+    },
+];
+
+/// The gpt-oss test template: a thought and a call the stop closes, a call cut short, a header
+/// that cannot match (no name after the marker) and one the end leaves unfinished, an answer with
+/// text outside it, arguments that are not JSON, text after the arguments, and nothing.
+const GPT_OSS_OUTPUTS: &[&str] = &[
+    "<|channel|>analysis<|message|>User asks for the weather.<|end|><|start|>assistant\
+     <|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>\
+     {\"city\": \"Paris\", \"days\": 3}",
+    "<|channel|>commentary to=functions.get_weather<|message|>{\"city\": \"Par",
+    "<|channel|>commentary to=functions.<|channel|>final<|message|>Hi",
+    "<|channel|>commentary to=functions.get_weather json",
+    "Hello <|channel|>final<|message|> It is sunny. <|end|> after",
+    "<|channel|>commentary to=functions.f<|message|>not json",
+    "<|channel|>commentary to=functions.f<|message|>{} trailing",
+    "",
+];
+
+/// Calls on abstract tags: a call its trailer closes, terminals whose header does not match (in
+/// the content, in a thought, twice in a row), a close the trailer does not end at, a call cut
+/// short, a call the stop closes after its trailer, a header the end leaves unfinished, and
+/// nothing.
+const SHAPED_TAGS_OUTPUTS: &[&str] = &[
+    "Sure.<c><n=f>{\"a\": 1}</f>\n</c>Done.",
+    "Hi <c><x>bye",
+    "<t>plan <c>oops</t>ok",
+    "<c><c><n=f>{}</f></c>",
+    "<c><n=f>{}</c>x</f></c>",
+    "<c><n=f>{\"a\": [1, 2",
+    "<c><n=f>{}</f>",
+    "<c><n=",
+    "",
 ];
 
 /// MiniMax M3's syntax: the recorded shape with its separators, the tree's shapes, cut streams,

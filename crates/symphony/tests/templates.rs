@@ -3,8 +3,8 @@
 //! declares, or one of transformers' own; each table here spells one with the rows a template
 //! needs: a framing state for the text outside every field, turn anchors, a start row, trimmed
 //! and joined stays, and the stop tokens that are terminals. The calls are spelled where a call
-//! syntax the crate has reads the template's (Gemma's, the JSON object), and left out where none
-//! does yet.
+//! syntax the crate has reads the template's (Gemma's, the JSON object, a call given as data whose
+//! header names the tool), and left out where none does yet.
 //!
 //! Each case is a prompt, an output and the finish, with the message Hugging Face's parser gives
 //! for them: `parse_response(output, template, prefix=prompt)` from transformers 5.18.0, the
@@ -21,9 +21,15 @@
 )]
 mod common;
 
+use std::{fs, path::PathBuf};
+
 use common::{bytes_of, chunkings, replay_after};
 use serde_json::Value;
-use symphony::{adapt, CallSyntax, Declared, Emits, Engine, EngineFinish, Format, Parser};
+use symphony::{
+    adapt,
+    shape::{self, Arguments, Atom, CallShape, Class, Dialect, NameSource, Pattern, Slot},
+    CallSyntax, Declared, Emits, Engine, EngineFinish, Format, Parser,
+};
 
 /// One output and the message it reads as.
 struct Case {
@@ -36,25 +42,87 @@ struct Case {
     calls: &'static [(&'static str, &'static str)],
 }
 
+/// Python `regex`'s `\w`, as `tests/fixtures/shape/classes.json` records it: the class a
+/// template's `\w` holds, which whoever lowers a template resolves into ranges.
+#[expect(
+    clippy::panic,
+    clippy::expect_used,
+    reason = "a fixture that cannot be read ends the test with its path"
+)]
+fn python_word() -> Class {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shape/classes.json");
+    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let tables: Value = serde_json::from_str(&text).expect("classes.json");
+    let ranges = tables["word"]
+        .as_array()
+        .expect("the word table")
+        .iter()
+        .map(|range| {
+            let mut chars = range.as_str().expect("a range").chars();
+            match (chars.next(), chars.next(), chars.next()) {
+                (Some(first), Some(last), None) => (first, last),
+                _ => panic!("a range is two characters: {range}"),
+            }
+        });
+    Class::new(ranges, false)
+}
+
 /// transformers v5.18.0's `tests/utils/test_chat_parsing.py` (`gpt_oss_template`): Harmony's
 /// messages, the analysis channel a thought and the final channel the answer, each closed by
-/// `<|end|>`, nothing kept outside them, the turn after `<|start|>assistant`. Its calls name the
-/// tool in the commentary channel's header, which no call syntax here reads yet, so they are left
-/// out. The stop tokens, `<|return|>`, `<|endoftext|>` and `<|call|>` (the `generation_config.json`
-/// of `openai/gpt-oss-20b`), are not terminals of this table.
+/// `<|end|>`, nothing kept outside them, the turn after `<|start|>assistant`. A call's open,
+/// `<\|channel\|>commentary to=functions\.(?P<name>\w+).*?<\|message\|>`, is the terminal
+/// `<|channel|>commentary to=functions.` and a header that names the tool; its arguments are one
+/// JSON value; its close, `<|call|>`, is a stop token, so the stream's stop closes it. The stop
+/// tokens are `<|return|>`, `<|endoftext|>` and `<|call|>` (the `generation_config.json` of
+/// `openai/gpt-oss-20b`).
 fn gpt_oss() -> Format {
+    let word = python_word();
+    let shape = shape::intern(CallShape {
+        header: Pattern(
+            [
+                Atom::Run {
+                    class: word.clone(),
+                    min: 1,
+                    max: None,
+                    greedy: true,
+                    capture: Some(Slot::Name),
+                },
+                Atom::Run {
+                    class: Class::any(),
+                    min: 0,
+                    max: None,
+                    greedy: false,
+                    capture: None,
+                },
+                Atom::Lit("<|message|>".into()),
+            ]
+            .into(),
+        ),
+        name: NameSource::Header,
+        arguments: Arguments::Json(Dialect::default()),
+        trailer: Pattern::default(),
+        word,
+        hold_cap: 8192,
+    });
     Format::new("gpt-oss test template")
         .terminal("analysis", "<|channel|>analysis<|message|>")
         .terminal("final", "<|channel|>final<|message|>")
         .terminal("end", "<|end|>")
+        .terminal("call_open", "<|channel|>commentary to=functions.")
+        .terminal("call_close", "<|call|>")
         .state("outside", Emits::Content)
         .state("reasoning", Emits::Reasoning)
         .state("content", Emits::Content)
+        .state("call", Emits::Arguments)
         .transition("outside", "analysis", "reasoning")
         .transition("outside", "final", "content")
         .transition("reasoning", "end", "outside")
         .transition("content", "end", "outside")
+        .transition("outside", "call_open", "call")
+        .transition("call", "call_close", "outside")
+        .calls(CallSyntax::Shaped(shape))
         .framing("outside")
+        .closes_at_stop("call")
         .turn_anchor("<|start|>assistant")
         .trims("reasoning")
         .trims("content")
@@ -180,8 +248,56 @@ fn muse() -> Format {
 
 /// The gpt-oss test template's cases. With the stop token's text fed, as transformers feeds it,
 /// the answers of the first two would keep `<|return|>` (and the second its edge before it): the
-/// stop decoder hides it here.
+/// stop decoder hides it here. The calls end at `<|call|>`, which the stream's stop stands for:
+/// after a thought, right after the marker, with words before `<|message|>` that the header
+/// skips, after an answer with spaces around the arguments, and a marker that names no tool
+/// (its header needs a word right after it), which opens no call.
 const GPT_OSS: &[Case] = &[
+    Case {
+        prompt: "<|start|>user<|message|>Weather in Paris?<|end|><|start|>assistant",
+        output: "<|channel|>analysis<|message|>Need the weather.<|end|><|start|>assistant\
+                 <|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>\
+                 {\"city\": \"Paris\"}",
+        finish: EngineFinish::Stop,
+        reasoning: Some("Need the weather."),
+        content: None,
+        calls: &[("get_weather", "{\"city\": \"Paris\"}")],
+    },
+    Case {
+        prompt: "<|start|>assistant",
+        output: "<|channel|>commentary to=functions.get_weather<|message|>{\"city\": \"Paris\", \
+                 \"days\": 3}",
+        finish: EngineFinish::Stop,
+        reasoning: None,
+        content: None,
+        calls: &[("get_weather", "{\"city\": \"Paris\", \"days\": 3}")],
+    },
+    Case {
+        prompt: "<|start|>assistant",
+        output: "<|channel|>commentary to=functions.get_weather json<|message|>{}",
+        finish: EngineFinish::Stop,
+        reasoning: None,
+        content: None,
+        calls: &[("get_weather", "{}")],
+    },
+    Case {
+        prompt: "<|start|>assistant",
+        output: "<|channel|>final<|message|>Checking.<|end|><|start|>assistant<|channel|>\
+                 commentary to=functions.lookup <|constrain|>json<|message|> {\"q\": [1, 2.5, \
+                 null]} ",
+        finish: EngineFinish::Stop,
+        reasoning: None,
+        content: Some("Checking."),
+        calls: &[("lookup", "{\"q\": [1, 2.5, null]}")],
+    },
+    Case {
+        prompt: "<|start|>assistant",
+        output: "<|channel|>commentary to=functions.<|channel|>final<|message|>Hi",
+        finish: EngineFinish::Stop,
+        reasoning: None,
+        content: Some("Hi"),
+        calls: &[],
+    },
     Case {
         prompt: "<|start|>user<|message|>Weather?<|end|><|start|>assistant",
         output: "<|channel|>analysis<|message|>User asks for the weather.<|end|><|start|>\
@@ -584,6 +700,7 @@ fn every_table_here_is_valid_and_names_its_stop_tokens() {
     }
     // A stop token that is not a terminal is not kept, and a terminal that ends a message inside
     // the turn is not a stop token.
+    assert!(gpt_oss().is_stop_token("<|call|>"));
     assert!(!gpt_oss().is_stop_token("<|return|>"));
     assert!(!gemma4().is_stop_token("<turn|>"));
     assert!(!inkling().is_stop_token("<|end_message|>"));

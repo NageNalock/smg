@@ -22,20 +22,34 @@
 //!   Python's `regex` module gives for the whole text (`match` under `DOTALL`, the dialect response
 //!   templates are written in), and it gives it as soon as no continuation of the text can change
 //!   it.
+//! - A [`Suffix`] runs a pattern from every place of a text as it arrives, and says where the
+//!   earliest match that ends at the text's end starts: where the text before a closing marker
+//!   (`</function>\s*` before `</tool_call>`) begins, when the marker comes.
 //! - [`Pattern::check`] refuses a pattern that a stream could decide only at the end of the
 //!   output.
 //! - An [`Interner`] keeps one copy of each distinct value for the life of the process, so a table
 //!   built at run time can hold its shapes as `&'static` data and stay `Copy`.
 //!
+//! A [`CallShape`] puts the patterns together into a call: the header after the region's
+//! terminal, which may capture the tool's name, the way the arguments are written
+//! ([`Arguments`]), and the trailer before the region's closing terminal. A table holds one as
+//! [`CallSyntax::Shaped`], [`intern`]ed, and the shape's [`Assembler`] turns a call written so
+//! into its events, giving back to the engine the bytes of a header that did not match.
+//!
 //! [`formats`]: crate::formats
+//! [`CallSyntax::Shaped`]: crate::CallSyntax::Shaped
 
+mod call;
 mod class;
 mod intern;
 mod matcher;
 
+use std::fmt;
+
+pub use call::{Assembler, Header};
 pub use class::Class;
 pub use intern::Interner;
-pub use matcher::{Match, Matcher, Verdict, HOLD_CAP};
+pub use matcher::{Match, Matcher, Suffix, Verdict, HOLD_CAP};
 
 /// A linear pattern: its atoms, matched one after another from the start of the text it is run
 /// over.
@@ -169,6 +183,218 @@ impl End {
     }
 }
 
+/// A call given as data: what the template writes after the region's terminal and before the
+/// arguments, how it writes the arguments, and what it writes after them before the region's
+/// closing terminal. A table holds one as [`CallSyntax::Shaped`], [`intern`]ed so that the call
+/// syntax stays `Copy`; [`CallShape::check`] says whether a stream can run it.
+///
+/// [`CallSyntax::Shaped`]: crate::CallSyntax::Shaped
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CallShape {
+    /// What follows the region's terminal, matched from its end: `\s*<function=(?P<name>\w+)>`.
+    /// It may capture the tool's name. A terminal whose header does not match opens no call, and
+    /// is the text of the state it came in. An empty header opens the call at the terminal.
+    pub header: Pattern,
+    /// Where the tool's name comes from.
+    pub name: NameSource,
+    /// How the arguments are written.
+    pub arguments: Arguments,
+    /// What comes after the arguments, right before the region's closing terminal:
+    /// `</function>\s*`, or the `}` of an object the header opened. A closing terminal the
+    /// trailer does not end at closes nothing, and is the call's text. An empty trailer ends
+    /// wherever the terminal comes.
+    pub trailer: Pattern,
+    /// The characters `\b` reads as a word's: the template dialect's `\w`, which whoever lowered
+    /// the shape resolved.
+    pub word: Class,
+    /// The most bytes a header or a trailer holds undecided; one longer is no match. [`HOLD_CAP`]
+    /// unless a shape says otherwise.
+    pub hold_cap: u32,
+}
+
+/// Where a shaped call's name comes from.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum NameSource {
+    /// The header's run captured as [`Slot::Name`]: `<function=(?P<name>\w+)>`.
+    Header,
+    /// The arguments' own object, which names the call: [`Arguments::Envelope`].
+    Body,
+    /// The template's text: a transform that writes the name itself.
+    Literal(Box<str>),
+}
+
+/// How a shaped call's arguments are written.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Arguments {
+    /// One JSON value, the arguments themselves, the call named by the header or the template
+    /// (`content: json`). They stream as the model's bytes.
+    Json(Dialect),
+    /// One JSON object that names the call and holds its arguments (`"function": "{content}"`):
+    /// the name at `name`, the arguments at `arguments`, which stream as the model's bytes.
+    Envelope {
+        dialect: Dialect,
+        name: Path,
+        arguments: Path,
+    },
+}
+
+/// The JSON a template writes: plain JSON, or a dialect of it, keys left bare and strings between
+/// the template's own delimiters, as transformers' `json` parser reads with `unquoted_keys` and
+/// `string_delims`. The default is plain JSON.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Dialect {
+    /// Keys written without quotes.
+    pub bare_keys: bool,
+    /// The delimiters around a string, each an opening and a closing one, written in place of
+    /// JSON's quotes; the text between them is the string as it is.
+    pub string_delims: Box<[(Box<str>, Box<str>)]>,
+}
+
+impl Dialect {
+    /// Whether this is plain JSON.
+    pub fn is_plain(&self) -> bool {
+        !self.bare_keys && self.string_delims.is_empty()
+    }
+}
+
+/// Where a member stands in a JSON object, key by key from the top: `["name"]`, or `["call",
+/// "args"]` for a dotted `{content.call.args}`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Path(pub Box<[Box<str>]>);
+
+impl Path {
+    /// The path through `keys`, from the top.
+    pub fn new<'k>(keys: impl IntoIterator<Item = &'k str>) -> Self {
+        Self(keys.into_iter().map(Box::from).collect())
+    }
+}
+
+/// The keys the envelope reader takes a call's name from, the first of them in the object.
+const NAME_KEYS: [&str; 2] = ["name", "tool_name"];
+/// The keys it takes the arguments from.
+const ARGUMENTS_KEYS: [&str; 3] = ["arguments", "parameters", "args"];
+
+/// The part of a call shape a pattern stands in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    Header,
+    Trailer,
+}
+
+impl fmt::Display for Part {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Header => "header",
+            Self::Trailer => "trailer",
+        })
+    }
+}
+
+/// Why a stream cannot run a call shape.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ShapeError {
+    /// A pattern a stream cannot run.
+    #[error("the {part}: {error}")]
+    Pattern { part: Part, error: PatternError },
+    /// A run captured as something the part has no place for: a key or a value in the header,
+    /// anything in the trailer.
+    #[error("the {part} captures a {slot:?}, which it has no place for")]
+    Capture { part: Part, slot: Slot },
+    /// The name comes from the header, which captures none.
+    #[error("the name comes from the header, which captures none")]
+    NoName,
+    /// The name comes from the arguments, which are no object that names the call.
+    #[error("the name comes from the arguments, which are no envelope")]
+    NoEnvelope,
+    /// The arguments are an object that names the call, and the name comes from elsewhere too.
+    #[error("the envelope names the call, and the name comes from elsewhere too")]
+    NamedTwice,
+    /// JSON in a dialect other than plain JSON, which no reader here takes yet.
+    #[error("JSON in a dialect other than plain JSON")]
+    Dialect,
+    /// An envelope path the envelope reader does not take: it reads the name from `name` or
+    /// `tool_name` and the arguments from `arguments`, `parameters` or `args`, each at the top.
+    #[error("an envelope path the envelope reader does not take: {0:?}")]
+    EnvelopePath(Path),
+}
+
+impl CallShape {
+    /// Whether a stream can run the shape: the header and the trailer pass [`Pattern::check`]; the
+    /// header captures only the name and the trailer nothing; the name comes from where the shape
+    /// says, the header capturing it, or an envelope naming the call and nothing else doing so;
+    /// the JSON is plain; and an envelope's paths are ones its reader takes.
+    pub fn check(&self) -> Result<(), ShapeError> {
+        for (part, pattern) in [(Part::Header, &self.header), (Part::Trailer, &self.trailer)] {
+            pattern
+                .check()
+                .map_err(|error| ShapeError::Pattern { part, error })?;
+            let allowed = |slot: Slot| part == Part::Header && slot == Slot::Name;
+            if let Some(slot) = pattern.captures().find(|&slot| !allowed(slot)) {
+                return Err(ShapeError::Capture { part, slot });
+            }
+        }
+        let header_names = self.header.captures().any(|slot| slot == Slot::Name);
+        match (&self.name, &self.arguments) {
+            (NameSource::Header, _) if !header_names => return Err(ShapeError::NoName),
+            (NameSource::Body, Arguments::Envelope { .. }) => {}
+            (NameSource::Body, _) => return Err(ShapeError::NoEnvelope),
+            (_, Arguments::Envelope { .. }) => return Err(ShapeError::NamedTwice),
+            _ => {}
+        }
+        match &self.arguments {
+            Arguments::Json(dialect) | Arguments::Envelope { dialect, .. }
+                if !dialect.is_plain() =>
+            {
+                Err(ShapeError::Dialect)
+            }
+            Arguments::Envelope {
+                name, arguments, ..
+            } => {
+                let top = |path: &Path, keys: &[&str]| match &*path.0 {
+                    [key] => keys.contains(&key.as_ref()),
+                    _ => false,
+                };
+                if !top(name, &NAME_KEYS) {
+                    return Err(ShapeError::EnvelopePath(name.clone()));
+                }
+                if !top(arguments, &ARGUMENTS_KEYS) {
+                    return Err(ShapeError::EnvelopePath(arguments.clone()));
+                }
+                Ok(())
+            }
+            Arguments::Json(_) => Ok(()),
+        }
+    }
+
+    /// The cap on what a header or a trailer holds undecided, in bytes.
+    pub(crate) fn cap(&self) -> usize {
+        usize::try_from(self.hold_cap).unwrap_or(usize::MAX)
+    }
+}
+
+impl Pattern {
+    /// The slots the pattern's runs capture, in order.
+    fn captures(&self) -> impl Iterator<Item = Slot> + '_ {
+        self.0.iter().filter_map(|atom| match atom {
+            Atom::Run {
+                capture: Some(slot),
+                ..
+            } => Some(*slot),
+            _ => None,
+        })
+    }
+}
+
+/// The process's one copy of `shape`, as [`CallSyntax::Shaped`] holds it: a shape built at run
+/// time, compiled from a model's template, becomes `'static` data, kept for the life of the
+/// process (see [`Interner`]).
+///
+/// [`CallSyntax::Shaped`]: crate::CallSyntax::Shaped
+pub fn intern(shape: CallShape) -> &'static CallShape {
+    static SHAPES: Interner<CallShape> = Interner::new();
+    SHAPES.intern(shape)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +526,149 @@ mod tests {
             .check(),
             Err(PatternError::Undecidable { atom: 0 })
         );
+    }
+
+    /// A shape on abstract tags: `<n=NAME>` after the terminal, the arguments as one JSON value.
+    fn named() -> CallShape {
+        let word = Class::new([('a', 'z')], false);
+        CallShape {
+            header: pattern([
+                Atom::Lit("<n=".into()),
+                captured(run(word.clone(), 1, None, true), Slot::Name),
+                Atom::Lit(">".into()),
+            ]),
+            name: NameSource::Header,
+            arguments: Arguments::Json(Dialect::default()),
+            trailer: Pattern::default(),
+            word,
+            hold_cap: 8,
+        }
+    }
+
+    fn envelope() -> Arguments {
+        Arguments::Envelope {
+            dialect: Dialect::default(),
+            name: Path::new(["name"]),
+            arguments: Path::new(["arguments"]),
+        }
+    }
+
+    #[test]
+    fn a_shape_names_its_call_from_one_place() {
+        assert_eq!(named().check(), Ok(()));
+        let literal = CallShape {
+            name: NameSource::Literal("f".into()),
+            ..named()
+        };
+        assert_eq!(
+            literal.check(),
+            Ok(()),
+            "a name the template writes; the header's capture is not read"
+        );
+        let unnamed = CallShape {
+            header: Pattern::default(),
+            ..named()
+        };
+        assert_eq!(unnamed.check(), Err(ShapeError::NoName));
+        let from_the_body = CallShape {
+            name: NameSource::Body,
+            ..named()
+        };
+        assert_eq!(from_the_body.check(), Err(ShapeError::NoEnvelope));
+        let enveloped = CallShape {
+            header: Pattern::default(),
+            name: NameSource::Body,
+            arguments: envelope(),
+            ..named()
+        };
+        assert_eq!(enveloped.check(), Ok(()));
+        let twice = CallShape {
+            arguments: envelope(),
+            ..named()
+        };
+        assert_eq!(twice.check(), Err(ShapeError::NamedTwice));
+    }
+
+    #[test]
+    fn a_header_captures_only_the_name_and_a_trailer_nothing() {
+        let word = Class::new([('a', 'z')], false);
+        let keyed = CallShape {
+            header: pattern([captured(run(word.clone(), 1, None, true), Slot::Key)]),
+            name: NameSource::Literal("f".into()),
+            ..named()
+        };
+        assert_eq!(
+            keyed.check(),
+            Err(ShapeError::Capture {
+                part: Part::Header,
+                slot: Slot::Key
+            })
+        );
+        let trailing = CallShape {
+            trailer: pattern([captured(run(word, 1, None, true), Slot::Name)]),
+            ..named()
+        };
+        assert_eq!(
+            trailing.check(),
+            Err(ShapeError::Capture {
+                part: Part::Trailer,
+                slot: Slot::Name
+            })
+        );
+        let undecidable = CallShape {
+            trailer: pattern([run(Class::any(), 0, None, true)]),
+            ..named()
+        };
+        assert_eq!(
+            undecidable.check(),
+            Err(ShapeError::Pattern {
+                part: Part::Trailer,
+                error: PatternError::Undecidable { atom: 0 }
+            })
+        );
+        assert_eq!(
+            undecidable.check().map_err(|error| error.to_string()),
+            Err("the trailer: atom 0: a greedy run of any character with no bound".to_string())
+        );
+    }
+
+    #[test]
+    fn json_is_plain_and_an_envelope_is_read_where_its_reader_reads() {
+        let bare = CallShape {
+            arguments: Arguments::Json(Dialect {
+                bare_keys: true,
+                string_delims: Box::default(),
+            }),
+            ..named()
+        };
+        assert_eq!(bare.check(), Err(ShapeError::Dialect));
+        let enveloped = |name: &[&str], arguments: &[&str]| CallShape {
+            header: Pattern::default(),
+            name: NameSource::Body,
+            arguments: Arguments::Envelope {
+                dialect: Dialect::default(),
+                name: Path::new(name.iter().copied()),
+                arguments: Path::new(arguments.iter().copied()),
+            },
+            ..named()
+        };
+        assert_eq!(enveloped(&["tool_name"], &["parameters"]).check(), Ok(()));
+        assert_eq!(enveloped(&["name"], &["args"]).check(), Ok(()));
+        assert_eq!(
+            enveloped(&["function", "name"], &["arguments"]).check(),
+            Err(ShapeError::EnvelopePath(Path::new(["function", "name"])))
+        );
+        assert_eq!(
+            enveloped(&["name"], &["input"]).check(),
+            Err(ShapeError::EnvelopePath(Path::new(["input"])))
+        );
+    }
+
+    #[test]
+    fn an_interned_shape_is_one_copy() {
+        let first = intern(named());
+        let again = intern(named());
+        assert!(std::ptr::eq(first, again));
+        assert_eq!(*first, named());
     }
 }
