@@ -2,8 +2,7 @@
 //! prompt's token ids as one message; a million of them are a few megabytes,
 //! which tonic's default message limit (4 MiB) refuses.
 
-use std::time::Duration;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use futures::StreamExt;
 use mock_worker::{config::Config, grpc::serve_with_listener};

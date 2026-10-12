@@ -187,6 +187,38 @@ fn generate_request(id: &str) -> proto::GenerateRequest {
     }
 }
 
+/// A message that arrived after the deadline passed is not handed over: the
+/// first poll past the deadline ends the stream with the deadline's status,
+/// buffered frames or not, and nothing follows.
+#[tokio::test]
+async fn a_message_ready_after_the_deadline_is_not_handed_over() {
+    let (endpoint, state) = spawn_mock().await.unwrap();
+    let client = VllmEngineClient::connect(&endpoint).await.unwrap();
+
+    let mut stream = client
+        .generate(generate_request("late-1"), Duration::from_millis(300))
+        .await
+        .unwrap();
+    let tx = state
+        .lock_tx()
+        .clone()
+        .expect("the mock holds the stream's sender");
+    tx.send(Ok(chunk())).await.unwrap();
+    tx.send(Ok(chunk())).await.unwrap();
+    // The frames wait in the window while nothing polls; the deadline passes.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let first = stream
+        .next()
+        .await
+        .expect("an item")
+        .expect_err("the deadline, not a frame");
+    assert!(smg_grpc_client::is_call_deadline(&first), "{first:?}");
+    assert!(
+        stream.next().await.is_none(),
+        "nothing follows the deadline"
+    );
+}
+
 #[tokio::test]
 async fn default_mode_aborts_immediately_on_drop() {
     let (endpoint, state) = spawn_mock().await.unwrap();

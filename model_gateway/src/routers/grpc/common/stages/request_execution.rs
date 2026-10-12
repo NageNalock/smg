@@ -895,6 +895,10 @@ fn start_failure_response(
     }
     if e.http_status().is_client_error() {
         warn!(function = function, error = %e, "{}: engine rejected the request", description);
+    } else if smg_grpc_client::is_call_deadline(e) {
+        // The request's own deadline (--request-timeout-secs), not a worker
+        // fault: a WARN, like the streamed path's.
+        warn!(function = function, error = %e, "{}: the request's deadline passed", description);
     } else {
         error!(function = function, error = %e, "{}", description);
     }
@@ -1921,7 +1925,11 @@ async fn execute_sequential_pd(
                     &e,
                 );
                 account_pd_leg_failure(metrics_labels::WORKER_PREFILL, &e);
-                error!(function = "execute_sequential_pd", error = %e, "Prefill stream error");
+                if smg_grpc_client::is_call_deadline(&e) {
+                    warn!(function = "execute_sequential_pd", error = %e, "Prefill stream ended at the request's deadline");
+                } else {
+                    error!(function = "execute_sequential_pd", error = %e, "Prefill stream error");
+                }
                 return Err(e.to_http_error(
                     "prefill_stream_error",
                     format!("Prefill stream error: {}", e.message()),

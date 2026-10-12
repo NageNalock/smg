@@ -4,7 +4,6 @@
 //! deadline, the exit code is 0, and the log says what was drained.
 #![cfg(unix)]
 
-use std::time::Duration;
 use std::{
     io::Read,
     net::{SocketAddr, TcpListener, TcpStream},

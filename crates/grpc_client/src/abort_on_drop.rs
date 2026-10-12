@@ -290,18 +290,28 @@ impl<T: Send + 'static, C: AbortOnDropClient> futures::Stream for AbortOnDropStr
                     // state is resolved either way.
                     this.saw_item = true;
                 }
-                if polled.is_ready() {
-                    return polled;
-                }
-                // Nothing arrived: past the deadline the stream ends with it.
                 let Some((deadline, sleep)) = this.deadline.as_mut() else {
-                    return Poll::Pending;
+                    return polled;
                 };
-                if sleep.as_mut().poll(cx).is_pending() {
-                    return Poll::Pending;
+                match polled {
+                    // A message that arrived after the deadline passed (a
+                    // consumer slower than the engine leaves frames waiting in
+                    // the window) is not handed over: the deadline ends the
+                    // stream, as it does a silent one.
+                    Poll::Ready(Some(_)) if tokio::time::Instant::now() >= deadline.at() => {
+                        this.expired = true;
+                        Poll::Ready(Some(Err(deadline.status())))
+                    }
+                    Poll::Ready(_) => polled,
+                    // Nothing arrived: past the deadline the stream ends with it.
+                    Poll::Pending => {
+                        if sleep.as_mut().poll(cx).is_pending() {
+                            return Poll::Pending;
+                        }
+                        this.expired = true;
+                        Poll::Ready(Some(Err(deadline.status())))
+                    }
                 }
-                this.expired = true;
-                Poll::Ready(Some(Err(deadline.status())))
             }
             // Only reachable if polled after Drop took the stream, which
             // cannot happen for an owned value; return end-of-stream rather

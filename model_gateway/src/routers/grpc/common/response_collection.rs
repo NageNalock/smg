@@ -226,7 +226,11 @@ async fn collect_stream_responses<S: FanoutChild>(
                 if let Some(leg) = leg {
                     account_pd_leg_failure(leg, &e);
                 }
-                trace_error!(function = "collect_stream_responses", worker = %worker_name, grpc_code = ?e.code(), error = ?e, "Worker stream error");
+                if smg_grpc_client::is_call_deadline(&e) {
+                    tracing::warn!(function = "collect_stream_responses", worker = %worker_name, error = %e, "Worker stream ended at the request's deadline");
+                } else {
+                    trace_error!(function = "collect_stream_responses", worker = %worker_name, grpc_code = ?e.code(), error = ?e, "Worker stream error");
+                }
                 // The worker's failure samples its breaker and counts against
                 // it as a streamed answer's does; the client's status and the
                 // router-error family are the pipeline's.
