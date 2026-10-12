@@ -20,15 +20,20 @@ use openai_protocol::{
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
-use tracing::debug;
+use tracing::{debug, warn};
+use uuid::Uuid;
 
 use super::{
     common::{
         responses::{
-            handlers::cancel_response_impl, streaming::build_sse_response_from_stream,
-            utils::validate_worker_availability, ResponsesContext,
+            background, handlers::cancel_response_impl, streaming::build_sse_response_from_stream,
+            utils::validate_worker_availability, BackgroundResponses, BackgroundStream,
+            ResponsesContext,
         },
-        stages::{helpers::resolve_request_id_stamp, RateLimitCell, RateLimitOutcome},
+        stages::{
+            context_length_exceeded, helpers::resolve_request_id_stamp, smallest_context_length,
+            RateLimitCell, RateLimitOutcome,
+        },
     },
     context::{RequestType, SharedComponents},
     harmony::{serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector},
@@ -45,6 +50,7 @@ use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
+    observability::metrics::metrics_labels,
     routers::{error, RouterTrait},
     worker::{RoutingPool, WorkerRegistry, WorkerType},
 };
@@ -188,6 +194,11 @@ impl GrpcRouter {
 
             // Capture storage request context from middleware task-local (before any spawn)
             let storage_request_context = smg_data_connector::current_request_context();
+            // One registry of background responses for both contexts: one cap,
+            // one place a cancel looks a running id up.
+            let background_responses = Arc::new(BackgroundResponses::new(
+                ctx.router_config.max_background_responses,
+            ));
 
             // Helper closure to create responses context with a given pipeline
             let create_responses_context = |pipeline: &RequestPipeline| {
@@ -200,6 +211,7 @@ impl GrpcRouter {
                     mcp_orchestrator.clone(),
                     ctx.mcp_format_registry.clone(),
                     storage_request_context.clone(),
+                    background_responses.clone(),
                 )
             };
 
@@ -406,30 +418,55 @@ impl GrpcRouter {
         let is_harmony =
             HarmonyDetector::is_harmony_model_in_registry(&self.worker_registry, &body.model);
 
+        // `background: true` answers the queued object at once and runs the
+        // work behind the response id; with the mode switched off such a
+        // request runs in the foreground, and its object says so.
+        let mut body = body.into_owned();
+        if body.background == Some(true) {
+            if responses_context.background.enabled() {
+                let request_context = smg_data_connector::current_request_context();
+                let ctx = if is_harmony {
+                    self.harmony_responses_context(
+                        harmony_pipeline,
+                        harmony_responses_context,
+                        request_context,
+                    )
+                } else {
+                    ResponsesContext {
+                        request_context,
+                        ..responses_context.clone()
+                    }
+                };
+                return self
+                    .route_background_responses(
+                        &ctx,
+                        is_harmony,
+                        headers,
+                        tenant_meta,
+                        body,
+                        model_id,
+                    )
+                    .await;
+            }
+            body.background = None;
+        }
+
         if is_harmony {
             debug!(
                 "Processing Harmony responses request for model: {}, streaming: {}",
                 model_id,
                 body.stream.unwrap_or(false)
             );
-            let harmony_ctx = ResponsesContext::new(
-                Arc::new(harmony_pipeline.clone()),
-                self.shared_components.clone(),
-                harmony_responses_context.response_storage.clone(),
-                harmony_responses_context.conversation_storage.clone(),
-                harmony_responses_context.conversation_item_storage.clone(),
-                harmony_responses_context.mcp_orchestrator.clone(),
-                harmony_responses_context.mcp_format_registry.clone(),
+            let harmony_ctx = self.harmony_responses_context(
+                harmony_pipeline,
+                harmony_responses_context,
                 smg_data_connector::current_request_context(),
             );
 
             if body.stream.unwrap_or(false) {
-                serve_harmony_responses_stream(&harmony_ctx, body.into_owned(), tenant_meta.clone())
-                    .await
+                serve_harmony_responses_stream(&harmony_ctx, body, tenant_meta.clone(), None).await
             } else {
-                match serve_harmony_responses(&harmony_ctx, body.into_owned(), tenant_meta.clone())
-                    .await
-                {
+                match serve_harmony_responses(&harmony_ctx, body, tenant_meta.clone(), None).await {
                     Ok(response) => Json(response).into_response(),
                     Err(error_response) => error_response,
                 }
@@ -437,13 +474,149 @@ impl GrpcRouter {
         } else {
             responses::route_responses(
                 responses_context,
-                Arc::new(body.into_owned()),
+                Arc::new(body),
                 headers.cloned(),
                 tenant_meta.clone(),
                 model_id.to_string(),
             )
             .await
         }
+    }
+
+    /// The per-request context of the Harmony Responses path: the Harmony
+    /// pipeline with the shared storage and MCP handles and this request's
+    /// storage context.
+    fn harmony_responses_context(
+        &self,
+        harmony_pipeline: &RequestPipeline,
+        harmony_responses_context: &ResponsesContext,
+        request_context: Option<smg_data_connector::RequestContext>,
+    ) -> ResponsesContext {
+        ResponsesContext::new(
+            Arc::new(harmony_pipeline.clone()),
+            self.shared_components.clone(),
+            harmony_responses_context.response_storage.clone(),
+            harmony_responses_context.conversation_storage.clone(),
+            harmony_responses_context.conversation_item_storage.clone(),
+            harmony_responses_context.mcp_orchestrator.clone(),
+            harmony_responses_context.mcp_format_registry.clone(),
+            request_context,
+            harmony_responses_context.background.clone(),
+        )
+    }
+
+    /// `background: true`: the `queued` Response object is stored under a new
+    /// id and answered (or streamed) at once; the work runs in a task of its
+    /// own behind that id, on the Harmony or the regular path. One beyond
+    /// the configured number in flight answers 429.
+    async fn route_background_responses(
+        &self,
+        ctx: &ResponsesContext,
+        is_harmony: bool,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        request: ResponsesRequest,
+        model_id: &str,
+    ) -> Response {
+        let id = format!("resp_{}", Uuid::now_v7());
+        let Some(slot) = ctx.background.admit(&id) else {
+            warn!(
+                in_flight = ctx.background.in_flight(),
+                max_in_flight = ctx.background.max_in_flight(),
+                "Background response refused: the limit is reached"
+            );
+            return background::limit_reached(ctx.background.max_in_flight());
+        };
+        let request = Arc::new(request);
+        let queued = background::queued_response(&id, &request);
+        if let Err(e) = background::store_record(
+            &ctx.response_storage,
+            &queued,
+            &request,
+            ctx.request_context.clone(),
+        )
+        .await
+        {
+            return error::internal_error(
+                "store_response_failed",
+                format!("Failed to store the queued response: {e}"),
+            );
+        }
+        debug!(response_id = %id, harmony = is_harmony, "Background response queued");
+
+        let tenant_meta = tenant_meta.clone();
+        let headers = headers.cloned();
+        let model_id = model_id.to_string();
+        if request.stream.unwrap_or(false) {
+            let stream = BackgroundStream::new(slot);
+            let answer = if is_harmony {
+                serve_harmony_responses_stream(
+                    ctx,
+                    Arc::unwrap_or_clone(request),
+                    tenant_meta,
+                    Some(stream),
+                )
+                .await
+            } else {
+                responses::route_responses_background_stream(
+                    ctx,
+                    request,
+                    headers,
+                    tenant_meta,
+                    model_id,
+                    stream,
+                )
+                .await
+            };
+            // A plain error before the stream opened closes the record as
+            // failed; the stream itself runs behind the id.
+            return background::close_before_stream(
+                &ctx.response_storage,
+                ctx.request_context.clone(),
+                &id,
+                answer,
+            )
+            .await;
+        }
+
+        if is_harmony {
+            background::spawn(
+                ctx.clone(),
+                slot,
+                request,
+                Box::new(move |ctx, request| {
+                    Box::pin(async move {
+                        serve_harmony_responses(
+                            ctx,
+                            Arc::unwrap_or_clone(request),
+                            tenant_meta,
+                            Some(id),
+                        )
+                        .await
+                    })
+                }),
+            );
+        } else {
+            background::spawn(
+                ctx.clone(),
+                slot,
+                request,
+                Box::new(move |ctx, request| {
+                    Box::pin(async move {
+                        responses::route_responses_background(
+                            ctx,
+                            request,
+                            headers,
+                            tenant_meta,
+                            model_id,
+                            id,
+                        )
+                        .await
+                    })
+                }),
+            );
+        }
+        (StatusCode::OK, Json(queued)).into_response()
     }
 
     /// Main route_embeddings implementation
@@ -490,13 +663,25 @@ impl GrpcRouter {
 
         // `max_tokens: 0` is answered as the public API answers it: an empty
         // message that reports the prompt's token count; nothing is generated.
-        // No worker takes part, so the answer carries neither the rate-limit
-        // reservation nor the pipeline's dispatch metrics, as count_tokens
-        // carries neither.
+        // No worker takes part, so the answer carries no rate-limit
+        // reservation, as count_tokens reserves none; it is counted as a
+        // Messages request, refusals included, where the pipeline counts
+        // its own, so the traffic stays visible.
         if canonical_body.max_tokens == 0 {
-            return self
+            const ENDPOINT: &str = metrics_labels::ENDPOINT_MESSAGES;
+            self.messages_pipeline.record_request(
+                ENDPOINT,
+                &model_id_cloned,
+                canonical_body.stream.unwrap_or(false),
+            );
+            let response = self
                 .empty_message_response(tenant_meta, canonical_body, &model_id_cloned)
                 .await;
+            if !response.status().is_success() {
+                self.messages_pipeline
+                    .record_error(Some(ENDPOINT), &model_id_cloned, &response);
+            }
+            return response;
         }
         let rate_limit_cell = Arc::new(RateLimitCell::new());
         let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
@@ -605,8 +790,15 @@ impl GrpcRouter {
     /// given it. A streaming request gets that message as `message_start`,
     /// then `message_delta` with the stop reason and `message_stop`. A request
     /// with media is counted at the placeholders the template writes for it,
-    /// as count_tokens counts it: the media is neither fetched nor checked, so
-    /// the count is the template's, not the expanded prompt's.
+    /// as count_tokens counts it: the media is neither fetched nor decoded, so
+    /// the count is the template's, not the expanded prompt's; an image or a
+    /// video to a pool whose every worker is language model only is refused
+    /// with `multimodal_not_supported` here as on every Messages path. A
+    /// prompt longer than the smallest context window the model's workers
+    /// advertise is refused as the pipeline refuses it after worker selection
+    /// (`context_length_exceeded`), so a 200 here means the prompt fits
+    /// whichever worker a real call lands on; a deployment that advertises no
+    /// window leaves the check to the engine, as the pipeline does.
     async fn empty_message_response(
         &self,
         tenant_meta: &TenantRequestMeta,
@@ -625,6 +817,13 @@ impl GrpcRouter {
             Ok(input_tokens) => input_tokens,
             Err(refused) => return refused,
         };
+        if let Some(limit) =
+            smallest_context_length(&self.worker_registry.get_by_model(model_id), model_id)
+        {
+            if input_tokens > limit {
+                return context_length_exceeded(input_tokens as usize, limit, model_id);
+            }
+        }
         let stream = body.stream.unwrap_or(false);
         let (id, _) = resolve_request_id_stamp(
             &RequestType::Messages(body),
@@ -1071,7 +1270,7 @@ mod pd_tests {
         Arc::new(
             AppContext::builder()
                 .router_config(config.clone())
-                .client(reqwest::Client::new())
+                .client(crate::http_client::client())
                 .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
                 .reasoning_parser_factory(Some(ReasoningParserFactory::new()))
                 .tool_parser_factory(Some(ToolParserFactory::new()))
@@ -1194,7 +1393,8 @@ mod pd_tests {
     /// id the pipeline would have given it (the client's `rid` when it sends
     /// one); streamed, that message as `message_start`, then `message_delta`
     /// with the stop reason and `message_stop`. No worker takes part; a
-    /// model nobody serves is a 404.
+    /// model nobody serves is a 404, and a prompt longer than the smallest
+    /// context window the model's workers advertise is the pipeline's 400.
     #[tokio::test]
     async fn max_tokens_zero_is_answered_with_an_empty_message() {
         let ctx = grpc_ctx(regular_routing_mode()).await;
@@ -1255,7 +1455,7 @@ mod pd_tests {
         let message: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
         assert_eq!(message["id"], "req-7");
 
-        let mut streamed = body;
+        let mut streamed = body.clone();
         streamed["stream"] = json!(true);
         let response = router
             .route_messages(None, &tenant_meta, message_request(streamed), "m")
@@ -1302,6 +1502,46 @@ mod pd_tests {
         assert_eq!(
             error::extract_error_code_from_response(&response),
             "model_not_found"
+        );
+
+        // The window check the pipeline makes after worker selection, here on
+        // the smallest window the model's workers advertise: a worker whose
+        // card holds the three-token prompt exactly changes nothing; one with
+        // a two-token window refuses it as the pipeline would.
+        let window_worker = |url: &str, context_length: u32| {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .model(ModelCard::new("m").with_context_length(context_length))
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            )
+        };
+        ctx.worker_registry
+            .register(window_worker("grpc://worker-window-3:30000", 3))
+            .expect("register worker");
+        let response = router
+            .route_messages(None, &tenant_meta, message_request(body.clone()), "m")
+            .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a three-token prompt fits a three-token window"
+        );
+        ctx.worker_registry
+            .register(window_worker("grpc://worker-window-2:30000", 2))
+            .expect("register worker");
+        let response = router
+            .route_messages(None, &tenant_meta, message_request(body), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "context_length_exceeded"
         );
     }
 

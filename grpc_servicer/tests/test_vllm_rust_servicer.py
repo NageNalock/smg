@@ -38,6 +38,18 @@ def _install(monkeypatch, name: str, **attrs) -> types.ModuleType:
     return module
 
 
+def _install_fake_servicer(monkeypatch, server, init_servicer_tracing=None):
+    """A fake ``smg.servicer`` binding under a fake ``smg`` package: the
+    installed package, where there is one, keeps its own ``servicer`` module."""
+    _install(monkeypatch, "smg")
+    return _install(
+        monkeypatch,
+        "smg.servicer",
+        VllmGrpcServer=server,
+        init_servicer_tracing=init_servicer_tracing or (lambda: None),
+    )
+
+
 def test_package_exposes_the_flag_and_the_rust_entry_points():
     import smg_grpc_servicer.vllm as pkg
 
@@ -449,6 +461,7 @@ def test_smg_media_options_follow_the_engine_config(tmp_path, monkeypatch):
     assert rust.smg_media_options(config, settings, str(tmp_path))["engine_item_limits"] == {
         "image": 8,
         "video": 2,
+        "audio": 1,
     }
     # The engine's video frame budget rides along: its media kwargs when set
     # (a non-positive count meaning every frame), else the loader's default,
@@ -564,6 +577,15 @@ def test_model_info_carries_where_the_engine_starts_a_grammar():
     info = rust.model_info_from_config(config)
     assert info["engine_reasoning_parser"] == ""
     assert info["structured_outputs_start"] == "first_token"
+
+
+def test_model_info_carries_the_stats_flag():
+    # The servicer is told whether the engine cores run with their scheduler
+    # statistics on (the wire then reports every step); unsaid, it classifies
+    # the wire by what it shows.
+    assert rust.model_info_from_config(_config())["log_stats"] is None
+    assert rust.model_info_from_config(_config(), log_stats=True)["log_stats"] is True
+    assert rust.model_info_from_config(_config(), log_stats=False)["log_stats"] is False
 
 
 def test_model_info_carries_the_running_window():
@@ -1027,10 +1049,7 @@ def test_serve_rust_starts_the_engine_cores_from_this_process(monkeypatch, tmp_p
     handshake port; the supervisor gets the cores' handle."""
     recorded = _stub_engine_core_launch(monkeypatch, _parallel())
     _stub_engine_exceptions(monkeypatch)
-    _install(monkeypatch, "smg")
-    _install(
-        monkeypatch, "smg.servicer", VllmGrpcServer=FakeServer, init_servicer_tracing=lambda: None
-    )
+    _install_fake_servicer(monkeypatch, FakeServer)
     monkeypatch.setattr(rust.multiprocessing, "get_context", lambda method: pytest.fail(method))
     monkeypatch.setattr(rust, "resolve_tokenizer_dir", lambda *a, **k: str(tmp_path))
     monkeypatch.setattr(rust, "free_port", lambda: 24321)
@@ -1058,6 +1077,33 @@ def test_serve_rust_starts_the_engine_cores_from_this_process(monkeypatch, tmp_p
     assert recorded["configs"][0][0] is args and recorded["configs"][1][0].headless is True
 
 
+def test_serve_rust_fakes_leave_the_installed_package_untouched():
+    """The fakes `_install_fake_servicer` installs (the helper every `serve_rust`
+    test here goes through) go under a fake ``smg`` package, so the installed
+    one keeps its own ``servicer`` module once a test is over. Skipped where the
+    `smg` wheel is not installed."""
+    servicer = pytest.importorskip("smg.servicer")
+    package = sys.modules["smg"]
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        _install_fake_servicer(monkeypatch, FakeServer)
+    assert sys.modules["smg"] is package
+    assert package.servicer is servicer
+
+
+def test_install_undoes_a_fake_under_a_real_package():
+    """A fake installed under a real package is undone with the test, the
+    attribute on the package like the ``sys.modules`` entry, so a later
+    ``from smg_grpc_servicer.vllm import servicer`` gets the real module."""
+    from smg_grpc_servicer import vllm as package
+
+    name = "smg_grpc_servicer.vllm.servicer"
+    before = (vars(package).get("servicer"), sys.modules.get(name))
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        fake = _install(monkeypatch, name)
+        assert package.servicer is fake and sys.modules[name] is fake
+    assert (vars(package).get("servicer"), sys.modules.get(name)) == before
+
+
 def test_serve_rust_constructs_the_server_with_keywords_the_binding_takes(monkeypatch, tmp_path):
     """The keyword set `serve_rust` hands the Rust server is bound against the
     compiled binding's constructor: a fact the launcher gains without a
@@ -1067,10 +1113,7 @@ def test_serve_rust_constructs_the_server_with_keywords_the_binding_takes(monkey
     signature = inspect.signature(servicer.VllmGrpcServer)
     _stub_engine_core_launch(monkeypatch, _parallel())
     _stub_engine_exceptions(monkeypatch)
-    _install(monkeypatch, "smg")
-    _install(
-        monkeypatch, "smg.servicer", VllmGrpcServer=FakeServer, init_servicer_tracing=lambda: None
-    )
+    _install_fake_servicer(monkeypatch, FakeServer)
     monkeypatch.setattr(rust, "resolve_tokenizer_dir", lambda *a, **k: str(tmp_path))
     monkeypatch.setattr(rust, "free_port", lambda: 24321)
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
@@ -1352,19 +1395,16 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
         @staticmethod
         def from_cli_args(args):
             recorded["engine_args_from"] = args
-            return SimpleNamespace(create_engine_config=lambda usage_context: _config())
+            return SimpleNamespace(
+                create_engine_config=lambda usage_context: _config(),
+                disable_log_stats=False,
+            )
 
     _stub_frontend_args(monkeypatch)
     _stub_engine_exceptions(monkeypatch)
     _install(monkeypatch, "vllm.engine.arg_utils", AsyncEngineArgs=AsyncEngineArgs)
     _install(monkeypatch, "vllm.usage.usage_lib", UsageContext=SimpleNamespace(OPENAI_API_SERVER=1))
-    _install(monkeypatch, "smg")
-    _install(
-        monkeypatch,
-        "smg.servicer",
-        VllmGrpcServer=FakeServer,
-        init_servicer_tracing=lambda: recorded.setdefault("tracing", True),
-    )
+    _install_fake_servicer(monkeypatch, FakeServer, lambda: recorded.setdefault("tracing", True))
     launched: list[argparse.Namespace] = []
 
     def fake_launch(ns):
@@ -1401,12 +1441,7 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
         servers.append(FakeServer(**kwargs))
         return servers[-1]
 
-    _install(
-        monkeypatch,
-        "smg.servicer",
-        VllmGrpcServer=recording_server,
-        init_servicer_tracing=lambda: None,
-    )
+    _install_fake_servicer(monkeypatch, recording_server)
 
     def failing_launch(ns):
         raise RuntimeError("engine would not start")
@@ -1428,6 +1463,8 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
     assert kwargs["served_model_name"] == "served-a"
     assert kwargs["eos_token_ids"] == [151645, 151643, 7]
     assert kwargs["kv_connector"] == ""
+    # The engine cores run with their statistics on: the servicer is told.
+    assert kwargs["log_stats"] is True
 
     (ns,) = launched
     assert ns.model == "org/m" and ns.model_tag is None and ns.grpc is False

@@ -8,8 +8,8 @@ use std::{fmt::Write as _, fs, path::PathBuf};
 
 use symphony::{
     formats::{
-        deepseek_v4_1, glm, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, plain, qwen2_5,
-        qwen3, seed_oss, xlam,
+        deepseek_v4_1, dots3, gemma4, glm, glm4, hy4, inkling, iquest, k2_horizon, kimi_k3, lfm2_5,
+        ling, minicpm5, minimax_m2, minimax_m3, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
     },
     tagged::{Placement, Spelling},
     CallSyntax, Format,
@@ -63,9 +63,16 @@ enum Table {
     Olmo3,
     Lfm2_5,
     Xlam,
+    MinimaxM2,
     MinimaxM3,
     KimiK3,
     Glm,
+    Glm4,
+    K2Horizon,
+    Inkling,
+    MiniCpm5,
+    Dots3,
+    Gemma4,
     Plain,
 }
 
@@ -85,9 +92,16 @@ impl Table {
             Self::Olmo3 => olmo3(),
             Self::Lfm2_5 => lfm2_5(),
             Self::Xlam => xlam(),
+            Self::MinimaxM2 => minimax_m2(),
             Self::MinimaxM3 => minimax_m3(),
             Self::KimiK3 => kimi_k3(),
             Self::Glm => glm(),
+            Self::Glm4 => glm4(),
+            Self::Inkling => inkling(),
+            Self::MiniCpm5 => minicpm5(),
+            Self::Dots3 => dots3(),
+            Self::Gemma4 => gemma4(),
+            Self::K2Horizon => k2_horizon(),
             Self::Plain => plain(),
         }
     }
@@ -142,7 +156,7 @@ const GROUPS: &[Group] = &[
         smg: (None, None),
         table: Some(Table::Qwen2_5),
         set: Some(41_533),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "apertus-8b-instruct-2509",
@@ -200,9 +214,9 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2026-08-09",
         smg: (None, None),
-        table: None,
-        set: None,
-        status: Status::Pending,
+        table: Some(Table::Dots3),
+        set: Some(54_195),
+        status: Status::Ready,
     },
     Group {
         slug: "ernie-4.5-21b-a3b-thinking",
@@ -220,9 +234,9 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2026-03-02",
         smg: (Some("json"), None),
-        table: None,
-        set: None,
-        status: Status::Pending,
+        table: Some(Table::Gemma4),
+        set: Some(54_416),
+        status: Status::Ready,
     },
     Group {
         slug: "glm-4.6",
@@ -230,9 +244,9 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2025-09-29",
         smg: (Some("glm45_moe"), None),
-        table: None,
-        set: None,
-        status: Status::Pending,
+        table: Some(Table::Glm4),
+        set: Some(43_309),
+        status: Status::Replaying,
     },
     Group {
         slug: "glm-4.7-flash",
@@ -262,7 +276,7 @@ const GROUPS: &[Group] = &[
         smg: (None, None),
         table: Some(Table::Qwen2_5),
         set: Some(41_533),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "hermes-4-14b",
@@ -272,7 +286,7 @@ const GROUPS: &[Group] = &[
         smg: (None, None),
         table: Some(Table::Qwen2_5),
         set: Some(41_533),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "hunyuan-a13b-instruct",
@@ -300,9 +314,9 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2026-07-14",
         smg: (Some("inkling"), Some("inkling")),
-        table: None,
-        set: None,
-        status: Status::Pending,
+        table: Some(Table::Inkling),
+        set: Some(54_418),
+        status: Status::Ready,
     },
     Group {
         slug: "iquest-q1",
@@ -312,7 +326,7 @@ const GROUPS: &[Group] = &[
         smg: (None, None),
         table: Some(Table::IQuest),
         set: Some(54_193),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "k-exaone-236b-a23b",
@@ -322,7 +336,7 @@ const GROUPS: &[Group] = &[
         smg: (None, None),
         table: Some(Table::Qwen3),
         set: Some(54_416),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "k2-horizon-36b",
@@ -330,9 +344,9 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2026-09-01",
         smg: (None, None),
-        table: None,
-        set: None,
-        status: Status::Pending,
+        table: Some(Table::K2Horizon),
+        set: Some(12_817),
+        status: Status::Replaying,
     },
     Group {
         slug: "kimi-k3",
@@ -350,9 +364,9 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2026-04-23",
         smg: (None, None),
-        table: None,
-        set: None,
-        status: Status::Pending,
+        table: Some(Table::Glm4),
+        set: Some(41_372),
+        status: Status::Ready,
     },
     Group {
         slug: "lfm2.5-1.2b-instruct",
@@ -362,7 +376,7 @@ const GROUPS: &[Group] = &[
         smg: (None, None),
         table: Some(Table::Lfm2_5),
         set: Some(54_418),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "ling-3.0-flash",
@@ -372,7 +386,7 @@ const GROUPS: &[Group] = &[
         smg: (None, None),
         table: Some(Table::Ling),
         set: Some(54_195),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "llama-xlam-2-8b-fc-r",
@@ -382,7 +396,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("json"), None),
         table: Some(Table::Xlam),
         set: Some(40_529),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "llava-1.5-7b-hf",
@@ -402,7 +416,7 @@ const GROUPS: &[Group] = &[
         smg: (None, None),
         table: Some(Table::Qwen3TaggedDirect),
         set: Some(54_181),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "minicpm5-2b",
@@ -410,9 +424,9 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2026-09-06",
         smg: (None, None),
-        table: None,
-        set: None,
-        status: Status::Pending,
+        table: Some(Table::MiniCpm5),
+        set: Some(54_181),
+        status: Status::Ready,
     },
     Group {
         slug: "minimax-m2",
@@ -420,9 +434,9 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2025-10-22",
         smg: (Some("minimax_m2"), Some("minimax")),
-        table: None,
-        set: None,
-        status: Status::Pending,
+        table: Some(Table::MinimaxM2),
+        set: Some(12_821),
+        status: Status::Replaying,
     },
     Group {
         slug: "minimax-m2.7",
@@ -430,9 +444,9 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2026-04-09",
         smg: (Some("minimax_m2"), Some("minimax")),
-        table: None,
-        set: None,
-        status: Status::Pending,
+        table: Some(Table::MinimaxM2),
+        set: Some(12_821),
+        status: Status::Replaying,
     },
     Group {
         slug: "minimax-m3",
@@ -442,7 +456,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("minimax_m3"), Some("minimax_m3")),
         table: Some(Table::MinimaxM3),
         set: Some(54_180),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "mistral-7b-instruct-v0.3",
@@ -492,7 +506,7 @@ const GROUPS: &[Group] = &[
         smg: (None, None),
         table: Some(Table::Olmo3),
         set: Some(41_533),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "phi-4-mini-instruct",
@@ -552,7 +566,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen2_5),
         set: Some(27_865),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen2.5-vl-32b-instruct",
@@ -562,7 +576,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen2_5),
         set: Some(27_865),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen2.5-vl-7b-instruct",
@@ -572,7 +586,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen2_5),
         set: Some(27_865),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3-30b-a3b",
@@ -582,7 +596,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen3),
         set: Some(54_418),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3-30b-a3b-instruct-2507",
@@ -592,7 +606,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen3),
         set: Some(41_533),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3-30b-a3b-thinking-2507",
@@ -602,7 +616,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen3),
         set: Some(54_418),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3-4b-instruct-2507",
@@ -612,7 +626,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen3),
         set: Some(41_533),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3-4b-saferl",
@@ -632,7 +646,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen3),
         set: Some(54_418),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3-8b",
@@ -658,7 +672,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen_xml"), Some("qwen3")),
         table: Some(Table::Qwen3Tagged),
         set: Some(41_362),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3-coder-next",
@@ -668,7 +682,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen_xml"), Some("qwen3")),
         table: Some(Table::Qwen3Tagged),
         set: Some(41_374),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3-next-80b-a3b-instruct",
@@ -678,7 +692,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen3),
         set: Some(41_533),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3-next-80b-a3b-thinking",
@@ -688,7 +702,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen3),
         set: Some(54_418),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3-omni-30b-a3b-instruct",
@@ -696,9 +710,9 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2025-09-20",
         smg: (Some("qwen"), Some("qwen3")),
-        table: None,
-        set: None,
-        status: Status::Pending,
+        table: Some(Table::Qwen3),
+        set: Some(54_418),
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3-omni-30b-a3b-thinking",
@@ -706,9 +720,9 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2025-09-15",
         smg: (Some("qwen"), Some("qwen3")),
-        table: None,
-        set: None,
-        status: Status::Pending,
+        table: Some(Table::Qwen3),
+        set: Some(54_418),
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3-vl-235b-a22b-thinking",
@@ -876,7 +890,7 @@ const GROUPS: &[Group] = &[
         smg: (None, None),
         table: Some(Table::SeedOss),
         set: Some(53_178),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "step-3.5-flash",
@@ -886,7 +900,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("step3"), None),
         table: Some(Table::Qwen3Tagged),
         set: Some(54_181),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "step3",

@@ -12,6 +12,7 @@ use smg_grpc_client::{
     TokenSpeedSchedulerClient, TrtllmServiceClient, VllmEngineClient,
 };
 
+use super::multimodal::SUPPORTS_VISION_LABEL;
 use crate::{
     observability::otel_trace::OtelTraceInjector,
     routers::grpc::{
@@ -356,17 +357,37 @@ impl GrpcClient {
         }
     }
 
-    /// Subscribe to KV cache events. Returns `Unimplemented` on backends
-    /// without KV-event streaming.
+    /// Subscribe to KV cache events, asking the servicer for its load records
+    /// before the publisher's first batch: the gateway's stream reader skips a
+    /// `load_only` batch before any sequence check (the KV-event monitor's
+    /// `process_stream`), so the records numbered 0 cost it nothing and a
+    /// worker's first request is judged like any later one. Returns
+    /// `Unimplemented` on backends without KV-event streaming.
     pub async fn subscribe_kv_events(
         &self,
         start_seq: u64,
     ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
         match self {
-            Self::Sglang(client) => client.subscribe_kv_events(start_seq).await,
-            Self::Vllm(client) => client.subscribe_kv_events(start_seq).await,
-            Self::Trtllm(client) => client.subscribe_kv_events(start_seq).await,
-            Self::TokenSpeed(client) => client.subscribe_kv_events(start_seq).await,
+            Self::Sglang(client) => {
+                client
+                    .subscribe_kv_events_with_load_records(start_seq)
+                    .await
+            }
+            Self::Vllm(client) => {
+                client
+                    .subscribe_kv_events_with_load_records(start_seq)
+                    .await
+            }
+            Self::Trtllm(client) => {
+                client
+                    .subscribe_kv_events_with_load_records(start_seq)
+                    .await
+            }
+            Self::TokenSpeed(client) => {
+                client
+                    .subscribe_kv_events_with_load_records(start_seq)
+                    .await
+            }
             Self::Mlx(_) => Err(tonic::Status::unimplemented(
                 "SubscribeKvEvents RPC not supported for MLX backend",
             )),
@@ -805,13 +826,39 @@ pub enum ServerInfo {
 impl ModelInfo {
     pub fn to_labels(&self) -> HashMap<String, String> {
         match self {
-            ModelInfo::Sglang(info) => flat_labels(info),
+            // The vLLM servicer computes `supports_vision` itself (the
+            // engine's own verdict; `false` = `--language-model-only` or a
+            // text model), so its `false` is a fact worth a label. One
+            // caveat: when that computation fails on an unexpected config
+            // shape, the servicer logs a warning and reports `false` as
+            // well, and a vision model in that state is refused images
+            // with the label's message instead of being served.
             ModelInfo::Vllm(info) => flat_labels(info),
-            ModelInfo::Trtllm(info) => flat_labels(info),
-            ModelInfo::Mlx(info) => flat_labels(info),
-            ModelInfo::TokenSpeed(info) => flat_labels(info),
+            ModelInfo::Sglang(info) => without_unset_vision(flat_labels(info)),
+            ModelInfo::Trtllm(info) => without_unset_vision(flat_labels(info)),
+            ModelInfo::Mlx(info) => without_unset_vision(flat_labels(info)),
+            ModelInfo::TokenSpeed(info) => without_unset_vision(flat_labels(info)),
         }
     }
+}
+
+/// A proto3 `bool` cannot tell "unset" from `false`. The SGLang Python
+/// servicer reads `supports_vision` from its scheduler info with a default
+/// of `false` (a vision model served by it was refused images on that
+/// default), and a servicer that predates the field sends the proto default;
+/// TokenSpeed's servicer derives the field from its static modality list, an
+/// accurate answer, but the field cannot tell that derivation from an older
+/// servicer's default. For every runtime but vLLM a `false` is therefore
+/// dropped as no verdict: no label, so nothing downstream reads a refusal
+/// into it; a `true` is kept.
+fn without_unset_vision(mut labels: HashMap<String, String>) -> HashMap<String, String> {
+    if labels
+        .get(SUPPORTS_VISION_LABEL)
+        .is_some_and(|value| value == "false")
+    {
+        labels.remove(SUPPORTS_VISION_LABEL);
+    }
+    labels
 }
 
 impl ServerInfo {
@@ -1039,7 +1086,7 @@ mod tests {
 
     use smg_grpc_client::{sglang_proto, tokenspeed_proto, vllm_proto};
 
-    use super::{trtllm_status_healthy, ModelInfo, ServerInfo};
+    use super::{trtllm_status_healthy, ModelInfo, ServerInfo, SUPPORTS_VISION_LABEL};
 
     /// A vLLM worker's `GetServerInfo` fields flatten into labels as they
     /// are: the engine's per-prompt media limits arrive as `mm_item_limits`,
@@ -1086,6 +1133,67 @@ mod tests {
         let silent = ServerInfo::Vllm(Box::default()).to_labels();
         assert!(!silent.contains_key("engine_reasoning_parser"));
         assert!(!silent.contains_key("structured_outputs_start"));
+    }
+
+    /// `supports_vision` is a label only when a servicer set it on purpose:
+    /// vLLM's `false` stays (language-model-only / text model); the SGLang
+    /// and TokenSpeed protos carry the same `bool`, which their servicers may
+    /// leave at the proto default even for a vision model, so their `false`
+    /// yields no label (unknown) and their `true` is kept.
+    #[test]
+    fn model_info_to_labels_keeps_only_a_deliberate_vision_verdict() {
+        let vllm_text = ModelInfo::Vllm(vllm_proto::GetModelInfoResponse {
+            supports_vision: false,
+            ..Default::default()
+        });
+        assert_eq!(
+            vllm_text
+                .to_labels()
+                .get(SUPPORTS_VISION_LABEL)
+                .map(String::as_str),
+            Some("false")
+        );
+        let vllm_vision = ModelInfo::Vllm(vllm_proto::GetModelInfoResponse {
+            supports_vision: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            vllm_vision
+                .to_labels()
+                .get(SUPPORTS_VISION_LABEL)
+                .map(String::as_str),
+            Some("true")
+        );
+
+        let sglang_unset = ModelInfo::Sglang(Box::default());
+        assert!(!sglang_unset.to_labels().contains_key(SUPPORTS_VISION_LABEL));
+        let sglang_vision = ModelInfo::Sglang(Box::new(sglang_proto::GetModelInfoResponse {
+            supports_vision: true,
+            ..Default::default()
+        }));
+        assert_eq!(
+            sglang_vision
+                .to_labels()
+                .get(SUPPORTS_VISION_LABEL)
+                .map(String::as_str),
+            Some("true")
+        );
+
+        let tokenspeed_unset = ModelInfo::TokenSpeed(Box::default());
+        assert!(!tokenspeed_unset
+            .to_labels()
+            .contains_key(SUPPORTS_VISION_LABEL));
+        // Other booleans keep flattening as before, `false` included.
+        assert_eq!(
+            ModelInfo::Sglang(Box::new(sglang_proto::GetModelInfoResponse {
+                is_generation: false,
+                ..Default::default()
+            }))
+            .to_labels()
+            .get("is_generation")
+            .map(String::as_str),
+            Some("false")
+        );
     }
 
     #[test]
@@ -1462,7 +1570,8 @@ mod tests {
 
     /// `GetModelInfoResponse` is flat for every backend, so it serializes via
     /// `flat_labels`: empty strings and zero numbers are skipped, booleans are
-    /// kept, arrays are JSON-encoded.
+    /// kept (except a non-vLLM `supports_vision: false`, which is no verdict),
+    /// arrays are JSON-encoded.
     #[test]
     fn model_info_to_labels_tokenspeed_flat_serializes_skipping_empty_and_zero() {
         let info = ModelInfo::TokenSpeed(Box::new(tokenspeed_proto::GetModelInfoResponse {
@@ -1474,6 +1583,7 @@ mod tests {
             vocab_size: 151_936,
             pad_token_id: 0, // zero — skipped
             supports_vision: false,
+            supports_multimodal: false,
             ..Default::default()
         }));
 
@@ -1496,8 +1606,11 @@ mod tests {
             labels.get("architectures").map(String::as_str),
             Some(r#"["Qwen3ForCausalLM"]"#)
         );
+        // A proto-default `false` is no vision verdict on this runtime...
+        assert!(!labels.contains_key("supports_vision"));
+        // ...while other booleans flatten as before, `false` included.
         assert_eq!(
-            labels.get("supports_vision").map(String::as_str),
+            labels.get("supports_multimodal").map(String::as_str),
             Some("false")
         );
         assert!(!labels.contains_key("tokenizer_path"));

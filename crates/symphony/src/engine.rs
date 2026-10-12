@@ -59,6 +59,7 @@
 use crate::{
     event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
     format::{CallSyntax, Emits, Format},
+    gemma,
     input::{EngineFinish, Input},
     json,
     markers::{Piece, Scanner},
@@ -109,6 +110,9 @@ enum Call {
     JsonList(json::list::Assembler),
     Xml(tagged::xml::Assembler),
     Xtml(tagged::xtml::Assembler),
+    Attributed(tagged::attributed::Assembler),
+    NamedJson(json::named::Assembler),
+    Gemma(gemma::Assembler),
 }
 
 impl Call {
@@ -125,10 +129,17 @@ impl Call {
             Some(CallSyntax::Keyed(tags)) => {
                 Self::Keyed(tagged::keyed::Assembler::new(index, id, tags))
             }
-            Some(CallSyntax::Pythonic) => Self::Pythonic(pythonic::Assembler::new(index)),
+            Some(CallSyntax::Pythonic(_)) => Self::Pythonic(pythonic::Assembler::new(index)),
             Some(CallSyntax::JsonList) => Self::JsonList(json::list::Assembler::new(index)),
             Some(CallSyntax::Xml) => Self::Xml(tagged::xml::Assembler::new(index, id)),
             Some(CallSyntax::Xtml) => Self::Xtml(tagged::xtml::Assembler::new(index, id)),
+            Some(CallSyntax::Attributed(tags)) => {
+                Self::Attributed(tagged::attributed::Assembler::new(index, id, tags))
+            }
+            Some(CallSyntax::NamedJson(marker)) => {
+                Self::NamedJson(json::named::Assembler::new(index, id, marker))
+            }
+            Some(CallSyntax::Gemma) => Self::Gemma(gemma::Assembler::new(index, id)),
         }
     }
 
@@ -157,6 +168,15 @@ impl Call {
                 text.len()
             }
             Self::Xtml(assembler) => {
+                assembler.feed(text, out);
+                text.len()
+            }
+            Self::Attributed(assembler) => {
+                assembler.feed(text, declared, out);
+                text.len()
+            }
+            Self::NamedJson(assembler) => assembler.feed(text, out),
+            Self::Gemma(assembler) => {
                 assembler.feed(text, out);
                 text.len()
             }
@@ -228,6 +248,26 @@ impl Call {
             }
             (Self::Xtml(assembler), Closed::ByMarker) => assembler.close("", out),
             (Self::Xtml(assembler), Closed::ByEnd) => assembler.finish(out),
+            // As for DSML: only the invoke's closing tag is a started call's end, and an invoke
+            // that named no call takes whichever terminal ended it.
+            (Self::Attributed(assembler), Closed::ByMarker)
+                if terminal == assembler.invoke_close() || !assembler.started() =>
+            {
+                assembler.close(terminal, out);
+                return true;
+            }
+            (Self::Attributed(assembler), Closed::ByMarker) => assembler.close("", out),
+            (Self::Attributed(assembler), Closed::ByEnd) => assembler.finish(out),
+            // The message's closing terminal is the region's, as Qwen3's `</tool_call>` is: the
+            // object closed the call at its brace.
+            (Self::NamedJson(assembler), Closed::ByMarker) => assembler.close(out),
+            (Self::NamedJson(assembler), Closed::ByEnd) => assembler.finish(out),
+            // Gemma 4's closing marker is the call's own, carried by its end.
+            (Self::Gemma(assembler), Closed::ByMarker) => {
+                assembler.close(terminal, out);
+                return true;
+            }
+            (Self::Gemma(assembler), Closed::ByEnd) => assembler.finish(out),
         }
         false
     }

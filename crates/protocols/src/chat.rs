@@ -6,11 +6,11 @@ use validator::Validate;
 
 use super::{
     common::{
-        default_true, deserialize_null_as_false, deserialize_null_as_true, is_false, is_true,
-        validate_json_schema_shape, validate_stop, CachePartition, ChatLogProbs, ContentPart,
-        Function, FunctionCall, FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions,
-        StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference,
-        Usage,
+        default_true, deserialize_null_as_empty_vec, deserialize_null_as_false,
+        deserialize_null_as_true, invalid, is_false, is_true, validate_json_schema_shape,
+        validate_stop, CachePartition, ChatLogProbs, ContentPart, Function, FunctionCall,
+        FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions, StringOrArray, Tool,
+        ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference, Usage,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -74,7 +74,9 @@ pub enum ChatMessage {
         ext: KimiDeveloperExt,
     },
     /// MiniMax extension: top-priority instruction message, above system.
-    /// Normalized to a system message for dispatch; rejected by other profiles.
+    /// Hoisted to the front for dispatch (several merge into one), where the
+    /// chat template reads it; a template without a root branch gets it as
+    /// the leading system message. Rejected by other profiles.
     #[serde(rename = "root")]
     Root {
         content: MessageContent,
@@ -432,9 +434,11 @@ impl ThinkingParam {
 
 impl ChatCompletionRequest {
     /// The cap the client put on the completion: `max_completion_tokens`,
-    /// else the deprecated `max_tokens`. The request keeps whichever field
-    /// the client wrote, so a proxied body reaches its upstream unchanged;
-    /// everything that needs the number reads it here.
+    /// else the deprecated `max_tokens`; when the client wrote both, the
+    /// current name wins, as the serving engines resolve the pair. The
+    /// request keeps whichever fields the client wrote, so a proxied body
+    /// reaches its upstream unchanged; everything that needs the number
+    /// reads it here.
     pub fn output_token_cap(&self) -> Option<u32> {
         #[expect(deprecated, reason = "the one place the deprecated field is read")]
         let max_tokens = self.max_tokens;
@@ -495,16 +499,13 @@ where
 
 fn validate_messages(messages: &[ChatMessage]) -> Result<(), validator::ValidationError> {
     if messages.is_empty() {
-        return Err(validator::ValidationError::new("messages cannot be empty"));
+        return Err(invalid(
+            "empty_array",
+            "Invalid 'messages': empty array. Expected an array with minimum length 1, but got an empty array instead.".to_string(),
+        ));
     }
 
     Ok(())
-}
-
-fn invalid(code: &'static str, message: String) -> validator::ValidationError {
-    let mut e = validator::ValidationError::new(code);
-    e.message = Some(message.into());
-    e
 }
 
 fn validate_verbosity(verbosity: &str) -> Result<(), validator::ValidationError> {
@@ -720,20 +721,11 @@ fn validate_chat_cross_parameters(
         ));
     }
 
-    // 10. `max_tokens` and `max_completion_tokens` are one setting: both at
-    //     once is a contradiction (normalization migrates the deprecated
-    //     name only when the current one is absent)
-    #[expect(deprecated)]
-    if req.max_tokens.is_some() && req.max_completion_tokens.is_some() {
-        return Err(invalid(
-            "invalid_parameter_combination",
-            "'max_tokens' and 'max_completion_tokens' cannot both be set; use \
-             'max_completion_tokens'"
-                .to_string(),
-        ));
-    }
-
-    // 11. Provider-profile contract rules, selected from the model id
+    // 10. Provider-profile contract rules, selected from the model id. Both
+    //     token limits at once are judged there: the request keeps whichever
+    //     the client wrote and `output_token_cap` reads `max_completion_tokens`
+    //     first, the precedence the serving engines apply themselves; only
+    //     OpenAI's own contract refuses the pair.
     ProviderProfile::for_model(&req.model).validate_chat(req)?;
 
     Ok(())
@@ -788,8 +780,8 @@ impl Normalizable for ChatCompletionRequest {
     /// Normalize the request:
     /// 1. Apply the profile's rewrites to the request as the client sent it,
     ///    before any migration: drop message extensions that belong to another
-    ///    provider's profile and fold MiniMax `root` into the leading system
-    ///    message (see [`ProviderProfile::normalize_chat`])
+    ///    provider's profile and merge MiniMax `root` messages into one
+    ///    leading root (see [`ProviderProfile::normalize_chat`])
     /// 2. Migrate deprecated fields to their replacements
     /// 3. Clear deprecated fields and log warnings
     /// 4. Apply OpenAI defaults for tool_choice
@@ -981,11 +973,16 @@ pub struct ChatCompletionMessage {
     /// refusals, so it is `null`.
     #[serde(default)]
     pub refusal: Option<String>,
+    /// Always present, as the OpenAI API sends it; the gateway attaches no
+    /// annotations of its own, so the list is empty unless an upstream sent
+    /// some. An upstream's missing key or `null` reads as the empty list.
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
+    pub annotations: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     pub reasoning_content: Option<String>,
     // Note: function_call is deprecated and not included
-    // Note: annotations, audio are not added yet
+    // Note: audio is not added yet
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -1381,6 +1378,7 @@ mod tests {
             role: "assistant".to_string(),
             content: None,
             refusal: None,
+            annotations: Vec::new(),
             tool_calls: Some(vec![crate::common::ToolCall {
                 id: "call_1".to_string(),
                 tool_type: "function".to_string(),
@@ -1394,6 +1392,41 @@ mod tests {
         let value = serde_json::to_value(&message).expect("serialize");
         assert_eq!(value.get("content"), Some(&Value::Null), "{value}");
         assert_eq!(value["tool_calls"][0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn completion_message_carries_the_always_present_annotations() {
+        // Parsed without annotations (an engine's answer), the message leaves
+        // with the public API's empty list.
+        let message: super::ChatCompletionMessage = serde_json::from_value(json!({
+            "role": "assistant", "content": "Hello!", "refusal": null, "reasoning_content": null
+        }))
+        .expect("parse");
+        let value = serde_json::to_value(&message).expect("serialize");
+        assert_eq!(value["annotations"], json!([]), "{value}");
+    }
+
+    #[test]
+    fn an_upstreams_null_annotations_read_as_the_empty_list_and_a_list_is_kept() {
+        // An upstream that writes the key as `null` parses (the key was ignored
+        // before the field existed) and leaves as the empty list.
+        let message: super::ChatCompletionMessage = serde_json::from_value(json!({
+            "role": "assistant", "content": "Hello!", "refusal": null,
+            "annotations": null, "reasoning_content": null
+        }))
+        .expect("a null annotations list parses");
+        let value = serde_json::to_value(&message).expect("serialize");
+        assert_eq!(value["annotations"], json!([]), "{value}");
+        // A list an upstream sent is kept as it was.
+        let sent =
+            json!([{"type": "url_citation", "url_citation": {"url": "https://example.com"}}]);
+        let message: super::ChatCompletionMessage = serde_json::from_value(json!({
+            "role": "assistant", "content": "Hello!", "refusal": null,
+            "annotations": sent, "reasoning_content": null
+        }))
+        .expect("parse");
+        let value = serde_json::to_value(&message).expect("serialize");
+        assert_eq!(value["annotations"], sent, "{value}");
     }
 }
 
@@ -1473,12 +1506,23 @@ mod request_contract_tests {
         assert_eq!(rejection(&good), None);
     }
 
+    /// Both token limits at once are accepted outside OpenAI's own contract
+    /// (a self-hosted model, a vendor profile), whatever the two values, and
+    /// `max_completion_tokens` is the cap; the deprecated name alone still
+    /// carries it.
     #[test]
-    fn max_tokens_and_max_completion_tokens_together_are_rejected() {
-        let both = request(json!({"max_tokens": 32, "max_completion_tokens": 64}));
-        assert!(rejection(&both).is_some_and(|e| e.contains("invalid_parameter_combination")));
-        // The deprecated name alone still migrates.
+    fn both_token_limits_are_accepted_and_max_completion_tokens_wins() {
+        for model in ["test-model", "MiniMax-M2"] {
+            for (legacy, current) in [(32, 64), (64, 32), (64, 64)] {
+                let both = request(
+                    json!({"model": model, "max_tokens": legacy, "max_completion_tokens": current}),
+                );
+                assert_eq!(rejection(&both), None, "{model}: {legacy} and {current}");
+                assert_eq!(both.output_token_cap(), Some(current), "{model}");
+            }
+        }
         let legacy = request(json!({"max_tokens": 32, "max_completion_tokens": null}));
         assert_eq!(rejection(&legacy), None);
+        assert_eq!(legacy.output_token_cap(), Some(32));
     }
 }

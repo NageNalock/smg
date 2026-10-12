@@ -40,7 +40,10 @@ use crate::{
                 FanoutStream, ProtoEmbedRequest, ProtoGenerateRequest, ProtoRequest,
                 ProtoResponseVariant, ProtoStream,
             },
-            utils::tonic_ext::{TonicResultExt, TonicStatusExt},
+            utils::{
+                account_pd_leg_failure,
+                tonic_ext::{TonicResultExt, TonicStatusExt},
+            },
         },
     },
     worker::{ConnectionModeExt, PrefillLoadGuard, Worker},
@@ -293,7 +296,9 @@ impl DumpScope {
         Some(Self {
             session,
             model: ctx.model_id.clone(),
-            root_request_id: ctx.root_request_id.clone(),
+            // The request-id middleware's id, which the dispatch carries
+            // whether or not cache tracing is on.
+            root_request_id: ctx.request_id.clone(),
         })
     }
 
@@ -1093,8 +1098,11 @@ async fn execute_parallel_pd(
                 prefill: prefill_stream,
                 decode: Box::new(decode_stream),
                 prefill_guards: vec![Some(prefill_guard)],
+                // Both legs were dispatched together, so the decode leg's
+                // time to first token is the end-to-end one.
                 pd_timing: PdTiming {
                     prefill_start,
+                    decode_sent: prefill_start,
                     runtime,
                 },
                 // The streaming layer drains the live prefill stream itself.
@@ -1200,8 +1208,10 @@ async fn dispatch_pd_legs(
 }
 
 /// Log, count and translate one leg's dispatch failure into the client answer.
+/// A failure that names the rendezvous counts under the rendezvous family too.
 fn pd_leg_error(leg: PdLeg, connection: &'static str, error: &tonic::Status) -> Response {
     Metrics::record_worker_error(leg.name(), connection, metrics_labels::ERROR_BACKEND);
+    account_pd_leg_failure(leg.name(), error);
     start_failure_response(
         error,
         "execute_parallel_pd",
@@ -1275,6 +1285,9 @@ enum SequentialPdDecodeForm {
 
 /// Pick the decode-leg form, failing fast when the selected decode worker is
 /// language-model-only and the request is one that pairing cannot serve.
+/// Worker selection keeps such a request off such workers while the model
+/// pairs a decode worker with the vision encoder (`decode_needs_vision`), so
+/// a refusal here means none is paired.
 fn sequential_pd_decode_form(
     request: &ProtoGenerateRequest,
     decode_language_model_only: bool,
@@ -1294,9 +1307,10 @@ fn sequential_pd_decode_form(
         // this pairing cannot serve the request.
         let mut response = error::bad_request(
             "pd_decode_language_model_only_mrope",
-            "the selected decode worker runs with --language-model-only, but this \
-             model's decode leg needs its M-RoPE grid tensors; run the decode pool \
-             with the vision encoder enabled for this model"
+            "no decode worker with a vision encoder is paired for this model, and its \
+             decode leg needs the M-RoPE grid tensors a decode worker running with \
+             --language-model-only cannot take; add a decode worker with the vision \
+             encoder enabled for this model"
                 .to_string(),
         );
         mark_non_retryable(&mut response);
@@ -1307,9 +1321,10 @@ fn sequential_pd_decode_form(
         // expands itself; a language-model-only decode worker cannot.
         let mut response = error::bad_request(
             "pd_decode_language_model_only_media_refs",
-            "the selected decode worker runs with --language-model-only and cannot \
-             expand media references; use router-side multimodal processing \
-             (--mm-processing=router) for this pool"
+            "no decode worker with a vision encoder is paired for this model, and a \
+             decode worker running with --language-model-only cannot expand media \
+             references; add such a decode worker or use router-side multimodal \
+             processing (--mm-processing=router) for this pool"
                 .to_string(),
         );
         mark_non_retryable(&mut response);
@@ -1320,9 +1335,10 @@ fn sequential_pd_decode_form(
         // a pixel-less decode worker cannot do.
         let mut response = error::bad_request(
             "pd_decode_language_model_only_n_samples",
-            "the selected decode worker runs with --language-model-only and cannot \
-             recompute a multimodal prompt; n>1 parallel sampling needs decode \
-             workers with the vision encoder enabled"
+            "no decode worker with a vision encoder is paired for this model, and n>1 \
+             parallel sampling of a multimodal prompt recomputes it on the decode \
+             leg, which a decode worker running with --language-model-only cannot \
+             do; add a decode worker with the vision encoder enabled"
                 .to_string(),
         );
         mark_non_retryable(&mut response);
@@ -1514,6 +1530,7 @@ async fn execute_sequential_pd(
                 prefill_label,
                 metrics_labels::ERROR_BACKEND,
             );
+            account_pd_leg_failure(metrics_labels::WORKER_PREFILL, &e);
             start_failure_response(
                 &e,
                 "execute_sequential_pd",
@@ -1551,6 +1568,7 @@ async fn execute_sequential_pd(
                     prefill_label,
                     metrics_labels::ERROR_BACKEND,
                 );
+                account_pd_leg_failure(metrics_labels::WORKER_PREFILL, &e);
                 error!(function = "execute_sequential_pd", error = %e, "Prefill stream error");
                 return Err(e.to_http_error(
                     "prefill_stream_error",
@@ -1563,11 +1581,9 @@ async fn execute_sequential_pd(
     // Prefill is drained: its admission slot is free while decode runs.
     drop(prefill_guard);
     workers.record_outcome_prefill(ledger, 200);
-    // Captured at drain; recorded below only once decode is established.
-    let prefill_duration = prefill_start.elapsed();
-
-    // KV-transfer window: prefill drain complete to decode send complete.
-    let kv_window_start = Instant::now();
+    // The prefill phase ends at the drain; recorded below only once decode is
+    // established.
+    let prefill_done = Instant::now();
 
     debug!("vLLM PD: prefill completed, sending decode request");
 
@@ -1675,6 +1691,12 @@ async fn execute_sequential_pd(
             &decode_request,
         )
     });
+    // The relay phase ends at the decode dispatch. Everything after this
+    // instant, including the engines' KV transfer and the decode scheduling,
+    // is the decode leg's time to first token; the instant is taken before the
+    // call so a worker that holds its response headers until the first token
+    // still lands in the decode phase.
+    let decode_sent = Instant::now();
     let decode_stream = start_generate(decode_client, decode_request, decode_call)
         .await
         .map_err(|e| {
@@ -1686,6 +1708,7 @@ async fn execute_sequential_pd(
                 decode_label,
                 metrics_labels::ERROR_BACKEND,
             );
+            account_pd_leg_failure(metrics_labels::WORKER_DECODE, &e);
             start_failure_response(
                 &e,
                 "execute_sequential_pd",
@@ -1701,13 +1724,13 @@ async fn execute_sequential_pd(
         metrics_labels::BACKEND_PD,
         model,
         runtime,
-        prefill_duration,
+        prefill_done.duration_since(prefill_start),
     );
     Metrics::record_pd_kv_transfer_duration(
         metrics_labels::BACKEND_PD,
         model,
         runtime,
-        kv_window_start.elapsed(),
+        decode_sent.duration_since(prefill_done),
     );
 
     // Prefill has completed and its KV blocks are held pending decode's
@@ -1730,6 +1753,7 @@ async fn execute_sequential_pd(
         prefill_guards: vec![None],
         pd_timing: PdTiming {
             prefill_start,
+            decode_sent,
             runtime,
         },
         prefill_input_logprobs,
@@ -1792,6 +1816,43 @@ mod tests {
             decode: leg("grpc://decode:30000", WorkerType::Decode),
             runtime_type: RuntimeType::TokenSpeed,
         }
+    }
+
+    /// A leg whose dispatch fails with the engine's rendezvous verdict is
+    /// counted under the rendezvous family, by leg and phase; any other
+    /// dispatch failure of a leg is not.
+    #[test]
+    fn a_leg_that_fails_its_rendezvous_at_dispatch_is_counted() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            pd_leg_error(
+                PdLeg::Prefill,
+                metrics_labels::CONNECTION_GRPC,
+                &tonic::Status::internal(
+                    "Prefill bootstrap failed for request rank=0 req.rid='r1' \
+                     req.bootstrap_room=41 with exception KVTransferError(bootstrap_room=41): \
+                     Request 41 timed out after 120.0s in KVPoll.Bootstrapping",
+                ),
+            );
+            pd_leg_error(
+                PdLeg::Decode,
+                metrics_labels::CONNECTION_GRPC,
+                &tonic::Status::unavailable("connection reset"),
+            );
+        });
+        let rendered = handle.render();
+        let counted: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_pd_rendezvous_failures_total{"))
+            .collect();
+        assert_eq!(counted.len(), 1, "{rendered}");
+        assert!(
+            counted[0].contains(r#"leg="prefill""#)
+                && counted[0].contains(r#"phase="bootstrap""#)
+                && counted[0].ends_with(" 1"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -2683,14 +2744,32 @@ mod tests {
         assert!(!tokenspeed_request(1, None).has_kv_transfer_params());
     }
 
+    /// The refusals of a pool with no vision-capable decode worker (worker
+    /// selection pairs one when the model has it): each names its code and
+    /// says that none is paired.
     #[tokio::test]
     async fn sequential_pd_decode_form_rejects_incompatible_pairings() {
+        async fn refusal(response: Response) -> String {
+            assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let text = String::from_utf8(body.to_vec()).expect("utf-8 body");
+            assert!(
+                text.contains("no decode worker with a vision encoder is paired"),
+                "{text}"
+            );
+            text
+        }
+
         // M-RoPE grids + language-model-only decode: cannot strip (positions
         // would be wrong), cannot send (encoder-cache budget 0).
         let gridded = vllm_pd_mm_request();
         let response = sequential_pd_decode_form(&gridded, true, true)
             .expect_err("mRoPE grids need a vision-capable decode worker");
-        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+        assert!(refusal(response)
+            .await
+            .contains("pd_decode_language_model_only_mrope"));
 
         // Media references + language-model-only decode: the leg would have
         // to expand the anchors itself.
@@ -2702,7 +2781,9 @@ mod tests {
         req.extra_mm_inputs.clear();
         let response = sequential_pd_decode_form(&refs_only, true, true)
             .expect_err("media refs need a processing decode worker");
-        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+        assert!(refusal(response)
+            .await
+            .contains("pd_decode_language_model_only_media_refs"));
 
         // n>1 + mm + language-model-only decode: no KV handoff, no local
         // recompute either.
@@ -2718,7 +2799,9 @@ mod tests {
             .clear();
         let response = sequential_pd_decode_form(&fanout, true, false)
             .expect_err("n>1 cannot recompute on a pixel-less decode worker");
-        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+        assert!(refusal(response)
+            .await
+            .contains("pd_decode_language_model_only_n_samples"));
     }
 
     #[test]

@@ -64,6 +64,18 @@ where
     Option::<bool>::deserialize(deserializer).map(|opt| opt.unwrap_or(false))
 }
 
+/// Deserialize a list that also accepts JSON `null` (mapped to the empty list).
+///
+/// Use with `#[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]`
+/// on always-present lists an upstream may write as `null`.
+pub fn deserialize_null_as_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<Vec<T>>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
 /// Deserialize an `Option<bool>` where JSON `null` means the default `true`.
 ///
 /// Use with `#[serde(default = "default_true", deserialize_with = "deserialize_null_as_true")]`
@@ -241,6 +253,13 @@ impl<'a> Iterator for StringOrArrayIter<'a> {
 
 impl<'a> ExactSizeIterator for StringOrArrayIter<'a> {}
 
+/// A validation error with the public API's `code` and message.
+pub(crate) fn invalid(code: &'static str, message: String) -> validator::ValidationError {
+    let mut e = validator::ValidationError::new(code);
+    e.message = Some(message.into());
+    e
+}
+
 /// Validates stop sequences (max 4, non-empty strings)
 /// Used by both ChatCompletionRequest and ResponsesRequest
 pub fn validate_stop(stop: &StringOrArray) -> Result<(), validator::ValidationError> {
@@ -254,8 +273,12 @@ pub fn validate_stop(stop: &StringOrArray) -> Result<(), validator::ValidationEr
         }
         StringOrArray::Array(arr) => {
             if arr.len() > 4 {
-                return Err(validator::ValidationError::new(
-                    "maximum 4 stop sequences allowed",
+                return Err(invalid(
+                    "array_above_max_length",
+                    format!(
+                        "Invalid 'stop': array too long. Expected an array with maximum length 4, but got an array with length {} instead.",
+                        arr.len()
+                    ),
                 ));
             }
             for s in arr {
@@ -892,9 +915,14 @@ pub struct LogProbs {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum ChatLogProbs {
+    /// The public API's object: `content` and `refusal` are both always
+    /// present (`null` when there is none); the gateway produces no refusals,
+    /// so `refusal` is `null`.
     Detailed {
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         content: Option<Vec<ChatLogProbsContent>>,
+        #[serde(default)]
+        refusal: Option<Vec<ChatLogProbsContent>>,
     },
     Raw(Value),
 }
@@ -1191,6 +1219,20 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn the_logprobs_object_carries_content_and_refusal() {
+        // Parsed as an engine reports it (content only), the object leaves
+        // with both of the public API's properties, `refusal` null.
+        let logprobs: ChatLogProbs = serde_json::from_value(json!({
+            "content": [{"token": "Hi", "logprob": -0.1, "bytes": [72, 105], "top_logprobs": []}]
+        }))
+        .expect("parse");
+        assert!(matches!(logprobs, ChatLogProbs::Detailed { .. }));
+        let value = serde_json::to_value(&logprobs).expect("serialize");
+        assert_eq!(value["content"][0]["token"], "Hi", "{value}");
+        assert_eq!(value.get("refusal"), Some(&Value::Null), "{value}");
+    }
 
     #[test]
     fn to_value_exact_keeps_f32_fields_as_the_client_wrote_them() {

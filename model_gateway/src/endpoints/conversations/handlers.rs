@@ -10,8 +10,9 @@ use axum::{
 use chrono::Utc;
 use serde_json::{json, Value};
 use smg_data_connector::{
-    Conversation, ConversationId, ConversationItem, ConversationItemId, ConversationItemStorage,
-    ConversationStorage, ListParams, NewConversation, NewConversationItem, SortOrder,
+    AddedAtSequence, Conversation, ConversationId, ConversationItem, ConversationItemId,
+    ConversationItemStorage, ConversationStorage, ListParams, NewConversation, NewConversationItem,
+    SortOrder,
 };
 use tracing::info;
 
@@ -78,6 +79,17 @@ fn internal_error(message: impl Into<String>) -> Response {
 
 fn bad_request_structured(error_obj: Value) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({"error": error_obj}))).into_response()
+}
+
+/// The refusal of an item the conversation already has, whether it arrives as an
+/// `item_reference` or under its own id.
+fn item_already_in_conversation() -> Response {
+    bad_request_structured(json!({
+        "message": "Item already in conversation",
+        "type": "invalid_request_error",
+        "param": "items",
+        "code": "item_already_in_conversation"
+    }))
 }
 
 // ============================================================================
@@ -267,16 +279,9 @@ pub async fn list_conversation_items(
 
     match item_storage.list_items(&conversation_id, params).await {
         Ok(items) => {
-            let item_values: Vec<Value> = items
-                .iter()
-                .map(|item| {
-                    let mut item_json = item_to_json(item);
-                    if let Some(obj) = item_json.as_object_mut() {
-                        obj.insert("created_at".to_string(), json!(item.created_at));
-                    }
-                    item_json
-                })
-                .collect();
+            // The item objects as the public API lists them: each item's own
+            // fields, the same object the single-item GET answers.
+            let item_values: Vec<Value> = items.iter().map(item_to_json).collect();
 
             (
                 StatusCode::OK,
@@ -322,9 +327,12 @@ pub async fn create_conversation_items(
     let mut warnings = Vec::new();
     let mut link_pairs = Vec::new();
     let mut seen_ids = HashSet::new();
-    let added_at = Utc::now();
+    // One stamp per item, each later than the one before: the stores order a conversation's
+    // items by `added_at`, so the items of this call list in the order the request gave them.
+    let mut stamps = AddedAtSequence::new();
 
     for item_val in items_array {
+        let added_at = stamps.next_added_at();
         match process_item(item_storage, &conversation_id, item_val, added_at).await {
             Ok((item_json, item_id, warning)) => {
                 if seen_ids.insert(item_id.0.clone()) {
@@ -392,10 +400,13 @@ async fn process_item(
 }
 
 /// Process an item_reference - resolve an existing item for linking.
-/// Linking is deferred to the caller for batch operation.
+/// Linking is deferred to the caller for batch operation. A reference to an item the
+/// conversation already has is refused, as an item arriving under such an id is: linked
+/// again, the item would be listed twice by one backend, moved by another and rejected
+/// by a third.
 async fn process_item_reference(
     item_storage: &Arc<dyn ConversationItemStorage>,
-    _conversation_id: &ConversationId,
+    conversation_id: &ConversationId,
     item_val: &Value,
     _added_at: chrono::DateTime<Utc>,
 ) -> Result<(Value, ConversationItemId, Option<String>), Response> {
@@ -405,6 +416,14 @@ async fn process_item_reference(
         .ok_or_else(|| bad_request("item_reference requires 'id' field"))?;
 
     let item_id = ConversationItemId::from(ref_id);
+
+    let is_linked = item_storage
+        .is_item_linked(conversation_id, &item_id)
+        .await
+        .map_err(|e| internal_error(format!("Failed to check item link: {e}")))?;
+    if is_linked {
+        return Err(item_already_in_conversation());
+    }
 
     let existing_item = match item_storage.get_item(&item_id).await {
         Ok(Some(item)) => item,
@@ -436,12 +455,7 @@ async fn process_item_with_id(
         .map_err(|e| internal_error(format!("Failed to check item link: {e}")))?;
 
     if is_linked {
-        return Err(bad_request_structured(json!({
-            "message": "Item already in conversation",
-            "type": "invalid_request_error",
-            "param": "items",
-            "code": "item_already_in_conversation"
-        })));
+        return Err(item_already_in_conversation());
     }
 
     // Check if item exists globally
@@ -637,7 +651,9 @@ fn parse_item_from_value(
         .map(String::from)
         .or_else(|| Some("completed".to_string()));
 
-    let content = if item_type == "message" || item_type == "reasoning" {
+    let content = if item_type == "message" {
+        message_content_parts(role.as_deref(), item_val.get("content"))
+    } else if item_type == "reasoning" {
         item_val.get("content").cloned().unwrap_or(json!([]))
     } else {
         // Strip image_generation_call.result base64 before storage. The
@@ -661,20 +677,34 @@ fn parse_item_from_value(
     ))
 }
 
+/// The content of a message item as it is stored and listed: a plain string
+/// becomes the one typed part the public API makes of it for the message's
+/// role, so an item added as `"content": "text"` has the shape of one added
+/// with typed parts or created by a response. An assistant message gets an
+/// `output_text` part (with empty `annotations`), the text part the public
+/// API accepts on that role when the history loaders replay the conversation
+/// upstream; every other role gets an `input_text` part. Typed parts stay as
+/// sent, an absent content is an empty list.
+fn message_content_parts(role: Option<&str>, content: Option<&Value>) -> Value {
+    match content {
+        Some(Value::String(text)) if role == Some("assistant") => {
+            json!([{ "type": "output_text", "text": text, "annotations": [] }])
+        }
+        Some(Value::String(text)) => json!([{ "type": "input_text", "text": text }]),
+        Some(parts) => parts.clone(),
+        None => json!([]),
+    }
+}
+
+/// The Conversation object. `metadata` is always present, an empty object
+/// for a conversation created without any, as the public API answers it.
 pub fn conversation_to_json(conversation: &Conversation) -> Value {
-    let mut obj = json!({
+    json!({
         "id": conversation.id.0,
         "object": "conversation",
-        "created_at": conversation.created_at.timestamp()
-    });
-
-    if let Some(metadata) = &conversation.metadata {
-        if !metadata.is_empty() {
-            obj["metadata"] = Value::Object(metadata.clone());
-        }
-    }
-
-    obj
+        "created_at": conversation.created_at.timestamp(),
+        "metadata": Value::Object(conversation.metadata.clone().unwrap_or_default()),
+    })
 }
 
 #[cfg(test)]

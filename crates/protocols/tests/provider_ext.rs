@@ -1049,7 +1049,7 @@ fn openai_tolerates_loose_arguments_but_pairs_tool_messages() {
 }
 
 #[test]
-fn minimax_normalizes_root_to_leading_system() {
+fn minimax_keeps_a_leading_root_message() {
     let mut req: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "MiniMax-M3",
         "messages": [
@@ -1062,8 +1062,44 @@ fn minimax_normalizes_root_to_leading_system() {
     assert!(req.validate().is_ok());
 
     let out = serde_json::to_value(&req).expect("serializes");
-    assert_eq!(out["messages"][0]["role"], json!("system"));
+    assert_eq!(out["messages"][0]["role"], json!("root"));
     assert_eq!(out["messages"][0]["content"], json!("top priority"));
+    assert_eq!(out["messages"][1]["role"], json!("user"));
+}
+
+#[test]
+fn minimax_keeps_the_system_message_that_follows_a_root() {
+    let mut req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "MiniMax-M3",
+        "messages": [
+            {"role": "root", "content": "Top priority: always answer in French."},
+            {"role": "system", "content": "You are a terse assistant."},
+            {"role": "user", "content": "hi"}
+        ]
+    }))
+    .expect("root role deserializes");
+    req.normalize();
+    assert!(req.validate().is_ok());
+
+    let out = serde_json::to_value(&req).expect("serializes");
+    let roles: Vec<&Value> = out["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(|m| &m["role"])
+        .collect();
+    assert_eq!(
+        roles,
+        vec![&json!("root"), &json!("system"), &json!("user")]
+    );
+    assert_eq!(
+        out["messages"][0]["content"],
+        json!("Top priority: always answer in French.")
+    );
+    assert_eq!(
+        out["messages"][1]["content"],
+        json!("You are a terse assistant.")
+    );
 }
 
 #[test]
@@ -1089,7 +1125,7 @@ fn minimax_hoists_a_non_leading_root_above_system() {
         .collect();
     assert_eq!(
         roles,
-        vec![&json!("system"), &json!("system"), &json!("user")]
+        vec![&json!("root"), &json!("system"), &json!("user")]
     );
     assert_eq!(
         out["messages"][0]["content"],
@@ -1116,13 +1152,38 @@ fn root_requires_content() {
 }
 
 #[test]
-fn minimax_hoists_every_root_in_order() {
+fn minimax_merges_every_root_into_one_leading_root() {
     let mut req: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "MiniMax-M3",
         "messages": [
             {"role": "user", "content": "hi"},
-            {"role": "root", "content": "Answer in French"},
+            {"role": "root", "content": "Answer in French", "name": "boss"},
             {"role": "root", "content": "Answer in German"}
+        ]
+    }))
+    .expect("root roles deserialize");
+    req.normalize();
+    assert!(req.validate().is_ok());
+    let out = serde_json::to_value(&req).expect("serializes");
+    let messages = out["messages"].as_array().expect("messages");
+    let roles: Vec<&Value> = messages.iter().map(|m| &m["role"]).collect();
+    assert_eq!(roles, vec![&json!("root"), &json!("user")]);
+    assert_eq!(
+        messages[0]["content"],
+        json!("Answer in French\n\nAnswer in German")
+    );
+    assert_eq!(messages[0]["name"], json!("boss"));
+}
+
+#[test]
+fn minimax_merges_root_parts_and_text_into_one_parts_list() {
+    let mut req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "MiniMax-M3",
+        "messages": [
+            {"role": "root", "content": [{"type": "text", "text": "Answer in French"}]},
+            {"role": "root", "content": "Answer in German"},
+            {"role": "system", "content": "Be terse"},
+            {"role": "user", "content": "hi"}
         ]
     }))
     .expect("root roles deserialize");
@@ -1132,10 +1193,16 @@ fn minimax_hoists_every_root_in_order() {
     let roles: Vec<&Value> = messages.iter().map(|m| &m["role"]).collect();
     assert_eq!(
         roles,
-        vec![&json!("system"), &json!("system"), &json!("user")]
+        vec![&json!("root"), &json!("system"), &json!("user")]
     );
-    assert_eq!(messages[0]["content"], json!("Answer in French"));
-    assert_eq!(messages[1]["content"], json!("Answer in German"));
+    assert_eq!(
+        messages[0]["content"],
+        json!([
+            {"type": "text", "text": "Answer in French"},
+            {"type": "text", "text": "Answer in German"}
+        ])
+    );
+    assert_eq!(messages[1]["content"], json!("Be terse"));
 }
 
 #[test]

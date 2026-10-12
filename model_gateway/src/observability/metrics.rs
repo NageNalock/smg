@@ -3,7 +3,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration};
 
 use dashmap::DashMap;
-use llm_tokenizer::cache::{cache_activity_stats, CacheActivityStats};
+use llm_tokenizer::{
+    cache::{cache_activity_stats, CacheActivityStats},
+    decode_activity_stats,
+};
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{
     DistributionBuilder, Matcher, PrometheusBuilder, PrometheusHandle,
@@ -194,11 +197,24 @@ pub(crate) const WORKER_RETRY_BACKOFF_BUCKETS: &[f64] = &[
 /// allocates again, so after a traffic burst an idle gateway kept ~1.5 GB
 /// resident over ~270 MB of live objects (soak s2, ten hours). A background
 /// thread purges on schedule instead; dirty pages are returned after 10 s and
-/// muzzy pages at once. This is jemalloc's application-provided `malloc_conf`
-/// string under the vendored build's `_rjem_` prefix; the `_RJEM_MALLOC_CONF`
-/// environment variable is read after it and overrides it entry by entry.
-pub const SERVER_MALLOC_CONF: &[u8; 61] =
-    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0\0";
+/// muzzy pages at once.
+///
+/// jemalloc runs 16 arenas. Its default is four per CPU of the affinity mask
+/// (one on a single CPU) with every thread on an arena of its own, and each
+/// (arena, size class) pair keeps at least one partly used slab, a 64 KiB
+/// page on the aarch64 build: with ~240 threads on a many-core host a gateway
+/// holding 235 MB of live objects kept 1.6 GB of slabs (1.17 GB resident)
+/// under a steady multi-turn mix, and every new blocking-pool thread added a
+/// fresh set. With 16 arenas the same load and live heap took 0.4 GB of slabs
+/// (0.46 GB resident) at the same CPU per request; 4 arenas saved little more
+/// and cost 12 % CPU in arena contention. On a host with fewer than four CPUs
+/// the fixed count is more arenas than the default, a few mostly empty slabs.
+///
+/// This is jemalloc's application-provided `malloc_conf` string under the
+/// vendored build's `_rjem_` prefix; the `_RJEM_MALLOC_CONF` environment
+/// variable is read after it and overrides it entry by entry.
+pub const SERVER_MALLOC_CONF: &[u8; 72] =
+    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0,narenas:16\0";
 
 /// Marks jemalloc as the final artifact's Rust global allocator.
 ///
@@ -223,6 +239,7 @@ pub(crate) fn init_metrics() {
         "Tokenizer cache entries removed for capacity; excludes clear, drop and replacement"
     );
     describe_counter!("smg_tokenizer_cache_reused_bytes_total", "UTF-8 input bytes served by tokenizer cache hits: whole inputs for L0, matched prefixes for L1; not memory usage");
+    describe_counter!("smg_detokenize_prefix_mismatch_total", "Incremental decode steps and end-of-input finishes whose output no longer started with the text already decoded and went on with the remainder (several per stream are possible; unary responses count too), by kind: byte_run (an invalid byte collapsed a ByteFallback run whose characters were already decoded) or decoder (another decoder step rewrote the decoded prefix)");
 
     #[cfg(all(
         feature = "jemalloc-stats",
@@ -251,6 +268,10 @@ pub(crate) fn init_metrics() {
     describe_gauge!(
         "smg_http_connections_active",
         "Currently active HTTP connections"
+    );
+    describe_counter!(
+        "smg_http_connection_timeouts_total",
+        "HTTP connections closed for carrying no request, by the timeout that closed them (header_read, idle)"
     );
     describe_counter!(
         "smg_http_rate_limit_total",
@@ -323,17 +344,31 @@ pub(crate) fn init_metrics() {
 
     // Layer 2: PD disaggregation metrics (signals only SMG can measure — it is the
     // only component that observes both the prefill and decode legs of a request).
+    //
+    // The PD time to first token is split into phases the gateway bounds itself.
+    // Under sequential dispatch (the gRPC router relays the legs) the three
+    // phase families add up to `smg_pd_ttft_seconds` exactly:
+    //   prefill  smg_pd_prefill_duration_seconds    prefill dispatch -> prefill response drained
+    //   relay    smg_pd_kv_transfer_duration_seconds prefill drained -> decode dispatch (gateway work only)
+    //   decode   smg_pd_decode_ttft_seconds          decode dispatch -> first decode token
+    // The engines' own KV transfer runs inside the decode phase. Parallel
+    // dispatch sends both legs together: the decode phase is the whole TTFT and
+    // there is no relay phase.
     describe_histogram!(
         "smg_pd_prefill_duration_seconds",
-        "Prefill-leg RPC duration by backend_type, model, runtime"
+        "PD prefill phase: prefill dispatch to the end of the prefill response, the prefill engine's queueing and compute included, by backend_type, model, runtime"
     );
     describe_histogram!(
         "smg_pd_kv_transfer_duration_seconds",
-        "KV-transfer window (prefill drain to decode send) by backend_type, model, runtime (vLLM sequential PD)"
+        "PD relay phase (sequential dispatch): end of the prefill response to the decode dispatch, gateway work only; not the engines' KV transfer, which runs inside smg_pd_decode_ttft_seconds; by backend_type, model, runtime"
+    );
+    describe_histogram!(
+        "smg_pd_decode_ttft_seconds",
+        "PD decode phase: decode dispatch to the first decode token, the engines' KV transfer and the decode scheduling included (the whole TTFT under parallel dispatch), by backend_type, model, runtime"
     );
     describe_histogram!(
         "smg_pd_ttft_seconds",
-        "Honest end-to-end TTFT (prefill start to first decode token) by backend_type, model, runtime"
+        "PD time to first token: prefill dispatch to the first decode token (the decode response head on the HTTP router); under sequential dispatch the prefill, relay and decode phases add up to it; by backend_type, model, runtime"
     );
     describe_counter!(
         "smg_pd_kv_connector_mode_total",
@@ -342,6 +377,10 @@ pub(crate) fn init_metrics() {
     describe_counter!(
         "smg_pd_bootstrap_failures_total",
         "PD bootstrap injection failures"
+    );
+    describe_counter!(
+        "smg_pd_rendezvous_failures_total",
+        "PD rendezvous failures by leg (the worker type of the leg that failed) and phase: a bootstrap port that refused the registration probe (probe), and the failures the engines report on the gRPC path when the legs never met (bootstrap) or the KV handoff after they met failed (transfer)"
     );
     describe_counter!(
         "smg_pd_kv_transfer_failures_total",
@@ -651,6 +690,11 @@ pub(crate) fn init_metrics() {
         "smg_worker_cb_consecutive_successes",
         "Current consecutive success count per worker"
     );
+    describe_counter!(
+        "smg_worker_cb_health_readmissions_total",
+        "Times a worker's open circuit breaker went half-open because the worker's health \
+         returned (its promotion to Ready) rather than at the breaker's timeout, by worker"
+    );
 
     // Layer 3: Worker resilience metrics (retry)
     describe_counter!(
@@ -720,6 +764,10 @@ pub(crate) fn init_metrics() {
     describe_gauge!(
         "smg_discovery_workers_discovered",
         "Workers known via discovery by source"
+    );
+    describe_counter!(
+        "smg_discovery_snapshot_errors_total",
+        "Discovery source observations rejected, by source and reason"
     );
 
     // Layer 5: MCP metrics
@@ -879,6 +927,13 @@ pub fn init_startup_series() {
 pub(super) fn record_tokenizer_cache_activity() {
     for stats in cache_activity_stats() {
         record_tokenizer_cache_activity_snapshot(stats);
+    }
+}
+
+pub(super) fn record_detokenize_activity() {
+    for stats in decode_activity_stats() {
+        counter!("smg_detokenize_prefix_mismatch_total", "kind" => stats.kind)
+            .absolute(stats.prefix_mismatches);
     }
 }
 
@@ -1256,6 +1311,16 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Record a connection closed by one of the HTTP edge's connection
+    /// timeouts (`header_read` or `idle`).
+    pub fn record_http_connection_timeout(timeout: &'static str) {
+        counter!(
+            "smg_http_connection_timeouts_total",
+            "timeout" => timeout
+        )
+        .increment(1);
+    }
+
     /// Record rate limit decision.
     pub fn record_http_rate_limit(result: &'static str) {
         counter!(
@@ -1575,7 +1640,8 @@ impl Metrics {
     // (never per retry attempt).
     // ========================================================================
 
-    /// Record prefill-leg RPC duration.
+    /// Record the PD prefill phase: prefill dispatch to the end of the prefill
+    /// response.
     /// Uses string interning for model_id; runtime is a static label.
     pub fn record_pd_prefill_duration(
         backend_type: &'static str,
@@ -1593,8 +1659,11 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
-    /// Record the KV-transfer window (prefill drain to decode send) for vLLM
-    /// sequential PD. Uses string interning for model_id; runtime is a static label.
+    /// Record the PD relay phase of sequential dispatch: the gateway's own gap
+    /// between the drained prefill response and the decode dispatch. The family
+    /// name predates the phase model and stays for compatibility; this is not
+    /// the engines' KV transfer, which runs inside the decode phase.
+    /// Uses string interning for model_id; runtime is a static label.
     pub fn record_pd_kv_transfer_duration(
         backend_type: &'static str,
         model_id: &str,
@@ -1611,12 +1680,36 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
-    /// Record honest end-to-end TTFT: prefill start to first decode token.
+    /// Record the PD decode phase: decode dispatch to the first decode token.
+    /// Under sequential dispatch this is where the engines' KV transfer and the
+    /// decode scheduling show up; under parallel dispatch both legs go out
+    /// together and the value is the end-to-end TTFT.
+    /// Uses string interning for model_id; runtime is a static label.
+    pub fn record_pd_decode_ttft(
+        backend_type: &'static str,
+        model_id: &str,
+        runtime: &'static str,
+        duration: Duration,
+    ) {
+        let model = intern_model_label(model_id);
+        histogram!(
+            "smg_pd_decode_ttft_seconds",
+            "backend_type" => backend_type,
+            "model" => model,
+            "runtime" => runtime
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    /// Record the PD time to first token: prefill dispatch to the first decode
+    /// token.
     ///
-    /// INVARIANT: this is the user-facing complement to
-    /// `smg_router_ttft_seconds{backend_type="pd"}`, which measures only the
-    /// decode leg (first decode token minus decode-send). For sequential PD the
-    /// two differ by the prefill + KV-transfer time; both are kept on purpose.
+    /// `smg_router_ttft_seconds{backend_type="pd"}` shares the prefill-dispatch
+    /// anchor on the gRPC streaming paths (their stream base is the prefill
+    /// dispatch). This family adds the runtime label and is the total that the
+    /// phase families (`record_pd_prefill_duration`,
+    /// `record_pd_kv_transfer_duration`, `record_pd_decode_ttft`) add up to
+    /// under sequential dispatch.
     /// Uses string interning for model_id; runtime is a static label.
     pub fn record_pd_ttft(
         backend_type: &'static str,
@@ -1646,6 +1739,20 @@ impl Metrics {
     /// Record a PD bootstrap injection failure.
     pub fn record_pd_bootstrap_failure() {
         counter!("smg_pd_bootstrap_failures_total").increment(1);
+    }
+
+    /// Record a PD rendezvous failure by `leg` (the worker type of the leg
+    /// that failed) and `phase` (`probe` at registration; `bootstrap` or
+    /// `transfer` as the engine reported it). Its own family: the injection
+    /// failures above keep their unlabelled series, so a bare selector on
+    /// it still reads them alone.
+    pub fn record_pd_rendezvous_failure(leg: &'static str, phase: &'static str) {
+        counter!(
+            "smg_pd_rendezvous_failures_total",
+            "leg" => leg,
+            "phase" => phase
+        )
+        .increment(1);
     }
 
     /// Record a PD KV-transfer failure (missing connector params at handoff).
@@ -2265,6 +2372,28 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Record an open circuit breaker put on trial (half-open) by the
+    /// worker's return to health rather than by its timeout.
+    pub fn record_worker_cb_health_readmission(worker: &str) {
+        let worker_interned = intern_string(worker);
+        counter!(
+            "smg_worker_cb_health_readmissions_total",
+            "worker" => worker_interned
+        )
+        .increment(1);
+    }
+
+    /// Publish the health-readmission counter at zero, so the series exists
+    /// before the worker's first return.
+    pub fn init_worker_cb_health_readmissions(worker: &str) {
+        let worker_interned = intern_string(worker);
+        counter!(
+            "smg_worker_cb_health_readmissions_total",
+            "worker" => worker_interned
+        )
+        .absolute(0);
+    }
+
     /// Set circuit breaker consecutive failures
     pub fn set_worker_cb_consecutive_failures(worker: &str, count: u32) {
         let worker_interned = intern_string(worker);
@@ -2329,6 +2458,17 @@ impl Metrics {
             "source" => source
         )
         .set(count as f64);
+    }
+
+    /// Record a discovery source observation that was rejected; the provider
+    /// keeps reconciling its last good snapshot meanwhile
+    pub fn record_discovery_snapshot_error(source: &'static str, reason: &'static str) {
+        counter!(
+            "smg_discovery_snapshot_errors_total",
+            "source" => source,
+            "reason" => reason
+        )
+        .increment(1);
     }
 
     // ========================================================================
@@ -3256,6 +3396,71 @@ mod tests {
     }
 
     #[test]
+    fn test_record_pd_decode_ttft_emits_histogram() {
+        let (rendered, ()) = with_test_recorder(|| {
+            Metrics::record_pd_decode_ttft(
+                metrics_labels::BACKEND_PD,
+                "m",
+                "vllm",
+                Duration::from_millis(321),
+            );
+        });
+        assert!(
+            rendered.contains("smg_pd_decode_ttft_seconds_count")
+                && rendered.contains(r#"runtime="vllm""#),
+            "pd decode ttft histogram not emitted; rendered:\n{rendered}"
+        );
+    }
+
+    /// The PD phase families say on `/metrics` what they bound: the relay
+    /// family is the gateway's own gap and not the engines' KV transfer, and
+    /// the prefill phase, the decode phase and the total name their anchors.
+    #[test]
+    fn pd_phase_families_describe_what_they_measure() {
+        let (rendered, ()) = with_test_recorder(|| {
+            init_metrics();
+            let sample = Duration::from_millis(5);
+            Metrics::record_pd_prefill_duration(metrics_labels::BACKEND_PD, "m", "vllm", sample);
+            Metrics::record_pd_kv_transfer_duration(
+                metrics_labels::BACKEND_PD,
+                "m",
+                "vllm",
+                sample,
+            );
+            Metrics::record_pd_decode_ttft(metrics_labels::BACKEND_PD, "m", "vllm", sample);
+            Metrics::record_pd_ttft(metrics_labels::BACKEND_PD, "m", "vllm", sample);
+        });
+        let help = |family: &str| -> String {
+            rendered
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("# HELP {family} ")))
+                .unwrap_or_else(|| panic!("no # HELP for {family}; rendered:\n{rendered}"))
+                .to_owned()
+        };
+        let prefill = help("smg_pd_prefill_duration_seconds");
+        assert!(
+            prefill.contains("prefill dispatch to the end of the prefill response"),
+            "{prefill}"
+        );
+        let relay = help("smg_pd_kv_transfer_duration_seconds");
+        assert!(
+            relay.contains("relay phase") && relay.contains("not the engines' KV transfer"),
+            "{relay}"
+        );
+        let decode = help("smg_pd_decode_ttft_seconds");
+        assert!(
+            decode.contains("decode dispatch to the first decode token"),
+            "{decode}"
+        );
+        let total = help("smg_pd_ttft_seconds");
+        assert!(
+            total.contains("prefill dispatch to the first decode token")
+                && total.contains("add up to it"),
+            "{total}"
+        );
+    }
+
+    #[test]
     fn test_record_pd_kv_connector_mode_counts_by_mode() {
         let (rendered, ()) = with_test_recorder(|| {
             Metrics::record_pd_kv_connector_mode(metrics_labels::KV_CONNECTOR_MOONCAKE);
@@ -3286,6 +3491,43 @@ mod tests {
         assert!(
             rendered.contains("smg_pd_kv_transfer_failures_total 2"),
             "kv transfer failure counter wrong; rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_record_pd_rendezvous_failure_by_leg_and_phase() {
+        let (rendered, ()) = with_test_recorder(|| {
+            Metrics::record_pd_bootstrap_failure();
+            Metrics::record_pd_rendezvous_failure(metrics_labels::WORKER_PREFILL, "probe");
+            Metrics::record_pd_rendezvous_failure(metrics_labels::WORKER_DECODE, "bootstrap");
+            Metrics::record_pd_rendezvous_failure(metrics_labels::WORKER_DECODE, "bootstrap");
+        });
+        // Two families: the injection series keeps its unlabelled shape, and
+        // the labelled rendezvous counts never join it.
+        assert!(
+            rendered.contains("smg_pd_bootstrap_failures_total 1"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("smg_pd_bootstrap_failures_total{"),
+            "{rendered}"
+        );
+        let labelled: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_pd_rendezvous_failures_total{"))
+            .collect();
+        assert_eq!(labelled.len(), 2, "{rendered}");
+        assert!(
+            labelled.iter().any(|line| line.contains(r#"leg="prefill""#)
+                && line.contains(r#"phase="probe""#)
+                && line.ends_with(" 1")),
+            "{rendered}"
+        );
+        assert!(
+            labelled.iter().any(|line| line.contains(r#"leg="decode""#)
+                && line.contains(r#"phase="bootstrap""#)
+                && line.ends_with(" 2")),
+            "{rendered}"
         );
     }
 }

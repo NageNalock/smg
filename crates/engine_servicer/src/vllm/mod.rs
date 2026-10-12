@@ -146,6 +146,15 @@ pub struct VllmModelInfo {
     /// parser to see the thought's end, `first_token` when the grammar runs
     /// from the first generated token; empty when the config does not say.
     pub structured_outputs_start: String,
+    /// Whether the engine's scheduler statistics are on (vLLM's
+    /// `--disable-log-stats` not given), as the launcher started it: such an
+    /// engine's wire reports every scheduler step, and the pushed load record
+    /// says so (`engine_reports_steps`) from the first record rather than
+    /// from the first stats-only step batch, so an engine that freezes before
+    /// its first batch is judged on the step-reporting path too. `None` when
+    /// the launcher did not say (an older one): the wire is then classified
+    /// by what it shows.
+    pub log_stats: Option<bool>,
 }
 
 /// How to bind, where the engine dials in, and what to advertise.
@@ -227,6 +236,9 @@ impl crate::kv_events::LoadSource for LoadFromState {
         let mut record = smg_grpc_client::common_proto::EngineLoad::from(load);
         record.waiting_uncached_tokens =
             estimated.then(|| u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
+        record.engine_silence_ms = state.engine.output_silence_ms();
+        record.engine_reports_steps = state.engine.reports_steps();
+        record.prefill_pending_tokens = state.engine.prefill_pending_tokens();
         Some(record)
     }
 }

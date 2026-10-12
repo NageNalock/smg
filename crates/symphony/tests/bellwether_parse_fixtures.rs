@@ -39,6 +39,10 @@
 //! the bitwise cases, the parallel calls, owe their count to the adapter rather than the parser:
 //! there the parser's content is nothing but the separator between the calls, and the adapter's
 //! rule that whitespace-only content is absent folds the difference away before the comparison.
+//! A template that re-serializes the arguments (Inkling's `tojson(sort_keys=true,
+//! separators=(",", ":"))`) has the model write the keys sorted and the spaces dropped, and the
+//! parser hands on the model's bytes; a case whose arguments differ from the reference's only so,
+//! equal as values, is counted as "respelled", and only for a family whose template does that.
 //! Bellwether #16: two probe cases put marker strings inside text, and the parser reads them as
 //! markers like every marker parser; they are listed in [`KNOWN_DIFFERENCES`] with their reason and
 //! with the call count and finish reason the parser gives, so the list allows that difference and
@@ -76,8 +80,8 @@ use serde::Deserialize;
 use symphony::{
     adapt,
     formats::{
-        deepseek_v4_1, glm, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, plain, qwen2_5,
-        qwen3, seed_oss, xlam,
+        deepseek_v4_1, dots3, gemma4, glm, glm4, hy4, inkling, iquest, k2_horizon, kimi_k3, lfm2_5,
+        ling, minicpm5, minimax_m2, minimax_m3, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
     },
     tagged::{Placement, Spelling},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
@@ -138,6 +142,11 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Qwen3,
         GenerationPrompt::ModelWritesTheThought,
     ),
+    (
+        "qwen3-30b-a3b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
     // The 2507 line, Qwen3-Next and Qwen3-VL split into instruct, with no thought, and thinking,
     // whose template always opens the thought in the prompt.
     (
@@ -157,6 +166,11 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
     ),
     (
         "qwen3-4b-thinking-2507",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "qwen3-30b-a3b-thinking-2507",
         Family::Qwen3,
         GenerationPrompt::AlwaysOpensTheThought,
     ),
@@ -235,6 +249,18 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Qwen3,
         GenerationPrompt::AlwaysOpensTheThought,
     ),
+    // Qwen3-Omni: the Qwen3 template over audio and video content too, so the same syntax and
+    // the same switch; both checkpoints leave the thought to the model.
+    (
+        "qwen3-omni-30b-a3b-instruct",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "qwen3-omni-30b-a3b-thinking",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
     // Qwen2.5: no thought at all.
     (
         "qwen2.5-7b-instruct-1m",
@@ -261,7 +287,7 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Qwen2_5,
         GenerationPrompt::Plain,
     ),
-    ("qwen2.5-omni-3b", Family::Qwen2_5, GenerationPrompt::Plain),
+    ("qwen2.5-omni-7b", Family::Qwen2_5, GenerationPrompt::Plain),
     // Qwen 3.5 and later write calls as tags and open the thought in the prompt; Qwen3-Coder
     // writes tags and has no thought.
     // Qwen3.5-0.8B's template has no thought.
@@ -425,6 +451,25 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Glm,
         GenerationPrompt::AlwaysOpensTheThought,
     ),
+    // GLM 4.5 and 4.6 write Ling's syntax with a newline after each pair instead of before the
+    // close, under GLM's turn opener, and the model writes its own
+    // `<think>`; the template closes an empty thought in the prompt only when the request turns
+    // thinking off (as `\n<think></think>`; the tail's newlines are not read, its markers are).
+    (
+        "glm-4.6",
+        Family::Glm4,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    // K2-Horizon writes GLM 4.6's keyed spelling under `ifm|`-prefixed tags in a block, and its
+    // prompt opens the thought whatever the request says (the template has no thinking switch;
+    // `reasoning_effort` picks the tag, `<ifm|think>` by default). The template raises on an
+    // assistant turn without a thinking field, so bellwether records five of its sixteen common
+    // cases, the reasoning ones and the thinking-on call.
+    (
+        "k2-horizon-36b",
+        Family::K2Horizon,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
     (
         "iquest-q1",
         Family::IQuest,
@@ -462,6 +507,47 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::MinimaxM3,
         GenerationPrompt::ModelDecides,
     ),
+    // MiniMax M2 and M2.7 write `<think>` blocks and `<minimax:tool_call>` blocks of invokes
+    // whose parameter tags name their key in an attribute; their prompt opens the thought on its
+    // own line whatever the request says (the template has no thinking switch).
+    (
+        "minimax-m2",
+        Family::MinimaxM2,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "minimax-m2.7",
+        Family::MinimaxM2,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    // Inkling: the generation prompt is the first message's opener and nothing more, whatever the
+    // request says (a system message carries the reasoning effort); the model writes the thought
+    // or not, and its markers are its own.
+    ("inkling", Family::Inkling, GenerationPrompt::ModelDecides),
+    // MiniCPM5: the model writes its own `<think>`, as Qwen3 does; thinking off closes it in the
+    // prompt.
+    (
+        "minicpm5-2b",
+        Family::MiniCpm5,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    // dots3: the model writes its own `<think>`, as Qwen3 does; thinking off closes it in the
+    // prompt.
+    (
+        "dots3-note-prev",
+        Family::Dots3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    // Laguna writes GLM 4.5's spelling (a newline after the name, each key and each value) under
+    // its own turn opener; its prompt ends in the thought's opener or its closer alone.
+    ("laguna-xs.2", Family::Glm4, GenerationPrompt::MarkerAlone),
+    // Gemma 4: the prompt is the turn's opener alone, whatever the request says (the template opens
+    // the thought channel only after a tool response); the model writes `<|channel>thought` or not.
+    (
+        "gemma-4-e4b-it",
+        Family::Gemma4,
+        GenerationPrompt::ModelDecides,
+    ),
 ];
 
 /// The turn opener a model's own chat template writes, for a model that reads another family's
@@ -477,6 +563,7 @@ const OPENERS: &[(&str, &str)] = &[
         "granite-4.1-3b",
         "<|start_of_role|>assistant<|end_of_role|>",
     ),
+    ("laguna-xs.2", "<assistant>"),
 ];
 
 /// The table that reads a checkpoint's output.
@@ -494,20 +581,33 @@ enum Family {
     DeepSeekV4_1,
     /// [`seed_oss`]: the tagged syntax under Seed-OSS's markers, typed by the request tools.
     SeedOss,
-    /// [`hy4`], [`ling`], [`iquest`], [`glm`]: keyed arguments, typed by the request tools.
+    /// [`hy4`], [`ling`], [`iquest`], [`glm`], [`glm4`], [`k2_horizon`]: keyed arguments, typed
+    /// by the request tools.
     Hy4,
     Ling,
     IQuest,
     Glm,
+    Glm4,
+    K2Horizon,
     /// [`olmo3`], [`lfm2_5`]: Python calls.
     Olmo3,
     Lfm2_5,
     /// [`xlam`]: a bare JSON list of calls.
     Xlam,
+    /// [`minimax_m2`]: parameters named by an attribute, typed by the request tools.
+    MinimaxM2,
     /// [`minimax_m3`]: an XML tree of arguments, typed by the request tools at every depth.
     MinimaxM3,
     /// [`kimi_k3`]: XTML, whose argument tags name their own values' types.
     KimiK3,
+    /// [`inkling`]: a turn of messages, a call as the tool's name, a marker and a JSON object.
+    Inkling,
+    /// [`minicpm5`]: `<function name="…">` calls of `<param name="…">` tags, no block, CDATA.
+    MiniCpm5,
+    /// [`dots3`]: MiniMax M2's tags in a block per call, every value on a line of its own.
+    Dots3,
+    /// [`gemma4`]: `call:NAME{…}` calls in Gemma's spelling, the thought a channel.
+    Gemma4,
     /// [`plain`]: content and nothing else.
     Plain,
 }
@@ -521,8 +621,19 @@ impl Family {
             Self::Hy4 => ("<think:opensource>", "</think:opensource>"),
             Self::MinimaxM3 => ("<mm:think>", "</mm:think>"),
             Self::KimiK3 => ("<|open|>think<|sep|>", "<|close|>think<|sep|>"),
+            Self::Inkling => ("<|content_thinking|>", "<|end_message|>"),
+            Self::Gemma4 => ("<|channel>thought\n", "<channel|>"),
+            Self::K2Horizon => ("<ifm|think>", "</ifm|think>"),
             _ => ("<think>", "</think>"),
         }
+    }
+
+    /// Whether the family's template re-serializes a call's arguments, so the model writes them
+    /// with the keys sorted and the spaces dropped, as Inkling's `tojson(sort_keys=true,
+    /// separators=(",", ":"))` does: a case whose arguments differ from the reference's only so,
+    /// equal as values, is counted as respelled, not as a difference.
+    fn respells_arguments(self) -> bool {
+        matches!(self, Self::Inkling | Self::Gemma4)
     }
 
     /// The engine for one of the model's cases: the family's table, with the model's own turn
@@ -546,12 +657,19 @@ impl Family {
             Self::Hy4 => hy4(),
             Self::Ling => ling(),
             Self::Glm => glm(),
+            Self::Glm4 => glm4(),
+            Self::K2Horizon => k2_horizon(),
             Self::IQuest => iquest(),
             Self::Olmo3 => olmo3(),
             Self::Lfm2_5 => lfm2_5(),
             Self::Xlam => xlam(),
+            Self::MinimaxM2 => minimax_m2(),
             Self::MinimaxM3 => minimax_m3(),
             Self::KimiK3 => kimi_k3(),
+            Self::Inkling => inkling(),
+            Self::MiniCpm5 => minicpm5(),
+            Self::Dots3 => dots3(),
+            Self::Gemma4 => gemma4(),
             Self::Plain => plain(),
         }
     }
@@ -563,17 +681,28 @@ impl Family {
         let list = match self {
             Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
             Self::Qwen3Tagged | Self::MiMo => KNOWN_TAGGED_DIFFERENCES,
-            // Seed-OSS, Hy4, Olmo 3, xLAM, Kimi K3 and the plain table read neither of the probes'
-            // Qwen markers: `</think>` stays reasoning text and the fenced `<tool_call>` block
-            // stays content, as the reference says.
-            Self::SeedOss | Self::Hy4 | Self::Olmo3 | Self::Xlam | Self::KimiK3 | Self::Plain => {
-                &[]
-            }
+            // Seed-OSS, Hy4, Olmo 3, xLAM, Kimi K3, K2-Horizon, Inkling, Gemma 4 and the plain
+            // table read neither of the probes' Qwen markers: `</think>` stays reasoning text and
+            // the fenced `<tool_call>` block stays content, as the reference says.
+            Self::SeedOss
+            | Self::Hy4
+            | Self::Olmo3
+            | Self::Xlam
+            | Self::KimiK3
+            | Self::K2Horizon
+            | Self::Inkling
+            | Self::Gemma4
+            | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
-            // tagged ones' (no call comes of the fence); IQuest, DSML and LFM2.5 read `</think>`
-            // but not `<tool_call>`.
-            Self::Ling | Self::Glm => KNOWN_TAGGED_DIFFERENCES,
-            Self::IQuest | Self::DeepSeekV4_1 | Self::Lfm2_5 => KNOWN_REASONING_PROBE,
+            // tagged ones' (no call comes of the fence); IQuest, DSML, LFM2.5, MiniMax M2,
+            // MiniCPM5 and dots3 read `</think>` but not `<tool_call>`.
+            Self::Ling | Self::Glm | Self::Glm4 => KNOWN_TAGGED_DIFFERENCES,
+            Self::IQuest
+            | Self::DeepSeekV4_1
+            | Self::Lfm2_5
+            | Self::MinimaxM2
+            | Self::MiniCpm5
+            | Self::Dots3 => KNOWN_REASONING_PROBE,
             Self::MinimaxM3 => KNOWN_M3_DIFFERENCES,
         };
         // A template that writes no thought for the probe's request leaves the reasoning out, so
@@ -654,6 +783,10 @@ enum GenerationPrompt {
     /// the requests do not set), and the template has a thought: the model writes `<mm:think>`
     /// itself or closes an empty thought with `</mm:think>` at once.
     ModelDecides,
+    /// Laguna: the thought's opener alone, with no newline, when the request turns thinking on,
+    /// so the output starts inside the thought; otherwise (the default) its closer alone, which
+    /// closes a thought never opened and leaves the output in content.
+    MarkerAlone,
 }
 
 impl GenerationPrompt {
@@ -675,6 +808,8 @@ impl GenerationPrompt {
             (Self::OpensTheThought, false) | (Self::AlwaysOpensTheThought, _) => opened,
             (Self::OpensTheThoughtWhenAsked, _) if request.thinking_on() => opened,
             (Self::OpensTheThoughtWhenAsked, _) => closed,
+            (Self::MarkerAlone, _) if request.thinking_on() => open.to_string(),
+            (Self::MarkerAlone, _) => close.to_string(),
         }
     }
 
@@ -682,7 +817,10 @@ impl GenerationPrompt {
     /// reasoning probe's does, so its reasoning is not in the output and the case is refused or
     /// allowed, not listed.
     fn writes_no_thought_unasked(self) -> bool {
-        matches!(self, Self::Plain | Self::OpensTheThoughtWhenAsked)
+        matches!(
+            self,
+            Self::Plain | Self::OpensTheThoughtWhenAsked | Self::MarkerAlone
+        )
     }
 }
 
@@ -700,7 +838,7 @@ const CONTENT_OR_CALLS: &[&str] = &[
     "qwen2.5-vl-3b-instruct",
     "qwen2.5-vl-7b-instruct",
     "qwen2.5-vl-32b-instruct",
-    "qwen2.5-omni-3b",
+    "qwen2.5-omni-7b",
 ];
 
 /// A class of difference the recorded sets have, allowed for what the fixture shows rather than
@@ -770,11 +908,17 @@ const KNOWN_DIFFERENCES: &[KnownDifference] = &[
 /// difference cannot be among that slug's fixtures, so the check that the list has not rotted
 /// skips it there.
 const REFUSED_PROBES: &[(&str, &str)] = &[
+    // Its template refuses the reasoning probe's request (the recorded common set has the fence
+    // probe and ten more, not it).
+    ("laguna-xs.2", "parse/reasoning-with-marker-text"),
     // Its template raises on a request that turns thinking off, and the content probe's does.
     (
         "qwen3.8-2.4t-a95b",
         "parse/content-with-marker-in-code-fence",
     ),
+    // bellwether's reference refuses the reasoning probe for its template: twelve of the sixteen
+    // common cases are recorded, and that one is not among them.
+    ("glm-4.6", "parse/reasoning-with-marker-text"),
 ];
 
 /// The reasoning probe: its reasoning holds a `</think>`, which every table with that marker
@@ -802,9 +946,9 @@ const FENCE_PROBE: KnownDifference = KnownDifference {
 /// Under the tagged syntax both probes differ.
 const KNOWN_TAGGED_DIFFERENCES: &[KnownDifference] = &[REASONING_PROBE, FENCE_PROBE];
 
-/// Under a table that reads `</think>` but not `<tool_call>` (DSML, IQuest), only the reasoning
-/// probe differs: the fence holds Qwen's syntax, which the table never reads as a call, so it is
-/// content, as the reference says.
+/// Under a table that reads `</think>` but not `<tool_call>`, only the reasoning probe differs:
+/// the fence holds Qwen's syntax, which the table never reads as a call, so it is content, as the
+/// reference says. The match on the family says which tables these are.
 const KNOWN_REASONING_PROBE: &[KnownDifference] = &[REASONING_PROBE];
 
 /// Under the MiniMax M3 table only the code-fence probe differs: the fence holds `<tool_call>`,
@@ -936,6 +1080,23 @@ impl Said {
         }
     }
 
+    /// Whether `other` says the same, the calls' arguments compared as JSON values: a template that
+    /// re-serializes the arguments (Inkling's `tojson(sort_keys=true, separators=(",", ":"))`)
+    /// writes the keys sorted and the spaces dropped, and the parser hands on what the model
+    /// wrote, so the bytes differ from the reference's while the values are the same.
+    fn same_values(&self, other: &Self) -> bool {
+        let value = |text: &str| serde_json::from_str::<serde_json::Value>(text).ok();
+        self.content == other.content
+            && self.reasoning == other.reasoning
+            && self.finish == other.finish
+            && self.calls.len() == other.calls.len()
+            && self.calls.iter().zip(&other.calls).all(
+                |((name, args), (other_name, other_args))| {
+                    name == other_name && value(args).is_some() && value(args) == value(other_args)
+                },
+            )
+    }
+
     /// The same, with the separator bytes trimmed from content and reasoning (bellwether #17). The
     /// template's separators are newlines, so only newlines are trimmed: any other whitespace the
     /// parser kept or lost still counts as a difference.
@@ -985,9 +1146,12 @@ fn qwen3_parse_fixtures_match_the_reference() {
         &ids,
         &|fixture| Family::Qwen3.engine(SLUG, fixture),
         &|_| String::new(),
-        KNOWN_DIFFERENCES,
-        &[],
-        Family::Qwen3.think_markers(),
+        Rules {
+            known_differences: KNOWN_DIFFERENCES,
+            allowed: &[],
+            think_markers: Family::Qwen3.think_markers(),
+            respells_arguments: false,
+        },
     );
     let verbose = verbose();
     let mut file = ReportFile::create("bellwether_parse_fixtures-qwen3-8b.txt")
@@ -1165,6 +1329,8 @@ fn replay_model(
         return Replayed::Skipped(format!("skipping {slug}: {reason}"));
     }
     let Cases { fixtures, ids } = read_fixtures(&dir).unwrap_or_else(|e| panic!("{e}"));
+    let known_differences = family.known_differences(slug, prompt);
+    let allowed = family.allowances(slug, prompt);
     let Parity {
         report,
         summary,
@@ -1174,9 +1340,12 @@ fn replay_model(
         &ids,
         &|fixture| family.engine(slug, fixture),
         &|fixture| prompt.tail(fixture, family),
-        &family.known_differences(slug, prompt),
-        &family.allowances(slug, prompt),
-        family.think_markers(),
+        Rules {
+            known_differences: &known_differences,
+            allowed: &allowed,
+            think_markers: family.think_markers(),
+            respells_arguments: family.respells_arguments(),
+        },
     );
     Replayed::Compared {
         report: format!("{slug} ({family:?}, {prompt:?}):\n{report}"),
@@ -1288,11 +1457,22 @@ impl Shown {
     }
 }
 
+/// What a family declares to the judge: the cases whose differences it lists, the classes it
+/// claims for the corpus, its thinking markers, and whether its template respells the arguments.
+#[derive(Clone, Copy)]
+struct Rules<'a> {
+    known_differences: &'a [KnownDifference],
+    allowed: &'a [Allowance],
+    think_markers: (&'a str, &'a str),
+    /// [`Family::respells_arguments`].
+    respells_arguments: bool,
+}
+
 /// Replays every fixture through a fresh parser from `new_parser`, after a prompt ending in the
 /// case's `prompt_tail`, on every chunking, reports one line per case and the set's summary, and
-/// returns with them every difference that neither `known_differences` nor `allowed` allows.
-/// `every_id` is the id of every case the set files hold, before any sample thinned them: a
-/// listed difference no longer among them is a failure too, so the list cannot rot.
+/// returns with them every difference the family's `rules` do not account for. `every_id` is the
+/// id of every case the set files hold, before any sample thinned them: a listed difference no
+/// longer among them is a failure too, so the list cannot rot.
 #[expect(
     clippy::panic,
     reason = "a fixture that cannot be replayed ends the test with its id"
@@ -1302,10 +1482,14 @@ fn parity(
     every_id: &[String],
     new_parser: &dyn Fn(&Fixture) -> Engine,
     prompt_tail: &dyn Fn(&Fixture) -> String,
-    known_differences: &[KnownDifference],
-    allowed: &[Allowance],
-    think_markers: (&str, &str),
+    rules: Rules<'_>,
 ) -> Parity {
+    let Rules {
+        known_differences,
+        allowed,
+        think_markers,
+        respells_arguments,
+    } = rules;
     let known = |id: &str| {
         known_differences
             .iter()
@@ -1314,7 +1498,8 @@ fn parity(
     let mut failures = Vec::new();
     let mut out = String::new();
     let mut shown = Shown::default();
-    let (mut bitwise, mut separators_only, mut listed, mut allowed_count) = (0, 0, 0, 0);
+    let (mut bitwise, mut separators_only, mut respelled, mut listed, mut allowed_count) =
+        (0, 0, 0, 0, 0);
     let (mut token_plans_run, mut without_pieces) = (0, 0);
     for fixture in fixtures {
         let text = fixture.reference.text.as_str();
@@ -1404,6 +1589,9 @@ fn parity(
         } else if said.trimmed() == expected.trimmed() {
             separators_only += 1;
             "separators only (bellwether #17)"
+        } else if respells_arguments && said.trimmed().same_values(&expected.trimmed()) {
+            respelled += 1;
+            "respelled arguments (the template re-serializes them)"
         } else if let Some(listed_case) = known(&fixture.id) {
             if said.calls.len() != listed_case.calls || said.finish != listed_case.finish {
                 failures.push(format!(
@@ -1464,9 +1652,9 @@ fn parity(
     }
     let sample = sample_note(sample_every());
     let totals = format!(
-        "{} cases{sample}: {bitwise} bitwise, {separators_only} separators only, \
-         {listed} listed, {allowed_count} allowed for the corpus; {token_plans_run} token plans \
-         replayed, {without_pieces} cases without output_pieces\n",
+        "{} cases{sample}: {bitwise} bitwise, {separators_only} separators only, {respelled} \
+         respelled, {listed} listed, {allowed_count} allowed for the corpus; {token_plans_run} \
+         token plans replayed, {without_pieces} cases without output_pieces\n",
         fixtures.len()
     );
     out.push_str(&totals);

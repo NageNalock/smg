@@ -4,7 +4,7 @@ use axum::http::HeaderName;
 use sha2::{Digest, Sha256};
 
 use super::*;
-use crate::policies::cost as selection_cost;
+use crate::{middleware::scheduler, policies::cost as selection_cost};
 
 /// Validate a user-supplied mesh server name. The name keys rate-limit
 /// shards as `rl:{counter}:{name}`, so an empty name or one containing the
@@ -131,6 +131,7 @@ impl ConfigValidator {
         Self::validate_model_aliases(config)?;
         Self::validate_rl(config)?;
         Self::validate_prefill_admission(config)?;
+        Self::validate_priority_scheduler(config)?;
         if let Some(discovery) = &config.discovery {
             Self::validate_discovery(discovery, &config.mode)?;
         }
@@ -203,6 +204,24 @@ impl ConfigValidator {
         }
 
         Ok(())
+    }
+
+    /// With the priority scheduler enabled, the optional YAML file must be
+    /// readable, parsable and valid: an operator who asked for tenant
+    /// priorities gets a start-up error naming the file instead of a gateway
+    /// that serves with the legacy admission (the contract of
+    /// `tenant_rate_limit_config`). Without the flag the path is not read.
+    fn validate_priority_scheduler(config: &RouterConfig) -> ConfigResult<()> {
+        if !config.priority_scheduler_enabled {
+            return Ok(());
+        }
+        scheduler::settings_from_config(config)
+            .map(drop)
+            .map_err(|reason| ConfigError::InvalidValue {
+                field: "priority_scheduler_config".to_string(),
+                value: config.priority_scheduler_config.clone().unwrap_or_default(),
+                reason,
+            })
     }
 
     fn validate_model_aliases(config: &RouterConfig) -> ConfigResult<()> {
@@ -655,6 +674,7 @@ impl ConfigValidator {
             }
             PolicyConfig::PowerOfTwo {
                 load_check_interval_secs,
+                ..
             } => {
                 if *load_check_interval_secs == 0 {
                     return Err(ConfigError::InvalidValue {
@@ -836,6 +856,16 @@ impl ConfigValidator {
             });
         }
 
+        // The async runtime builder panics on zero worker threads; refuse it
+        // here like every other count that must be positive.
+        if config.runtime_worker_threads == Some(0) {
+            return Err(ConfigError::InvalidValue {
+                field: "runtime_worker_threads".to_string(),
+                value: "0".to_string(),
+                reason: "Must be >= 1".to_string(),
+            });
+        }
+
         // A zero-capacity job channel panics at construction and a
         // zero-permit dispatcher never dequeues; reject both here so a
         // config-file value fails as early as the CLI parsers do.
@@ -967,7 +997,44 @@ impl ConfigValidator {
             DiscoveryConfig::Kubernetes(kubernetes) => {
                 Self::validate_kubernetes_discovery(kubernetes, mode)
             }
+            DiscoveryConfig::File(file) => Self::validate_file_discovery(file, mode),
         }
+    }
+
+    /// The manifest's own contents (worker types against the routing mode
+    /// included) are checked each time it is read, not here: it may not exist
+    /// yet, and it changes while the router runs.
+    fn validate_file_discovery(
+        discovery: &FileDiscoveryConfig,
+        mode: &RoutingMode,
+    ) -> ConfigResult<()> {
+        if discovery.path.as_os_str().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "discovery.path".to_string(),
+                value: String::new(),
+                reason: "File discovery needs a manifest path".to_string(),
+            });
+        }
+
+        if discovery.check_interval_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "discovery.check_interval_secs".to_string(),
+                value: discovery.check_interval_secs.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+
+        let unsupported = match mode {
+            RoutingMode::Regular { .. }
+            | RoutingMode::PrefillDecode { .. }
+            | RoutingMode::EncodePrefillDecode { .. } => return Ok(()),
+            RoutingMode::OpenAI { .. } => "OpenAI",
+            RoutingMode::Anthropic { .. } => "Anthropic",
+            RoutingMode::Gemini { .. } => "Gemini",
+        };
+        Err(ConfigError::ValidationFailed {
+            reason: format!("{unsupported} mode does not support service discovery"),
+        })
     }
 
     fn validate_kubernetes_discovery(
@@ -1298,7 +1365,8 @@ impl ConfigValidator {
 
         Self::validate_mtls(config)?;
 
-        if !has_service_discovery {
+        // Under dp_aware each URL registers one worker per DP rank.
+        if !has_service_discovery && !config.dp_aware {
             if let PolicyConfig::PowerOfTwo { .. } = &config.policy {
                 let worker_count = config.mode.worker_count();
                 if worker_count < 2 {
@@ -1561,6 +1629,126 @@ mod tests {
 
         let config = RouterConfig {
             mm_per_request_image_limit: Some(128),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    fn scheduler_config(path: Option<&str>) -> RouterConfig {
+        RouterConfig {
+            priority_scheduler_enabled: true,
+            priority_scheduler_config: path.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    /// A class entry with every field, `queue_timeout_secs` set to `timeout`.
+    fn class_yaml(class: &str, timeout: u64) -> String {
+        format!(
+            "classes:\n  {class}:\n    reserved_floor: 1\n    queue_size: 16\n    \
+             queue_timeout_secs: {timeout}\n    starvation_threshold_secs: 10\n    \
+             can_preempt: false\n"
+        )
+    }
+
+    /// The `(value, reason)` of the `priority_scheduler_config` error a
+    /// configuration is refused with.
+    fn refused_scheduler_config(config: &RouterConfig) -> (String, String) {
+        match ConfigValidator::validate(config) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) if field == "priority_scheduler_config" => (value, reason),
+            other => panic!("expected a priority_scheduler_config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_priority_scheduler_config_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.yaml");
+        let path = path.to_str().unwrap();
+        let (value, reason) = refused_scheduler_config(&scheduler_config(Some(path)));
+        assert_eq!(value, path);
+        assert!(
+            reason.starts_with("reading ") && reason.contains(path),
+            "the reason names the file and the read error: {reason}"
+        );
+    }
+
+    #[test]
+    fn an_unparsable_priority_scheduler_config_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("garbage.yaml");
+        std::fs::write(&path, "not: [valid: yaml\n").unwrap();
+        let path = path.to_str().unwrap();
+        let (value, reason) = refused_scheduler_config(&scheduler_config(Some(path)));
+        assert_eq!(value, path);
+        assert!(
+            reason.starts_with("parsing ") && reason.contains(path),
+            "the reason names the file and the parse error: {reason}"
+        );
+    }
+
+    #[test]
+    fn an_invalid_priority_scheduler_config_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // A class the scheduler does not know.
+        let unknown_class = dir.path().join("unknown-class.yaml");
+        std::fs::write(&unknown_class, class_yaml("gold", 1)).unwrap();
+        let (value, reason) = refused_scheduler_config(&scheduler_config(unknown_class.to_str()));
+        assert_eq!(value, unknown_class.to_str().unwrap());
+        assert!(
+            reason.contains("gold"),
+            "the reason names the unknown class: {reason}"
+        );
+        // A value the scheduler's own validation refuses.
+        let zero_timeout = dir.path().join("zero-timeout.yaml");
+        std::fs::write(&zero_timeout, class_yaml("bulk", 0)).unwrap();
+        let (value, reason) = refused_scheduler_config(&scheduler_config(zero_timeout.to_str()));
+        assert_eq!(value, zero_timeout.to_str().unwrap());
+        assert!(
+            reason.contains("queue_timeout_secs must be > 0"),
+            "the reason is the scheduler's own: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_valid_or_absent_priority_scheduler_config_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = dir.path().join("scheduler.yaml");
+        let tenant_policies = "tenant_policies:\n  \"header:a\":\n    max_class: bulk\n";
+        std::fs::write(
+            &valid,
+            format!("{}{tenant_policies}", class_yaml("interactive", 5)),
+        )
+        .unwrap();
+        assert!(ConfigValidator::validate(&scheduler_config(valid.to_str())).is_ok());
+        // Enabled without a file: the built-in class defaults.
+        assert!(ConfigValidator::validate(&scheduler_config(None)).is_ok());
+        // Not enabled: the path is not read, as for the tenant rate limiter.
+        let missing = dir.path().join("missing.yaml");
+        let config = RouterConfig {
+            priority_scheduler_config: missing.to_str().map(str::to_owned),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn zero_runtime_worker_threads_is_rejected() {
+        let config = RouterConfig {
+            runtime_worker_threads: Some(0),
+            ..Default::default()
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "runtime_worker_threads"
+        ));
+
+        let config = RouterConfig {
+            runtime_worker_threads: Some(4),
             ..Default::default()
         };
         assert!(ConfigValidator::validate(&config).is_ok());
@@ -1911,6 +2099,47 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_file_discovery() {
+        let file = |path: &str, check_interval_secs| {
+            Some(DiscoveryConfig::File(FileDiscoveryConfig {
+                path: path.into(),
+                check_interval_secs,
+            }))
+        };
+
+        let mut config = regular_mode_config();
+        config.discovery = file("/run/smg/workers.json", 30);
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        for (discovery, field) in [
+            (file("", 30), "discovery.path"),
+            (
+                file("/run/smg/workers.json", 0),
+                "discovery.check_interval_secs",
+            ),
+        ] {
+            config.discovery = discovery;
+            assert!(matches!(
+                ConfigValidator::validate(&config),
+                Err(ConfigError::InvalidValue { field: ref actual, .. }) if actual == field
+            ));
+        }
+
+        let mut openai = RouterConfig {
+            mode: RoutingMode::OpenAI {
+                worker_urls: vec![],
+            },
+            ..Default::default()
+        };
+        openai.discovery = file("/run/smg/workers.json", 30);
+        assert!(matches!(
+            ConfigValidator::validate(&openai),
+            Err(ConfigError::ValidationFailed { ref reason })
+                if reason.contains("does not support service discovery")
+        ));
+    }
+
+    #[test]
     fn test_validate_invalid_kv_annotation_names() {
         for (field, kv_connector_annotation, kv_engine_id_annotation) in [
             (
@@ -2244,6 +2473,7 @@ mod tests {
             },
             PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
+                load_metric: Default::default(),
             },
         );
 
@@ -2282,6 +2512,7 @@ mod tests {
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
+                    load_metric: Default::default(),
                 }),
             },
             PolicyConfig::Random, // Main policy as fallback
@@ -2293,7 +2524,7 @@ mod tests {
 
     #[test]
     fn test_validate_pd_mode_power_of_two_insufficient_workers() {
-        let config = RouterConfig::new(
+        let mut config = RouterConfig::new(
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![("http://prefill1:8000".to_string(), None)], // Only 1 prefill
                 decode_urls: vec![
@@ -2302,6 +2533,7 @@ mod tests {
                 ],
                 prefill_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
+                    load_metric: Default::default(),
                 }), // Requires 2+ workers
                 decode_policy: None,
             },
@@ -2313,6 +2545,9 @@ mod tests {
         if let Err(e) = result {
             assert!(e.to_string().contains("prefill requires at least 2"));
         }
+
+        config.dp_aware = true;
+        assert!(ConfigValidator::validate(&config).is_ok());
     }
 
     #[test]
@@ -2334,6 +2569,7 @@ mod tests {
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
+                    load_metric: Default::default(),
                 }),
             },
             PolicyConfig::Random, // Main policy as fallback

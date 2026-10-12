@@ -21,7 +21,7 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
     reason = "jemalloc reads its options from this exported symbol; a NUL-terminated byte string nothing in Rust dereferences"
 )]
 #[export_name = "_rjem_malloc_conf"]
-pub static MALLOC_CONF: &[u8; 61] = observability::metrics::SERVER_MALLOC_CONF;
+pub static MALLOC_CONF: &[u8; 72] = observability::metrics::SERVER_MALLOC_CONF;
 use smg::*;
 use smg_auth as auth;
 
@@ -481,6 +481,7 @@ struct Router {
     queue_size: usize,
     queue_timeout_secs: u64,
     rate_limit_tokens_per_second: Option<i32>,
+    max_background_responses: usize,
     connection_mode: worker::ConnectionMode,
     model_path: Option<String>,
     tokenizer_path: Option<String>,
@@ -541,6 +542,8 @@ struct Router {
     cache_boundaries: Vec<usize>,
     cache_index: String,
     cache_ttl_secs: u64,
+    header_read_timeout_secs: u64,
+    idle_connection_timeout_secs: u64,
     job_queue_capacity: usize,
     job_queue_concurrency: usize,
     worker_overload_waiting_requests: Option<usize>,
@@ -596,6 +599,7 @@ struct Router {
     mesh_tls_ca_cert: Option<String>,
     mesh_tls_cert: Option<String>,
     mesh_tls_key: Option<String>,
+    power_of_two_load_metric: String,
 }
 
 /// Read the keyword-only `discovery` mapping by the same rules as
@@ -758,6 +762,15 @@ impl Router {
             }
         })?;
 
+        let power_of_two_load_metric = config::PowerOfTwoLoadMetric::parse(
+            &self.power_of_two_load_metric,
+        )
+        .ok_or_else(|| config::ConfigError::InvalidValue {
+            field: "power_of_two_load_metric".to_string(),
+            value: self.power_of_two_load_metric.clone(),
+            reason: "expected expected_wait, requests or least_requests".to_string(),
+        })?;
+
         let convert_policy = |policy: &PolicyType| -> config::ConfigResult<ConfigPolicyConfig> {
             Ok(match policy {
                 PolicyType::Random => ConfigPolicyConfig::Random,
@@ -783,6 +796,7 @@ impl Router {
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: self.load_monitor_interval,
+                    load_metric: power_of_two_load_metric,
                 },
                 PolicyType::LeastLoad => ConfigPolicyConfig::LeastLoad {
                     load_check_interval_secs: self.load_monitor_interval,
@@ -1086,6 +1100,7 @@ impl Router {
                     .then(|| self.storage_context_headers.clone()),
             )
             .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
+            .max_background_responses(self.max_background_responses)
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
@@ -1103,6 +1118,8 @@ impl Router {
             .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
             .max_buffered_request_bytes(self.max_buffered_request_bytes)
             .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
+            .header_read_timeout_secs(self.header_read_timeout_secs)
+            .idle_connection_timeout_secs(self.idle_connection_timeout_secs)
             .multimodal_tensor_transport(multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
             .multimodal_max_inflight_bytes(self.multimodal_max_inflight_bytes)
@@ -1332,6 +1349,9 @@ impl Router {
         tenant_rate_limit_config = None,
         jemalloc_prof_dir = None,
         tokenizer_cache_l0_max_memory = 268435456,
+        max_background_responses = 1024,
+        header_read_timeout_secs = 30,
+        idle_connection_timeout_secs = 90,
         token_dump_dir = None,
         token_dump_on_start = false,
         token_dump_max_mb = 1024,
@@ -1340,6 +1360,7 @@ impl Router {
         mesh_tls_ca_cert = None,
         mesh_tls_cert = None,
         mesh_tls_key = None,
+        power_of_two_load_metric = String::from("expected_wait"),
         discovery = None,
     ))]
     #[expect(clippy::too_many_arguments)]
@@ -1527,12 +1548,16 @@ impl Router {
         tenant_rate_limit_config: Option<String>,
         jemalloc_prof_dir: Option<String>,
         tokenizer_cache_l0_max_memory: usize,
+        max_background_responses: usize,
+        header_read_timeout_secs: u64,
+        idle_connection_timeout_secs: u64,
         token_dump_dir: Option<String>,
         token_dump_on_start: bool,
         token_dump_max_mb: u64,
         mesh_tls_ca_cert: Option<String>,
         mesh_tls_cert: Option<String>,
         mesh_tls_key: Option<String>,
+        power_of_two_load_metric: String,
         discovery: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         // Two spellings of one choice: refuse both rather than pick one.
@@ -1653,6 +1678,7 @@ impl Router {
             queue_size,
             queue_timeout_secs,
             rate_limit_tokens_per_second,
+            max_background_responses,
             connection_mode,
             model_path,
             tokenizer_path,
@@ -1708,6 +1734,8 @@ impl Router {
             cache_boundaries,
             cache_index,
             cache_ttl_secs,
+            header_read_timeout_secs,
+            idle_connection_timeout_secs,
             job_queue_capacity,
             job_queue_concurrency,
             worker_overload_waiting_requests,
@@ -1755,6 +1783,7 @@ impl Router {
             mesh_tls_ca_cert,
             mesh_tls_cert,
             mesh_tls_key,
+            power_of_two_load_metric,
         })
     }
 
@@ -1931,6 +1960,10 @@ fn get_available_reasoning_parsers() -> Vec<String> {
 #[pymodule]
 fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     observability::metrics::register_jemalloc_as_global_allocator();
+    // The process-level TLS crypto provider, installed once when the module
+    // is imported: every HTTP client a binding builds takes it, whether or
+    // not a router is started in this process.
+    tls::install_crypto_provider();
 
     m.add_class::<PolicyType>()?;
     m.add_class::<BackendType>()?;

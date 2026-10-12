@@ -1,5 +1,6 @@
 use std::{
     any::Any,
+    collections::VecDeque,
     fmt,
     sync::{
         atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering},
@@ -86,7 +87,8 @@ impl LazyHttpClient {
     }
 
     fn init(&self) -> &Arc<reqwest::Client> {
-        self.cell.get_or_init(|| Arc::new(reqwest::Client::new()))
+        self.cell
+            .get_or_init(|| Arc::new(crate::http_client::client()))
     }
 }
 
@@ -440,7 +442,9 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// implementations that carry no shared runtime (the language bindings,
     /// test doubles): the gate only reaches a worker that reports a running
     /// window, and any implementation that does report one must override
-    /// these three with a real claim, or the window is not enforced.
+    /// these three with a real claim, or the window is not enforced (and
+    /// the three queue methods after them with a real order, or the wait
+    /// is not first come, first served).
     fn try_admit_pd(&self, _count: usize, _window: usize) -> bool {
         true
     }
@@ -451,6 +455,33 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Rooms currently claimed on this worker.
     fn pd_admitted(&self) -> usize {
         0
+    }
+
+    /// Take a place at the back of this worker's admission queue for a
+    /// dispatch that needs `rooms`. The gate lets it claim only while no older
+    /// place needs as few rooms ([`Worker::pd_may_claim`]), which is what
+    /// hands a freed room to the request that has waited longest for one;
+    /// the place is given back through [`Worker::pd_dequeue`] however the
+    /// wait ends.
+    fn pd_enqueue(&self, _rooms: usize) -> u64 {
+        0
+    }
+
+    /// Whether `place` may claim: no older place still waiting needs as few
+    /// rooms as it does, or fewer. The default never queues, so it always may.
+    fn pd_may_claim(&self, _place: u64) -> bool {
+        true
+    }
+
+    /// Give `place` back, whether its dispatch claimed, was shed, or stopped
+    /// waiting early; the places behind it move up.
+    fn pd_dequeue(&self, _place: u64) {}
+
+    /// The notifier of `place`, fired when it is worth trying again: rooms
+    /// were released, or a place ahead of it left. `None` (the default, or a
+    /// place already given back) leaves the gate to its retry interval.
+    fn pd_wake(&self, _place: u64) -> Option<Arc<Notify>> {
+        None
     }
 
     /// Get the current routing-key load cardinality.
@@ -610,6 +641,22 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     fn pushes_load_records(&self) -> bool {
         false
     }
+
+    /// Record whether the worker's latest load record reports its engine
+    /// silent on its in-flight requests for the wedge bound (see
+    /// [`super::liveness`]).
+    fn note_engine_stall(&self, _stalled: bool) {}
+
+    /// Whether the latest load record reported the engine stalled.
+    fn engine_stalled(&self) -> bool {
+        false
+    }
+
+    /// The prefill rate observed on this worker, tokens per second; zero
+    /// until a window of first tokens has been seen.
+    fn prefill_rate_tps(&self) -> u64 {
+        0
+    }
     /// Record the start of a request whose responses the gateway sees one by
     /// one (a streaming generation to this worker over gRPC): the pile the
     /// wedged rule counts, and the start of its clock when a run begins.
@@ -645,11 +692,20 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// successful contact, instead of at its next scheduled probe.
     fn signal_connected(&self) {}
 
-    /// Close the circuit breaker: the worker has returned (a liveness veto
-    /// cleared by a contact, or health promoted it back to Ready) and the
-    /// failures that opened it belong to the outage. It reopens on fresh
-    /// failures like any closed breaker.
+    /// Close the circuit breaker: a liveness veto was cleared by a contact,
+    /// so the failures that opened it belong to the outage. It reopens on
+    /// fresh failures like any closed breaker. A health promotion goes
+    /// through [`Self::readmit_circuit_breaker`] instead: an open breaker is
+    /// put on trial, not closed.
     fn reset_circuit_breaker(&self) {}
+
+    /// The worker's health returned: put its open circuit breaker on trial
+    /// (half-open) now, as its timeout would, or forget the failure streak a
+    /// still-closed breaker banked during the outage. Returns whether an
+    /// open breaker went on trial; a worker without a breaker never does.
+    fn readmit_circuit_breaker(&self) -> bool {
+        false
+    }
 
     /// Record that the worker just became routable (promotion to Ready, or a
     /// liveness veto cleared); the warm-up slice counts from here.
@@ -689,10 +745,12 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// backlog only.
     fn note_prefill_started(&self, _tokens: u64, _timed: bool) {}
 
-    /// The request's first token came back (`prefilled`), or its stream ended
-    /// or was dropped before one (`!prefilled`): its prompt is no longer
-    /// pending prefill. `timed` as at its start.
-    fn note_prefill_ended(&self, _tokens: u64, _timed: bool, _prefilled: bool) {}
+    /// The request's first token came back, with `cached` of its prompt
+    /// tokens reported served from the engine's prefix cache (`Some`; zero
+    /// when the engine reports no count), or its stream ended or was dropped
+    /// before one (`None`): its prompt is no longer pending prefill. `timed`
+    /// as at its start.
+    fn note_prefill_ended(&self, _tokens: u64, _timed: bool, _cached: Option<u64>) {}
 
     /// How long the engine may still need before the first token of its
     /// in-flight work is due: the prompt tokens dispatched and not yet
@@ -1379,6 +1437,13 @@ pub struct WorkerRuntime {
     /// the over-window burst the gate exists to prevent. Lives here so a
     /// same-URL replacement inherits the rooms the engine still holds.
     pd_admitted: AtomicUsize,
+    /// The dispatches waiting at the PD admission gate for this worker's
+    /// rooms, oldest first, so a room that frees goes to the one that has
+    /// waited longest for it (see [`Self::pd_enqueue`]), each with the
+    /// notifier its wait sleeps on. Kept with the rooms rather than in a
+    /// registry of its own: the order lives and dies with the worker, and a
+    /// same-URL replacement inherits it with them.
+    pd_queue: Mutex<PdQueue>,
     processed_counter: AtomicUsize,
     worker_routing_key_load: WorkerRoutingKeyLoad,
     revision: AtomicU64,
@@ -1399,6 +1464,9 @@ pub struct WorkerRuntime {
     /// The worker's KV-event stream has pushed a load record: silence is
     /// then judged by the stream's cadence (see [`super::liveness`]).
     pushed_loads: AtomicBool,
+    /// The latest pushed load record reports the engine silent on its
+    /// in-flight requests past the wedge bound (see [`super::liveness`]).
+    engine_stalled: AtomicBool,
     /// In-flight count at the previous liveness sweep.
     last_load_sample: AtomicUsize,
     /// Woken on every contact, so a loop backing off from this worker (the
@@ -1461,13 +1529,20 @@ const PREFILL_WINDOW_MS: u64 = 1_000;
 /// gaps around it would count as prefill again and its decode would be
 /// timed as the prefill of its prompt.
 ///
-/// Tokens are counted as dispatched, the prompt's length: the gateway does
-/// not see how much of a prompt the engine computed, so a prefix served
-/// from the engine's cache counts as prefilled work, and a worker fed
-/// mostly cache hits learns an optimistic rate, which leaves the bound for
-/// a later burst of cold prompts at the bare threshold (as the wall-time
-/// window already did on a busy worker). Counting the uncached tokens only
-/// needs the engine's or the router's cache-hit count: not done here.
+/// A first token teaches the tokens the engine computed for its prompt:
+/// the prompt's length less the prefix-cache hit the engine reports with
+/// it (the servicers forward the engine's per-request cached-token count
+/// on every chunk; one that reports none teaches the full length). Counted
+/// at full length, a worker fed mostly cache hits (a multi-turn chat)
+/// learned a rate many times its cold one, and a later burst of cold
+/// prompts got a bound at the bare threshold: the false positive the bound
+/// exists to prevent. Two things still err toward patience: the backlog
+/// counts a pending prompt at full length, since its hit is known only
+/// when the engine answers; and the time to first token of a mostly cached
+/// prompt is the engine's step latency more than prefill, so a worker fed
+/// mostly hits learns a rate below its cold one. An underestimate is
+/// halved away by the next cold first token; an overestimate vetoes a
+/// healthy worker, and nothing corrects it.
 #[derive(Debug, Default)]
 struct PrefillBook {
     /// Prompt tokens dispatched to the worker and not yet answered with a
@@ -1504,14 +1579,17 @@ impl PrefillBook {
         self.timed = self.timed.saturating_add(tokens);
     }
 
-    fn ended(&mut self, tokens: u64, timed: bool, prefilled: bool, now_ms: u64) {
+    fn ended(&mut self, tokens: u64, timed: bool, cached: Option<u64>, now_ms: u64) {
         self.pending = self.pending.saturating_sub(tokens);
         if !timed {
             return;
         }
         self.timed = self.timed.saturating_sub(tokens);
-        if prefilled && tokens > 0 {
-            self.observe(tokens, now_ms);
+        if tokens > 0 {
+            if let Some(cached) = cached {
+                // What the engine computed: the prompt less its cache hit.
+                self.observe(tokens.saturating_sub(cached), now_ms);
+            }
         }
         if self.timed == 0 {
             if let Some(since) = self.busy_since_ms.take() {
@@ -1531,22 +1609,27 @@ impl PrefillBook {
         self.window_busy_ms.saturating_add(open)
     }
 
-    /// Fold `tokens` prefilled at `now_ms` into the observed rate: once the
-    /// window holds [`PREFILL_WINDOW_MS`] of busy time its tokens over that
-    /// time are a sample, and each sample halves into the running estimate.
+    /// Fold `tokens` computed for a prompt whose first token came back at
+    /// `now_ms` into the observed rate: once the window holds
+    /// [`PREFILL_WINDOW_MS`] of busy time its tokens over that time are a
+    /// sample, and each sample halves into the running estimate. A window
+    /// in which the engine computed nothing (every prompt a whole cache
+    /// hit) makes no sample.
     fn observe(&mut self, tokens: u64, now_ms: u64) {
         self.window_tokens = self.window_tokens.saturating_add(tokens);
         let span_ms = self.window_span_ms(now_ms);
         if span_ms < PREFILL_WINDOW_MS {
             return;
         }
-        let sample = self.window_tokens.saturating_mul(1000) / span_ms;
-        self.rate_tps = if self.rate_tps == 0 {
-            sample
-        } else {
-            self.rate_tps.midpoint(sample)
+        if self.window_tokens > 0 {
+            let sample = self.window_tokens.saturating_mul(1000) / span_ms;
+            self.rate_tps = if self.rate_tps == 0 {
+                sample
+            } else {
+                self.rate_tps.midpoint(sample)
+            }
+            .max(1);
         }
-        .max(1);
         self.window_busy_ms = 0;
         self.window_tokens = 0;
         if self.busy_since_ms.is_some() {
@@ -1567,6 +1650,59 @@ impl PrefillBook {
     }
 }
 
+/// The PD admission gate's queue on one worker (see [`Worker::pd_enqueue`]):
+/// the places outstanding, oldest first, each with the rooms it needs and
+/// the notifier its wait sleeps on, and the next place number to hand out. A
+/// place is handed out and queued under the one lock, so the queue is always
+/// in arrival order.
+#[derive(Debug, Default)]
+struct PdQueue {
+    next: u64,
+    waiting: VecDeque<PdPlace>,
+}
+
+#[derive(Debug)]
+struct PdPlace {
+    place: u64,
+    rooms: usize,
+    wake: Arc<Notify>,
+}
+
+impl PdQueue {
+    /// Whether `place` may claim: no older place needs as few rooms as it
+    /// does, or fewer. Requests of a size are served in arrival order, and a
+    /// request that needs more rooms than the ones behind it never idles the
+    /// window waiting for them to free all at once: they pass it, and it
+    /// claims when its rooms are free together, as it did before the queue
+    /// existed. A place that is not queued may not claim.
+    fn may_claim(&self, place: u64) -> bool {
+        let mut fewest_ahead = usize::MAX;
+        for waiting in &self.waiting {
+            if waiting.place == place {
+                return waiting.rooms < fewest_ahead;
+            }
+            fewest_ahead = fewest_ahead.min(waiting.rooms);
+        }
+        false
+    }
+
+    /// The notifiers of the places that may claim now (see
+    /// [`Self::may_claim`]): the front, and behind it each place that needs
+    /// fewer rooms than every place ahead of it. Woken when rooms are
+    /// released and when one of them leaves; the others have nothing to try.
+    fn claimable_wakes(&self) -> Vec<Arc<Notify>> {
+        let mut fewest_ahead = usize::MAX;
+        let mut wakes = Vec::new();
+        for waiting in &self.waiting {
+            if waiting.rooms < fewest_ahead {
+                wakes.push(Arc::clone(&waiting.wake));
+                fewest_ahead = waiting.rooms;
+            }
+        }
+        wakes
+    }
+}
+
 impl WorkerRuntime {
     pub fn new(url: &str, initial_status: WorkerStatus) -> Self {
         Self {
@@ -1580,6 +1716,7 @@ impl WorkerRuntime {
             total_pending_probes: AtomicUsize::new(0),
             load_counter: AtomicUsize::new(0),
             pd_admitted: AtomicUsize::new(0),
+            pd_queue: Mutex::new(PdQueue::default()),
             processed_counter: AtomicUsize::new(0),
             worker_routing_key_load: WorkerRoutingKeyLoad::new(url),
             revision: AtomicU64::new(0),
@@ -1590,6 +1727,7 @@ impl WorkerRuntime {
             last_waiting_reqs: AtomicI64::new(0),
             transport_failed: AtomicBool::new(false),
             pushed_loads: AtomicBool::new(false),
+            engine_stalled: AtomicBool::new(false),
             last_load_sample: AtomicUsize::new(0),
             contact_wake: Arc::new(Notify::new()),
             admitted_at_ms: AtomicU64::new(super::liveness::now_ms()),
@@ -1697,6 +1835,14 @@ impl WorkerRuntime {
         self.pushed_loads.load(Ordering::Relaxed)
     }
 
+    pub fn note_engine_stall(&self, stalled: bool) {
+        self.engine_stalled.store(stalled, Ordering::Relaxed);
+    }
+
+    pub fn engine_stalled(&self) -> bool {
+        self.engine_stalled.load(Ordering::Relaxed)
+    }
+
     /// Time without a token or completion, counted from the later of the last
     /// one and the start of the current run of in-flight requests: a worker
     /// that was idle (or just registered) has nothing to show progress on
@@ -1723,13 +1869,19 @@ impl WorkerRuntime {
         self.prefill.lock().started(tokens, timed, now_ms);
     }
 
-    pub fn note_prefill_ended(&self, tokens: u64, timed: bool, prefilled: bool) {
-        self.note_prefill_ended_at(tokens, timed, prefilled, super::liveness::now_ms().max(1));
+    pub fn note_prefill_ended(&self, tokens: u64, timed: bool, cached: Option<u64>) {
+        self.note_prefill_ended_at(tokens, timed, cached, super::liveness::now_ms().max(1));
     }
 
     /// [`Self::note_prefill_ended`] at `now_ms` on the gateway clock.
-    pub fn note_prefill_ended_at(&self, tokens: u64, timed: bool, prefilled: bool, now_ms: u64) {
-        self.prefill.lock().ended(tokens, timed, prefilled, now_ms);
+    pub fn note_prefill_ended_at(
+        &self,
+        tokens: u64,
+        timed: bool,
+        cached: Option<u64>,
+        now_ms: u64,
+    ) {
+        self.prefill.lock().ended(tokens, timed, cached, now_ms);
     }
 
     pub fn prefill_rate_tps(&self) -> u64 {
@@ -1889,13 +2041,85 @@ impl WorkerRuntime {
             .is_ok()
     }
 
-    /// Release `count` claimed rooms, saturating at zero.
+    /// Release `count` claimed rooms, saturating at zero, and wake the waits
+    /// that may claim now.
     pub fn release_pd(&self, count: usize) {
         let _ = self
             .pd_admitted
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
                 Some(admitted.saturating_sub(count))
             });
+        self.wake_claimable();
+    }
+
+    /// Wake the places that may claim now; the others would find nothing to
+    /// do. One wakeup per such place, not one per waiter: `notify_one` keeps
+    /// a permit for a wait that is between tries, so none is lost.
+    fn wake_claimable(&self) {
+        let wakes = self.pd_queue.lock().claimable_wakes();
+        for wake in wakes {
+            wake.notify_one();
+        }
+    }
+
+    /// Join the admission queue at the back, needing `rooms`; the place comes
+    /// back through [`Self::pd_dequeue`] on every way out of the wait.
+    pub fn pd_enqueue(&self, rooms: usize) -> u64 {
+        let mut queue = self.pd_queue.lock();
+        let place = queue.next;
+        queue.next += 1;
+        queue.waiting.push_back(PdPlace {
+            place,
+            rooms,
+            wake: Arc::new(Notify::new()),
+        });
+        place
+    }
+
+    /// Whether `place` may claim: no older place still waiting needs as few
+    /// rooms as it does, or fewer (see [`PdQueue::may_claim`]).
+    pub fn pd_may_claim(&self, place: u64) -> bool {
+        self.pd_queue.lock().may_claim(place)
+    }
+
+    /// Leave the queue from wherever the place is: after a claim or the shed,
+    /// or when a dispatch stops waiting early. The places behind move up; a
+    /// place already gone is a no-op. Only a place that could claim held any
+    /// other back, so only then are the places that may claim now woken. The
+    /// scans are linear in the queue, which holds only the dispatches waiting
+    /// on this worker now.
+    pub fn pd_dequeue(&self, place: u64) {
+        let wakes = {
+            let mut queue = self.pd_queue.lock();
+            let Some(at) = queue
+                .waiting
+                .iter()
+                .position(|waiting| waiting.place == place)
+            else {
+                return;
+            };
+            let could_claim = queue.may_claim(place);
+            queue.waiting.remove(at);
+            if could_claim {
+                queue.claimable_wakes()
+            } else {
+                Vec::new()
+            }
+        };
+        for wake in wakes {
+            wake.notify_one();
+        }
+    }
+
+    /// The notifier of `place` (see [`Worker::pd_wake`]); `None` once the
+    /// place is given back.
+    pub fn pd_wake(&self, place: u64) -> Option<Arc<Notify>> {
+        self.pd_queue
+            .lock()
+            .waiting
+            .iter()
+            .find(|waiting| waiting.place == place)
+            .map(|waiting| Arc::clone(&waiting.wake))
     }
 
     // ── Routing-key load ────────────────────────────────────────────
@@ -2333,6 +2557,22 @@ impl Worker for BasicWorker {
         self.runtime.load().pd_admitted()
     }
 
+    fn pd_enqueue(&self, rooms: usize) -> u64 {
+        self.runtime.load().pd_enqueue(rooms)
+    }
+
+    fn pd_may_claim(&self, place: u64) -> bool {
+        self.runtime.load().pd_may_claim(place)
+    }
+
+    fn pd_dequeue(&self, place: u64) {
+        self.runtime.load().pd_dequeue(place);
+    }
+
+    fn pd_wake(&self, place: u64) -> Option<Arc<Notify>> {
+        self.runtime.load().pd_wake(place)
+    }
+
     fn routing_key_load(&self) -> usize {
         self.runtime.load().routing_key_load()
     }
@@ -2417,6 +2657,18 @@ impl Worker for BasicWorker {
         self.runtime.load().pushes_load_records()
     }
 
+    fn note_engine_stall(&self, stalled: bool) {
+        self.runtime.load().note_engine_stall(stalled);
+    }
+
+    fn engine_stalled(&self) -> bool {
+        self.runtime.load().engine_stalled()
+    }
+
+    fn prefill_rate_tps(&self) -> u64 {
+        self.runtime.load().prefill_rate_tps()
+    }
+
     fn swap_waiting_reqs(&self, waiting: i64) -> i64 {
         self.runtime.load().swap_waiting_reqs(waiting)
     }
@@ -2440,6 +2692,15 @@ impl Worker for BasicWorker {
 
     fn reset_circuit_breaker(&self) {
         self.circuit_breaker.load().reset();
+    }
+
+    fn readmit_circuit_breaker(&self) -> bool {
+        let breaker = self.circuit_breaker.load();
+        if breaker.try_half_open() {
+            return true;
+        }
+        breaker.clear_failure_streak();
+        false
     }
 
     fn note_admitted(&self) {
@@ -2466,10 +2727,10 @@ impl Worker for BasicWorker {
         self.runtime.load().note_prefill_started(tokens, timed);
     }
 
-    fn note_prefill_ended(&self, tokens: u64, timed: bool, prefilled: bool) {
+    fn note_prefill_ended(&self, tokens: u64, timed: bool, cached: Option<u64>) {
         self.runtime
             .load()
-            .note_prefill_ended(tokens, timed, prefilled);
+            .note_prefill_ended(tokens, timed, cached);
     }
 
     fn prefill_backlog(&self) -> Duration {
@@ -3221,6 +3482,95 @@ mod tests {
 
         assert_eq!(admitted, window, "exactly the window's worth may claim");
         assert_eq!(worker.pd_admitted(), window);
+    }
+
+    #[test]
+    fn test_pd_admission_queue_is_arrival_ordered_and_closes_over_departures() {
+        use crate::worker::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("grpc://w:30000").build();
+
+        let (first, second, third) = (
+            worker.pd_enqueue(1),
+            worker.pd_enqueue(1),
+            worker.pd_enqueue(1),
+        );
+        assert!(worker.pd_may_claim(first), "the oldest place is next");
+        assert!(!worker.pd_may_claim(second));
+        assert!(!worker.pd_may_claim(third));
+        assert!(
+            worker.pd_wake(second).is_some(),
+            "a queued place has its notifier"
+        );
+
+        // A dispatch that stops waiting from the middle leaves no hole.
+        worker.pd_dequeue(second);
+        assert!(worker.pd_may_claim(first));
+        assert!(
+            worker.pd_wake(second).is_none(),
+            "a place given back has none"
+        );
+        worker.pd_dequeue(first);
+        assert!(worker.pd_may_claim(third), "the places behind move up");
+        assert!(
+            !worker.pd_may_claim(second),
+            "a place given back never comes back"
+        );
+
+        // Leaving twice, or with a place never handed out, changes nothing.
+        worker.pd_dequeue(second);
+        worker.pd_dequeue(u64::MAX);
+        assert!(worker.pd_may_claim(third));
+
+        worker.pd_dequeue(third);
+        assert!(
+            worker.pd_may_claim(worker.pd_enqueue(1)),
+            "with nobody waiting a newcomer is next at once"
+        );
+    }
+
+    #[test]
+    fn test_pd_admission_queue_lets_a_narrower_place_pass_a_wider_older_one() {
+        use crate::worker::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("grpc://w:30000").build();
+
+        // Arrival order, with the rooms each needs: 4, 1, 2, 1, 3.
+        let wide = worker.pd_enqueue(4);
+        let narrow = worker.pd_enqueue(1);
+        let middle = worker.pd_enqueue(2);
+        let narrow_too = worker.pd_enqueue(1);
+        let wider = worker.pd_enqueue(3);
+        assert!(worker.pd_may_claim(wide), "the front always may");
+        assert!(
+            worker.pd_may_claim(narrow),
+            "it needs fewer rooms than everyone ahead of it"
+        );
+        assert!(
+            !worker.pd_may_claim(middle),
+            "the 1-room place ahead goes first"
+        );
+        assert!(
+            !worker.pd_may_claim(narrow_too),
+            "its equal ahead goes first"
+        );
+        assert!(!worker.pd_may_claim(wider));
+
+        // The narrow one is served: the 2-room place now needs fewer than the
+        // front, and the other 1-room place fewer than both ahead of it.
+        worker.pd_dequeue(narrow);
+        assert!(worker.pd_may_claim(wide));
+        assert!(worker.pd_may_claim(middle));
+        assert!(worker.pd_may_claim(narrow_too));
+        assert!(!worker.pd_may_claim(wider), "a 1-room place is still ahead");
+
+        // The wide front leaves (shed, or its rooms freed together).
+        worker.pd_dequeue(wide);
+        assert!(worker.pd_may_claim(middle));
+        assert!(worker.pd_may_claim(narrow_too));
+        assert!(!worker.pd_may_claim(wider));
+
+        worker.pd_dequeue(middle);
+        worker.pd_dequeue(narrow_too);
+        assert!(worker.pd_may_claim(wider), "last in line, and alone");
     }
 
     #[test]
@@ -4454,14 +4804,14 @@ mod tests {
         // Their first tokens come back within 1.5 s of busy time (the window
         // closes at the first one past a second): an observed rate of ~98k
         // tokens/s replaces the prior, and nothing is pending.
-        runtime.note_prefill_ended_at(64 * 1_152, true, true, 1_600);
-        runtime.note_prefill_ended_at(64 * 1_152, true, true, 2_500);
+        runtime.note_prefill_ended_at(64 * 1_152, true, Some(0), 1_600);
+        runtime.note_prefill_ended_at(64 * 1_152, true, Some(0), 2_500);
         assert_eq!(runtime.prefill_backlog(), Duration::ZERO);
         assert_eq!(runtime.prefill_rate_tps(), 98_304);
         runtime.note_prefill_started_at(1_000_000, true, 3_000);
         assert_eq!(runtime.prefill_backlog(), Duration::from_millis(10_172));
         // A dropped stream releases its tokens without a rate sample.
-        runtime.note_prefill_ended_at(2_000_000, true, false, 3_500);
+        runtime.note_prefill_ended_at(2_000_000, true, None, 3_500);
         assert_eq!(runtime.prefill_backlog(), Duration::ZERO);
     }
 
@@ -4475,9 +4825,9 @@ mod tests {
         // request and no pile. Only busy time counts now.
         let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
         runtime.note_prefill_started_at(47, true, 1_000);
-        runtime.note_prefill_ended_at(47, true, true, 1_010);
+        runtime.note_prefill_ended_at(47, true, Some(0), 1_010);
         runtime.note_prefill_started_at(47, true, 61_000);
-        runtime.note_prefill_ended_at(47, true, true, 61_010);
+        runtime.note_prefill_ended_at(47, true, Some(0), 61_010);
         assert_eq!(
             runtime.prefill_rate_tps(),
             0,
@@ -4489,13 +4839,13 @@ mod tests {
             Duration::from_millis(4),
             "one short pending prompt at the cold prior, not 47 s"
         );
-        runtime.note_prefill_ended_at(47, true, true, 62_010);
+        runtime.note_prefill_ended_at(47, true, Some(0), 62_010);
         // Short prompts do make a rate once their busy time adds up to the
         // window: 100 of them at 10 ms each are a second of prefill.
         let mut now = 100_000;
         for _ in 0..97 {
             runtime.note_prefill_started_at(47, true, now);
-            runtime.note_prefill_ended_at(47, true, true, now + 10);
+            runtime.note_prefill_ended_at(47, true, Some(0), now + 10);
             now += 5_000;
         }
         assert_eq!(
@@ -4508,8 +4858,8 @@ mod tests {
         let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
         runtime.note_prefill_started_at(10_000, true, 1_000);
         runtime.note_prefill_started_at(10_000, true, 1_200);
-        runtime.note_prefill_ended_at(10_000, true, true, 1_900);
-        runtime.note_prefill_ended_at(10_000, true, true, 2_400);
+        runtime.note_prefill_ended_at(10_000, true, Some(0), 1_900);
+        runtime.note_prefill_ended_at(10_000, true, Some(0), 2_400);
         assert_eq!(runtime.prefill_rate_tps(), 20_000 * 1000 / 1_400);
     }
 
@@ -4528,7 +4878,7 @@ mod tests {
             runtime.note_prefill_started_at(500, true, now);
             if i >= 2 {
                 // the prompt dispatched 400 ms ago gets its first token
-                runtime.note_prefill_ended_at(500, true, true, now - 100);
+                runtime.note_prefill_ended_at(500, true, Some(0), now - 100);
             }
             if runtime.prefill_rate_tps() != last_rate {
                 samples += 1;
@@ -4559,18 +4909,18 @@ mod tests {
             runtime.note_prefill_started_at(100, true, 1_000);
             match order {
                 "end-then-start" => {
-                    runtime.note_prefill_ended_at(100, true, true, 1_500);
+                    runtime.note_prefill_ended_at(100, true, Some(0), 1_500);
                     runtime.note_prefill_started_at(50, true, 1_500);
                 }
                 _ => {
                     runtime.note_prefill_started_at(50, true, 1_500);
-                    runtime.note_prefill_ended_at(100, true, true, 1_500);
+                    runtime.note_prefill_ended_at(100, true, Some(0), 1_500);
                 }
             }
             // The next first token, 600 ms later, completes a window of
             // 1.1 s of busy time either way (500 ms banked or still open,
             // plus 600 ms) and makes a rate: 150 tokens over 1.1 s.
-            runtime.note_prefill_ended_at(50, true, true, 2_100);
+            runtime.note_prefill_ended_at(50, true, Some(0), 2_100);
             assert_eq!(
                 runtime.prefill_rate_tps(),
                 150 * 1000 / 1_100,
@@ -4604,7 +4954,7 @@ mod tests {
         let mut now = 6_000;
         for _ in 0..5 {
             runtime.note_prefill_started_at(47, true, now);
-            runtime.note_prefill_ended_at(47, true, true, now + 10);
+            runtime.note_prefill_ended_at(47, true, Some(0), now + 10);
             now += 5_000;
         }
         assert_eq!(
@@ -4613,7 +4963,7 @@ mod tests {
             "50 ms of busy time is no window: the gaps stayed idle"
         );
         // Its answer, 30 s after dispatch: no sample, and the backlog is gone.
-        runtime.note_prefill_ended_at(4_000, false, true, 31_000);
+        runtime.note_prefill_ended_at(4_000, false, Some(0), 31_000);
         assert_eq!(
             runtime.prefill_rate_tps(),
             0,
@@ -4623,6 +4973,61 @@ mod tests {
         // The next short prompt gets the prior's bound, not the gaps'.
         runtime.note_prefill_started_at(47, true, 31_500);
         assert_eq!(runtime.prefill_backlog(), Duration::from_millis(4));
+    }
+
+    #[test]
+    fn a_prefix_cache_hit_teaches_the_tokens_the_engine_computed() {
+        // A worker serving multi-turn conversations: 2,000-token prompts of
+        // which the engine's prefix cache holds 1,900, so it computes 100
+        // tokens per turn, 10 ms each at its 10k tokens/s. Counted at their
+        // full length, a hundred such turns taught 200k tokens/s, and a
+        // burst of four cold 16,000-token prompts then got a backlog of
+        // 320 ms, the bare threshold, for a prefill the engine needs 6.4 s
+        // for, during which nothing streams: the false positive the bound
+        // exists to prevent. A first token teaches the tokens the engine
+        // computed, the prompt less the hit it reports.
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        let mut now = 1_000;
+        for _ in 0..100 {
+            runtime.note_prefill_started_at(2_000, true, now);
+            runtime.note_prefill_ended_at(2_000, true, Some(1_900), now + 10);
+            now += 500;
+        }
+        assert_eq!(
+            runtime.prefill_rate_tps(),
+            10_000,
+            "a hundred turns of 100 computed tokens over a second of busy time"
+        );
+        runtime.note_prefill_started_at(4 * 16_000, true, now);
+        assert_eq!(
+            runtime.prefill_backlog(),
+            Duration::from_millis(6_400),
+            "the cold burst's prefill time at the rate learned, not 320 ms"
+        );
+        // The cold prompts' first tokens, with no hit, teach their full
+        // length: 64,000 tokens over 6.4 s, the same rate.
+        runtime.note_prefill_ended_at(4 * 16_000, true, Some(0), now + 6_400);
+        assert_eq!(runtime.prefill_rate_tps(), 10_000);
+        assert_eq!(runtime.prefill_backlog(), Duration::ZERO);
+        // An engine that serves whole prompts from its cache computes
+        // nothing the window can time: no sample, the prior stands.
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        for i in 0..100u64 {
+            let now = 1_000 + i * 500;
+            runtime.note_prefill_started_at(2_000, true, now);
+            runtime.note_prefill_ended_at(2_000, true, Some(2_000), now + 10);
+        }
+        assert_eq!(
+            runtime.prefill_rate_tps(),
+            0,
+            "nothing computed, nothing learned"
+        );
+        runtime.note_prefill_started_at(4 * 16_000, true, 60_000);
+        assert_eq!(
+            runtime.prefill_backlog(),
+            Duration::from_millis(6_400),
+            "the cold prior, 10k tokens/s"
+        );
     }
 
     #[test]

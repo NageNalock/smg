@@ -39,13 +39,14 @@ use openai_protocol::{
         ListWorkersQuery, StartProfileRequest, StopProfileRequest, WorkerSpec, WorkerUpdateRequest,
     },
 };
-use rustls::crypto::{ring, CryptoProvider};
 use serde::Deserialize;
 use serde_json::Value;
 use smg_mesh::{MeshServerBuilder, MeshServerConfig, MeshServerHandler};
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
+
+pub mod connection_timeouts;
 
 use crate::{
     app_context::AppContext,
@@ -68,6 +69,7 @@ use crate::{
         http::router::{stream_eligible_request_bodies, StreamBodyState},
         RouterTrait,
     },
+    server::connection_timeouts::{ConnectionTimeoutAcceptor, ConnectionTimeouts},
     service_discovery::{start_service_discovery, RuntimeDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
@@ -177,7 +179,8 @@ async fn v1_model(
     Path(model_id): Path<String>,
     req: Request,
 ) -> Response {
-    models::retrieve_model(&state.context, req.headers(), &model_id)
+    let request_id = middleware::request_id_of(&req);
+    models::retrieve_model(&state.context, req.headers(), &model_id, request_id).await
 }
 
 async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
@@ -1292,9 +1295,22 @@ where
 {
     app.fallback(sink_handler)
         .method_not_allowed_fallback(method_not_allowed_handler)
+        // Marks every response that came back through the body-limit layer
+        // below, so the envelope pass outside it re-shapes only the limit
+        // layer's own refusal (a 413 minted inside, a handler's or a relayed
+        // upstream's, keeps its body).
+        .layer(axum::middleware::from_fn(
+            middleware::mark_passed_body_limit_middleware,
+        ))
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
+        ))
+        // The limit layer refuses a declared over-limit length with a plain
+        // text 413: the gateway's envelope and error code go on here, outside
+        // it, the same as the chunked refusal the extractor builds.
+        .layer(axum::middleware::from_fn(
+            middleware::payload_too_large_envelope_middleware,
         ))
         // The Messages envelope once more, outside the body-size limit: a
         // declared over-limit length is refused by the limit layer before any
@@ -1350,29 +1366,8 @@ fn supervise_discovery(
     abort
 }
 
-/// The process-level crypto provider rustls uses, installed before anything
-/// in this process builds a TLS configuration.
-///
-/// The gateway links both rustls backends: `ring` directly and through its
-/// gRPC stack, `aws-lc-rs` through the HTTP client's default feature set.
-/// With two backends compiled in rustls cannot pick one on its own, and a
-/// `ServerConfig::builder()` call panics in whichever task builds the first
-/// TLS configuration without a provider installed: the mesh listener's task,
-/// when the mesh runs with mTLS, so the listener never bound while the
-/// gateway kept serving. The provider is `ring`, the one every explicit
-/// choice in this binary already makes. Installing is idempotent: a provider
-/// installed earlier, by an embedding process or a previous start in the
-/// same process, stays.
-fn install_crypto_provider() {
-    if CryptoProvider::get_default().is_none() {
-        // An error here means another thread installed one in between,
-        // which is the outcome wanted.
-        let _ = ring::default_provider().install_default();
-    }
-}
-
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    install_crypto_provider();
+    crate::tls::install_crypto_provider();
 
     // Defense in depth: the CLI and Python bindings both validate via
     // `RouterConfigBuilder::build()` before reaching here, but `RouterConfig`
@@ -1885,6 +1880,19 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         // Phase 3: Teardown proceeds after axum server stops (in the main task)
     });
 
+    // Bounds on connections that carry no request (a head that never
+    // arrives or stalls, an idle keep-alive connection); a request in flight,
+    // an open streaming response included, is never cut here.
+    let connection_timeouts = ConnectionTimeouts::from_secs(
+        config.router_config.header_read_timeout_secs,
+        config.router_config.idle_connection_timeout_secs,
+    );
+    info!(
+        header_read_timeout_secs = config.router_config.header_read_timeout_secs,
+        idle_connection_timeout_secs = config.router_config.idle_connection_timeout_secs,
+        "HTTP connection timeouts (0 = disabled)"
+    );
+
     let server_result = if let (Some(cert), Some(key)) = (
         &config.router_config.server_cert,
         &config.router_config.server_key,
@@ -1895,11 +1903,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .map_err(|e| format!("Failed to create TLS config: {e}"))?;
 
         axum_server::bind_rustls(addr, tls_config)
+            .map(|acceptor| ConnectionTimeoutAcceptor::new(acceptor, connection_timeouts))
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
     } else {
-        bind_http_server(addr)
+        bind_http_server(addr, connection_timeouts)
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
@@ -1929,12 +1938,21 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 }
 
 /// Disable Nagle buffering on accepted plain-HTTP sockets so small streaming
-/// writes need not wait for outstanding data to be acknowledged. This changes
-/// neither HTTP payloads nor the separately configured TLS listener.
+/// writes need not wait for outstanding data to be acknowledged, and bound the
+/// connections that carry no request (see [`connection_timeouts`]). This
+/// changes no HTTP payload; the separately configured TLS listener applies the
+/// same bounds around its handshake acceptor.
 fn bind_http_server(
     addr: std::net::SocketAddr,
-) -> axum_server::Server<std::net::SocketAddr, axum_server::accept::NoDelayAcceptor> {
-    axum_server::bind(addr).acceptor(axum_server::accept::NoDelayAcceptor::new())
+    timeouts: ConnectionTimeouts,
+) -> axum_server::Server<
+    std::net::SocketAddr,
+    ConnectionTimeoutAcceptor<axum_server::accept::NoDelayAcceptor>,
+> {
+    axum_server::bind(addr).acceptor(ConnectionTimeoutAcceptor::new(
+        axum_server::accept::NoDelayAcceptor::new(),
+        timeouts,
+    ))
 }
 
 #[expect(
@@ -2315,7 +2333,9 @@ mod tests {
         assert_eq!(json["error"]["type"], "request_too_large", "{json}");
         assert_eq!(json["request_id"], request_id, "{json}");
 
-        // Declared length: refused by the limit layer before the body.
+        // Declared length: refused by the limit layer before the body, and
+        // still the JSON envelope with the same code as the chunked refusal
+        // (the limit layer's own answer is plain text).
         let response = app
             .oneshot(
                 http::Request::builder()
@@ -2329,6 +2349,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            route_error::extract_error_code_from_response(&response),
+            "request_body_too_large"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "request_body_too_large", "{json}");
+        assert_eq!(json["error"]["type"], "invalid_request_error", "{json}");
     }
 
     /// The same answer survives the request-body watchdog the typed-JSON
@@ -2463,14 +2491,14 @@ mod tests {
             socket.set_nodelay(false).unwrap();
             assert!(!socket.nodelay().unwrap());
             let service = Arc::new(());
-            let server = bind_http_server(addr);
+            let server = bind_http_server(addr, ConnectionTimeouts::disabled());
             let (socket, returned_service) = server
                 .get_ref()
                 .accept(socket, service.clone())
                 .await
                 .unwrap();
-            assert!(socket.nodelay().unwrap());
-            assert!(Arc::ptr_eq(&service, &returned_service));
+            assert!(socket.get_ref().nodelay().unwrap());
+            assert!(Arc::ptr_eq(&service, &returned_service.into_inner()));
         })
         .await
         .expect("plain HTTP acceptor test timed out");
@@ -2494,12 +2522,18 @@ mod tests {
                         ]))
                     }),
                 );
-            let serving = bind_http_server("127.0.0.1:0".parse().unwrap())
-                .handle(handle.clone())
-                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>());
+            let serving = bind_http_server(
+                "127.0.0.1:0".parse().unwrap(),
+                ConnectionTimeouts::disabled(),
+            )
+            .handle(handle.clone())
+            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>());
             let checking = async {
                 let addr = handle.listening().await.expect("HTTP server did not bind");
-                let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                let client = crate::http_client::client_builder()
+                    .no_proxy()
+                    .build()
+                    .unwrap();
                 for (path, content_type, expected) in [
                     ("plain", "application/json", "{\"ok\":true}"),
                     (

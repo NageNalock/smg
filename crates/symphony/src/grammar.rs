@@ -21,10 +21,16 @@
 //! per property for Ling's newlines and Hy4's suffixed tags (the `keyed` module); `<function=`
 //! and `<parameter=` tags, one per property, for Qwen 3.5's and Seed-OSS's tagged syntax (the
 //! `tagged` module); a tag grammar per parameter for DSML; for Kimi K3's XTML, one argument tag
-//! per property of the schema (the `xtml` module). The gateway's
-//! old parsers wrote these tags by hand, one function per parser; where one exists for a format
-//! Symphony has, the derived tag is pinned to it in the tests, so the switch changes nothing an
-//! engine sees.
+//! per property of the schema (the `xtml` module); `<invoke name="…">` blocks of `<parameter
+//! name="…">` tags for MiniMax M2 (the `attributed` module); Python calls, one per line or as a
+//! list, each value in the template's spelling, for Olmo 3 and LFM2.5 (the `pythonic` module);
+//! xLAM's bare list of JSON objects, written from the tools alone since its table has no markers;
+//! for MiniMax M3, the XML tree of elements with the table's separator before every tag (the
+//! `xml` module); Gemma 4's `call:NAME{key:value}` spelling, the keys sorted and each string
+//! between `<|"|>` tokens (the `gemma` module). The gateway's old parsers wrote these tags by
+//! hand, one function per parser;
+//! where one exists for a format Symphony has, the derived tag is pinned to it in the tests, so
+//! the switch changes nothing an engine sees.
 //!
 //! With the prompt's reasoning still open, the tag is wrapped in a prefix: free text that can
 //! write none of the table's markers but the thought's own, nor the call syntax's inner tags,
@@ -43,21 +49,26 @@
 //! other state, its own row into the block. So the model closes whatever the prompt left open on
 //! its way to the calls, whichever that was.
 //!
-//! Not derived yet, so [`Format::grammar`] gives `None` for them: MiniMax M3's XML tree, the
-//! pythonic tables, xLAM's list, and a table without calls. The gateway then takes the JSON-schema
-//! path, as it does for those models today.
+//! A table without calls gives `None`, as does Inkling's named JSON (a forced call's tag would
+//! start inside the first message, before any opener) until its tag is derived; the gateway takes
+//! the JSON-schema path for it.
 
 use openai_protocol::common::Tool;
 use serde_json::{json, Value};
 
 use crate::{
     format::{CallSyntax, Emits, Format},
+    gemma::STRING as GEMMA_STRING,
     tagged::{assembler::TAGS as TAGGED_TAGS, dsml, keyed::Tags as KeyedTags},
 };
 
+mod attributed;
+mod gemma;
 mod keyed;
+mod pythonic;
 mod schema;
 mod tagged;
+mod xml;
 mod xtml;
 
 /// A structural-tag grammar, as the engines take it.
@@ -181,6 +192,22 @@ impl Grammar {
     pub fn payload(&self) -> Value {
         json!({"format": self.to_json()})
     }
+
+    /// The nodes in the tree, this one included: its size, for a derivation that bounds it.
+    pub(crate) fn nodes(&self) -> usize {
+        1 + match self {
+            Self::ConstString(_)
+            | Self::AnyText { .. }
+            | Self::Regex(_)
+            | Self::JsonSchema { .. } => 0,
+            Self::Sequence(elements) | Self::Or(elements) => elements.iter().map(Self::nodes).sum(),
+            Self::Optional(content) | Self::Star(content) | Self::Plus(content) => content.nodes(),
+            Self::Tag(tag) => tag.content.nodes(),
+            Self::TriggeredTags { tags, .. } | Self::TagsWithSeparator { tags, .. } => {
+                tags.iter().map(|tag| tag.content.nodes()).sum()
+            }
+        }
+    }
 }
 
 /// The markers a table's rows give a call: the terminals into and out of the arguments state, and
@@ -253,16 +280,17 @@ struct Region<'a> {
 
 impl Format {
     /// The structural tag for a forced or required call to one of `tools`, or `None` when the
-    /// table's call syntax has no derivation yet, the table has no calls, or no tool has a name.
-    /// `at_least_one` asks for at least one call (`tool_choice` `required`, a named function, or
-    /// an allowed-tools list in `required` mode). With `reasoning_open`, the prompt left the model
-    /// inside its thought, and the tag follows a prefix of free text without the call markers,
-    /// nothing owed at its end (the thought and its close, or nothing, by where the engine starts
-    /// the grammar); a table without a thought has no prefix, and the tag comes back as it is; a
-    /// table whose thought does not close back to where it opened has no prefix yet, and gives
-    /// `None`. Kimi
-    /// K3's tag has a way in per state its block is entered from, the state's close first when it
-    /// has one, so it is the same either way.
+    /// table has no calls or no tool has a name. `at_least_one` asks for at least one call
+    /// (`tool_choice` `required`, a named function, or an allowed-tools list in `required` mode).
+    /// With `reasoning_open`, the prompt left the model inside its thought, and the tag follows a
+    /// prefix of free text without the call markers, nothing owed at its end (the thought and its
+    /// close, or nothing, by where the engine starts the grammar); a table without a thought has
+    /// no prefix, and the tag comes back as it is; a table whose thought does not close back to
+    /// where it opened has no prefix yet, and gives `None`. Kimi K3's tag has a way in per state
+    /// its block is entered from, the state's close first when it has one, so it is the same
+    /// either way; so is MiniMax M3's, whose block is entered the same way from every state and
+    /// whose thought closes in the free text before the trigger; so is xLAM's list, whose table
+    /// has no thought.
     pub fn grammar(
         &self,
         tools: &[Tool],
@@ -276,26 +304,42 @@ impl Format {
         if named.is_empty() {
             return None;
         }
-        let markers = self.call_markers()?;
+        // The markers are the syntaxes' with a region of calls; xLAM's list has none.
+        let markers = self.call_markers();
+        let markers = markers.as_ref();
         let calls = match self.call_syntax()? {
-            CallSyntax::Json => Self::json_calls(&markers, &named, at_least_one),
+            // The list stands alone in the turn, no marker before or after it, and its table has
+            // no thought: the list is the same either way.
+            CallSyntax::JsonList => return Some(Self::json_list_calls(&named, at_least_one)),
+            CallSyntax::Json => Self::json_calls(markers?, &named, at_least_one),
             CallSyntax::Keyed(tags) if *tags == KeyedTags::PLAIN => {
-                Self::keyed_calls(&markers, &named, at_least_one)
+                Self::keyed_calls(markers?, &named, at_least_one)
             }
-            CallSyntax::Dsml => Self::dsml_calls(&markers, &named, at_least_one)?,
+            CallSyntax::Dsml => Self::dsml_calls(markers?, &named, at_least_one)?,
+            CallSyntax::Attributed(tags) => attributed::calls(markers?, tags, &named, at_least_one),
             CallSyntax::Keyed(tags) => {
-                let ways_in = self.ways_into_block(&markers);
-                keyed::calls(&markers, &ways_in, tags, &named, at_least_one)
+                let markers = markers?;
+                let ways_in = self.ways_into_block(markers);
+                keyed::calls(markers, &ways_in, tags, &named, at_least_one)
             }
             CallSyntax::Xtml => {
+                let markers = markers?;
                 let ways_in = self.ways_into(markers.block.as_ref()?.state);
-                return xtml::calls(&markers, &ways_in, &named, at_least_one);
+                return xtml::calls(markers, &ways_in, &named, at_least_one);
             }
             CallSyntax::Tagged(spelling, _) => {
-                let ways_in = self.ways_into_block(&markers);
-                tagged::calls(&markers, &ways_in, *spelling, &named, at_least_one)
+                let markers = markers?;
+                let ways_in = self.ways_into_block(markers);
+                tagged::calls(markers, &ways_in, *spelling, &named, at_least_one)
             }
-            CallSyntax::Pythonic | CallSyntax::JsonList | CallSyntax::Xml => return None,
+            CallSyntax::Pythonic(dialect) => {
+                pythonic::calls(markers?, *dialect, &named, at_least_one)
+            }
+            CallSyntax::Xml => {
+                return xml::calls(markers?, self.separator(), &named, at_least_one);
+            }
+            CallSyntax::Gemma => gemma::calls(markers?, &named, at_least_one),
+            CallSyntax::NamedJson(_) => return None,
         };
         if !reasoning_open {
             return Some(calls);
@@ -320,7 +364,9 @@ impl Format {
                 tags.value_close,
             ],
             Some(CallSyntax::Dsml) => &[dsml::PARAMETER_OPEN, dsml::PARAMETER_CLOSE],
+            Some(CallSyntax::Attributed(tags)) => &[tags.parameter_open, tags.parameter_close],
             Some(CallSyntax::Tagged(..)) => &TAGGED_TAGS,
+            Some(CallSyntax::Gemma) => &[GEMMA_STRING],
             _ => &[],
         };
         excludes.extend(inner.iter().map(|tag| tag.to_string()));
@@ -351,6 +397,56 @@ impl Format {
             triggers: vec![markers.call_open.to_string()],
             tags,
             at_least_one,
+        }
+    }
+
+    /// xLAM's list: the whole output is `[`, the calls joined by `, `, `]`, each call a JSON object
+    /// whose `name` is the tool's and whose `arguments` the tool's schema accepts, spelled as the
+    /// template spells it (`{"name": "NAME", "arguments": {...}}`, a space after each colon and
+    /// comma); with `at_least_one`, the list alone, and otherwise the list or prose, since the
+    /// model answers in prose instead. The prose is the assembler's rule exactly: its first byte
+    /// that is not whitespace is not `[`, and the rest is free, a `[` later in it included (a
+    /// Markdown link, in 592 of the 13,085 recorded prose answers). The one place the grammar is
+    /// narrower than the assembler: an output that starts with `[` and opens no object is content
+    /// to the assembler and not writable here.
+    fn json_list_calls(tools: &[&Tool], at_least_one: bool) -> Grammar {
+        let one_call = Grammar::Or(
+            tools
+                .iter()
+                .map(|tool| {
+                    let name = Value::String(tool.function.name.clone());
+                    Grammar::Sequence(vec![
+                        Grammar::ConstString(format!("{{\"name\": {name}, \"arguments\": ")),
+                        Grammar::JsonSchema {
+                            schema: tool.function.parameters.clone(),
+                            style: None,
+                        },
+                        Grammar::ConstString("}".to_string()),
+                    ])
+                })
+                .collect(),
+        );
+        let list = Grammar::Sequence(vec![
+            Grammar::ConstString("[".to_string()),
+            one_call.clone(),
+            Grammar::Star(Box::new(Grammar::Sequence(vec![
+                Grammar::ConstString(", ".to_string()),
+                one_call,
+            ]))),
+            Grammar::ConstString("]".to_string()),
+        ]);
+        if at_least_one {
+            list
+        } else {
+            Grammar::Or(vec![
+                Grammar::Sequence(vec![
+                    Grammar::Regex(r"\s*[^\s\[]".to_string()),
+                    Grammar::AnyText {
+                        excludes: Vec::new(),
+                    },
+                ]),
+                list,
+            ])
         }
     }
 
@@ -438,6 +534,14 @@ impl Format {
             },
             Grammar::ConstString(block_close.to_string()),
         ]))
+    }
+
+    /// The text the table drops wherever it stands, which the template writes before every tag
+    /// (MiniMax M3's separator), or nothing for a table without one.
+    fn separator(&self) -> &str {
+        (0..self.terminal_texts().count())
+            .find(|&index| self.ignored(index))
+            .map_or("", |index| self.terminal_text(index))
     }
 
     /// The call markers the rows give: the region of the arguments state, and of the wrapper state
@@ -697,7 +801,7 @@ mod tests {
         assert_eq!(payload["format"]["tags"][0]["end"], "</iquest_tool_call>");
         // Ling writes the template's newlines between the tags, which the compact style does not,
         // so its table says so and its tag is written from its own tags (the `keyed` module).
-        assert_eq!(KeyedTags::LING.between, "\n");
+        assert_eq!(KeyedTags::LING.newlines.after_name, "\n");
     }
 
     #[test]
@@ -1078,25 +1182,82 @@ mod tests {
     }
 
     #[test]
-    fn no_named_tool_and_no_derivation_yet_give_none() {
+    fn xlam_writes_the_list_alone_each_call_named_and_its_arguments_by_the_schema() {
+        // The recorded outputs: `[` first, `{"name": "NAME", "arguments": {...}}` with a space
+        // after each colon and comma, `, ` between calls, `]` last and nothing after it. The table
+        // has no thought, so the thought's state changes nothing.
+        let tools = weather_tools();
+        let payload = formats::xlam()
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
+        let call = |name: &str, parameters: Value| {
+            value!({"type": "sequence", "elements": [
+                {
+                    "type": "const_string",
+                    "value": format!("{{\"name\": \"{name}\", \"arguments\": "),
+                },
+                {"type": "json_schema", "json_schema": parameters},
+                {"type": "const_string", "value": "}"},
+            ]})
+        };
+        let one_call = value!({"type": "or", "elements": tools
+            .iter()
+            .filter(|tool| !tool.function.name.is_empty())
+            .map(|tool| call(&tool.function.name, tool.function.parameters.clone()))
+            .collect::<Vec<_>>()});
+        assert_eq!(
+            payload,
+            value!({"format": {"type": "sequence", "elements": [
+                {"type": "const_string", "value": "["},
+                one_call,
+                {"type": "star", "content": {"type": "sequence", "elements": [
+                    {"type": "const_string", "value": ", "},
+                    one_call,
+                ]}},
+                {"type": "const_string", "value": "]"},
+            ]}})
+        );
+        assert_eq!(
+            formats::xlam()
+                .grammar(&tools, true, true)
+                .expect("a grammar")
+                .payload(),
+            payload
+        );
+    }
+
+    #[test]
+    fn xlam_without_a_required_call_writes_the_list_or_prose_without_a_bracket() {
+        let tools = weather_tools();
+        let list = formats::xlam()
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .to_json();
+        let either = formats::xlam()
+            .grammar(&tools, false, false)
+            .expect("a grammar")
+            .to_json();
+        assert_eq!(
+            either,
+            value!({"type": "or", "elements": [
+                {"type": "sequence", "elements": [
+                    {"type": "regex", "pattern": "\\s*[^\\s\\[]"},
+                    {"type": "any_text", "excludes": []},
+                ]},
+                list,
+            ]})
+        );
+    }
+
+    #[test]
+    fn no_named_tool_and_no_calls_give_none() {
         let tools = weather_tools();
         assert!(formats::glm().grammar(&[], true, false).is_none());
         assert!(formats::glm()
             .grammar(&[tool("", None, value!({}))], true, false)
             .is_none());
-        for format in [
-            formats::minimax_m3(),
-            formats::olmo3(),
-            formats::lfm2_5(),
-            formats::xlam(),
-            formats::plain(),
-        ] {
-            assert!(
-                format.grammar(&tools, true, false).is_none(),
-                "{}",
-                format.name()
-            );
-        }
+        assert!(formats::plain().grammar(&tools, true, false).is_none());
     }
 
     #[test]
