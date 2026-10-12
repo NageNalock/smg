@@ -105,7 +105,7 @@ use crate::{
     gemma,
     markers::{Piece, Scanner},
     pythonic,
-    shape::{CallShape, ValueRead, Values},
+    shape::{CallShape, Layout, ValueRead, Values},
     tagged::{self, dsml, keyed, xtml},
 };
 
@@ -250,6 +250,8 @@ pub struct Format {
     values: Values,
     thinks_first: bool,
     marker_tokens: Vec<String>,
+    /// How the model's chat template writes a turn, where the table holds one.
+    layout: Option<Box<Layout>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -329,6 +331,7 @@ impl Format {
             values: Values::inferred(),
             thinks_first: false,
             marker_tokens: Vec::new(),
+            layout: None,
         }
     }
 
@@ -585,6 +588,22 @@ impl Format {
     /// The marker texts that are one token each, the longest first.
     pub(crate) fn marker_token_texts(&self) -> &[String] {
         &self.marker_tokens
+    }
+
+    /// How the model's chat template writes a turn of this table where the response template's
+    /// patterns leave the text open ([`Layout`]), as whoever compiled the table learned it from a
+    /// rendering: what a structural tag needs to write only what the template renders. Parsing
+    /// does not read it. [`Layout::check`] says whether it fits the table. Given again, it
+    /// replaces the one before.
+    #[must_use]
+    pub fn with_layout(mut self, layout: Layout) -> Self {
+        self.layout = Some(Box::new(layout));
+        self
+    }
+
+    /// The table's layout, if it has one.
+    pub fn layout(&self) -> Option<&Layout> {
+        self.layout.as_deref()
     }
 
     /// The turn opener, if the table names one.

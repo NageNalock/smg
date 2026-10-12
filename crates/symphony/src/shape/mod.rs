@@ -39,12 +39,17 @@
 //! bytes of a header that did not match. A value's text reads by the template's [`ValueParser`]
 //! and is typed by the table's [`ValueRead`]er, [`Inferred`] unless the table names another.
 //!
+//! A [`Layout`] says how the model's chat template writes a turn where the patterns leave the text
+//! open: which whitespace a `\s*` stands for, which attributes a skip passes, what the text outside
+//! every field is: what a structural tag needs to write only what the template renders.
+//!
 //! [`formats`]: crate::formats
 //! [`CallSyntax::Shaped`]: crate::CallSyntax::Shaped
 
 mod call;
 mod class;
 mod intern;
+mod layout;
 mod matcher;
 mod params;
 mod read;
@@ -54,6 +59,9 @@ use std::fmt;
 pub use call::{Assembler, Header};
 pub use class::Class;
 pub use intern::Interner;
+pub use layout::{
+    CallLayout, Layout, LayoutError, Message, Nested, Segment, Spellings, Words, Written,
+};
 use matcher::reads_through;
 pub use matcher::{Match, Matcher, Suffix, Verdict, HOLD_CAP};
 pub(crate) use read::Values;
