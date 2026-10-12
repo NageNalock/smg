@@ -155,7 +155,9 @@ fn muse_messages() -> Box<dyn Parser> {
             .transition("reasoning", "eom", "outside")
             .transition("content", "eot", "outside")
             .transition("content", "eom", "outside")
-            .framing("outside"),
+            .framing("outside")
+            .trims("reasoning")
+            .trims("content"),
         Declared::default(),
     ))
 }
@@ -186,7 +188,38 @@ fn ernie() -> Box<dyn Parser> {
             .calls(CallSyntax::Json)
             .framing("outside")
             .turn_anchor("Assistant:")
-            .starts_in("reasoning"),
+            .starts_in("reasoning")
+            .trims("reasoning")
+            .trims("content"),
+        Declared::default(),
+    ))
+}
+
+/// Gemma 4's turn, spelled from the response template of `google/gemma-4-31B-it` (its
+/// `tokenizer_config.json`): two anchors, a thought, the calls in Gemma's spelling, the content
+/// outside them trimmed stay by stay, and its non-stop close, `<|tool_response>`, a row back into
+/// the content that drops the marker.
+fn gemma4_template() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        Format::new("gemma 4 template")
+            .terminal("think_open", "<|channel>thought\n")
+            .terminal("think_close", "<channel|>")
+            .terminal("call_open", "<|tool_call>")
+            .terminal("call_close", "<tool_call|>")
+            .terminal("response_open", "<|tool_response>")
+            .state("content", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("call", Emits::Arguments)
+            .transition("content", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "content")
+            .transition("content", "call_open", "call")
+            .transition("call", "call_close", "content")
+            .transition("content", "response_open", "content")
+            .calls(CallSyntax::Gemma)
+            .turn_anchor("<|turn>model\n")
+            .turn_anchor("<tool_response|>")
+            .trims("content")
+            .trims("reasoning"),
         Declared::default(),
     ))
 }
@@ -291,6 +324,11 @@ const FORMATS: &[Subject] = &[
         name: "ernie, started in the thought",
         new: ernie,
         outputs: ERNIE_OUTPUTS,
+    },
+    Subject {
+        name: "gemma 4 template, trimmed",
+        new: gemma4_template,
+        outputs: GEMMA4_TEMPLATE_OUTPUTS,
     },
     Subject {
         name: "iquest",
@@ -605,6 +643,22 @@ const ERNIE_OUTPUTS: &[&str] = &[
     "</think>\n<response>\nHi\n</response>",
     "A thought cut short",
     "<respo",
+    "",
+];
+
+/// Gemma 4's turns: transformers' streaming fixture for the template, a thought, calls and an
+/// answer with whitespace at every edge, whitespace inside the text, the content's own close
+/// between two stays, Python's whitespace beyond ASCII, a call written inside a thought, a stay
+/// of whitespace only, a cut call, and nothing.
+const GEMMA4_TEMPLATE_OUTPUTS: &[&str] = &[
+    "<|channel>thought\nhi<channel|><|tool_call>call:foo{a:1,b:<|\"|>bar<|\"|>}<tool_call|>",
+    "<|channel>thought\n The user wants the weather.\n<channel|>\n<|tool_call>call:get_weather{\
+     city:<|\"|>Paris<|\"|>}<tool_call|>\n\nIt is\n\nsunny. \n",
+    "Hi <|tool_response> there\n",
+    "\u{a0}\u{1c}Hi\u{2003}there\u{2003}\u{1f}",
+    "<|channel>thought\nPlan <|tool_call>call:f{}<tool_call|> more<channel|>Done",
+    " \n\t ",
+    "Sure.\n<|tool_call>call:get_weather{city:<|\"|>Par",
     "",
 ];
 

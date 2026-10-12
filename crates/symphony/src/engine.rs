@@ -39,6 +39,13 @@
 //!   Hugging Face's null sink, the space around a response template's fields. Every byte of text
 //!   there, a terminal with no row from the state and what the scanner held at the end included,
 //!   is `Dropped { Wrapper }` at every finish; the state's rows still move the engine.
+//! - A table can trim a state's text stay by stay ([`Format::trims`]), as Hugging Face's `text`
+//!   parser strips a field's value: whitespace before a stay's first other character is
+//!   `Dropped { Whitespace }` as it arrives, and a run of it after the last one is held, with any
+//!   terminal the table ignores inside it, until more text in the stay shows it was inside the
+//!   text, which releases it as the state's text, or a row ends the stay or the stream ends,
+//!   which drops it. Held bytes have not reached the ledger, so the tokens are counted in the
+//!   output's order whatever the run turns out to be.
 //! - With the tagged syntax, a value's type comes from the request's tools ([`Declared`]): a
 //!   declared string streams, every other value is written at its close. A call to a function the
 //!   request did not declare has every value inferred.
@@ -116,6 +123,31 @@ pub struct Engine {
     stage: Stage,
     /// Whether the turn's first piece is still to come, for a table with a start row.
     at_turn_start: bool,
+    /// The stay in the current state, as far as a trimmed state needs it.
+    stay: Stay,
+}
+
+/// The stay in a state, from the row that entered it to the row that leaves it, as trimming reads
+/// it: whether text other than whitespace has arrived, and the run held after the last of it.
+#[derive(Debug, Default)]
+struct Stay {
+    begun: bool,
+    held: Vec<Held>,
+}
+
+/// Bytes a trimmed stay holds after its last text that is not whitespace, in the output's order.
+#[derive(Debug)]
+enum Held {
+    /// Whitespace: the state's text if more text follows in the stay, dropped if the stay ends.
+    Space(String),
+    /// A terminal the table ignores, inside the run: dropped wherever it stands, in its place.
+    Ignored(String),
+}
+
+/// Whitespace as Python's `str.strip` removes it: Unicode's white space and the information
+/// separators U+001C to U+001F, which `str.isspace` takes too.
+fn is_strip_space(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
 
 /// The assembler of the call region, one per call syntax.
@@ -329,6 +361,7 @@ impl Engine {
             reasoning_tokens: 0,
             stage: Stage::Fresh,
             at_turn_start,
+            stay: Stay::default(),
         };
         // A table whose output starts inside a call (a bare list of calls, with no marker before
         // it) opens the call here, since no terminal will.
@@ -366,12 +399,10 @@ impl Engine {
             return;
         }
         match self.emits() {
-            Emits::Content => out.push_content(self.tokens.text(text)),
-            Emits::Reasoning => {
-                let counted = self.tokens.text(text);
-                self.reasoning_tokens += counted.tokens.unwrap_or(0);
-                out.push_reasoning(counted);
+            Emits::Content | Emits::Reasoning if self.format.is_trimmed(self.state) => {
+                self.trimmed(text, out);
             }
+            Emits::Content | Emits::Reasoning => self.show(text, out),
             Emits::Arguments => {
                 let Some(call) = &mut self.call else {
                     // An arguments state always has a call open; kept as content, not lost.
@@ -384,6 +415,73 @@ impl Engine {
                 self.wrapping(&text[taken..], TEXT_AFTER_THE_OBJECT, out);
             }
             Emits::Wrapper => self.wrapping(text, TEXT_BETWEEN_CALLS, out),
+        }
+    }
+
+    /// Text of the content or reasoning state the engine is in, as the client sees it.
+    fn show(&mut self, text: &str, out: &mut Events) {
+        let counted = self.tokens.text(text);
+        if self.emits() == Emits::Reasoning {
+            self.reasoning_tokens += counted.tokens.unwrap_or(0);
+            out.push_reasoning(counted);
+        } else {
+            out.push_content(counted);
+        }
+    }
+
+    /// Text in a trimmed stay: whitespace before the stay's first other character is dropped as it
+    /// arrives; a run of it after the last one is held, and released as the state's text before
+    /// more text that is not whitespace.
+    fn trimmed(&mut self, text: &str, out: &mut Events) {
+        let mut rest = text;
+        if !self.stay.begun {
+            let body = rest.trim_start_matches(is_strip_space);
+            let lead = &rest[..rest.len() - body.len()];
+            if !lead.is_empty() {
+                out.push(Event::Dropped {
+                    text: self.tokens.text(lead),
+                    why: DropReason::Whitespace,
+                });
+            }
+            if body.is_empty() {
+                return;
+            }
+            self.stay.begun = true;
+            rest = body;
+        }
+        let body = rest.trim_end_matches(is_strip_space);
+        if !body.is_empty() {
+            for held in std::mem::take(&mut self.stay.held) {
+                match held {
+                    Held::Space(space) => self.show(&space, out),
+                    Held::Ignored(terminal) => out.push(Event::Dropped {
+                        text: self.tokens.text(&terminal),
+                        why: DropReason::Wrapper,
+                    }),
+                }
+            }
+            self.show(body, out);
+        }
+        let tail = &rest[body.len()..];
+        if !tail.is_empty() {
+            match self.stay.held.last_mut() {
+                Some(Held::Space(space)) => space.push_str(tail),
+                _ => self.stay.held.push(Held::Space(tail.to_string())),
+            }
+        }
+    }
+
+    /// The stay ends: the run it held after its last text is the template's, and is dropped.
+    fn end_stay(&mut self, out: &mut Events) {
+        for held in std::mem::take(&mut self.stay.held) {
+            let (text, why) = match held {
+                Held::Space(space) => (space, DropReason::Whitespace),
+                Held::Ignored(terminal) => (terminal, DropReason::Wrapper),
+            };
+            out.push(Event::Dropped {
+                text: self.tokens.text(&text),
+                why,
+            });
         }
     }
 
@@ -428,6 +526,11 @@ impl Engine {
                     return;
                 }
             }
+            // Inside a trimmed stay's held run, the terminal keeps its place among the bytes held.
+            if !self.stay.held.is_empty() {
+                self.stay.held.push(Held::Ignored(text));
+                return;
+            }
             out.push(Event::Dropped {
                 text: self.tokens.text(&text),
                 why: DropReason::Wrapper,
@@ -443,6 +546,7 @@ impl Engine {
         // bytes stay in the output's order; a new call before the previous one closed finishes
         // what arrived, then starts. A call syntax may take the terminal as the call's end.
         let terminal = self.format.terminal_text(index).to_string();
+        self.end_stay(out);
         let taken =
             self.emits() == Emits::Arguments && self.close_call(Closed::ByMarker, &terminal, out);
         if !taken {
@@ -467,6 +571,7 @@ impl Engine {
             self.open_call();
         }
         self.state = next;
+        self.stay = Stay::default();
     }
 
     /// The next call takes the next free index; the index is spent only when a call starts, so a
@@ -543,6 +648,8 @@ impl Engine {
         let (turn, start) = self.format.turn(prompt);
         let mut scanner = Scanner::new(self.format.terminal_texts());
         let (mut state, mut rest) = (start, start);
+        // Whether the prompt wrote text other than whitespace in the stay the output continues.
+        let mut begun = false;
         // An anchor that names its own state leaves no start to choose.
         self.at_turn_start &= start == 0;
         let pieces = scanner.feed(turn).into_iter().chain(scanner.finish());
@@ -550,21 +657,32 @@ impl Engine {
             if self.at_turn_start {
                 if let Some(opened) = self.opening(state, &piece) {
                     self.at_turn_start = false;
+                    if opened != state {
+                        begun = false;
+                    }
                     (state, rest) = (opened, opened);
                 }
             }
-            if let Piece::Marker(index) = piece {
-                if let Some(to) = self.format.next(state, index) {
-                    state = to;
-                }
-            }
+            let text = match piece {
+                Piece::Marker(index) if self.format.ignored(index) => continue,
+                Piece::Marker(index) => match self.format.next(state, index) {
+                    Some(to) => {
+                        (state, begun) = (to, false);
+                        continue;
+                    }
+                    None => self.format.terminal_text(index).to_string(),
+                },
+                Piece::Text(text) => text,
+            };
+            begun |= !text.chars().all(is_strip_space);
         }
         if self.format.emits(state) == Emits::Arguments {
-            state = rest;
+            (state, begun) = (rest, false);
         }
         if state != self.state {
             self.enter(state, out);
         }
+        self.stay.begun = begun;
     }
 
     fn end(&mut self, finish: EngineFinish, out: &mut Events) {
@@ -582,6 +700,7 @@ impl Engine {
         for piece in scanner.finish() {
             match piece {
                 Piece::Text(text) if self.format.is_cut_tag(self.state, &text) => {
+                    self.end_stay(out);
                     if self.emits() == Emits::Arguments {
                         self.close_call(Closed::ByEnd, "", out);
                     }
@@ -593,6 +712,7 @@ impl Engine {
                 piece => self.take(piece, out),
             }
         }
+        self.end_stay(out);
         match self.emits() {
             Emits::Reasoning => out.push(Event::ReasoningEnd),
             Emits::Arguments => {
@@ -1226,6 +1346,192 @@ mod tests {
                 .expect("end");
             let [content, reasoning, ..] = kinds(&out.drain());
             assert_eq!([content, reasoning], expected, "{pieces:?}");
+        }
+    }
+
+    /// Gemma 4's turn with its stays trimmed and the content's non-stop close, `<|tool_response>`,
+    /// a row back into the content that drops the marker.
+    fn gemma_trimmed() -> Format {
+        gemma_turn()
+            .terminal("response_open", "<|tool_response>")
+            .transition("content", "response_open", "content")
+            .trims("content")
+            .trims("reasoning")
+    }
+
+    /// The text of the whitespace a trimmed stay dropped.
+    fn trimmed_space(events: &[Event]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped {
+                    text,
+                    why: DropReason::Whitespace,
+                } => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Replays `output` after `prompt` cut at every two-way split and character by character,
+    /// and checks that each cut says what the whole does.
+    fn same_at_every_cut(format: &Format, prompt: &str, output: &str) -> [String; 4] {
+        let replay = |cuts: &[usize]| {
+            let mut engine = Engine::new(format.clone(), declared());
+            let mut out = Events::new();
+            engine
+                .feed(
+                    Input::Prompt {
+                        token_ids: &[],
+                        text: prompt,
+                    },
+                    &mut out,
+                )
+                .expect("prompt");
+            let mut from = 0;
+            for &cut in cuts.iter().chain(std::iter::once(&output.len())) {
+                engine
+                    .feed(
+                        Input::Delta {
+                            token_ids: &[],
+                            text: &output[from..cut],
+                            spans: &[],
+                        },
+                        &mut out,
+                    )
+                    .expect("delta");
+                from = cut;
+            }
+            engine
+                .feed(
+                    Input::End {
+                        finish: EngineFinish::Stop,
+                    },
+                    &mut out,
+                )
+                .expect("end");
+            let events = out.drain();
+            assert_eq!(bytes(&events), output, "{cuts:?}");
+            (kinds(&events), trimmed_space(&events))
+        };
+        let whole = replay(&[]);
+        let starts: Vec<usize> = output.char_indices().map(|(at, _)| at).skip(1).collect();
+        for cut in &starts {
+            assert_eq!(replay(&[*cut]), whole, "{output:?} cut at {cut}");
+        }
+        assert_eq!(replay(&starts), whole, "{output:?} character by character");
+        whole.0
+    }
+
+    #[test]
+    fn a_trimmed_stay_drops_the_whitespace_at_its_edges_and_keeps_the_rest() {
+        let format = gemma_trimmed();
+        let [content, reasoning, ..] = same_at_every_cut(
+            &format,
+            "<|turn>model\n",
+            "<|channel>thought\n The user\n wants  the weather. \n<channel|>\n\nIt is\n\nsunny. ",
+        );
+        assert_eq!(
+            [content, reasoning],
+            ["It is\n\nsunny.", "The user\n wants  the weather."]
+        );
+        let events = run_after(format, "<|turn>model\n", "\n\nIt is sunny.\n\n");
+        assert_eq!(trimmed_space(&events), "\n\n\n\n");
+    }
+
+    #[test]
+    fn whitespace_is_what_pythons_strip_removes() {
+        // No-break and em spaces, and the separators U+001C to U+001F that `str.isspace` takes,
+        // are trimmed; a zero-width space is not whitespace there, and stays.
+        let [content, ..] = same_at_every_cut(
+            &gemma_trimmed(),
+            "",
+            "\u{a0}\u{1c}Hi\u{2003}there\u{2003}\u{1f}",
+        );
+        assert_eq!(content, "Hi\u{2003}there");
+        let [content, ..] = kinds(&run(
+            gemma_trimmed(),
+            "\u{200b}Hi\u{200b}",
+            EngineFinish::Stop,
+        ));
+        assert_eq!(content, "\u{200b}Hi\u{200b}");
+        // Python's whitespace, recorded from Python 3.12: the code points `str.isspace` takes.
+        let python: Vec<u32> = [
+            0x09..=0x0d,
+            0x1c..=0x20,
+            0x85..=0x85,
+            0xa0..=0xa0,
+            0x1680..=0x1680,
+            0x2000..=0x200a,
+            0x2028..=0x2029,
+            0x202f..=0x202f,
+            0x205f..=0x205f,
+            0x3000..=0x3000,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let ours: Vec<u32> = (0..=0x10ffff)
+            .filter_map(char::from_u32)
+            .filter(|&c| is_strip_space(c))
+            .map(u32::from)
+            .collect();
+        assert_eq!(ours, python);
+    }
+
+    #[test]
+    fn each_stay_is_trimmed_on_its_own() {
+        // The content's own close is a row back into it: two stays, each trimmed, joined.
+        let [content, ..] = same_at_every_cut(
+            &gemma_trimmed(),
+            "<|turn>model\n",
+            "Hi <|tool_response> there\n",
+        );
+        assert_eq!(content, "Hithere");
+        // A call between two answers ends one stay and the next starts after it.
+        let events = run(
+            gemma_trimmed(),
+            "Let me check.\n<|tool_call>call:get_weather{\
+             city:<|\"|>Paris<|\"|>}<tool_call|>\n Done. ",
+            EngineFinish::Stop,
+        );
+        let [content, ..] = kinds(&events);
+        assert_eq!(content, "Let me check.Done.");
+        assert_eq!(trimmed_space(&events), "\n\n  ");
+    }
+
+    #[test]
+    fn a_stay_the_prompt_began_keeps_its_leading_whitespace() {
+        let prompt = "<|turn>model\n<|channel>thought\nI think";
+        let [_, reasoning, ..] = same_at_every_cut(&gemma_trimmed(), prompt, " more. <channel|>");
+        assert_eq!(reasoning, " more.");
+        let blank = "<|turn>model\n<|channel>thought\n  ";
+        let [_, reasoning, ..] = same_at_every_cut(&gemma_trimmed(), blank, " more. <channel|>");
+        assert_eq!(reasoning, "more.");
+    }
+
+    #[test]
+    fn an_ignored_terminal_keeps_its_place_in_a_held_run() {
+        let format = || {
+            Format::new("separated")
+                .terminal("open", "<a>")
+                .ignores("separator", "|")
+                .state("content", Emits::Content)
+                .trims("content")
+        };
+        for (output, content, dropped) in [
+            ("Hi | there |", "Hi  there", "||"),
+            ("Hi |", "Hi", "|"),
+            ("| Hi", "Hi", "|"),
+        ] {
+            let events = run(format(), output, EngineFinish::Stop);
+            let [shown, _, wrapping, _] = kinds(&events);
+            assert_eq!(
+                [shown.as_str(), wrapping.as_str()],
+                [content, dropped],
+                "{output:?}"
+            );
+            assert_eq!(bytes(&events), output);
         }
     }
 

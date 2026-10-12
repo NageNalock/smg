@@ -37,6 +37,14 @@
 //!   the state included, is `Dropped { Wrapper }`, and so is what the scanner still held there
 //!   when the stream ended, at every finish: neither the client nor `Malformed` sees it. The
 //!   state's rows move the engine as before.
+//! - A **trim row** names a content or reasoning state whose text is trimmed stay by stay, as
+//!   Hugging Face's `text` parser strips a field's value (`strip`, on unless a template turns it
+//!   off). A stay is the text between the row that enters the state and the row that leaves it,
+//!   a row back into the same state ending one stay and starting the next. Whitespace before the
+//!   stay's first other character is `Dropped { Whitespace }`; a run of it after the last one is
+//!   held until more text in the stay shows it was inside the text, or the stay ends and drops it.
+//!   Whitespace is what Python's `str.strip` removes: Unicode's white space and the separators
+//!   U+001C to U+001F.
 //! - The **stop tokens** are the terminals that are tokens the engine stops on (Harmony's
 //!   `<|call|>`): the stop decoder hides them, so the engine never reads one, and a constraint
 //!   derived from the table can end a region one of them closes with no text of its own, since
@@ -175,6 +183,8 @@ pub struct Format {
     stop_tokens: Vec<String>,
     /// The states whose text the template discards.
     framing: Vec<usize>,
+    /// The states whose stays are trimmed.
+    trimmed: Vec<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -232,6 +242,7 @@ impl Format {
             stop_closes: Vec::new(),
             stop_tokens: Vec::new(),
             framing: Vec::new(),
+            trimmed: Vec::new(),
         }
     }
 
@@ -321,6 +332,18 @@ impl Format {
         let state = self.state_named(state);
         if !self.framing.contains(&state) {
             self.framing.push(state);
+        }
+        self
+    }
+
+    /// The text of `state`, a content or reasoning state, is trimmed stay by stay: whitespace at
+    /// a stay's edges is `Dropped { Whitespace }` (see the trim row in [`crate::format`]). The
+    /// state must already be in the table.
+    #[must_use]
+    pub fn trims(mut self, state: &str) -> Self {
+        let state = self.state_named(state);
+        if !self.trimmed.contains(&state) {
+            self.trimmed.push(state);
         }
         self
     }
@@ -556,14 +579,20 @@ impl Format {
         self.framing.contains(&index)
     }
 
+    /// Whether the text of state `index` is trimmed stay by stay.
+    pub(crate) fn is_trimmed(&self, index: usize) -> bool {
+        self.trimmed.contains(&index)
+    }
+
     /// What every table must hold before an engine runs it: a state to start in, which does not
     /// emit reasoning (a thought the output starts inside is entered by the prompt's replay, which
     /// pushes `ReasoningStart`; an arguments state at the start has its call opened by the
     /// engine), a call syntax when a state emits arguments, a text for every terminal, a turn
     /// opener and turn anchors that are not empty and not both named, a start row only where a
     /// turn's first byte is read from the first state and no opener replays it, a stop row only
-    /// for an arguments state, and a framing row only for a state of content or wrapping. The
-    /// builder keeps a row from naming what the table lacks; this checks the rest.
+    /// for an arguments state, a framing row only for a state of content or wrapping, and a trim
+    /// row only for a state of content or reasoning that is not framing. The builder keeps a row
+    /// from naming what the table lacks; this checks the rest.
     pub fn validate(&self) -> Result<(), String> {
         let Some(first) = self.states.first() else {
             return Err(format!("format {}: a table with no state", self.name));
@@ -643,6 +672,21 @@ impl Format {
                 "format {}: state {:?} is framing, but it emits {:?}",
                 self.name, state.name, state.emits
             ));
+        }
+        for &index in &self.trimmed {
+            let state = &self.states[index];
+            if matches!(state.emits, Emits::Arguments | Emits::Wrapper) {
+                return Err(format!(
+                    "format {}: state {:?} is trimmed, but it emits {:?}",
+                    self.name, state.name, state.emits
+                ));
+            }
+            if self.is_framing(index) {
+                return Err(format!(
+                    "format {}: state {:?} is trimmed, but its text is framing",
+                    self.name, state.name
+                ));
+            }
         }
         Ok(())
     }
@@ -932,6 +976,46 @@ mod tests {
     #[should_panic(expected = "format t: no state named \"outside\"")]
     fn a_framing_row_for_a_state_the_table_lacks_is_a_programming_error() {
         let _ = two_states().framing("outside");
+    }
+
+    #[test]
+    fn a_trim_row_names_a_state_of_content_or_reasoning_that_is_not_framing() {
+        let format = Format::new("trimmed")
+            .terminal("open", "<call>")
+            .state("content", Emits::Content)
+            .state("thought", Emits::Reasoning)
+            .state("between", Emits::Wrapper)
+            .state("call", Emits::Arguments)
+            .state("outside", Emits::Content)
+            .transition("content", "open", "call")
+            .calls(CallSyntax::Json)
+            .framing("outside")
+            .trims("content")
+            .trims("thought")
+            .trims("content");
+        assert_eq!(format.trimmed, [0, 1], "a state named twice is kept once");
+        assert!(format.is_trimmed(0) && format.is_trimmed(1) && !format.is_trimmed(2));
+        assert!(format.validate().is_ok());
+        assert_eq!(
+            format.clone().trims("between").validate(),
+            Err("format trimmed: state \"between\" is trimmed, but it emits Wrapper".to_string())
+        );
+        assert_eq!(
+            format.clone().trims("call").validate(),
+            Err("format trimmed: state \"call\" is trimmed, but it emits Arguments".to_string())
+        );
+        assert_eq!(
+            format.trims("outside").validate(),
+            Err(
+                "format trimmed: state \"outside\" is trimmed, but its text is framing".to_string()
+            )
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "format t: no state named \"answer\"")]
+    fn a_trim_row_for_a_state_the_table_lacks_is_a_programming_error() {
+        let _ = two_states().trims("answer");
     }
 
     #[test]
