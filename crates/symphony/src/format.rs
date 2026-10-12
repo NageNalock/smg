@@ -59,6 +59,17 @@
 //! and the output starts in the first state. A table names a turn opener or turn anchors, not
 //! both.
 //!
+//! A **start row** names the state a turn starts in when it does not start with a terminal: a
+//! response template's open with a `^` alternative (`(?:^|<think>\s*)`), which matches with no
+//! text at the turn's first byte. Hugging Face's parser takes the longest delimiter at a place,
+//! and a regular expression the first alternative that matches: so at the turn's first byte a
+//! terminal whose row leads into another state wins, being longer than the empty match, while a
+//! terminal whose row leads into the start state is text there, the `^` having matched first
+//! (`<think>` at the first byte is the thought's text). Any other first piece starts the turn in
+//! the start state and is read there. The turn's first byte is where the replay starts, after the
+//! anchor; when the prompt leaves nothing to replay, it is the output's. A turn an anchor started
+//! in a state of its own has no start to choose.
+//!
 //! The table holds what is static about a format. What belongs to one request, the tools that
 //! type a tagged call's values, reaches the [`Engine`] with the request, not the table.
 //!
@@ -155,6 +166,8 @@ pub struct Format {
     turn_opener: Option<String>,
     /// The turn anchors, in the order a match at one place prefers them.
     anchors: Vec<Anchor>,
+    /// The state a turn starts in when it does not start with a terminal.
+    start: Option<usize>,
     structural_tokens: Vec<String>,
     /// The arguments states whose call the stream's stop closes.
     stop_closes: Vec<usize>,
@@ -214,6 +227,7 @@ impl Format {
             calls: None,
             turn_opener: None,
             anchors: Vec::new(),
+            start: None,
             structural_tokens: Vec::new(),
             stop_closes: Vec::new(),
             stop_tokens: Vec::new(),
@@ -365,6 +379,20 @@ impl Format {
             state,
         });
         self
+    }
+
+    /// The state a turn starts in when its first piece is not a terminal whose row leads into
+    /// another state, as a response template's `^` alternative of the state's open (see the start
+    /// row in [`crate::format`]). The state must already be in the table.
+    #[must_use]
+    pub fn starts_in(mut self, state: &str) -> Self {
+        self.start = Some(self.state_named(state));
+        self
+    }
+
+    /// The state the start row names, if the table has one.
+    pub(crate) fn start(&self) -> Option<usize> {
+        self.start
     }
 
     /// The turn opener, if the table names one.
@@ -532,9 +560,10 @@ impl Format {
     /// emit reasoning (a thought the output starts inside is entered by the prompt's replay, which
     /// pushes `ReasoningStart`; an arguments state at the start has its call opened by the
     /// engine), a call syntax when a state emits arguments, a text for every terminal, a turn
-    /// opener and turn anchors that are not empty and not both named, a stop row only for an
-    /// arguments state, and a framing row only for a state of content or wrapping. The builder
-    /// keeps a row from naming what the table lacks; this checks the rest.
+    /// opener and turn anchors that are not empty and not both named, a start row only where a
+    /// turn's first byte is read from the first state and no opener replays it, a stop row only
+    /// for an arguments state, and a framing row only for a state of content or wrapping. The
+    /// builder keeps a row from naming what the table lacks; this checks the rest.
     pub fn validate(&self) -> Result<(), String> {
         let Some(first) = self.states.first() else {
             return Err(format!("format {}: a table with no state", self.name));
@@ -578,6 +607,20 @@ impl Format {
                 "format {}: a turn opener and turn anchors; a table names one",
                 self.name
             ));
+        }
+        if self.start.is_some() {
+            if first.emits == Emits::Arguments {
+                return Err(format!(
+                    "format {}: a start row, but the first state {:?} holds a call",
+                    self.name, first.name
+                ));
+            }
+            if self.turn_opener.is_some() {
+                return Err(format!(
+                    "format {}: a start row needs the turn's start, which a turn opener replays",
+                    self.name
+                ));
+            }
         }
         if let Some(state) = self
             .stop_closes
@@ -824,6 +867,36 @@ mod tests {
     #[should_panic(expected = "format t: no state named \"thought\"")]
     fn an_anchor_starting_in_a_state_the_table_lacks_is_a_programming_error() {
         let _ = two_states().turn_anchor_starting_in("<turn>", "thought");
+    }
+
+    #[test]
+    fn a_start_row_needs_a_first_state_without_a_call_and_no_opener() {
+        let format = two_states().starts_in("inside");
+        assert_eq!(format.start(), Some(1));
+        assert!(format.validate().is_ok());
+        assert_eq!(two_states().start(), None);
+        assert_eq!(
+            Format::new("list")
+                .state("calls", Emits::Arguments)
+                .state("content", Emits::Content)
+                .calls(CallSyntax::JsonList)
+                .starts_in("content")
+                .validate(),
+            Err("format list: a start row, but the first state \"calls\" holds a call".to_string())
+        );
+        assert_eq!(
+            format.opens_turn("<turn>").validate(),
+            Err(
+                "format t: a start row needs the turn's start, which a turn opener replays"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "format t: no state named \"thought\"")]
+    fn a_start_row_for_a_state_the_table_lacks_is_a_programming_error() {
+        let _ = two_states().starts_in("thought");
     }
 
     #[test]

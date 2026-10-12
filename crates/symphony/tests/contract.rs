@@ -160,6 +160,37 @@ fn muse_messages() -> Box<dyn Parser> {
     ))
 }
 
+/// ERNIE's turn, spelled from transformers v5.18.0's `tests/utils/test_chat_parsing.py`
+/// (`ernie_template`): the thought opens with `(?:^|<think>\s*)`, so a turn that starts with text
+/// starts in it; the answer opens with `<response>\n`, a call with `<tool_call>`, and nothing is
+/// kept outside them.
+fn ernie() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        Format::new("ernie")
+            .terminal("think_open", "<think>")
+            .terminal("think_close", "</think>")
+            .terminal("answer_open", "<response>\n")
+            .terminal("answer_close", "</response>")
+            .terminal("call_open", "<tool_call>")
+            .terminal("call_close", "</tool_call>")
+            .state("outside", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("content", Emits::Content)
+            .state("call", Emits::Arguments)
+            .transition("outside", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "outside")
+            .transition("outside", "answer_open", "content")
+            .transition("content", "answer_close", "outside")
+            .transition("outside", "call_open", "call")
+            .transition("call", "call_close", "outside")
+            .calls(CallSyntax::Json)
+            .framing("outside")
+            .turn_anchor("Assistant:")
+            .starts_in("reasoning"),
+        Declared::default(),
+    ))
+}
+
 fn iquest() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::iquest(), keyed_tools()))
 }
@@ -255,6 +286,11 @@ const FORMATS: &[Subject] = &[
         name: "muse messages, framed",
         new: muse_messages,
         outputs: MUSE_OUTPUTS,
+    },
+    Subject {
+        name: "ernie, started in the thought",
+        new: ernie,
+        outputs: ERNIE_OUTPUTS,
     },
     Subject {
         name: "iquest",
@@ -550,6 +586,25 @@ const MUSE_OUTPUTS: &[&str] = &[
     "to=self<|message|>Only a thought.",
     "to=self<|message|>Plan.<|eom|><|start|>assistant to=us",
     "Text outside every message, <|eom|> and to=user without its marker.",
+    "",
+];
+
+/// ERNIE's turns: the transformers tests' outputs without their stop text (a thought then a call,
+/// a thought then an answer, `<think>` at the first byte), an answer or a call at the first byte,
+/// a thought's close at the first byte, a thought cut short, a marker cut short, and nothing.
+const ERNIE_OUTPUTS: &[&str] = &[
+    "The user is asking about the weather in Paris today.\n</think>\n\n<tool_call>\n\
+     {\"name\": \"get_current_temperature\", \"arguments\": {\"location\": \"Paris\"}}\n\
+     </tool_call>\n",
+    "The user just greeted me.\n\nFirst, I'll say hello back.\n</think>\n\n<response>\n\
+     Hello! I'm doing well, thank you for asking.\n</response>\n",
+    "<think>some deliberation here</think>\n\n<tool_call>\n{\"name\": \"get_current_temperature\", \
+     \"arguments\": {\"location\": \"Paris\"}}\n</tool_call>\n",
+    "<response>\nHello!\n</response>",
+    "<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call>",
+    "</think>\n<response>\nHi\n</response>",
+    "A thought cut short",
+    "<respo",
     "",
 ];
 

@@ -65,7 +65,11 @@
 //! arguments state open is read as content for now (a prefilled call is a later step).
 //!
 //! A table with turn anchors ([`Format::turn_anchor`]) is replayed from the end of the last
-//! anchor, in the state that anchor names, and not at all when the prompt holds none.
+//! anchor, in the state that anchor names, and not at all when the prompt holds none. A table
+//! with a start row ([`Format::starts_in`]) lets the turn's first piece decide: a terminal whose
+//! row leads into another state moves the engine as any terminal does, and anything else starts
+//! the turn in the start state, where it is read; the first piece is the replay's first, or the
+//! output's when the prompt left nothing to replay.
 //!
 //! [`Declared`]: crate::tagged::Declared
 
@@ -110,6 +114,8 @@ pub struct Engine {
     tokens: Ledger,
     reasoning_tokens: u32,
     stage: Stage,
+    /// Whether the turn's first piece is still to come, for a table with a start row.
+    at_turn_start: bool,
 }
 
 /// The assembler of the call region, one per call syntax.
@@ -311,6 +317,7 @@ impl Engine {
         if let Err(why) = format.validate() {
             panic!("{why}");
         }
+        let at_turn_start = format.start().is_some();
         let mut engine = Self {
             scanner: Scanner::new(format.terminal_texts()),
             format,
@@ -321,6 +328,7 @@ impl Engine {
             tokens: Ledger::new(),
             reasoning_tokens: 0,
             stage: Stage::Fresh,
+            at_turn_start,
         };
         // A table whose output starts inside a call (a bare list of calls, with no marker before
         // it) opens the call here, since no terminal will.
@@ -335,6 +343,14 @@ impl Engine {
     }
 
     fn take(&mut self, piece: Piece, out: &mut Events) {
+        if self.at_turn_start {
+            if let Some(state) = self.opening(self.state, &piece) {
+                self.at_turn_start = false;
+                if state != self.state {
+                    self.enter(state, out);
+                }
+            }
+        }
         match piece {
             Piece::Text(text) => self.text(&text, out),
             Piece::Marker(index) => self.terminal(index, out),
@@ -501,16 +517,42 @@ impl Engine {
         }
     }
 
+    /// The state the turn starts in, once its first piece decides it: the start row's state, unless
+    /// the piece is a terminal whose row from `state` leads into another one, which wins as the
+    /// longer match; then `state`. A terminal the table ignores decides nothing, and gives `None`.
+    fn opening(&self, state: usize, piece: &Piece) -> Option<usize> {
+        let Some(start) = self.format.start() else {
+            return Some(state);
+        };
+        match *piece {
+            Piece::Marker(index) if self.format.ignored(index) => None,
+            Piece::Marker(index)
+                if self.format.next(state, index).is_some_and(|to| to != start) =>
+            {
+                Some(state)
+            }
+            _ => Some(start),
+        }
+    }
+
     /// Where the prompt leaves the engine: its terminals replayed over the table from the state the
     /// turn starts in, starting at the last turn opener the table names, or after its last turn
-    /// anchor. An arguments state is not entered from the prompt: the engine rests where the turn
-    /// started.
+    /// anchor, the turn's first piece deciding its start where the table has a start row. An
+    /// arguments state is not entered from the prompt: the engine rests where the turn started.
     fn seed(&mut self, prompt: &str, out: &mut Events) {
         let (turn, start) = self.format.turn(prompt);
         let mut scanner = Scanner::new(self.format.terminal_texts());
-        let mut state = start;
+        let (mut state, mut rest) = (start, start);
+        // An anchor that names its own state leaves no start to choose.
+        self.at_turn_start &= start == 0;
         let pieces = scanner.feed(turn).into_iter().chain(scanner.finish());
         for piece in pieces {
+            if self.at_turn_start {
+                if let Some(opened) = self.opening(state, &piece) {
+                    self.at_turn_start = false;
+                    (state, rest) = (opened, opened);
+                }
+            }
             if let Piece::Marker(index) = piece {
                 if let Some(to) = self.format.next(state, index) {
                     state = to;
@@ -518,7 +560,7 @@ impl Engine {
             }
         }
         if self.format.emits(state) == Emits::Arguments {
-            state = start;
+            state = rest;
         }
         if state != self.state {
             self.enter(state, out);
@@ -1038,6 +1080,153 @@ mod tests {
         assert_eq!(events.first(), Some(&Event::ReasoningStart));
         let [content, reasoning, ..] = kinds(&events);
         assert_eq!([content, reasoning], ["\n\n4", "Four."]);
+    }
+
+    /// ERNIE's turn, spelled from transformers v5.18.0's `tests/utils/test_chat_parsing.py`
+    /// (`ernie_template`): the thought opens with `(?:^|<think>\s*)`, the answer with
+    /// `<response>\n`, a call with `<tool_call>`, and nothing is kept outside them.
+    fn ernie() -> Format {
+        Format::new("ernie")
+            .terminal("think_open", "<think>")
+            .terminal("think_close", "</think>")
+            .terminal("answer_open", "<response>\n")
+            .terminal("answer_close", "</response>")
+            .terminal("call_open", "<tool_call>")
+            .terminal("call_close", "</tool_call>")
+            .state("outside", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("content", Emits::Content)
+            .state("call", Emits::Arguments)
+            .transition("outside", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "outside")
+            .transition("outside", "answer_open", "content")
+            .transition("content", "answer_close", "outside")
+            .transition("outside", "call_open", "call")
+            .transition("call", "call_close", "outside")
+            .calls(CallSyntax::Json)
+            .framing("outside")
+            .turn_anchor("Assistant:")
+            .starts_in("reasoning")
+    }
+
+    #[test]
+    fn a_turn_that_starts_with_text_starts_in_the_start_rows_state() {
+        let events = run_after(
+            ernie(),
+            "User: Weather?\nAssistant:",
+            "Let me think.\n</think>\n<response>\nIt is sunny.\n</response>",
+        );
+        assert_eq!(events.first(), Some(&Event::ReasoningStart));
+        let [content, reasoning, ..] = kinds(&events);
+        assert_eq!([content, reasoning], ["It is sunny.\n", "Let me think.\n"]);
+    }
+
+    #[test]
+    fn a_terminal_into_another_state_wins_at_the_first_byte() {
+        let [content, reasoning, ..] = kinds(&run_after(
+            ernie(),
+            "Assistant:",
+            "<response>\nHello!\n</response>",
+        ));
+        assert_eq!([content, reasoning], ["Hello!\n", ""]);
+        let events = run_after(
+            ernie(),
+            "Assistant:",
+            "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {}}\n</tool_call>",
+        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, Event::ReasoningStart)));
+        assert_eq!(calls(&events).len(), 1);
+    }
+
+    #[test]
+    fn a_terminal_into_the_start_state_is_its_text_at_the_first_byte() {
+        // The `^` alternative comes first, so it matches at the first byte and `<think>` is the
+        // thought's text, as Hugging Face's parser reads it; a terminal with no row from the
+        // turn's state starts the thought too, and is read there.
+        let [_, reasoning, ..] = kinds(&run_after(
+            ernie(),
+            "Assistant:",
+            "<think>\nPlan.\n</think>\n<response>\nHi\n</response>",
+        ));
+        assert_eq!(reasoning, "<think>\nPlan.\n");
+        let events = run_after(
+            ernie(),
+            "Assistant:",
+            "</think>\n<response>\nHi\n</response>",
+        );
+        assert_eq!(
+            events[..3],
+            [
+                Event::ReasoningStart,
+                Event::Dropped {
+                    text: Text::uncounted("</think>"),
+                    why: DropReason::Wrapper,
+                },
+                Event::ReasoningEnd,
+            ]
+        );
+        // After the first byte `<think>` opens the thought as any terminal does.
+        let [content, reasoning, ..] = kinds(&run_after(
+            ernie(),
+            "Assistant:",
+            "<response>\nHi\n</response><think>More.</think>",
+        ));
+        assert_eq!([content, reasoning], ["Hi\n", "More."]);
+    }
+
+    #[test]
+    fn the_prompt_decides_the_start_when_it_writes_the_turns_first_byte() {
+        // The generation prompt ends with a space after the anchor: the thought starts there, so
+        // the answer's marker in the output is the thought's text.
+        let [content, reasoning, ..] = kinds(&run_after(
+            ernie(),
+            "Assistant: ",
+            "<response>\nHi\n</response>",
+        ));
+        assert_eq!([content, reasoning], ["", "<response>\nHi\n</response>"]);
+        // An anchor that names its own state leaves no start to choose.
+        let named = || {
+            ernie()
+                .terminal("thought_anchor", "Thinking:")
+                .turn_anchor_starting_in("Answer:", "content")
+        };
+        let [content, reasoning, ..] = kinds(&run_after(named(), "Answer:", "Hi"));
+        assert_eq!([content, reasoning], ["Hi", ""]);
+    }
+
+    #[test]
+    fn a_held_first_piece_decides_once_it_is_known() {
+        for (pieces, expected) in [
+            (["<resp", "onse>\nHi"], ["Hi", ""]),
+            (["<resp", "ite"], ["", "<respite"]),
+        ] {
+            let mut engine = Engine::new(ernie(), declared());
+            let mut out = Events::new();
+            for piece in pieces {
+                engine
+                    .feed(
+                        Input::Delta {
+                            token_ids: &[],
+                            text: piece,
+                            spans: &[],
+                        },
+                        &mut out,
+                    )
+                    .expect("delta");
+            }
+            engine
+                .feed(
+                    Input::End {
+                        finish: EngineFinish::Stop,
+                    },
+                    &mut out,
+                )
+                .expect("end");
+            let [content, reasoning, ..] = kinds(&out.drain());
+            assert_eq!([content, reasoning], expected, "{pieces:?}");
+        }
     }
 
     #[test]
