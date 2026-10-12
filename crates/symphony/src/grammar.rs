@@ -54,6 +54,13 @@
 //! (the thought's close, the row that starts the next message, the row into the block), so a
 //! state with no row of its own into the block still has a way in when the framing leads there.
 //!
+//! A table read from a response template has rows of its own ([`Format::framing`],
+//! [`Format::stop_tokens`]). A framing state, whose text the template drops, lies between the
+//! messages as a wrapper state does: a way in passes through it, and it holds no answer. A stop
+//! token ends the region it closes at the model's stop, and the stop decoder hides it, so no tag
+//! writes it: a region's close is never one, no way in steps on one, and an answer a stop token
+//! may close ends with nothing after its JSON.
+//!
 //! Inkling's named JSON takes the tag the gateway's old Inkling parser writes, the call marker its
 //! trigger inside whatever message the model is writing. A table without calls gives `None`, and
 //! the gateway takes the JSON-schema path for it.
@@ -626,16 +633,19 @@ impl Format {
     /// stop token writes nothing after it. Otherwise the model starts in the turn's own state, or
     /// in its thought when the prompt opened it, and the tag is one `tag`: the way into the answer
     /// from there, the thought's close first as a call's way in has it, the schema, then the
-    /// answer's close and the end of the turn (Kimi K3's response region, Inkling's text message).
-    /// `None` for a table with no content state (xLAM, whose answer is anything but a list), with
-    /// no way into it from where the model starts, or, with the thought open, a thought that does
-    /// not close back to where it opened, as for [`Self::grammar`].
+    /// answer's close and the end of the turn (Kimi K3's response region, Inkling's text message);
+    /// an answer a stop token may close ends at the model's stop, with nothing after the schema.
+    /// The answer's state is the first content state whose text the template keeps: a framing
+    /// state, whose text a response template drops, holds no answer. `None` for a table with no
+    /// such state (xLAM, whose answer is anything but a list), with no way into it from where the
+    /// model starts, or, with the thought open, a thought that does not close back to where it
+    /// opened, as for [`Self::grammar`].
     pub fn answer_grammar(&self, schema: &Value, reasoning_open: bool) -> Option<Grammar> {
         let answer = Grammar::JsonSchema {
             schema: schema.clone(),
             style: None,
         };
-        let content = self.state_emitting(Emits::Content)?;
+        let content = self.answer_state()?;
         if content == 0 {
             let answer = match self.turn_end() {
                 "" => answer,
@@ -652,9 +662,11 @@ impl Format {
             _ => 0,
         };
         let way = self.way_in(start, content)?;
-        let mut end = self
-            .close_of(content)
-            .map_or_else(String::new, |(close, _)| close.to_string());
+        // An answer a stop token may close ends at the model's stop, which writes nothing.
+        let mut end = match self.close_of(content) {
+            Some((close, _)) if !self.stopped(content) => close.to_string(),
+            _ => String::new(),
+        };
         end.push_str(self.turn_end());
         self.led(
             Grammar::Tag(Tag::new(way.begin(), answer, end)),
@@ -981,6 +993,20 @@ impl Format {
         (0..self.states()).find(|&state| self.emits(state) == emits)
     }
 
+    /// The state an answer is written in: the first content state whose text the template keeps,
+    /// a framing row's state (the text outside a response template's fields) being none.
+    fn answer_state(&self) -> Option<usize> {
+        (0..self.states())
+            .find(|&state| self.emits(state) == Emits::Content && !self.is_framing(state))
+    }
+
+    /// Whether a stop token closes the region `state` is: a row out of it on one, which the
+    /// model's stop takes.
+    fn stopped(&self, state: usize) -> bool {
+        self.transitions()
+            .any(|(source, on, target)| source == state && target != state && self.stops(on))
+    }
+
     /// The states with a row into `state`, other than itself and the states `within` it, in the
     /// order of the states: the states the region is entered from.
     fn entered_from(&self, state: usize, within: impl Fn(usize) -> bool) -> Vec<usize> {
@@ -995,7 +1021,8 @@ impl Format {
     }
 
     /// The markers of the region `state` is: its close is the terminal of the row from `state`
-    /// back to a state it is entered from, other than the end of the turn, and its opener the
+    /// back to a state it is entered from, other than the end of the turn and a stop token (the
+    /// model's stop ends the region there, with no text a tag could write), and its opener the
     /// terminal of that state's row into `state`; that state is its home. The states name the
     /// markers, not the order of the rows. The turn's own state, where the opener leaves the
     /// engine, is no region: the rows back into it close the regions it holds.
@@ -1006,7 +1033,7 @@ impl Format {
         let from = self.entered_from(state, within);
         let turn_close = self.turn_close();
         let (_, close, home) = self.transitions().find(|&(source, on, target)| {
-            source == state && from.contains(&target) && Some(on) != turn_close
+            source == state && from.contains(&target) && Some(on) != turn_close && !self.stops(on)
         })?;
         let (_, open, _) = self
             .transitions()
@@ -1059,8 +1086,8 @@ impl Format {
     /// The close of the region `state` is, and the state it leaves the engine in: the row back to
     /// the state the region opened from, its home ([`Self::region`]); for a region with no such
     /// row, its row into a framing state, as a thought closes into the wrapping between the
-    /// template's messages (Inkling's message close). Neither is the end of the turn, nor a row
-    /// into the calls' block; the turn's own state is no region and has no close.
+    /// template's messages (Inkling's message close). Neither is the end of the turn, a stop token
+    /// or a row into the calls' block; the turn's own state is no region and has no close.
     fn close_of(&self, state: usize) -> Option<(&str, usize)> {
         if let Some(Region { close, home, .. }) =
             self.region(state, |state| self.is_call_state(state))
@@ -1080,7 +1107,8 @@ impl Format {
                 source == state
                     && target != state
                     && Some(on) != turn_close
-                    && self.is_wrapping(target)
+                    && !self.stops(on)
+                    && self.between_messages(target)
                     && Some(target) != block
             })
             .map(|(_, on, target)| (self.terminal_text(on), target))
@@ -1088,9 +1116,10 @@ impl Format {
 
     /// The shortest path of rows from `from` to `to` through framing states alone, the terminals
     /// in the order the model writes them; `None` when there is none. One row where `from` has a
-    /// row into `to`. The end of the turn is no step of a path: a way in that wrote it would end
-    /// the turn before the calls. Rows are tried in the table's order, so of two paths of one
-    /// length the one whose rows come first is taken: the first row into `to` when there are two.
+    /// row into `to`. The end of the turn is no step of a path, nor is a stop token: a way in that
+    /// wrote either would end the turn before the calls. Rows are tried in the table's order, so
+    /// of two paths of one length the one whose rows come first is taken: the first row into `to`
+    /// when there are two.
     fn path(&self, from: usize, to: usize) -> Option<Vec<&str>> {
         if from == to {
             return Some(Vec::new());
@@ -1102,7 +1131,7 @@ impl Format {
         let mut frontier = VecDeque::from([from]);
         while let Some(state) = frontier.pop_front() {
             for (source, on, target) in self.transitions() {
-                if source != state || seen[target] || Some(on) == turn_close {
+                if source != state || seen[target] || Some(on) == turn_close || self.stops(on) {
                     continue;
                 }
                 seen[target] = true;
@@ -1117,7 +1146,7 @@ impl Format {
                     rows.reverse();
                     return Some(rows);
                 }
-                if self.is_wrapping(target) {
+                if self.between_messages(target) {
                     frontier.push_back(target);
                 }
             }
@@ -1125,10 +1154,19 @@ impl Format {
         None
     }
 
-    /// Whether `state` is the template's wrapping, which the model writes only as the markers
-    /// around its messages and calls, so a way in may pass through it.
-    fn is_wrapping(&self, state: usize) -> bool {
-        self.emits(state) == Emits::Wrapper
+    /// Whether `state` lies between the template's messages: its wrapping (a wrapper state), or
+    /// text the template discards (a framing row: the text outside a response template's
+    /// fields). The model writes only the markers around its messages and calls there, so a way
+    /// in may pass through it.
+    fn between_messages(&self, state: usize) -> bool {
+        self.emits(state) == Emits::Wrapper || self.is_framing(state)
+    }
+
+    /// Whether terminal `on` is a token the model stops on ([`Format::is_stop_token`]): the stop
+    /// decoder hides it, so a tag cannot write it, and the region it closes ends at the model's
+    /// stop.
+    fn stops(&self, on: usize) -> bool {
+        self.is_stop_token(self.terminal_text(on))
     }
 
     /// Whether `state` emits a call's arguments.
@@ -2722,6 +2760,128 @@ mod tests {
                 "calls": [{"name": "get_weather", "arguments": {"city": "Paris"}}],
             })
         );
+    }
+
+    /// A table spelled as a response template's fields read, on abstract tags: the text outside
+    /// every field is framing; a thought between `<t>` and `</t>`; an answer after `<a>` that
+    /// `</a>` closes, or the stop token `<s>`, whose row comes first; and calls of JSON between
+    /// `<c>` and `</c>`.
+    fn framed() -> Format {
+        Format::new("framed")
+            .terminal("think_open", "<t>")
+            .terminal("think_close", "</t>")
+            .terminal("answer_open", "<a>")
+            .terminal("answer_close", "</a>")
+            .terminal("stop", "<s>")
+            .terminal("call_open", "<c>")
+            .terminal("call_close", "</c>")
+            .state("outside", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("content", Emits::Content)
+            .state("call", Emits::Arguments)
+            .transition("outside", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "outside")
+            .transition("outside", "answer_open", "content")
+            .transition("content", "stop", "outside")
+            .transition("content", "answer_close", "outside")
+            .transition("outside", "call_open", "call")
+            .transition("call", "call_close", "outside")
+            .calls(CallSyntax::Json)
+            .framing("outside")
+            .stop_tokens(["<s>"])
+    }
+
+    #[test]
+    fn a_framing_state_holds_no_answer_and_a_stop_token_ends_one() {
+        // The answer is the first content state the template keeps, not the framing the turn
+        // starts in; a stop token closes it, so the tag ends at the model's stop.
+        let schema = answer_schema();
+        let json_schema = value!({"type": "json_schema", "json_schema": schema});
+        let format = framed();
+        assert_eq!(
+            answer(&format, false),
+            Some(value!({"format": {
+                "type": "tag",
+                "begin": "<a>",
+                "content": json_schema,
+                "end": "",
+            }}))
+        );
+        // With the thought open, the way in is its close, then the row into the answer.
+        assert_eq!(
+            answer(&format, true).map(|payload| payload["format"]["begin"].clone()),
+            Some(value!("</t><a>"))
+        );
+        // Without the stop token, the answer's own close ends it.
+        let format = Format::new("framed")
+            .terminal("answer_open", "<a>")
+            .terminal("answer_close", "</a>")
+            .state("outside", Emits::Content)
+            .state("content", Emits::Content)
+            .transition("outside", "answer_open", "content")
+            .transition("content", "answer_close", "outside")
+            .framing("outside");
+        assert_eq!(
+            answer(&format, false).map(|payload| payload["format"]["end"].clone()),
+            Some(value!("</a>"))
+        );
+        let json = "{\"city\": \"Paris\"}";
+        let message = read(&framed(), &[], "", &format!("<a>{json}"));
+        assert_eq!(message["content"], value!(json));
+        assert_eq!(message["calls"], value!([]));
+    }
+
+    #[test]
+    fn a_regions_close_and_a_ways_step_are_never_a_stop_token() {
+        // The stop row out of the answer comes first in the table, but a tag cannot write the
+        // stop token: the region's close is the answer's own, and no path steps on the token.
+        let format = framed();
+        let content = format.answer_state().expect("an answer state");
+        let region = format
+            .region(content, |state| format.is_call_state(state))
+            .expect("the answer's region");
+        assert_eq!((region.open, region.close), ("<a>", "</a>"));
+        assert_eq!(format.close_of(content), Some(("</a>", 0)));
+        assert_eq!(
+            format.path(content, 3),
+            Some(vec!["</a>", "<c>"]),
+            "out through the answer's close and the framing, not the stop token"
+        );
+        assert!(format.stopped(content));
+        assert!(!format.stopped(1));
+    }
+
+    #[test]
+    fn a_way_in_passes_through_the_framing_between_two_markers() {
+        // The thought closes into framing of its own, and a second marker leads on into the
+        // framing the turn starts in, from where the answer opens: the way in is all three.
+        let format = Format::new("two markers")
+            .terminal("think_open", "<t>")
+            .terminal("think_close", "</t>")
+            .terminal("next", "<n>")
+            .terminal("answer_open", "<a>")
+            .terminal("answer_close", "</a>")
+            .state("outside", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("gap", Emits::Content)
+            .state("content", Emits::Content)
+            .transition("outside", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "gap")
+            .transition("gap", "next", "outside")
+            .transition("outside", "answer_open", "content")
+            .transition("content", "answer_close", "outside")
+            .framing("outside")
+            .framing("gap");
+        assert_eq!(format.validate(), Ok(()));
+        assert_eq!(format.path(2, 3), Some(vec!["<n>", "<a>"]));
+        assert_eq!(
+            answer(&format, true).map(|payload| payload["format"]["begin"].clone()),
+            Some(value!("</t><n><a>"))
+        );
+        let json = "{\"city\": \"Paris\"}";
+        let message = read(&format, &[], "<t>", &format!("plan</t><n><a>{json}</a>"));
+        assert_eq!(message["content"], value!(json));
+        assert_eq!(message["reasoning"], value!("plan"));
     }
 
     /// Every node of `payload` of `kind`, depth first.
