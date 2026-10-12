@@ -329,19 +329,12 @@ enum IndexBuild {
 
 /// The class of the advisory lock the builder of the open-background index
 /// holds for the build (session-level, tried, never waited for); the lock's
-/// second key is the hash of the schema-qualified index name, so two stores
-/// sharing one database under different schemas build their own index at
-/// the same time, and one gateway per schema builds.
+/// second key is the hash of the index name qualified by the schema the
+/// store writes to, resolved on the server (`owner`, else
+/// `current_schema()`), so two stores sharing one database under different
+/// schemas build their own index at the same time, two spellings of one
+/// schema share the key, and one gateway per schema builds.
 const POSTGRES_INDEX_BUILD_LOCK_CLASS: i32 = 0x736D_6778;
-
-/// The schema-qualified name of `name` in the schema the store writes to,
-/// the second key of the build lock.
-fn qualified_index_name(schema: &SchemaConfig, name: &str) -> String {
-    match schema.owner.as_deref() {
-        Some(owner) => format!("{owner}.{name}"),
-        None => name.to_string(),
-    }
-}
 
 /// Builds the open-background index on one connection of `pool`, under the
 /// build lock, with the statement timeout lifted for the build; see
@@ -357,11 +350,11 @@ async fn build_open_background_index(
         .get()
         .await
         .map_err(|e| format!("no connection for the index build: {}", describe_error(&e)))?;
-    let lock_name = qualified_index_name(schema, OPEN_BACKGROUND_INDEX);
+    let owner = schema.owner.as_deref();
     let locked: bool = client
         .query_one(
-            "SELECT pg_try_advisory_lock($1, hashtext($2))",
-            &[&POSTGRES_INDEX_BUILD_LOCK_CLASS, &lock_name],
+            "SELECT pg_try_advisory_lock($1, hashtext(COALESCE($2, current_schema()) || '.' || $3))",
+            &[&POSTGRES_INDEX_BUILD_LOCK_CLASS, &owner, &OPEN_BACKGROUND_INDEX],
         )
         .await
         .map_err(|e| format!("failed to try the index build lock: {}", describe_error(&e)))?
@@ -392,8 +385,12 @@ async fn build_open_background_index(
     .await;
     if let Err(e) = client
         .execute(
-            "SELECT pg_advisory_unlock($1, hashtext($2))",
-            &[&POSTGRES_INDEX_BUILD_LOCK_CLASS, &lock_name],
+            "SELECT pg_advisory_unlock($1, hashtext(COALESCE($2, current_schema()) || '.' || $3))",
+            &[
+                &POSTGRES_INDEX_BUILD_LOCK_CLASS,
+                &owner,
+                &OPEN_BACKGROUND_INDEX,
+            ],
         )
         .await
     {
