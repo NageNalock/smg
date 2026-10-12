@@ -1531,6 +1531,7 @@ impl ResponseStorage for OracleResponseStorage {
             model,
             conversation_id,
             raw_response,
+            tenant,
         } = response;
         let read_back = id.clone();
         let response_id_str = id.0;
@@ -1554,6 +1555,7 @@ impl ResponseStorage for OracleResponseStorage {
                     ("model", &model),
                     ("conversation_id", &conversation_id),
                     ("raw_response", &json_raw_response),
+                    ("tenant", &tenant),
                 ];
                 let mut columns = Vec::new();
                 let mut params: Vec<&dyn ToSql> = Vec::new();
