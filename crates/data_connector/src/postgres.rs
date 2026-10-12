@@ -330,10 +330,11 @@ enum IndexBuild {
 /// The class of the advisory lock the builder of the open-background index
 /// holds for the build (session-level, tried, never waited for); the lock's
 /// second key is the hash of the index name qualified by the schema the
-/// store writes to, resolved on the server (`owner`, else
-/// `current_schema()`), so two stores sharing one database under different
-/// schemas build their own index at the same time, two spellings of one
-/// schema share the key, and one gateway per schema builds.
+/// store writes to, resolved on the server (`owner` folded to lower case as
+/// the unquoted DDL is, else `current_schema()`), so two stores sharing one
+/// database under different schemas build their own index at the same
+/// time, two spellings of one schema share the key, and one gateway per
+/// schema builds.
 const POSTGRES_INDEX_BUILD_LOCK_CLASS: i32 = 0x736D_6778;
 
 /// Builds the open-background index on one connection of `pool`, under the
@@ -353,7 +354,7 @@ async fn build_open_background_index(
     let owner = schema.owner.as_deref();
     let locked: bool = client
         .query_one(
-            "SELECT pg_try_advisory_lock($1, hashtext(COALESCE($2, current_schema()) || '.' || $3))",
+            "SELECT pg_try_advisory_lock($1, hashtext(COALESCE(lower($2), current_schema()) || '.' || $3))",
             &[&POSTGRES_INDEX_BUILD_LOCK_CLASS, &owner, &OPEN_BACKGROUND_INDEX],
         )
         .await
@@ -385,7 +386,7 @@ async fn build_open_background_index(
     .await;
     if let Err(e) = client
         .execute(
-            "SELECT pg_advisory_unlock($1, hashtext(COALESCE($2, current_schema()) || '.' || $3))",
+            "SELECT pg_advisory_unlock($1, hashtext(COALESCE(lower($2), current_schema()) || '.' || $3))",
             &[
                 &POSTGRES_INDEX_BUILD_LOCK_CLASS,
                 &owner,
@@ -427,9 +428,11 @@ async fn index_exists(
     index_exists_on_client(client, schema, name, false).await
 }
 
-/// Whether an index named `name` exists in the schema the store writes to;
-/// with `valid_only`, an INVALID one (an interrupted concurrent build) does
-/// not count.
+/// Whether an index named `name` exists in the schema the store writes to
+/// (`owner` folded to lower case, as the unquoted DDL that created the
+/// schema's objects was by the server, else `current_schema()`); with
+/// `valid_only`, an INVALID one (an interrupted concurrent build) does not
+/// count.
 async fn index_exists_on_client(
     client: &impl deadpool_postgres::GenericClient,
     schema: &SchemaConfig,
@@ -441,7 +444,7 @@ async fn index_exists_on_client(
             "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
              JOIN pg_index i ON i.indexrelid = c.oid \
              WHERE c.relkind = 'i' AND c.relname = $1 \
-             AND n.nspname = COALESCE($2, current_schema()) \
+             AND n.nspname = COALESCE(lower($2), current_schema()) \
              AND (i.indisvalid OR NOT $3)",
             &[&name, &schema.owner.as_deref(), &valid_only],
         )
@@ -464,7 +467,7 @@ async fn drop_invalid_index(
         .query(
             "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE c.relname = $1 AND n.nspname = COALESCE($2, current_schema()) \
+             WHERE c.relname = $1 AND n.nspname = COALESCE(lower($2), current_schema()) \
              AND NOT i.indisvalid",
             &[&name, &schema.owner.as_deref()],
         )
