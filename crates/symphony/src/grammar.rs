@@ -46,13 +46,18 @@
 //! inside its thought. Kimi
 //! K3's tag takes no prefix: the block of calls can be entered from the turn itself, from the
 //! thought or from the answer, and the tag has one way in per state: from a region with a close
-//! of its own, that close and then the row into the block from where the close returns; from any
-//! other state, its own row into the block. So the model closes whatever the prompt left open on
-//! its way to the calls, whichever that was.
+//! of its own, that close and then the rows into the block from where the close returns; from any
+//! other state, its own rows into the block. So the model closes whatever the prompt left open on
+//! its way to the calls, whichever that was. The rows are a path through the template's framing,
+//! the shortest the table has: one row for Kimi K3, and more where a template frames each message
+//! (the thought's close, the row that starts the next message, the row into the block), so a
+//! state with no row of its own into the block still has a way in when the framing leads there.
 //!
 //! Inkling's named JSON takes the tag the gateway's old Inkling parser writes, the call marker its
 //! trigger inside whatever message the model is writing. A table without calls gives `None`, and
 //! the gateway takes the JSON-schema path for it.
+
+use std::collections::VecDeque;
 
 use openai_protocol::common::Tool;
 use serde_json::{json, Value};
@@ -245,25 +250,33 @@ struct Block<'a> {
     close: &'a str,
 }
 
-/// One way into a block of calls, from a state with a row into it: from a region with a close of
-/// its own (a thought, an answer) whose home has a row into the block, that close first, then the
-/// home's row, so the model closes what the prompt left open and goes on from where that leaves
-/// it; from any other state (the turn's own, one with no close, one whose home has no row into
-/// the block), the opener of its own row. Every way in is a path the table has.
+/// One way into a block of calls, from a state with a path into it: from a region with a close of
+/// its own (a thought, an answer) whose close leaves the engine where a path into the block
+/// starts, that close first, then the path, so the model closes what the prompt left open and
+/// goes on from where that leaves it; from any other state (the turn's own, one with no close,
+/// one whose close leads nowhere into the block), its own path. A path is the rows from one state
+/// to the block through framing states alone, the shortest there is: one row where a state has a
+/// row into the block, and more where the template frames its messages (the close of a thought,
+/// the row that starts the next message, the row into the block). Every way in is a path the
+/// table has.
 struct WayIn<'a> {
     close: Option<&'a str>,
-    open: &'a str,
+    rows: Vec<&'a str>,
 }
 
 impl WayIn<'_> {
     /// What the model writes to enter the block this way.
     fn begin(&self) -> String {
-        format!("{}{}", self.close.unwrap_or(""), self.open)
+        let mut begin = self.close.unwrap_or("").to_string();
+        begin.extend(self.rows.iter().copied());
+        begin
     }
 
-    /// The text that triggers this way in: the close when there is one, else the opener.
+    /// The text that triggers this way in: the close when there is one, else the first row's.
     fn trigger(&self) -> &str {
-        self.close.unwrap_or(self.open)
+        self.close
+            .or_else(|| self.rows.first().copied())
+            .unwrap_or("")
     }
 }
 
@@ -700,31 +713,113 @@ impl Format {
         })
     }
 
-    /// The ways into the block `state` is, one per state it is entered from, in the order of the
-    /// states, the same way in once: from a region with a close whose home has a row into the
-    /// block, the close and then that row; from any other state, its own row.
+    /// The ways into the block `state` is, one per state with a path into it (a row into it, or
+    /// rows through framing states), in the order of the states, the same way in once: from a
+    /// region with a close that leaves the engine where a path into the block starts, the close
+    /// and then that path; from any other state, its own path.
     fn ways_into(&self, state: usize) -> Vec<WayIn<'_>> {
-        let door = |from: usize| {
-            self.transitions()
-                .find(|&(source, _, target)| source == from && target == state)
-                .map(|(_, on, _)| self.terminal_text(on))
-        };
         let mut ways: Vec<WayIn<'_>> = Vec::new();
-        for from in self.entered_from(state, |state| self.is_arguments(state)) {
-            let through_home = self
-                .region(from, |state| self.is_call_state(state))
-                .and_then(|Region { close, home, .. }| Some((Some(close), door(home)?)));
-            let (close, open) = match through_home {
-                Some((close, open)) => (close, Some(open)),
-                None => (None, door(from)),
+        let reaching = (0..self.states()).filter(|&from| {
+            from != state && !self.is_arguments(from) && self.path(from, state).is_some()
+        });
+        for from in reaching {
+            let Some(way) = self.way_in(from, state) else {
+                continue;
             };
-            let Some(open) = open else { continue };
-            let way = WayIn { close, open };
             if !ways.iter().any(|known| known.begin() == way.begin()) {
                 ways.push(way);
             }
         }
         ways
+    }
+
+    /// The way into `state` from `from`: the close of the region `from` is, when it has one and a
+    /// path into `state` starts where the close leaves the engine, then that path; else the path
+    /// from `from` itself.
+    fn way_in(&self, from: usize, state: usize) -> Option<WayIn<'_>> {
+        let through_close = self.close_of(from).and_then(|(close, landing)| {
+            Some(WayIn {
+                close: Some(close),
+                rows: self.path(landing, state)?,
+            })
+        });
+        through_close.or_else(|| {
+            Some(WayIn {
+                close: None,
+                rows: self.path(from, state)?,
+            })
+        })
+    }
+
+    /// The close of the region `state` is, and the state it leaves the engine in: the row back to
+    /// the state the region opened from, its home ([`Self::region`]); for a region with no such
+    /// row, its row into a framing state, as a thought closes into the wrapping between the
+    /// template's messages. Neither is the end of the turn, nor a row into the calls; the turn's
+    /// own state is no region and has no close.
+    fn close_of(&self, state: usize) -> Option<(&str, usize)> {
+        if let Some(Region { close, home, .. }) =
+            self.region(state, |state| self.is_call_state(state))
+        {
+            return Some((close, home));
+        }
+        if state == 0 {
+            return None;
+        }
+        let turn_close = self.turn_close();
+        self.transitions()
+            .find(|&(source, on, target)| {
+                source == state
+                    && target != state
+                    && Some(on) != turn_close
+                    && self.is_wrapping(target)
+                    && !self.is_call_state(target)
+            })
+            .map(|(_, on, target)| (self.terminal_text(on), target))
+    }
+
+    /// The shortest path of rows from `from` to `to` through framing states alone, the terminals
+    /// in the order the model writes them; `None` when there is none. One row where `from` has a
+    /// row into `to`. The end of the turn is no step of a path: a way in that wrote it would end
+    /// the turn before the calls. Rows are tried in the table's order, so of two paths of one
+    /// length the one whose rows come first is taken: the first row into `to` when there are two.
+    fn path(&self, from: usize, to: usize) -> Option<Vec<&str>> {
+        if from == to {
+            return Some(Vec::new());
+        }
+        let turn_close = self.turn_close();
+        let mut reached_by: Vec<Option<(usize, usize)>> = vec![None; self.states()];
+        let mut seen = vec![false; self.states()];
+        seen[from] = true;
+        let mut frontier = VecDeque::from([from]);
+        while let Some(state) = frontier.pop_front() {
+            for (source, on, target) in self.transitions() {
+                if source != state || seen[target] || Some(on) == turn_close {
+                    continue;
+                }
+                seen[target] = true;
+                reached_by[target] = Some((state, on));
+                if target == to {
+                    let mut rows = Vec::new();
+                    let mut at = to;
+                    while let Some((before, on)) = reached_by[at] {
+                        rows.push(self.terminal_text(on));
+                        at = before;
+                    }
+                    rows.reverse();
+                    return Some(rows);
+                }
+                if self.is_wrapping(target) {
+                    frontier.push_back(target);
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether `state` is the template's wrapping, which the model writes only as the markers
+    /// around its messages and calls, so a way in may pass through it.
+    fn is_wrapping(&self, state: usize) -> bool {
+        self.emits(state) == Emits::Wrapper
     }
 
     /// Whether `state` emits a call's arguments.
@@ -1019,6 +1114,114 @@ mod tests {
         assert_eq!(as_xtml["format"]["triggers"], value!(["<tool_call>"]));
         assert_eq!(begins(&as_xtml), ["<tool_call>"]);
         assert_eq!(as_xtml["format"]["tags"][0]["end"], "</tool_call>");
+    }
+
+    #[test]
+    fn a_way_in_follows_the_framing_between_messages() {
+        // A turn of messages: `<|start|>` opens one from the wrapping between them, its kind
+        // follows, and `<|end|>` closes a thought back into the wrapping. The block is entered
+        // from a message's header alone, so the turn's start goes in by starting a message, and
+        // the thought by closing, starting the next message and entering the block: a close, a
+        // row between messages and the block's opener. The header, with its own row, keeps it.
+        let messages = Format::new("messages")
+            .terminal("start", "<|start|>")
+            .terminal("think", "<|think|>")
+            .terminal("end", "<|end|>")
+            .terminal("calls_open", "<|calls|>")
+            .terminal("calls_close", "<|/calls|>")
+            .terminal("call_open", "<|call|>")
+            .terminal("call_close", "<|/call|>")
+            .state("between", Emits::Wrapper)
+            .state("header", Emits::Wrapper)
+            .state("reasoning", Emits::Reasoning)
+            .state("calls", Emits::Wrapper)
+            .state("call", Emits::Arguments)
+            .transition("between", "start", "header")
+            .transition("header", "think", "reasoning")
+            .transition("reasoning", "end", "between")
+            .transition("header", "calls_open", "calls")
+            .transition("calls", "call_open", "call")
+            .transition("call", "call_close", "calls")
+            .transition("calls", "calls_close", "header")
+            .calls(CallSyntax::Xtml);
+        let tools = weather_tools();
+        let payload = messages
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
+        assert_eq!(
+            begins(&payload),
+            [
+                "<|start|><|calls|>",
+                "<|calls|>",
+                "<|end|><|start|><|calls|>"
+            ]
+        );
+        assert_eq!(
+            payload["format"]["triggers"],
+            value!(["<|start|>", "<|calls|>", "<|end|>"])
+        );
+        assert_eq!(payload["format"]["tags"][0]["end"], "<|/calls|>");
+        // The open thought changes nothing: the tag closes it on its own way in.
+        assert_eq!(
+            messages.grammar(&tools, true, true),
+            messages.grammar(&tools, true, false)
+        );
+        // The end of the turn is no step of a way in. Here the answer closes into an aside, and
+        // the aside's rows back to the turn's state are the end of the turn, the first of them,
+        // and `<|next|>`: the answer's way in closes it and goes on by `<|next|>`, as the aside's
+        // own does, never by ending the turn.
+        let aside = Format::new("aside")
+            .terminal("response_open", "<|response|>")
+            .terminal("response_close", "<|/response|>")
+            .terminal("next", "<|next|>")
+            .terminal("calls_open", "<|calls|>")
+            .terminal("calls_close", "<|/calls|>")
+            .terminal("call_open", "<|call|>")
+            .terminal("call_close", "<|/call|>")
+            .terminal("turn_end", "<|turn_end|>")
+            .state("turn", Emits::Wrapper)
+            .state("content", Emits::Content)
+            .state("aside", Emits::Wrapper)
+            .state("calls", Emits::Wrapper)
+            .state("call", Emits::Arguments)
+            .transition("turn", "response_open", "content")
+            .transition("content", "response_close", "aside")
+            .transition("aside", "turn_end", "turn")
+            .transition("aside", "next", "turn")
+            .transition("turn", "calls_open", "calls")
+            .transition("calls", "call_open", "call")
+            .transition("call", "call_close", "calls")
+            .transition("calls", "calls_close", "turn")
+            .transition("turn", "turn_end", "turn")
+            .transition("content", "turn_end", "turn")
+            .transition("calls", "turn_end", "turn")
+            .transition("call", "turn_end", "turn")
+            .calls(CallSyntax::Xtml);
+        let payload = aside
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
+        assert_eq!(
+            begins(&payload),
+            [
+                "<|calls|>",
+                "<|/response|><|next|><|calls|>",
+                "<|next|><|calls|>"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_thought_that_closes_into_its_answer_has_no_way_of_its_own() {
+        // Hy4's shape: the block is entered from content alone, and the thought closes into
+        // content, which is text, not framing; the thought has no path of its own, and the open
+        // thought takes the prefix instead, as before.
+        let payload = formats::hy4()
+            .grammar(&weather_tools(), true, false)
+            .expect("a grammar")
+            .payload();
+        assert_eq!(begins(&payload), ["<tool_calls:opensource>"]);
     }
 
     /// The `begin` of each way into a block, from a `triggered_tags` payload.
