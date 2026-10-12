@@ -23,14 +23,15 @@ use std::{future::Future, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 use tracing::warn;
 
 use crate::core::{
-    Conversation, ConversationId, ConversationItem, ConversationItemId, ConversationItemResult,
-    ConversationItemStorage, ConversationItemStorageError, ConversationMetadata,
-    ConversationResult, ConversationStorage, ConversationStorageError, ListParams, NewConversation,
-    NewConversationItem, ResponseId, ResponseResult, ResponseStorage, ResponseStorageError,
-    StoredResponse,
+    ConditionalStore, Conversation, ConversationId, ConversationItem, ConversationItemId,
+    ConversationItemResult, ConversationItemStorage, ConversationItemStorageError,
+    ConversationMetadata, ConversationResult, ConversationStorage, ConversationStorageError,
+    ListParams, NewConversation, NewConversationItem, ResponseId, ResponseResult, ResponseStorage,
+    ResponseStorageError, StoredResponse,
 };
 
 /// The bound of one store call, with the backend's name for the error message
@@ -164,6 +165,47 @@ impl ResponseStorage for BoundedResponseStorage {
             .run(
                 "delete_identifier_responses",
                 self.inner.delete_identifier_responses(identifier, tenant),
+                ResponseStorageError::Timeout,
+            )
+            .await
+    }
+
+    async fn store_response_if_open(
+        &self,
+        response: StoredResponse,
+    ) -> ResponseResult<ConditionalStore> {
+        self.bound
+            .run(
+                "store_response_if_open",
+                self.inner.store_response_if_open(response),
+                ResponseStorageError::Timeout,
+            )
+            .await
+    }
+
+    async fn update_response_object_if_open(
+        &self,
+        response_id: &ResponseId,
+        raw_response: Value,
+    ) -> ResponseResult<ConditionalStore> {
+        self.bound
+            .run(
+                "update_response_object_if_open",
+                self.inner
+                    .update_response_object_if_open(response_id, raw_response),
+                ResponseStorageError::Timeout,
+            )
+            .await
+    }
+
+    async fn list_open_background_responses(
+        &self,
+        limit: usize,
+    ) -> ResponseResult<Vec<StoredResponse>> {
+        self.bound
+            .run(
+                "list_open_background_responses",
+                self.inner.list_open_background_responses(limit),
                 ResponseStorageError::Timeout,
             )
             .await
