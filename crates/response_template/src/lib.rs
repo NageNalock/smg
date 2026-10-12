@@ -9,8 +9,9 @@
 //! patterns as the `regex` module reads them, and says whether this crate
 //! runs it.
 //!
-//! With the `symphony` feature, `to_symphony` types a call's values for a
-//! table of smg's symphony parser as transformers types them.
+//! With the `symphony` feature, `to_symphony` compiles a template into a
+//! table of smg's symphony parser, which streams with literal markers and
+//! reads an output as transformers' whole-text reading does.
 //!
 //! Portions are ported from Hugging Face transformers (Apache-2.0). The files
 //! follow its layout (`response_templates.rs`, `response_parser.rs`,

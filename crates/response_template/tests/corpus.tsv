@@ -1,0 +1,8 @@
+hub/muse-glimmer	refused	TaggedParameters (Field 'tool_calls': arguments as tagged parameters)
+serve/qwen3_5	refused	TaggedParameters (Field 'tool_calls': arguments as tagged parameters)
+trl/qwen3_5	refused	TaggedParameters (Field 'tool_calls': arguments as tagged parameters)
+hf-tests/qwen3_template	refused	TaggedParameters (Field 'tool_calls': arguments as tagged parameters)
+hf-tests/_XML_STRING_ARGS_TEMPLATE	refused	TaggedParameters (Field 'tool_calls': arguments as tagged parameters)
+hub/cohere-north	table	anchors ["<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"]; 0:outside content trimmed
+hf-pipelines/any_to_any_gemma3_style	table	anchors ["<start_of_turn>model\n"]; 0:outside content trimmed; 1:thinking reasoning trimmed in ["<think>"] out ["</think>"]
+hf-pipelines/text_generation_chatml	table	anchors ["<|im_start|>assistant\n"]; 0:outside content trimmed; 1:thinking reasoning trimmed in ["<think>"] out ["</think>"]

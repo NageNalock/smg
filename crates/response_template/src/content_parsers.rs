@@ -96,6 +96,25 @@ impl Content {
         }
     }
 
+    /// Whether the parser strips its text (`strip`, on unless `content_args` turn it off).
+    #[cfg(feature = "symphony")]
+    pub(crate) fn strips(&self) -> bool {
+        self.strip
+    }
+
+    /// Whether the JSON is written in a dialect: keys without quotes, or strings between the
+    /// template's own delimiters.
+    #[cfg(feature = "symphony")]
+    pub(crate) fn json_dialect(&self) -> bool {
+        self.unquoted_keys || !self.string_delims.is_empty()
+    }
+
+    /// Whether a key written twice keeps every value (`merge_duplicates`).
+    #[cfg(feature = "symphony")]
+    pub(crate) fn merges_duplicates(&self) -> bool {
+        self.merge_duplicates
+    }
+
     /// Check the `content_args` the parser reads (`None` when absent).
     pub(crate) fn new(parser: ContentParser, args: Option<&Value>) -> Result<Self, Unsupported> {
         let empty = Map::new();

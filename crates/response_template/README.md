@@ -221,6 +221,65 @@ Both raise an explicit error where transformers returns a value:
   Python raises `RecursionError` only near its C recursion limit, about 10,000
   levels.
 
+## Compiling a template into a symphony table
+
+With the `symphony` feature, `to_symphony::compile(&template, stops)` lowers a
+template into a table of smg's `symphony` parser (a `symphony::Format`), which
+reads a stream with literal markers and never runs a regular expression. The
+table gives the message transformers' whole-text reading gives,
+`parse_response(output + stop, template, prefix=prompt, tools=tools)`, at every
+chunking of the output, except where a difference below applies. `stops` are
+the texts of the tokens the model stops on, which the stop decoder hides from
+the stream.
+
+- `start_anchor` (one literal or several) and a `start_anchor_pattern` that is
+  a finite set of literals (alternatives, optional literals, at most 32
+  spellings) become the table's turn anchors, in the order the pattern tries
+  them; the prompt's replay starts after the last one.
+- The field with no open is the text outside the other fields: `content` is a
+  content state, trimmed with Python's `str.strip` unless `strip: false`; any
+  other name, or no such field, is a framing state, whose text is dropped.
+  `thinking` or `reasoning_content` is a reasoning state, `content` a content
+  state, and a field of another name a framing state.
+- A delimiter's marker is a literal: an open's first literal after optional
+  whitespace, a close's last literal before it. Whitespace the pattern takes
+  beside the marker must be next to a state that is trimmed or dropped, and
+  must not be able to take the first character of another marker that moves
+  that state. Alternatives are markers of their own, tried in the pattern's
+  order.
+- A close made of markers (`<|end|>` and then the anchor's text) moves where
+  its markers move in turn; text after a marker that leads into a framing state
+  is dropped with it. A close of the outside text that is a stop text adds no
+  row, and another close of it drops its marker. Every marker that is a stop
+  text is named a stop token of the table.
+- Values of calls read with `to_symphony::TRANSFORMERS`, this crate's port of
+  `_sub_parse`, `_coerce`, `_schema_types` and `_coerce_tool_calls`, the code
+  `parse_response` runs.
+
+Tool calls are not lowered yet: a template with a `tool_calls` field is refused
+(`Construct::TaggedParameters`, `JsonArguments` or `JsonEnvelope`). Everything
+the compile does not lower is refused by name: `Refusals` lists every construct
+the template uses, each with a stable `Construct` code, and the compile goes on
+after a refused construct to find the rest. `tests/corpus.tsv` pins the outcome
+for the public templates of `tests/fixtures/compiled/`, and
+`tests/to_symphony.tsv` for every template of `tests/fixtures/hf/` that loads.
+
+Where a compiled table's message differs from transformers', by design, each
+difference has a code:
+
+- X1: a field that does not repeat, written more than once, keeps every stay
+  in order, each trimmed, where transformers keeps the last. A stream cannot
+  take back text it sent.
+- X2: text the prompt wrote after its last anchor (a prefill) belongs to the
+  prompt and is not streamed again.
+- X3: a stop text is not fed to the table; a region it closes closes at the
+  stream's stop, and a stop text transformers keeps as text is not in the
+  message.
+- X5: where transformers raises, the table's events are defined.
+- X6: fields other than the thought, the content and the calls are dropped.
+- X9: with no anchor in the prompt, reading starts at the output, where
+  transformers reads the whole prompt as the message's start.
+
 ## Parity tests
 
 `scripts/generate_hf_fixtures.py` runs transformers itself and records what it

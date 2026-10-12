@@ -17,13 +17,16 @@ use crate::{
 /// An open or close delimiter, or the start anchor: the pattern as the
 /// `regex` module reads it (`None` for literal strings), and as this crate's
 /// matcher runs it (`None` when it does not). `literals` when it came from
-/// literal strings, `can_extend` when one of them is a strict prefix of
+/// literal strings, which `texts` holds in the order the pattern tries them
+/// (longest first); `can_extend` when one of them is a strict prefix of
 /// another.
 #[derive(Debug)]
 pub(crate) struct Delimiter {
     pub(crate) regex: Option<Regex>,
     pub(crate) pattern: Option<Pattern>,
     pub(crate) literals: bool,
+    #[cfg(feature = "symphony")]
+    pub(crate) texts: Vec<String>,
     pub(crate) can_extend: bool,
 }
 
@@ -177,6 +180,8 @@ fn compile_anchor(
             regex: None,
             pattern: Some(Pattern::literals(&literals)),
             literals: true,
+            #[cfg(feature = "symphony")]
+            texts: literals,
             can_extend,
         }));
     }
@@ -198,6 +203,8 @@ fn compile_anchor(
         regex: Some(regex),
         pattern,
         literals: false,
+        #[cfg(feature = "symphony")]
+        texts: Vec::new(),
         can_extend: false,
     }))
 }

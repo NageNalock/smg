@@ -1,32 +1,319 @@
-//! The values of a symphony table's calls, typed as transformers types them: a call's value reads
-//! as transformers' `_sub_parse`, `_coerce` and `_coerce_tool_calls` read it, over every row
-//! `fixtures/compiled/values.jsonl` records with transformers' own functions.
+//! Templates compiled into symphony tables.
+//!
+//! - Every public template of `fixtures/compiled/` either compiles or is refused with the
+//!   constructs `corpus.tsv` pins, and every template of `fixtures/hf/` that is read, with those
+//!   `to_symphony.tsv` pins (`TO_SYMPHONY_WRITE=1` rewrites them). A refusal lists every construct
+//!   no table reads, with its code.
+//! - A call's value reads as transformers' `_sub_parse`, `_coerce` and `_coerce_tool_calls` read
+//!   it, over every row `fixtures/compiled/values.jsonl` records with transformers' own functions.
+//! - Templates written for these tests on abstract tags compile into tables that read random
+//!   outputs as the template's reader in this crate does, at every chunking, keeping symphony's
+//!   contract.
 
 #![expect(
     clippy::unwrap_used,
     clippy::panic,
-    reason = "a test: a bad fixture should panic"
+    reason = "a test: a bad fixture or table should panic"
 )]
 
 mod common;
+mod replay;
 
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, fmt::Write as _};
 
-use common::{read_json, read_jsonl, untag};
+use common::{fixtures_dir, read_json, read_jsonl, untag};
 use openai_protocol::common::Tool;
-use serde_json::Value;
-use smg_response_template::to_symphony::TRANSFORMERS;
+use replay::{check_contract, compiled, compiled_dir, pinned, plans, rows, run, Said};
+use serde_json::{json, Value};
+use smg_response_template::{
+    load_response_template, read_response_template,
+    to_symphony::{compile, Compiled, Construct, Refusals, TRANSFORMERS},
+    Event as RegionEvent, ResponseParser, ResponseTemplate,
+};
 use symphony::{
     shape::{Dialect, Duplicates, Schema, ValueParser},
-    Declared, ValueRead,
+    Declared, EngineFinish, ValueRead,
 };
 
-/// The public templates, transformers' sessions for them, and its typing of values.
-fn compiled_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compiled")
+/// One line for a pinned list: the table's summary, or every refusal.
+fn outcome(id: &str, result: Option<&Result<Compiled, Refusals>>) -> String {
+    match result {
+        None => format!("{id}\tnot read\n"),
+        Some(Ok(compiled)) => format!("{id}\ttable\t{}\n", compiled.summary),
+        Some(Err(refusals)) => {
+            let mut line = format!("{id}\trefused");
+            for (at, refusal) in refusals.refusals().iter().enumerate() {
+                let sep = if at == 0 { '\t' } else { ' ' };
+                let _ = write!(
+                    line,
+                    "{sep}{} ({}: {})",
+                    refusal.construct, refusal.scope, refusal.detail
+                );
+            }
+            line + "\n"
+        }
+    }
+}
+
+#[test]
+fn the_public_templates_compile_or_are_refused_as_pinned() {
+    let mut seen = String::new();
+    for row in rows(&compiled_dir()) {
+        seen.push_str(&outcome(&row.id, compiled(&row).as_ref()));
+    }
+    pinned("corpus.tsv", &seen);
+}
+
+#[test]
+fn the_fixture_templates_compile_or_are_refused_as_pinned() {
+    let mut seen = String::new();
+    for row in rows(&fixtures_dir()) {
+        let result = compiled(&row);
+        if result.is_some() {
+            seen.push_str(&outcome(&row.id, result.as_ref()));
+        }
+    }
+    pinned("to_symphony.tsv", &seen);
+}
+
+#[test]
+fn a_refusal_is_displayed_as_the_first_and_lists_every_construct() {
+    let template = read_response_template(&json!({
+        "start_anchor_pattern": "<a>\\s*",
+        "fields": {
+            "content": {"open": "<c>", "close": "</c>", "repeats": true},
+            "tool_calls": {
+                "open": "<t>", "close": "</t>", "content": "kv-lines",
+                "transform": {"function": {"name": "{name}", "arguments": "{content}"}}
+            }
+        }
+    }))
+    .unwrap();
+    let refused = compile(&template, &[]).unwrap_err();
+    assert_eq!(
+        refused.constructs(),
+        [
+            Construct::AnchorNotFinite,
+            Construct::RepeatedTextField,
+            Construct::NonRepeatingCalls,
+            Construct::KeyValueLines,
+            Construct::HeaderName,
+        ]
+    );
+    assert_eq!(
+        refused.to_string(),
+        "response_template: AnchorNotFinite: a start anchor pattern that is not literal text"
+    );
+}
+
+/// A template for each construct of a field, a delimiter or a call that no table reads, refused
+/// with its code.
+#[test]
+fn each_construct_no_table_reads_is_refused_by_name() {
+    let call = |field: Value| json!({"start_anchor": "<a>", "fields": {"tool_calls": field}});
+    let named = json!({"function": {"name": "{name}", "arguments": "{content}"}});
+    let text = |fields: Value| json!({"start_anchor": "<a>", "fields": fields});
+    let cases = [
+        (
+            Construct::ImplicitField,
+            text(json!({"thinking": {"close": "</t>"}})),
+        ),
+        (
+            Construct::SharedField,
+            text(json!({
+                "thinking": {"open": "<t>", "close": "</t>"},
+                "reasoning_content": {"open": "<r>", "close": "</r>"},
+            })),
+        ),
+        (
+            Construct::TextFieldContent,
+            text(json!({"content": {"open": "<c>", "close": "</c>", "content": "json"}})),
+        ),
+        (
+            Construct::TextFieldTransform,
+            text(
+                json!({"content": {"open": "<c>", "close": "</c>", "transform": {"text": "{content}"}}}),
+            ),
+        ),
+        (
+            Construct::RepeatedTextField,
+            text(json!({"content": {"open": "<c>", "close": "</c>", "repeats": true, "join": ""}})),
+        ),
+        (
+            Construct::Default,
+            json!({
+                "start_anchor": "<a>",
+                "defaults": {"content": "hi"},
+                "fields": {"content": {"open": "<c>", "close": "</c>"}},
+            }),
+        ),
+        (
+            // transformers' message holds the default whether or not a field writes it.
+            Construct::Default,
+            json!({
+                "start_anchor": "<a>",
+                "defaults": {"thinking": "hi"},
+                "fields": {"content": {"open": "<c>", "close": "</c>"}},
+            }),
+        ),
+        (
+            Construct::TextFieldDelimiter,
+            text(json!({"thinking": {"open_pattern": "<t>\\w+", "close": "</t>"}})),
+        ),
+        (
+            Construct::UntrimmedSlack,
+            text(json!({"content": {
+                "open_pattern": "<c>\\s*", "close": "</c>", "content_args": {"strip": false},
+            }})),
+        ),
+        (
+            Construct::SlackBeforeMarker,
+            text(json!({
+                "thinking": {"open": "<t>", "close_pattern": "</t>\\s*"},
+                "content": {"open": " <c>", "close": "</c>"},
+            })),
+        ),
+        (
+            // The pattern's match starts in the whitespace before `</t>`, ahead of the newline
+            // the table would read first.
+            Construct::SlackBeforeMarker,
+            text(json!({"thinking": {"open": "<t>", "close_pattern": "(?:\\s*</t>|\\n)"}})),
+        ),
+        (
+            Construct::SlackBeforeMarker,
+            text(json!({
+                "content": {"close_pattern": "\\s*<e>"},
+                "notes": {"open": "\n", "close": "</n>"},
+            })),
+        ),
+        (
+            Construct::AlternativeOrder,
+            text(json!({"thinking": {"open_pattern": "(?:<t>|<t>x)", "close": "</t>"}})),
+        ),
+        (
+            Construct::NoLiteral,
+            text(json!({"thinking": {"open_pattern": "[^<]*<t>", "close": "</t>"}})),
+        ),
+        (
+            Construct::ZeroWidthOpen,
+            text(json!({"thinking": {"open_pattern": "(?=[\\s\\S]*?</t>)", "close": "</t>"}})),
+        ),
+        (
+            Construct::SharedOpenMarker,
+            text(json!({
+                "thinking": {"open": "<x>", "close": "</t>"},
+                "notes": {"open": "<x>", "close": "</n>"},
+            })),
+        ),
+        (
+            Construct::MarkerInsideMarker,
+            text(json!({
+                "thinking": {"open": "<t>", "close": "</t>"},
+                "content": {"open": "<c>", "close": "z</t>"},
+            })),
+        ),
+        (
+            Construct::NonRepeatingCalls,
+            call(json!({"open": "<c>", "close": "</c>", "content": "json", "transform": named})),
+        ),
+        (
+            Construct::TransformEach,
+            call(json!({
+                "open": "<c>", "close": "</c>", "repeats": true, "content": "json",
+                "transform": named, "transform_each": true,
+            })),
+        ),
+        (
+            Construct::CallTransform,
+            call(
+                json!({"open": "<c>", "close": "</c>", "repeats": true, "transform": {"function": 5}}),
+            ),
+        ),
+        (
+            Construct::DottedPath,
+            call(json!({
+                "open": "<c>", "close": "</c>", "repeats": true, "content": "json",
+                "transform": {"function": {"name": "{content.name}", "arguments": "{content.args}"}},
+            })),
+        ),
+        (
+            Construct::CallContent,
+            call(
+                json!({"open": "<c>", "close": "</c>", "repeats": true, "content": "int", "transform": named}),
+            ),
+        ),
+        (
+            Construct::JsonArguments,
+            call(json!({
+                "open_pattern": "<c>(?P<name>\\w+)>", "close": "</c>", "repeats": true,
+                "content": "json", "transform": named,
+            })),
+        ),
+        (
+            Construct::JsonEnvelope,
+            call(json!({
+                "open": "<c>", "close": "</c>", "repeats": true, "content": "json",
+                "transform": {"function": "{content}"},
+            })),
+        ),
+        (
+            Construct::JsonDialect,
+            call(json!({
+                "open_pattern": "<c>(?P<name>\\w+)>", "close": "</c>", "repeats": true,
+                "content": "json", "content_args": {"unquoted_keys": true}, "transform": named,
+            })),
+        ),
+        (
+            Construct::TaggedParameters,
+            call(json!({
+                "open_pattern": "<c>(?P<name>\\w+)>", "close": "</c>", "repeats": true,
+                "content": "xml-inline",
+                "content_args": {"tag_pattern": "<k=(?P<key>\\w+)>(?P<value>.*?)</k>"},
+                "transform": named,
+            })),
+        ),
+        (
+            Construct::KeyValueLines,
+            call(json!({
+                "open_pattern": "<c>(?P<name>\\w+)>", "close": "</c>", "repeats": true,
+                "content": "kv-lines", "transform": named,
+            })),
+        ),
+        (
+            Construct::MergeDuplicates,
+            call(json!({
+                "open_pattern": "<c>(?P<name>\\w+)>", "close": "</c>", "repeats": true,
+                "content": "xml-inline",
+                "content_args": {
+                    "tag_pattern": "<k=(?P<key>\\w+)>(?P<value>.*?)</k>",
+                    "merge_duplicates": true,
+                },
+                "transform": named,
+            })),
+        ),
+        (
+            Construct::HeaderName,
+            call(
+                json!({"open": "<c>", "close": "</c>", "repeats": true, "content": "json", "transform": named}),
+            ),
+        ),
+        (
+            Construct::UnboundedHeaderRun,
+            call(json!({
+                "open_pattern": "<c>(?P<name>\\w+)[\\s\\S]*<m>", "close": "</c>", "repeats": true,
+                "content": "json", "transform": named,
+            })),
+        ),
+    ];
+    for (construct, spec) in cases {
+        let template = read_response_template(&spec).unwrap_or_else(|e| panic!("{construct}: {e}"));
+        let refused = compile(&template, &[]).expect_err(construct.code());
+        assert!(
+            refused.constructs().contains(&construct),
+            "{construct}: {:?}",
+            refused.refusals()
+        );
+    }
 }
 
 /// A value parser as the fixture writes it (`value_parser` of `content_args`), as a table's shape
@@ -173,4 +460,135 @@ fn values_are_typed_as_transformers_types_them() {
             ("sub_parse".to_owned(), 588),
         ])
     );
+}
+
+/// Templates written for these tests on abstract tags, each with the pieces its outputs are made
+/// of: the constructs a compiled table reads, one or two at a time.
+fn synthetic() -> Vec<(&'static str, Value, Vec<&'static str>)> {
+    let filler = ["hi", " ", "\n", "x<", "<e", "turn", "é", "\u{a0}", "\u{1c}"];
+    // The markers three times over, so that most outputs open a field.
+    let with = |pieces: &[&'static str]| -> Vec<&'static str> {
+        pieces
+            .iter()
+            .chain(pieces)
+            .chain(pieces)
+            .chain(filler.iter())
+            .copied()
+            .collect()
+    };
+    vec![
+        (
+            // Nothing outside the fields is kept; a close of two markers; a close list.
+            "framing",
+            json!({
+                "start_anchor": "<turn>",
+                "fields": {
+                    "thinking": {"open": "<t>", "close": "<e><turn>"},
+                    "content": {"open": "<c>", "close": ["<r>", "<e>"]},
+                },
+            }),
+            with(&["<t>", "<e><turn>", "<e>", "<c>", "<turn>"]),
+        ),
+        (
+            // Content outside the thought, trimmed; whitespace the delimiters take; a close of
+            // the content that is no stop, dropped; two anchors.
+            "slack",
+            json!({
+                "start_anchor": ["<turn>", "<turn2>"],
+                "fields": {
+                    "reasoning_content": {"open_pattern": "<t>\\s*", "close_pattern": "\\s*</t>\\s*"},
+                    "content": {"close_pattern": "\\s*(?:<end>|<stop>)"},
+                },
+            }),
+            with(&["<t>", "</t>", "<end>", "<turn>", "  ", "\n\n"]),
+        ),
+        (
+            // A field the message has no place for; content kept as written; an anchor pattern
+            // of three literals.
+            "kept",
+            json!({
+                "start_anchor_pattern": "<a>(?:<b>|<c>)?",
+                "defaults": {"role": "assistant", "note": "x"},
+                "fields": {
+                    "notes": {"open": "<n>", "close": "</n>"},
+                    "content": {"open": "<c>", "close": "</c>", "content_args": {"strip": false}},
+                },
+            }),
+            with(&["<n>", "</n>", "<c>", "</c>", "<a>", "<b>"]),
+        ),
+        (
+            // The text outside the thought is a field the message has no place for, closed by the
+            // marker that opens the thought: the open wins.
+            "outside-field",
+            json!({
+                "start_anchor": "<s>",
+                "fields": {
+                    "log": {"close": "<x>"},
+                    "thinking": {"open": "<x>", "close": "</x>"},
+                },
+            }),
+            with(&["<x>", "</x>", "<s>"]),
+        ),
+    ]
+}
+
+/// What the template's reader closes in each field, every value joined: a thought's and the
+/// content's text as a stream gives them, which joins a field written twice.
+fn read_joined(template: &ResponseTemplate, output: &str) -> Option<(String, String)> {
+    let mut parser = ResponseParser::new(template, "", &[]).ok()?;
+    let mut events = parser.feed(output).ok()?;
+    events.extend(parser.finalize().ok()?.1);
+    let (mut reasoning, mut content) = (String::new(), String::new());
+    for event in events {
+        if let RegionEvent::RegionClose { field, value } = event {
+            match (field.as_str(), value.as_str()) {
+                ("thinking" | "reasoning_content", Some(text)) => reasoning.push_str(text),
+                ("content", Some(text)) => content.push_str(text),
+                _ => {}
+            }
+        }
+    }
+    Some((reasoning, content))
+}
+
+/// Templates on abstract tags compile into tables that read random outputs made of their own
+/// literals as the template's reader in this crate does, every field written more than once
+/// joined, whole and at every chunking, keeping the contract.
+#[test]
+fn compiled_tables_read_random_outputs_as_the_template_reader_does() {
+    for (name, spec, pieces) in synthetic() {
+        let template = load_response_template(&spec).unwrap();
+        let format = compile(&template, &["<stop>", "<r>"])
+            .unwrap_or_else(|why| panic!("{name}: {why}"))
+            .format;
+        let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ name.len() as u64;
+        let mut next = |below: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as usize % below
+        };
+        for _ in 0..600 {
+            let count = next(16);
+            let output: String = (0..count).map(|_| pieces[next(pieces.len())]).collect();
+            let Some((reasoning, content)) = read_joined(&template, &output) else {
+                continue;
+            };
+            for (plan, cuts) in plans(&output, &pieces, 64).into_iter().take(40) {
+                let place = format!("{name}: {output:?} ({plan})");
+                let events = run(
+                    &format,
+                    &Declared::default(),
+                    "",
+                    &output,
+                    &cuts,
+                    &EngineFinish::Stop,
+                );
+                check_contract(&place, &output, &events);
+                let said = Said::of(&events);
+                assert_eq!(said.reasoning.concat(), reasoning, "{place}: reasoning");
+                assert_eq!(said.content, content, "{place}: content");
+            }
+        }
+    }
 }
