@@ -327,9 +327,21 @@ enum IndexBuild {
     AnotherGatewayBuilds,
 }
 
-/// The advisory lock the builder of the open-background index holds for the
-/// build, session-level and tried (never waited for).
-const POSTGRES_INDEX_BUILD_LOCK_ID: i64 = POSTGRES_SCHEMA_LOCK_ID + 1;
+/// The class of the advisory lock the builder of the open-background index
+/// holds for the build (session-level, tried, never waited for); the lock's
+/// second key is the hash of the schema-qualified index name, so two stores
+/// sharing one database under different schemas build their own index at
+/// the same time, and one gateway per schema builds.
+const POSTGRES_INDEX_BUILD_LOCK_CLASS: i32 = 0x736D_6778;
+
+/// The schema-qualified name of `name` in the schema the store writes to,
+/// the second key of the build lock.
+fn qualified_index_name(schema: &SchemaConfig, name: &str) -> String {
+    match schema.owner.as_deref() {
+        Some(owner) => format!("{owner}.{name}"),
+        None => name.to_string(),
+    }
+}
 
 /// Builds the open-background index on one connection of `pool`, under the
 /// build lock, with the statement timeout lifted for the build; see
@@ -345,10 +357,11 @@ async fn build_open_background_index(
         .get()
         .await
         .map_err(|e| format!("no connection for the index build: {}", describe_error(&e)))?;
+    let lock_name = qualified_index_name(schema, OPEN_BACKGROUND_INDEX);
     let locked: bool = client
         .query_one(
-            "SELECT pg_try_advisory_lock($1)",
-            &[&POSTGRES_INDEX_BUILD_LOCK_ID],
+            "SELECT pg_try_advisory_lock($1, hashtext($2))",
+            &[&POSTGRES_INDEX_BUILD_LOCK_CLASS, &lock_name],
         )
         .await
         .map_err(|e| format!("failed to try the index build lock: {}", describe_error(&e)))?
@@ -378,9 +391,10 @@ async fn build_open_background_index(
     }
     .await;
     if let Err(e) = client
-        .batch_execute(&format!(
-            "SELECT pg_advisory_unlock({POSTGRES_INDEX_BUILD_LOCK_ID})"
-        ))
+        .execute(
+            "SELECT pg_advisory_unlock($1, hashtext($2))",
+            &[&POSTGRES_INDEX_BUILD_LOCK_CLASS, &lock_name],
+        )
         .await
     {
         tracing::warn!(

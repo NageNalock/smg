@@ -1685,7 +1685,8 @@ async fn open_background_responses_are_listed_until_they_close() {
         storage.delete_response(&stored.id).await.expect("delete");
     }
 
-    // The listing is served by the partial index created with the table.
+    // The listing is served by the partial index, built off the start-up path
+    // and waited for here.
     let (client, connection) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
         .await
         .expect("connect");
@@ -1732,9 +1733,40 @@ async fn a_stored_object_with_a_nul_escape_is_stored_listed_and_moved_under_the_
     let bundle = postgres_bundle(&db_url).await.expect("create storage");
     let storage = bundle.response_storage;
 
+    // The partial index is built off the start-up path: the records below are
+    // stored once it is valid, so Postgres evaluates its expression on their
+    // INSERT, which is what this case is about.
+    let (client, connection) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test drives its own connection for the queries it makes"
+    )]
+    let driver = tokio::spawn(connection);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let valid = client
+            .query(
+                "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+                 WHERE c.relname = 'responses_open_background_idx'",
+                &[],
+            )
+            .await
+            .expect("pg_index");
+        if valid.iter().any(|row| row.get::<_, bool>(0)) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the open-background index is built within its time"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
     // An open background record whose object carries a NUL in a string (as a
-    // model's or a client's text can), stored after the partial index exists
-    // (the store created it with the table); and an open one without a lease.
+    // model's or a client's text can), stored under the index; and an open
+    // one without a lease.
     let record = |status: &str, text: &str, lease: bool| {
         let mut stored = StoredResponse::new(None);
         let mut raw = json!({
@@ -1815,10 +1847,45 @@ async fn a_stored_object_with_a_nul_escape_is_stored_listed_and_moved_under_the_
         .iter()
         .all(|r| r.id != nul.id));
 
-    // The listing is served by the partial index: with sequential scans off
-    // the planner must still find a plan, through the index. The index is
-    // built off the start-up path, so it is waited for.
-    let (client, connection) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
+    drop(client);
+    let _ = driver.await;
+
+    for stored in [&nul, &literal, &no_lease] {
+        storage.delete_response(&stored.id).await.expect("delete");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn the_listing_s_plan_uses_the_open_background_index() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    // A database of its own: a table with no updated rows, so the index
+    // built concurrently is usable by every snapshot as soon as it is valid
+    // (a concurrent build over rows updated before it can be left for the
+    // older snapshots to drain first).
+    let scratch = ScratchDatabase::create(&db_url, "plan")
+        .await
+        .expect("scratch database");
+    let postgres_cfg: PostgresConfig = serde_json::from_value(json!({
+        "db_url": scratch.url,
+        "pool_max": 4,
+        "schema": {"auto_migrate": true},
+    }))
+    .expect("a Postgres config");
+    let bundle = create_storage(StorageFactoryConfig {
+        backend: &HistoryBackend::Postgres,
+        oracle: None,
+        postgres: Some(&postgres_cfg),
+        redis: None,
+        hook: None,
+    })
+    .await
+    .expect("create storage");
+    let storage = bundle.response_storage.clone();
+
+    let (client, connection) = tokio_postgres::connect(&scratch.url, tokio_postgres::NoTls)
         .await
         .expect("connect");
     #[expect(
@@ -1845,52 +1912,33 @@ async fn a_stored_object_with_a_nul_escape_is_stored_listed_and_moved_under_the_
         );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+
+    let mut stored = StoredResponse::new(None);
+    stored.raw_response = json!({
+        "id": stored.id.0, "status": "in_progress", "background": true, "output": [],
+        "_lease": {"owner": "gw_test", "expires_at": 1_700_000_000},
+    });
+    storage.store_response(stored).await.expect("store");
+
+    // With sequential scans off the planner must still find a plan, through
+    // the index.
     client
         .batch_execute("SET enable_seqscan = off")
         .await
         .expect("set");
-    // The plan is read until it uses the index: a build another test's
-    // start left running (its task is gone with that test's runtime, the
-    // server finishes or drops the index on its own) can be replacing it
-    // while this test runs.
-    let plan = loop {
-        let plan = client
-            .query(
-                "EXPLAIN SELECT id FROM responses WHERE \
-                 replace(raw_response::text, '\\u0000', '\\u0020')::json->>'status' \
-                 IN ('queued', 'in_progress') AND \
-                 replace(raw_response::text, '\\u0000', '\\u0020')::json->>'background' = 'true' AND \
-                 replace(raw_response::text, '\\u0000', '\\u0020')::json->>'_lease' IS NOT NULL \
-                 ORDER BY created_at ASC LIMIT 1024",
-                &[],
-            )
-            .await
-            .expect("explain");
-        let plan: Vec<String> = plan.iter().map(|row| row.get::<_, String>(0)).collect();
-        if plan
-            .iter()
-            .any(|line| line.contains("responses_open_background_idx"))
-        {
-            break plan;
-        }
-        if std::time::Instant::now() >= deadline {
-            let state = client
-                .query(
-                    "SELECT i.indisvalid, i.indisready FROM pg_index i \
-                     JOIN pg_class c ON c.oid = i.indexrelid \
-                     WHERE c.relname = 'responses_open_background_idx'",
-                    &[],
-                )
-                .await
-                .expect("pg_index");
-            let state: Vec<(bool, bool)> = state
-                .iter()
-                .map(|row| (row.get::<_, bool>(0), row.get::<_, bool>(1)))
-                .collect();
-            panic!("the listing's plan never used the index; index (valid, ready) = {state:?}; plan = {plan:?}");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    };
+    let plan = client
+        .query(
+            "EXPLAIN SELECT id FROM responses WHERE \
+             replace(raw_response::text, '\\u0000', '\\u0020')::json->>'status' \
+             IN ('queued', 'in_progress') AND \
+             replace(raw_response::text, '\\u0000', '\\u0020')::json->>'background' = 'true' AND \
+             replace(raw_response::text, '\\u0000', '\\u0020')::json->>'_lease' IS NOT NULL \
+             ORDER BY created_at ASC LIMIT 1024",
+            &[],
+        )
+        .await
+        .expect("explain");
+    let plan: Vec<String> = plan.iter().map(|row| row.get::<_, String>(0)).collect();
     assert!(
         plan.iter()
             .any(|line| line.contains("responses_open_background_idx")),
@@ -1898,10 +1946,9 @@ async fn a_stored_object_with_a_nul_escape_is_stored_listed_and_moved_under_the_
     );
     drop(client);
     let _ = driver.await;
-
-    for stored in [&nul, &literal, &no_lease] {
-        storage.delete_response(&stored.id).await.expect("delete");
-    }
+    drop(storage);
+    drop(bundle);
+    scratch.drop().await;
 }
 
 #[tokio::test]
