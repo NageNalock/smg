@@ -27,7 +27,7 @@ use ts::{
 use crate::{
     config::Config,
     drain::InFlight,
-    engine::{self, Engine, KvEventStream, LoadsLike, NewRequest},
+    engine::{self, Engine, EngineFinish, KvEventStream, LoadsLike, NewRequest},
     replay::Capture,
 };
 
@@ -218,10 +218,9 @@ impl TokenSpeedScheduler for MockScheduler {
                 }
             }
             let cut = injected.and_then(|fault| {
-                let end = if fault.finish_error {
-                    CutEnd::EngineError
-                } else {
-                    CutEnd::Status(injected_status(fault.status))
+                let end = match fault.finish {
+                    Some(finish) => CutEnd::EngineFinish(finish),
+                    None => CutEnd::Status(injected_status(fault.status)),
                 };
                 fault
                     .after_tokens
@@ -485,9 +484,10 @@ fn injected_status(status: u16) -> Status {
 enum CutEnd {
     /// The gRPC status the stream ends with.
     Status(Status),
-    /// A `Complete` whose finish reason is `error`, as an engine that failed
-    /// the request sends it: the output so far, no status.
-    EngineError,
+    /// A `Complete` whose finish reason is the given one, as an engine that
+    /// failed the request (`error`) or a servicer whose engine side left it
+    /// (`abort`) sends it: the output so far, no status.
+    EngineFinish(EngineFinish),
 }
 
 /// The generate stream's state between items.
@@ -563,7 +563,7 @@ fn generate_stream(
                         if st.output_ids.len() > *after as usize {
                             let item = match end {
                                 CutEnd::Status(status) => Err(status.clone()),
-                                CutEnd::EngineError => {
+                                CutEnd::EngineFinish(finish) => {
                                     // The output the engine had produced
                                     // before it failed: the tokens it sent.
                                     st.output_ids.truncate(*after as usize);
@@ -571,7 +571,7 @@ fn generate_stream(
                                         request_id: st.request_id.clone(),
                                         response: Some(GenResp::Complete(ts::GenerateComplete {
                                             output_ids: std::mem::take(&mut st.output_ids),
-                                            finish_reason: "error".to_string(),
+                                            finish_reason: finish.reason().to_string(),
                                             prompt_tokens,
                                             completion_tokens: *after,
                                             cached_tokens,
@@ -1015,7 +1015,11 @@ mod tests {
         tx.send(done(4)).unwrap();
         drop(tx);
         let cuts = Arc::new(AtomicU64::new(0));
-        let cut = Some((2, CutEnd::EngineError, Arc::clone(&cuts)));
+        let cut = Some((
+            2,
+            CutEnd::EngineFinish(EngineFinish::Error),
+            Arc::clone(&cuts),
+        ));
         let mut stream = generate_stream(rx, true, "r".to_string(), None, cut);
         assert_eq!(chunk_ids(stream.next().await), vec![1]);
         assert_eq!(chunk_ids(stream.next().await), vec![2]);
@@ -1035,6 +1039,43 @@ mod tests {
                 assert_eq!(complete.completion_tokens, 2);
             }
             other => panic!("not an error completion: {other:?}"),
+        }
+        assert!(stream.next().await.is_none(), "nothing after the cut");
+        assert_eq!(cuts.load(Ordering::Relaxed), 1, "the cut is counted once");
+    }
+
+    /// `finish=abort` ends the stream the way a servicer ends a request its
+    /// engine side left behind: a `Complete` with finish reason `abort` after
+    /// the given tokens, no status.
+    #[tokio::test]
+    async fn an_engine_abort_cut_ends_with_an_abort_complete_after_the_given_tokens() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        for id in 1..=4 {
+            tx.send(token(id)).unwrap();
+        }
+        tx.send(done(4)).unwrap();
+        drop(tx);
+        let cuts = Arc::new(AtomicU64::new(0));
+        let cut = Some((
+            2,
+            CutEnd::EngineFinish(EngineFinish::Abort),
+            Arc::clone(&cuts),
+        ));
+        let mut stream = generate_stream(rx, true, "r".to_string(), None, cut);
+        assert_eq!(chunk_ids(stream.next().await), vec![1]);
+        assert_eq!(chunk_ids(stream.next().await), vec![2]);
+        let item = stream
+            .next()
+            .await
+            .expect("the cut")
+            .expect("a response, not a status");
+        match item.response {
+            Some(GenResp::Complete(complete)) => {
+                assert_eq!(complete.finish_reason, "abort");
+                assert_eq!(complete.output_ids, vec![1, 2]);
+                assert_eq!(complete.completion_tokens, 2);
+            }
+            other => panic!("not an abort completion: {other:?}"),
         }
         assert!(stream.next().await.is_none(), "nothing after the cut");
         assert_eq!(cuts.load(Ordering::Relaxed), 1, "the cut is counted once");

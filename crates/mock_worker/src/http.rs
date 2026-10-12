@@ -200,9 +200,9 @@ async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Respon
             }
         }
         // An HTTP worker has no engine-failure frame on its wire: an armed
-        // `finish=error` cuts with a 500 here.
+        // `finish=error` or `finish=abort` cuts with a 500 here.
         let cut = injected.and_then(|fault| {
-            let status = if fault.finish_error {
+            let status = if fault.finish.is_some() {
                 500
             } else {
                 fault.status

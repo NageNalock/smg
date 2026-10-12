@@ -11,7 +11,7 @@
 //!   cache and publish `AllBlocksCleared` (an engine restart, to the index).
 //! - `POST /admin/fault/{worker}/drop?batches=N`, `.../delay?ms=D`,
 //!   `.../restart-publisher`, `.../pause`, `.../resume`,
-//!   `.../fail?status=S[&count=N|&secs=T][&after_tokens=K][&stall_ms=M]` and
+//!   `.../fail?status=S[&count=N|&secs=T][&after_tokens=K][&stall_ms=M][&finish=error|abort]` and
 //!   `GET /admin/fault/{worker}`: the fault hooks (see the README).
 //! - `POST /admin/truth/{worker}` with `{"token_ids": [...]}`: what the
 //!   worker would serve from cache for that prompt right now;
@@ -40,7 +40,7 @@ use tokio::net::TcpListener;
 
 use crate::{
     config::Config,
-    engine::{self, Engine, FaultScope, RequestFault},
+    engine::{self, Engine, EngineFinish, FaultScope, RequestFault},
 };
 
 struct AdminState {
@@ -147,7 +147,8 @@ fn status_json(e: &Engine) -> Value {
         "fail_pending": fail_pending,
         "fail_secs_left": fail_secs_left,
         "fail_after_tokens": fail.and_then(|f| f.after_tokens),
-        "fail_finish_error": fail.is_some_and(|f| f.finish_error),
+        "fail_finish_error": fail.is_some_and(|f| f.finish == Some(EngineFinish::Error)),
+        "fail_finish": fail.and_then(|f| f.finish).map(EngineFinish::reason),
         "fail_stall_ms": fail.map_or(0, |f| f.stall.as_millis() as u64),
         "failed_total": s.failed_total,
         "cut_total": s.cut_total,
@@ -185,30 +186,36 @@ fn optional<T: std::str::FromStr>(
 /// after a `stall_ms=M` hold; `after_tokens=K` serves K tokens first and cuts
 /// the stream with S. `finish=error` ends the stream as an engine that failed
 /// the request does, a `Complete` with finish reason `error` after K tokens
-/// (0 when unset), with no status needed. `status=0` alone clears; with
-/// `stall_ms` it stalls and then serves.
+/// (0 when unset), with no status needed; `finish=abort` the same with
+/// `abort`, as a servicer ends the requests its engine side left behind.
+/// `status=0` alone clears; with `stall_ms` it stalls and then serves.
 fn fail_query(q: &HashMap<String, String>) -> Result<Option<RequestFault>, String> {
     let status: u16 = optional(q, "status")?.unwrap_or(0);
     let count: Option<u32> = optional(q, "count")?;
     let secs: Option<f64> = optional(q, "secs")?;
     let mut after_tokens: Option<u32> = optional(q, "after_tokens")?;
     let stall_ms: u64 = optional(q, "stall_ms")?.unwrap_or(0);
-    let finish_error = match q.get("finish").map(String::as_str) {
-        None => false,
-        Some("error") => true,
-        Some(other) => return Err(format!("finish must be \"error\", got {other}")),
+    let finish = match q.get("finish").map(String::as_str) {
+        None => None,
+        Some("error") => Some(EngineFinish::Error),
+        Some("abort") => Some(EngineFinish::Abort),
+        Some(other) => {
+            return Err(format!(
+                "finish must be \"error\" or \"abort\", got {other}"
+            ))
+        }
     };
     if status != 0 && !(400..=599).contains(&status) {
         return Err(format!(
             "status must be 0 or an error status (400-599), got {status}"
         ));
     }
-    if finish_error {
+    if finish.is_some() {
         after_tokens = Some(after_tokens.unwrap_or(0));
     } else if status == 0 && after_tokens.is_some() {
         return Err("after_tokens needs a status to cut the stream with".to_string());
     }
-    if status == 0 && stall_ms == 0 && !finish_error {
+    if status == 0 && stall_ms == 0 && finish.is_none() {
         return Ok(None);
     }
     let scope = match (count, secs) {
@@ -227,7 +234,7 @@ fn fail_query(q: &HashMap<String, String>) -> Result<Option<RequestFault>, Strin
         status,
         stall: Duration::from_millis(stall_ms),
         after_tokens,
-        finish_error,
+        finish,
         scope,
     }))
 }

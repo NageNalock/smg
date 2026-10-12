@@ -40,7 +40,7 @@ use crate::{
         error::error_type_for_status,
         grpc::{
             context::{DispatchMetadata, WorkerSelection},
-            proto_wrapper::ENGINE_ERROR_MESSAGE,
+            proto_wrapper::{ENGINE_ABORT_MESSAGE, ENGINE_ERROR_MESSAGE},
         },
     },
     worker::{worker::WorkerTypeExt, ConnectionModeExt, Worker},
@@ -205,11 +205,13 @@ impl UpstreamClass {
     }
 }
 
-/// Whether `status` is the engine's own report that the request failed (its
-/// `Complete` had finish reason `error`; the ZMQ lane's adapters end their
+/// Whether `status` is the engine's own report that the request did not
+/// complete (its `Complete` had finish reason `error`, or `abort` with no
+/// cancellation of the client's behind it; the ZMQ lane's adapters end their
 /// streams with the same words), as opposed to a failed call to the worker.
 fn is_the_engines_own_report(status: &tonic::Status) -> bool {
-    status.code() == tonic::Code::Internal && status.message() == ENGINE_ERROR_MESSAGE
+    status.code() == tonic::Code::Internal
+        && (status.message() == ENGINE_ERROR_MESSAGE || status.message() == ENGINE_ABORT_MESSAGE)
 }
 
 /// Why a streaming response ended before its final chunk.
@@ -219,7 +221,8 @@ pub(crate) enum StreamFailure {
     /// began: the connection broke (the engine went away mid-stream), the
     /// engine answered a status after its first chunk, or it finished the
     /// request with an error of its own (`finish_reason == "error"`, the KV
-    /// handoff of a decode leg that failed). `completion_tokens` is how far
+    /// handoff of a decode leg that failed) or aborted it unasked
+    /// (`"abort"`: its engine side gone). `completion_tokens` is how far
     /// the response had come; `leg` says which worker's stream it was.
     Upstream {
         status: tonic::Status,
@@ -881,6 +884,56 @@ mod tests {
         assert!(
             !rendered.contains("error_type=\"backend_error\""),
             "the engine's own failure is not a backend error:\n{rendered}"
+        );
+    }
+
+    /// An abort the engine sent on its own (its engine side gone mid-stream)
+    /// is its own report too: an `engine_error` charged to the worker, a
+    /// `stream_error` to the client, never a backend error of the call.
+    #[test]
+    fn the_engines_own_abort_is_an_engine_error_charged_to_the_worker() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let worker = worker();
+        let selection = WorkerSelection::Single {
+            worker: Arc::clone(&worker),
+        };
+        let source =
+            StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT);
+        let failure = StreamFailure::upstream(tonic::Status::internal(ENGINE_ABORT_MESSAGE), 155);
+        assert_eq!(failure.error_type(), "stream_error");
+        assert_eq!(
+            failure.to_string(),
+            format!("Stream error: {ENGINE_ABORT_MESSAGE}")
+        );
+        let class = UpstreamClass::of(&tonic::Status::internal(ENGINE_ABORT_MESSAGE));
+        assert_eq!(
+            (class.http, class.error_type, class.breaker_sample),
+            (StatusCode::INTERNAL_SERVER_ERROR, "engine_error", Some(500))
+        );
+        metrics::with_local_recorder(&recorder, || source.account(&failure));
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+        let rendered = recorder.handle().render();
+        assert!(
+            sample(
+                &rendered,
+                "smg_worker_errors_total",
+                &["worker_type=\"regular\"", "error_type=\"engine_error\""]
+            )
+            .is_some_and(|line| line.ends_with(" 1")),
+            "{rendered}"
+        );
+        assert!(
+            sample(
+                &rendered,
+                "smg_router_request_errors_total",
+                &["endpoint=\"chat\"", "error_type=\"engine_error\""]
+            )
+            .is_some_and(|line| line.ends_with(" 1")),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("error_type=\"backend_error\""),
+            "the engine's own abort is not a backend error:\n{rendered}"
         );
     }
 

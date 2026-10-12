@@ -2065,26 +2065,40 @@ impl ProtoGenerateResponse {
 
     /// Whether this is a `Complete` the engine finished with reason `"error"`.
     pub fn engine_error(&self) -> bool {
+        self.finished_with("error")
+    }
+
+    /// Whether this is a `Complete` the engine finished with reason
+    /// `"abort"`: what the servicers send for every choice still open when
+    /// their engine side goes away or an abort lands. The gateway's own
+    /// aborts drop the stream before they are sent, so an abort read from a
+    /// live stream is the engine's doing, not the client's.
+    pub fn engine_abort(&self) -> bool {
+        self.finished_with("abort")
+    }
+
+    /// Whether this is a `Complete` whose finish reason is `reason`.
+    fn finished_with(&self, reason: &str) -> bool {
         match self {
             Self::Sglang(resp) => matches!(
                 &resp.response,
-                Some(sglang::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+                Some(sglang::generate_response::Response::Complete(c)) if c.finish_reason == reason
             ),
             Self::Vllm(resp) => matches!(
                 &resp.response,
-                Some(vllm::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+                Some(vllm::generate_response::Response::Complete(c)) if c.finish_reason == reason
             ),
             Self::Trtllm(resp) => matches!(
                 &resp.response,
-                Some(trtllm::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+                Some(trtllm::generate_response::Response::Complete(c)) if c.finish_reason == reason
             ),
             Self::Mlx(resp) => matches!(
                 &resp.response,
-                Some(mlx::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+                Some(mlx::generate_response::Response::Complete(c)) if c.finish_reason == reason
             ),
             Self::TokenSpeed(resp) => matches!(
                 &resp.response,
-                Some(tokenspeed::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+                Some(tokenspeed::generate_response::Response::Complete(c)) if c.finish_reason == reason
             ),
         }
     }
@@ -3140,13 +3154,27 @@ mod tracked_tests {
 pub(crate) const ENGINE_ERROR_MESSAGE: &str =
     "engine finished the request with an error (see engine logs)";
 
-/// Surface an engine-side failure (`finish_reason == "error"`) as a stream error, like the ZMQ lane.
+/// The message of the status a stream the engine aborted ends with: the
+/// servicers' `Complete(finish_reason = "abort")` for every choice still open
+/// when their engine side went away, or an abort the gateway did not send
+/// (its own aborts drop the stream first). The stream-failure accounting
+/// keys its `engine_error` label on it, as on [`ENGINE_ERROR_MESSAGE`].
+pub(crate) const ENGINE_ABORT_MESSAGE: &str =
+    "engine aborted the request before it completed (see engine logs)";
+
+/// Surface an engine-side failure as a stream error, like the ZMQ lane: a
+/// `Complete` with finish reason `"error"` (the engine failed the request)
+/// or `"abort"` (the engine ended it without being asked to). Neither is a
+/// completion the client can read as a short answer.
 fn reject_engine_error(
     item: Result<ProtoGenerateResponse, tonic::Status>,
 ) -> Result<ProtoGenerateResponse, tonic::Status> {
     match item {
         Ok(response) if response.engine_error() => {
             Err(tonic::Status::internal(ENGINE_ERROR_MESSAGE))
+        }
+        Ok(response) if response.engine_abort() => {
+            Err(tonic::Status::internal(ENGINE_ABORT_MESSAGE))
         }
         item => item,
     }
@@ -3983,6 +4011,44 @@ mod engine_error_tests {
         }
         let passed = reject_engine_error(Err(tonic::Status::unavailable("leg died")));
         assert!(matches!(passed, Err(status) if status.code() == tonic::Code::Unavailable));
+    }
+
+    #[test]
+    fn engine_abort_is_true_only_for_complete_with_abort_finish_reason() {
+        assert!(completes("abort")
+            .iter()
+            .all(ProtoGenerateResponse::engine_abort));
+        for reason in ["stop", "length", "error", ""] {
+            assert!(!completes(reason)
+                .iter()
+                .any(ProtoGenerateResponse::engine_abort));
+        }
+        let chunk = ProtoGenerateResponse::Vllm(Box::new(vllm::GenerateResponse {
+            response: Some(vllm::generate_response::Response::Chunk(
+                vllm::GenerateStreamChunk::default(),
+            )),
+        }));
+        assert!(!chunk.engine_abort());
+    }
+
+    /// A `Complete` the engine aborted is not a completion: the stream ends
+    /// with an internal status carrying the abort message, told apart from
+    /// the engine's own error by its words, like it on every backend.
+    #[test]
+    fn reject_engine_error_turns_abort_complete_into_internal_status() {
+        for response in completes("abort") {
+            let Err(status) = reject_engine_error(Ok(response)) else {
+                panic!("an engine abort must not pass through as a completion");
+            };
+            assert_eq!(status.code(), tonic::Code::Internal);
+            assert_eq!(status.message(), ENGINE_ABORT_MESSAGE);
+            assert_ne!(status.message(), ENGINE_ERROR_MESSAGE);
+        }
+        for reason in ["stop", "length"] {
+            for response in completes(reason) {
+                assert!(reject_engine_error(Ok(response)).is_ok(), "{reason}");
+            }
+        }
     }
 }
 
