@@ -1696,7 +1696,7 @@ async fn open_background_responses_are_listed_until_they_close() {
     )]
     let driver = tokio::spawn(connection);
     // The index is built off the start-up path: waited for.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let indexes = loop {
         let indexes = client
             .query(
@@ -1709,10 +1709,10 @@ async fn open_background_responses_are_listed_until_they_close() {
             break indexes;
         }
         assert!(
-            std::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "the open-background index is built within its time"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     };
     assert_eq!(indexes.len(), 1, "the open-background index exists");
     let indexdef: String = indexes[0].get(0);
@@ -1744,7 +1744,7 @@ async fn a_stored_object_with_a_nul_escape_is_stored_listed_and_moved_under_the_
         reason = "the test drives its own connection for the queries it makes"
     )]
     let driver = tokio::spawn(connection);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let valid = client
             .query(
@@ -1758,10 +1758,10 @@ async fn a_stored_object_with_a_nul_escape_is_stored_listed_and_moved_under_the_
             break;
         }
         assert!(
-            std::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "the open-background index is built within its time"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     // An open background record whose object carries a NUL in a string (as a
@@ -1893,7 +1893,7 @@ async fn the_listing_s_plan_uses_the_open_background_index() {
         reason = "the test drives its own connection for the queries it makes"
     )]
     let driver = tokio::spawn(connection);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let valid = client
             .query(
@@ -1907,10 +1907,10 @@ async fn the_listing_s_plan_uses_the_open_background_index() {
             break;
         }
         assert!(
-            std::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "the open-background index is built within its time"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     let mut stored = StoredResponse::new(None);
@@ -1976,6 +1976,7 @@ async fn a_transition_keeps_the_columns_written_when_the_record_was_created() {
     let postgres_cfg = PostgresConfig {
         db_url: scratch.url.clone(),
         pool_max: 4,
+        op_timeout_secs: PostgresConfig::default_op_timeout_secs(),
         schema: Some(schema),
     };
     let bundle = create_storage(StorageFactoryConfig {

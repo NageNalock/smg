@@ -1122,10 +1122,7 @@ async fn close_lost(
     request_context: Option<StorageRequestContext>,
 ) -> Result<Lost, ResponseStorageError> {
     let update = async {
-        let Some(stored) = storage
-            .get_response(&ResponseId::from(id))
-            .await?
-        else {
+        let Some(stored) = storage.get_response(&ResponseId::from(id)).await? else {
             return Ok(Lost::Gone);
         };
         if is_terminal(stored.raw_response["status"].as_str().unwrap_or("")) {
