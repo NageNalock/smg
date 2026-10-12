@@ -97,6 +97,8 @@
 //! [`formats`]: crate::formats
 
 use crate::{
+    engine::is_strip_space,
+    markers::{Piece, Scanner},
     pythonic,
     shape::{CallShape, ValueRead, Values},
     tagged::{self, keyed},
@@ -227,6 +229,23 @@ struct Terminal {
 struct State {
     name: String,
     emits: Emits,
+}
+
+/// What the replay of a prompt leaves ([`Format::replayed`]): the state the output starts in,
+/// whether the turn's first piece is still to come, and the stay the output continues.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Replay {
+    /// The state the walk ends in; where the prompt left a call open, the state the turn started
+    /// in.
+    pub(crate) state: usize,
+    /// Whether the turn's first piece is still to come, for a table with a start row.
+    pub(crate) at_turn_start: bool,
+    /// Whether the prompt wrote a byte in the stay the output continues.
+    pub(crate) touched: bool,
+    /// Whether it wrote text other than whitespace there.
+    pub(crate) begun: bool,
+    /// The joined states with a stay the replay saw.
+    pub(crate) joined: Vec<usize>,
 }
 
 /// A literal that starts the model's turn in the prompt, and the state the output starts in after
@@ -546,6 +565,107 @@ impl Format {
             last = Some((at, anchor));
             from = at + anchor.text.len();
         }
+    }
+
+    /// The state the turn starts in once its first piece decides it, for a table with a start row:
+    /// the start row's state, unless the piece is a terminal whose row from `state` leads into
+    /// another one, which wins as the longer match; then `state`. A terminal the table ignores
+    /// decides nothing, and gives `None`. A table without a start row starts where it stands.
+    pub(crate) fn opening(&self, state: usize, piece: &Piece) -> Option<usize> {
+        let Some(start) = self.start else {
+            return Some(state);
+        };
+        match *piece {
+            Piece::Marker(index) if self.ignored(index) => None,
+            Piece::Marker(index) if self.next(state, index).is_some_and(|to| to != start) => {
+                Some(state)
+            }
+            _ => Some(start),
+        }
+    }
+
+    /// Where `prompt` leaves the table: [`Self::turn`]'s text replayed over the rows from the state
+    /// the turn starts in, the turn's first piece deciding its start where the table has a start
+    /// row ([`Self::opening`]), a terminal the table ignores, or one with no row from where the
+    /// walk stands, moving nothing; and the stay the output continues. A call the prompt left
+    /// open is not entered: the walk rests where the turn started. The engine starts the output
+    /// where this leaves it, and [`Self::reasoning_open`] reads the same walk.
+    pub(crate) fn replayed(&self, prompt: &str) -> Replay {
+        let (turn, start) = self.turn(prompt);
+        let mut scanner = Scanner::new(self.terminal_texts());
+        let (mut state, mut rest) = (start, start);
+        // Whether the prompt wrote a byte, and text other than whitespace, in the stay the output
+        // continues; and the joined states with a stay the replay saw.
+        let (mut touched, mut begun) = (false, false);
+        let mut joined: Vec<usize> = Vec::new();
+        let count = |state: usize, joined: &mut Vec<usize>| {
+            if self.joiner(state).is_some() && !joined.contains(&state) {
+                joined.push(state);
+            }
+        };
+        if start != 0 {
+            count(start, &mut joined);
+        }
+        // An anchor that names its own state leaves no start to choose.
+        let mut at_turn_start = self.start.is_some() && start == 0;
+        let pieces = scanner.feed(turn).into_iter().chain(scanner.finish());
+        for piece in pieces {
+            if at_turn_start {
+                if let Some(opened) = self.opening(state, &piece) {
+                    at_turn_start = false;
+                    if opened != state {
+                        (touched, begun) = (false, false);
+                        count(opened, &mut joined);
+                    }
+                    (state, rest) = (opened, opened);
+                }
+            }
+            let text = match piece {
+                Piece::Marker(index) if self.ignored(index) => continue,
+                Piece::Marker(index) => match self.next(state, index) {
+                    Some(to) => {
+                        (state, touched, begun) = (to, false, false);
+                        if to != 0 {
+                            count(to, &mut joined);
+                        }
+                        continue;
+                    }
+                    None => self.terminal_text(index).to_string(),
+                },
+                Piece::Text(text) => text,
+            };
+            if state == 0 && !touched {
+                count(0, &mut joined);
+            }
+            touched = true;
+            begun |= !text.chars().all(is_strip_space);
+        }
+        if self.emits(state) == Emits::Arguments {
+            (state, touched, begun) = (rest, false, false);
+        }
+        Replay {
+            state,
+            at_turn_start,
+            touched,
+            begun,
+            joined,
+        }
+    }
+
+    /// The state `prompt` leaves the table in ([`Self::replayed`]): where the engine starts the
+    /// output.
+    pub(crate) fn prompt_state(&self, prompt: &str) -> usize {
+        self.replayed(prompt).state
+    }
+
+    /// Whether `prompt` leaves the model inside its thought: its terminals replayed over the table
+    /// from the turn's opener or its last anchor, as the engine replays them before the output.
+    /// The value the structural tags take as `reasoning_open` ([`Format::grammar`],
+    /// [`Format::answer_grammar`]), read where the prompt ends, whatever it writes after the
+    /// opener: Qwen 3.5's and DeepSeek's templates open the thought there, and a template with
+    /// thinking turned off opens and closes it there.
+    pub fn reasoning_open(&self, prompt: &str) -> bool {
+        self.emits(self.prompt_state(prompt)) == Emits::Reasoning
     }
 
     /// The format's name.
@@ -1292,6 +1412,28 @@ mod tests {
                     .to_string()
             )
         );
+    }
+
+    #[test]
+    fn the_prompts_replay_walks_the_rows_from_the_last_opener() {
+        // Terminals before the last opener move nothing; after it, each moves the walk where its
+        // row says, a terminal with no row from where the walk stands moving nothing; a terminal
+        // the prompt cut short is text.
+        let format = two_states().opens_turn("<turn>");
+        assert_eq!(format.prompt_state("<turn>"), 0);
+        assert_eq!(format.prompt_state("<turn><a>"), 1);
+        assert!(format.reasoning_open("<turn><a>"));
+        assert!(!format.reasoning_open("<a><turn>"));
+        assert!(!format.reasoning_open("<turn><a>x</a>"));
+        assert!(
+            format.reasoning_open("<turn></a><a>"),
+            "a close in content is text"
+        );
+        assert!(
+            format.reasoning_open("<turn><a></a"),
+            "a cut close moves nothing"
+        );
+        assert!(format.reasoning_open("<a>"), "no opener: the whole prompt");
     }
 
     #[test]

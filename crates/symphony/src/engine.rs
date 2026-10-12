@@ -101,7 +101,7 @@ use std::collections::VecDeque;
 
 use crate::{
     event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
-    format::{CallSyntax, Emits, Format},
+    format::{CallSyntax, Emits, Format, Replay},
     gemma,
     input::{EngineFinish, Input},
     json,
@@ -187,7 +187,7 @@ enum Held {
 
 /// Whitespace as Python's `str.strip` removes it: Unicode's white space and the information
 /// separators U+001C to U+001F, which `str.isspace` takes too.
-fn is_strip_space(c: char) -> bool {
+pub(crate) fn is_strip_space(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
 
@@ -546,7 +546,7 @@ impl Engine {
     /// the turn starts, then text is the state's and a terminal moves the engine or is text.
     fn place(&mut self, piece: Piece, out: &mut Events) {
         if self.at_turn_start {
-            if let Some(state) = self.opening(self.state, &piece) {
+            if let Some(state) = self.format.opening(self.state, &piece) {
                 self.at_turn_start = false;
                 if state != self.state {
                     self.enter(state, out);
@@ -574,7 +574,7 @@ impl Engine {
             return None;
         };
         let from = if self.at_turn_start {
-            self.opening(self.state, &Piece::Marker(index))?
+            self.format.opening(self.state, &Piece::Marker(index))?
         } else {
             self.state
         };
@@ -948,81 +948,20 @@ impl Engine {
         }
     }
 
-    /// The state the turn starts in, once its first piece decides it: the start row's state, unless
-    /// the piece is a terminal whose row from `state` leads into another one, which wins as the
-    /// longer match; then `state`. A terminal the table ignores decides nothing, and gives `None`.
-    fn opening(&self, state: usize, piece: &Piece) -> Option<usize> {
-        let Some(start) = self.format.start() else {
-            return Some(state);
-        };
-        match *piece {
-            Piece::Marker(index) if self.format.ignored(index) => None,
-            Piece::Marker(index)
-                if self.format.next(state, index).is_some_and(|to| to != start) =>
-            {
-                Some(state)
-            }
-            _ => Some(start),
-        }
-    }
-
-    /// Where the prompt leaves the engine: its terminals replayed over the table from the state the
-    /// turn starts in, starting at the last turn opener the table names, or after its last turn
-    /// anchor, the turn's first piece deciding its start where the table has a start row. An
-    /// arguments state is not entered from the prompt: the engine rests where the turn started.
+    /// Where the prompt leaves the engine: the table's replay of it ([`Format::replayed`], which
+    /// [`Format::reasoning_open`] reads too), from the last turn opener the table names or after
+    /// its last turn anchor, the turn's first piece deciding its start where the table has a start
+    /// row. An arguments state is not entered from the prompt: the engine rests where the turn
+    /// started.
     fn seed(&mut self, prompt: &str, out: &mut Events) {
-        let (turn, start) = self.format.turn(prompt);
-        let mut scanner = Scanner::new(self.format.terminal_texts());
-        let (mut state, mut rest) = (start, start);
-        // Whether the prompt wrote a byte, and text other than whitespace, in the stay the output
-        // continues; and the joined states with a stay the replay saw.
-        let (mut touched, mut begun) = (false, false);
-        let mut joined: Vec<usize> = Vec::new();
-        let count = |state: usize, joined: &mut Vec<usize>| {
-            if self.format.joiner(state).is_some() && !joined.contains(&state) {
-                joined.push(state);
-            }
-        };
-        if start != 0 {
-            count(start, &mut joined);
-        }
-        // An anchor that names its own state leaves no start to choose.
-        self.at_turn_start &= start == 0;
-        let pieces = scanner.feed(turn).into_iter().chain(scanner.finish());
-        for piece in pieces {
-            if self.at_turn_start {
-                if let Some(opened) = self.opening(state, &piece) {
-                    self.at_turn_start = false;
-                    if opened != state {
-                        (touched, begun) = (false, false);
-                        count(opened, &mut joined);
-                    }
-                    (state, rest) = (opened, opened);
-                }
-            }
-            let text = match piece {
-                Piece::Marker(index) if self.format.ignored(index) => continue,
-                Piece::Marker(index) => match self.format.next(state, index) {
-                    Some(to) => {
-                        (state, touched, begun) = (to, false, false);
-                        if to != 0 {
-                            count(to, &mut joined);
-                        }
-                        continue;
-                    }
-                    None => self.format.terminal_text(index).to_string(),
-                },
-                Piece::Text(text) => text,
-            };
-            if state == 0 && !touched {
-                count(0, &mut joined);
-            }
-            touched = true;
-            begun |= !text.chars().all(is_strip_space);
-        }
-        if self.format.emits(state) == Emits::Arguments {
-            (state, touched, begun) = (rest, false, false);
-        }
+        let Replay {
+            state,
+            at_turn_start,
+            touched,
+            begun,
+            joined,
+        } = self.format.replayed(prompt);
+        self.at_turn_start = at_turn_start;
         if state != self.state {
             self.enter(state, out);
         }

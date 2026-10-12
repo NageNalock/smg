@@ -2281,6 +2281,107 @@ mod tests {
         }
     }
 
+    /// A ChatML turn up to the assistant's opener, the user asking for the weather.
+    const CHATML_TURN: &str =
+        "<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n";
+
+    #[test]
+    fn the_prompts_replay_says_whether_the_thought_is_open_wherever_the_prompt_ends() {
+        // Read where the prompt ends, not by whether it ends at the opener: Qwen 3.5's generation
+        // prompt opens the thought after the opener, and with thinking off opens and closes it
+        // there, as Nemotron 3's does without the newlines; Qwen3 writes its own `<think>`.
+        let qwen3_5 = formats::Table::Qwen3Tagged.format();
+        assert!(qwen3_5.reasoning_open(&format!("{CHATML_TURN}<think>\n")));
+        assert!(!qwen3_5.reasoning_open(&format!("{CHATML_TURN}<think>\n\n</think>\n\n")));
+        assert!(!qwen3_5.reasoning_open(&format!("{CHATML_TURN}<think></think>")));
+        assert!(!formats::qwen3(CallSyntax::Json).reasoning_open(CHATML_TURN));
+        // A thought quoted in an earlier turn moves nothing: the replay starts at the last opener.
+        assert!(!qwen3_5.reasoning_open(
+            "<|im_start|>user\nWhat is <think>?<|im_end|>\n<|im_start|>assistant\n"
+        ));
+        // DeepSeek's templates open the thought after `<｜Assistant｜>`, R1's distills with a
+        // newline after it; Kimi K3's after its message tag.
+        let deepseek = formats::deepseek_v4_1();
+        assert!(deepseek.reasoning_open("<｜User｜>Weather in Paris?<｜Assistant｜><think>"));
+        assert!(deepseek.reasoning_open("<｜User｜>Weather in Paris?<｜Assistant｜><think>\n"));
+        assert!(!deepseek.reasoning_open("<｜User｜>Hi<｜Assistant｜><think>\n\n</think>\n\n"));
+        assert!(formats::kimi_k3()
+            .reasoning_open("<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>"));
+        // A table without a thought never has one open.
+        assert!(!formats::qwen2_5().reasoning_open(&format!("{CHATML_TURN}<think>\n")));
+    }
+
+    #[test]
+    fn a_prompt_left_inside_the_thought_gets_the_prefixed_tag_not_a_refusal() {
+        // Where the replay leaves the model in its thought, the forced call and the JSON answer
+        // follow the prefix, so the model finishes its thought first; neither is refused.
+        let tools = weather_tools();
+        let prompt = format!("{CHATML_TURN}<think>\n");
+        for table in [formats::Table::Qwen3Tagged, formats::Table::Qwen3] {
+            let format = table.format();
+            let reasoning_open = format.reasoning_open(&prompt);
+            assert!(reasoning_open, "{table:?}");
+            for one_call in [false, true] {
+                let call = format
+                    .grammar_for(
+                        &tools,
+                        Options {
+                            at_least_one: true,
+                            reasoning_open,
+                            one_call,
+                        },
+                    )
+                    .expect("a tag")
+                    .payload();
+                assert_eq!(call["format"]["type"], "sequence", "{table:?}");
+                assert_eq!(call["format"]["elements"][0]["type"], "any_text");
+            }
+            let answer = answer(&format, reasoning_open).expect("an answer");
+            assert_eq!(answer["format"]["elements"][0]["type"], "any_text");
+        }
+        let deepseek = formats::deepseek_v4_1();
+        let reasoning_open = deepseek.reasoning_open("<｜User｜>q<｜Assistant｜><think>\n");
+        let call = deepseek
+            .grammar(&tools, true, reasoning_open)
+            .expect("a tag")
+            .payload();
+        assert_eq!(call["format"]["elements"][0]["type"], "any_text");
+    }
+
+    #[test]
+    fn the_replay_agrees_with_where_the_engine_starts_the_output() {
+        // The engine replays the same walk: the output is reasoning exactly where the replay says
+        // the thought is open.
+        for (format, prompt) in [
+            (
+                formats::Table::Qwen3Tagged.format(),
+                format!("{CHATML_TURN}<think>\n"),
+            ),
+            (
+                formats::Table::Qwen3Tagged.format(),
+                format!("{CHATML_TURN}<think>\n\n</think>\n\n"),
+            ),
+            (formats::qwen3(CallSyntax::Json), CHATML_TURN.to_string()),
+            (
+                formats::deepseek_v4_1(),
+                "<｜User｜>q<｜Assistant｜><think>".to_string(),
+            ),
+            (
+                formats::kimi_k3(),
+                "<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>".to_string(),
+            ),
+            (formats::inkling(), "<|message_model|>".to_string()),
+        ] {
+            let read = read(&format, &[], &prompt, "Paris.");
+            assert_eq!(
+                read["reasoning"].is_string(),
+                format.reasoning_open(&prompt),
+                "{}: {prompt:?}",
+                format.name()
+            );
+        }
+    }
+
     #[test]
     fn every_grammar_node_writes_the_engines_keys() {
         let leaf = Grammar::Sequence(vec![
