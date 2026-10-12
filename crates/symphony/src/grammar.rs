@@ -63,6 +63,12 @@
 //! one, and the call's end carries the terminal that ends the turn wherever the model stands, where
 //! the table has one (Kimi K3's message close), since nothing may follow; a turn a stop token ends
 //! has nothing after the call.
+//!
+//! [`Format::answer_grammar`] is the tag for an answer that is JSON a schema accepts, the
+//! `response_format` of a request, from the same table: the rows into the state the answer is
+//! written in, the schema, and the answer's close with the end of the turn. Where the output
+//! starts in content, as in ChatML's tables, it is the schema alone, after the prefix above when
+//! the prompt left the model inside its thought.
 
 use std::collections::VecDeque;
 
@@ -502,8 +508,57 @@ impl Format {
         if !options.reasoning_open {
             return Some(calls);
         }
+        self.after_the_thought(calls)
+    }
+
+    /// The structural tag for an answer that is JSON `schema` accepts (`response_format`
+    /// `json_schema`, or `json_object` with an object's schema): the rows into the state the
+    /// answer is written in, the JSON, and the answer's close with what ends the turn after it.
+    /// Where the output starts in that state (the content of ChatML's tables, of Gemma 4's,
+    /// MiniMax's, DeepSeek's), the tag is the schema alone, after the prefix [`Self::grammar`]
+    /// writes when the prompt left the model inside its thought; a table whose turn ends at a
+    /// stop token writes nothing after it. Otherwise the model starts in the turn's own state, or
+    /// in its thought when the prompt opened it, and the tag is one `tag`: the way into the answer
+    /// from there, the thought's close first as a call's way in has it, the schema, then the
+    /// answer's close and the end of the turn (Kimi K3's response region, Inkling's text message).
+    /// `None` for a table with no content state (xLAM, whose answer is anything but a list), with
+    /// no way into it from where the model starts, or, with the thought open, a thought that does
+    /// not close back to where it opened, as for [`Self::grammar`].
+    pub fn answer_grammar(&self, schema: &Value, reasoning_open: bool) -> Option<Grammar> {
+        let answer = Grammar::JsonSchema {
+            schema: schema.clone(),
+            style: None,
+        };
+        let content = self.state_emitting(Emits::Content)?;
+        if content == 0 {
+            let answer = match self.turn_end() {
+                "" => answer,
+                end => Grammar::Sequence(vec![answer, Grammar::ConstString(end.to_string())]),
+            };
+            if !reasoning_open {
+                return Some(answer);
+            }
+            return self.after_the_thought(answer);
+        }
+        let start = match self.state_emitting(Emits::Reasoning) {
+            Some(reasoning) if reasoning_open => reasoning,
+            _ => 0,
+        };
+        let way = self.way_in(start, content)?;
+        let mut end = self
+            .close_of(content)
+            .map_or_else(String::new, |(close, _)| close.to_string());
+        end.push_str(self.turn_end());
+        Some(Grammar::Tag(Tag::new(way.begin(), answer, end)))
+    }
+
+    /// `body` after the prefix a prompt's open thought takes: free text that can write none of the
+    /// table's terminals but the thought's own, nor the call syntax's inner tags, with nothing
+    /// owed at its end. A table without a thought has no prefix, and gives `body` as it is; a
+    /// thought that does not close back to where it opened has no prefix yet, and gives `None`.
+    fn after_the_thought(&self, body: Grammar) -> Option<Grammar> {
         let Some(reasoning) = self.state_emitting(Emits::Reasoning) else {
-            return Some(calls);
+            return Some(body);
         };
         // The thought's own markers stay writable: the model closes its thought inside the
         // prefix where the engine applies the grammar from the first token, and an engine that
@@ -528,10 +583,7 @@ impl Format {
             _ => &[],
         };
         excludes.extend(inner.iter().map(|tag| tag.to_string()));
-        Some(Grammar::Sequence(vec![
-            Grammar::AnyText { excludes },
-            calls,
-        ]))
+        Some(Grammar::Sequence(vec![Grammar::AnyText { excludes }, body]))
     }
 
     /// The JSON family: each call is the call markers around one JSON object whose `name` is the
@@ -852,8 +904,8 @@ impl Format {
     /// The close of the region `state` is, and the state it leaves the engine in: the row back to
     /// the state the region opened from, its home ([`Self::region`]); for a region with no such
     /// row, its row into a framing state, as a thought closes into the wrapping between the
-    /// template's messages. Neither is the end of the turn, nor a row into the calls; the turn's
-    /// own state is no region and has no close.
+    /// template's messages (Inkling's message close). Neither is the end of the turn, nor a row
+    /// into the calls' block; the turn's own state is no region and has no close.
     fn close_of(&self, state: usize) -> Option<(&str, usize)> {
         if let Some(Region { close, home, .. }) =
             self.region(state, |state| self.is_call_state(state))
@@ -864,13 +916,17 @@ impl Format {
             return None;
         }
         let turn_close = self.turn_close();
+        let block = self
+            .call_markers()
+            .and_then(|markers| markers.block)
+            .map(|block| block.state);
         self.transitions()
             .find(|&(source, on, target)| {
                 source == state
                     && target != state
                     && Some(on) != turn_close
                     && self.is_wrapping(target)
-                    && !self.is_call_state(target)
+                    && Some(target) != block
             })
             .map(|(_, on, target)| (self.terminal_text(on), target))
     }
@@ -2065,6 +2121,163 @@ mod tests {
             ),
         ] {
             assert_eq!(read(&format, &tools, "", sample), call, "{}", format.name());
+        }
+    }
+
+    /// A JSON answer's schema.
+    fn answer_schema() -> Value {
+        value!({"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]})
+    }
+
+    /// The JSON answer's tag for `format`, as a payload.
+    fn answer(format: &Format, reasoning_open: bool) -> Option<Value> {
+        format
+            .answer_grammar(&answer_schema(), reasoning_open)
+            .map(|grammar| grammar.payload())
+    }
+
+    #[test]
+    fn a_json_answer_where_the_output_starts_in_content_is_the_schema_alone() {
+        // Qwen3, GLM, Gemma 4 and MiniMax M2 start their output in content and end their turn at
+        // a stop token: the answer is the schema and nothing else, the constraint the gateway
+        // gives a `json_schema` response today.
+        let alone = value!({"format": {"type": "json_schema", "json_schema": answer_schema()}});
+        for format in [
+            formats::qwen3(CallSyntax::Json),
+            formats::glm(),
+            formats::gemma4(),
+            formats::minimax_m2(),
+            formats::deepseek_v4_1(),
+            formats::plain(),
+        ] {
+            assert_eq!(
+                answer(&format, false),
+                Some(alone.clone()),
+                "{}",
+                format.name()
+            );
+        }
+    }
+
+    #[test]
+    fn with_the_thought_open_the_answer_follows_the_prefix_a_forced_call_takes() {
+        // The prefix is the forced call's: the thought's own markers writable, so the model
+        // closes its thought where the engine runs the grammar from the first token; every other
+        // terminal and the syntax's inner tags not; nothing owed at its end.
+        let schema = value!({"type": "json_schema", "json_schema": answer_schema()});
+        assert_eq!(
+            answer(&formats::qwen3(CallSyntax::Json), true),
+            Some(value!({"format": {"type": "sequence", "elements": [
+                {"type": "any_text", "excludes": ["<tool_call>", "</tool_call>"]},
+                schema,
+            ]}}))
+        );
+        let tools = weather_tools();
+        for format in [
+            formats::glm(),
+            formats::gemma4(),
+            formats::minimax_m2(),
+            formats::deepseek_v4_1(),
+        ] {
+            let call = format
+                .grammar(&tools, true, true)
+                .expect("a grammar")
+                .payload();
+            assert_eq!(
+                answer(&format, true),
+                Some(value!({"format": {"type": "sequence", "elements": [
+                    call["format"]["elements"][0].clone(),
+                    schema,
+                ]}})),
+                "{}",
+                format.name()
+            );
+        }
+        // A table without a thought has no prefix.
+        assert_eq!(
+            answer(&formats::plain(), true),
+            answer(&formats::plain(), false)
+        );
+    }
+
+    #[test]
+    fn kimi_k3s_answer_is_its_response_region_then_the_end_of_the_turn() {
+        // The turn is regions: the answer opens the response region from the turn's own state,
+        // and closes it and the turn. The prompt opens the thought, so the answer's way in closes
+        // it first, as the block of calls' does.
+        let closed = value!({"format": {
+            "type": "tag",
+            "begin": "<|open|>response<|sep|>",
+            "content": {"type": "json_schema", "json_schema": answer_schema()},
+            "end": "<|close|>response<|sep|><|close|>message<|sep|>",
+        }});
+        assert_eq!(answer(&formats::kimi_k3(), false), Some(closed.clone()));
+        let mut open = closed;
+        open["format"]["begin"] = Value::from("<|close|>think<|sep|><|open|>response<|sep|>");
+        assert_eq!(answer(&formats::kimi_k3(), true), Some(open));
+    }
+
+    #[test]
+    fn inklings_answer_is_a_text_message() {
+        // The output starts after the message's opener, where the text marker makes the message
+        // the answer, and the message's close ends it. The generation prompt opens no thought; a
+        // thought a prompt left open reaches a text message only through the next message's
+        // header, which reads calls and is no framing, so it has no answer tag.
+        assert_eq!(
+            answer(&formats::inkling(), false),
+            Some(value!({"format": {
+                "type": "tag",
+                "begin": "<|content_text|>",
+                "content": {"type": "json_schema", "json_schema": answer_schema()},
+                "end": "<|end_message|>",
+            }}))
+        );
+        assert_eq!(answer(&formats::inkling(), true), None);
+    }
+
+    #[test]
+    fn a_table_without_content_or_with_a_thought_that_does_not_close_home_has_no_answer_tag() {
+        // xLAM's one state reads calls, and its answer is whatever is not a list. MiniMax M3's
+        // thought closes into a content state of its own, not where it opened: as for a forced
+        // call, the open thought has no prefix yet.
+        assert_eq!(answer(&formats::xlam(), false), None);
+        assert!(answer(&formats::minimax_m3(), false).is_some());
+        assert_eq!(answer(&formats::minimax_m3(), true), None);
+    }
+
+    #[test]
+    fn a_json_answers_sample_reads_back_as_that_content_and_no_call() {
+        let json = "{\"city\": \"Paris\"}";
+        for (format, prompt, sample) in [
+            (formats::qwen3(CallSyntax::Json), "", json.to_string()),
+            (
+                formats::qwen3(CallSyntax::Json),
+                "<|im_start|>assistant\n<think>\n",
+                format!("Paris, then.\n</think>\n\n{json}"),
+            ),
+            (formats::gemma4(), "", json.to_string()),
+            (
+                formats::kimi_k3(),
+                "<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+                format!(
+                    "<|close|>think<|sep|><|open|>response<|sep|>{json}<|close|>response<|sep|>\
+                     <|close|>message<|sep|>"
+                ),
+            ),
+            (
+                formats::inkling(),
+                "<|message_model|>",
+                format!("<|content_text|>{json}<|end_message|>"),
+            ),
+        ] {
+            let message = read(&format, &[], prompt, &sample);
+            assert_eq!(
+                message["content"].as_str().map(str::trim),
+                Some(json),
+                "{}",
+                format.name()
+            );
+            assert_eq!(message["calls"], value!([]), "{}", format.name());
         }
     }
 
