@@ -663,3 +663,353 @@ fn compiled_tables_read_random_outputs_as_the_template_reader_does() {
         }
     }
 }
+
+/// A message as the template's reader and a compiled table both give it: the thought and the
+/// content, every value of a field joined, and each call's name and arguments.
+type Read = (String, String, Vec<(String, Value)>);
+
+/// What the template's reader gives for `output` with `tools`, every value of a text field joined
+/// (a stream joins a field written twice), each call's name and arguments as its region closes
+/// them; `None` where it raises.
+fn read_message(template: &ResponseTemplate, output: &str, tools: &[Value]) -> Option<Read> {
+    let mut parser = ResponseParser::new(template, "", tools).ok()?;
+    let mut events = parser.feed(output).ok()?;
+    events.extend(parser.finalize().ok()?.1);
+    let (mut reasoning, mut content, mut calls) = (String::new(), String::new(), Vec::new());
+    for event in events {
+        if let RegionEvent::RegionClose { field, value } = event {
+            match (field.as_str(), value.as_str()) {
+                ("thinking" | "reasoning_content", Some(text)) => reasoning.push_str(text),
+                ("content", Some(text)) => content.push_str(text),
+                ("tool_calls", None) => {
+                    let function = &value["function"];
+                    let name = function["name"].as_str().unwrap_or_default().to_owned();
+                    calls.push((name, function["arguments"].clone()));
+                }
+                _ => {}
+            }
+        }
+    }
+    Some((reasoning, content, calls))
+}
+
+/// What a client assembles from a table's events. With `cut`, a call the stream cut is closed:
+/// its arguments' object closed, as the template's reader closes the region at the end of the
+/// text. Without it, every call's arguments must be whole.
+fn said_message(said: &Said, cut: bool) -> Read {
+    let calls = said
+        .calls
+        .iter()
+        .map(|(index, _, name)| {
+            let arguments = said
+                .arguments
+                .iter()
+                .find(|(at, _)| at == index)
+                .map(|(_, json)| json.as_str())
+                .unwrap_or_default();
+            let value = serde_json::from_str(arguments)
+                .or_else(|error| match arguments {
+                    "" if cut => serde_json::from_str("{}"),
+                    open if cut => serde_json::from_str(&format!("{open}}}")),
+                    _ => Err(error),
+                })
+                .unwrap_or_else(|e| panic!("{arguments:?}: {e}"));
+            (name.clone(), value)
+        })
+        .collect();
+    (said.reasoning.concat(), said.content.clone(), calls)
+}
+
+/// The tools the outputs of the call templates call: `f` on abstract tags, and the weather tool
+/// of the public templates' sessions.
+fn call_tools() -> Vec<Value> {
+    let tools = json!([
+        {"type": "function", "function": {"name": "f", "parameters": {
+            "type": "object",
+            "properties": {
+                "n": {"type": "integer"},
+                "b": {"type": "boolean"},
+                "s": {"type": "string"},
+                "o": {"type": "object"},
+            },
+        }}},
+        {"type": "function", "function": {"name": "get_weather", "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
+        }}},
+    ]);
+    tools.as_array().cloned().unwrap()
+}
+
+/// Templates whose calls compile, each with the texts of its stop tokens and the pieces its
+/// outputs are made of: two written for these tests on abstract tags, and the public templates
+/// of `fixtures/compiled/` whose calls are tagged parameters.
+fn call_templates() -> Vec<(String, Value, Vec<String>, Vec<&'static str>)> {
+    let filler = ["hi", " ", "\n", "x<", "é", "\u{a0}"];
+    let with = |pieces: &[&'static str]| -> Vec<&'static str> {
+        pieces
+            .iter()
+            .chain(pieces)
+            .chain(filler.iter())
+            .copied()
+            .collect()
+    };
+    let named =
+        json!({"type": "function", "function": {"name": "{name}", "arguments": "{content}"}});
+    let mut templates = vec![
+        (
+            // Nothing outside the fields is kept. A call's name ends its header; a value ends at
+            // its close or where the next parameter begins, and reads as JSON where it is JSON; a
+            // call closes at its marker or at the stream's stop.
+            "abstract/calls-ahead".to_owned(),
+            json!({
+                "start_anchor": "<turn>",
+                "fields": {
+                    "thinking": {"open": "<t>", "close": "</t>"},
+                    "tool_calls": {
+                        "open_pattern": "<c (?P<name>\\w+)",
+                        "close": ["</c>", "<stop>"],
+                        "repeats": true,
+                        "content": "xml-inline",
+                        "content_args": {
+                            "tag_pattern": "<k=(?P<key>\\w+)>(?P<value>.*?)(?:</k>|(?=<k=))",
+                            "value_parser": {"name": "json", "args": {"allow_non_json": true}},
+                        },
+                        "transform": named,
+                    },
+                },
+            }),
+            vec!["<stop>".to_owned()],
+            with(&[
+                "<t>",
+                "</t>",
+                "<c f",
+                "<c g",
+                "<c ",
+                "<k=n>",
+                "<k=b>",
+                "<k=s>",
+                "<k=o>",
+                "5",
+                "true",
+                "\"7\"",
+                "{\"a\": 1}",
+                "</k>",
+                "</c>",
+                "<turn>",
+                "<k=n>5</k>",
+                "<k=b>true",
+                "<k=s>\"7\" ",
+                "<k=o>{\"a\": [1]}</k>",
+                "<c f<k=n>06</k></c>",
+            ]),
+        ),
+        (
+            // Content outside the call, trimmed, its close dropped. The template writes the
+            // call's name; a value is the text as written; text before the call's closing
+            // marker is its trailer.
+            "abstract/calls-text".to_owned(),
+            json!({
+                "start_anchor": "<turn>",
+                "fields": {
+                    "content": {"close": "<end>"},
+                    "tool_calls": {
+                        "open": "<call>",
+                        "close_pattern": "</args>\\s*</call>",
+                        "repeats": true,
+                        "content": "xml-inline",
+                        "content_args": {
+                            "tag_pattern": "<v (?P<key>\\w+)>(?P<value>.*?)</v>",
+                            "value_parser": {"name": "text", "args": {"strip": false}},
+                        },
+                        "transform": {"function": {"name": "f", "arguments": "{content}"}},
+                    },
+                },
+            }),
+            Vec::new(),
+            with(&[
+                "<call>",
+                "<v n>",
+                "<v s>",
+                "<v b>",
+                " 5 ",
+                "1",
+                "a b",
+                "</v>",
+                "</args>",
+                "</call>",
+                "</args></call>",
+                "<end>",
+                "<turn>",
+                "<v n>7</v>",
+                "<v s> x </v>",
+                "<v b>1</v>\n",
+                "</args>\n</call>",
+                "<call><v s>y</v></args></call>",
+            ]),
+        ),
+    ];
+    let public: [(&str, &[&'static str]); 5] = [
+        (
+            "hub/muse-glimmer",
+            &[
+                "to=self<|message|>",
+                "to=user<|message|>",
+                "<|eom|>",
+                "<atem:invoke",
+                " name=\"get_weather\">",
+                " x=\"1\" name=\"f\">",
+                "<atem:parameter",
+                " name=\"city\">",
+                " name=\"days\" y>",
+                "Paris",
+                "\"Paris\"",
+                "3",
+                "</atem:parameter>",
+                "</atem:invoke>",
+                "<|start|>assistant",
+                "<atem:invoke name=\"get_weather\">",
+                "<atem:parameter name=\"city\">Paris</atem:parameter>",
+                "<atem:parameter name=\"days\">3</atem:parameter> ",
+            ],
+        ),
+        (
+            "serve/qwen3_5",
+            &[
+                "<think>",
+                "</think>",
+                "<tool_call>",
+                "<function=get_weather>",
+                "<function=f>",
+                "<parameter=city>",
+                "<parameter=days>",
+                "Paris",
+                "3",
+                "</parameter>",
+                "</function>",
+                "</tool_call>",
+                "<|im_start|>assistant\n",
+                "<tool_call>\n<function=get_weather>\n",
+                "<parameter=city>\nParis\n</parameter>\n",
+                "<parameter=days>\n3\n</parameter>\n",
+                "</function>\n</tool_call>",
+            ],
+        ),
+        (
+            "trl/qwen3_5",
+            &[
+                "<think>",
+                "</think>",
+                "<tool_call>",
+                "<function=get_weather>",
+                "<function=f>",
+                "<parameter=city>",
+                "<parameter=days>",
+                "Paris",
+                "3",
+                "[1]",
+                "</parameter>",
+                "</function>",
+                "</tool_call>",
+                "<|im_start|>assistant\n",
+                "<tool_call>\n<function=get_weather>\n",
+                "<parameter=city>\nParis\n</parameter>\n",
+                "<parameter=days>\n3\n</parameter>\n",
+                "</function>\n</tool_call>\n",
+            ],
+        ),
+        (
+            "hf-tests/qwen3_template",
+            &[
+                "<think>",
+                "</think>",
+                "<tool_call>",
+                "<function=get_weather>",
+                "<function=f>",
+                "<parameter=city>",
+                "<parameter=days>",
+                "Paris",
+                "3",
+                "\"3\"",
+                "</parameter>",
+                "</tool_call>",
+                "<|im_start|>assistant\n",
+                "<tool_call>\n<function=get_weather>\n",
+                "<parameter=city>\nParis\n</parameter>\n",
+                "<parameter=days>\n3\n</parameter>\n",
+            ],
+        ),
+        (
+            "hf-tests/_XML_STRING_ARGS_TEMPLATE",
+            &[
+                "<tool_call>",
+                "<function=get_weather>",
+                "<parameter=city>",
+                "<parameter=days>",
+                "Paris",
+                "3",
+                "</parameter>",
+                "</tool_call>",
+                "<|im_start|>assistant\n",
+                "<tool_call>\n<function=get_weather>\n",
+                "<parameter=city>\nParis\n</parameter>\n",
+                "<parameter=days>\n3\n</parameter>\n",
+            ],
+        ),
+    ];
+    let rows = rows(&compiled_dir());
+    for (id, pieces) in public {
+        let row = rows.iter().find(|row| row.id == id).unwrap();
+        templates.push((
+            id.to_owned(),
+            row.spec.clone(),
+            row.stops.clone(),
+            with(pieces),
+        ));
+    }
+    templates
+}
+
+/// Templates whose calls compile read random outputs made of their own literals as the template's
+/// reader in this crate does, every field written more than once joined, whole and at every
+/// chunking, keeping the contract: a stream that stops closes every call, as the end of the text
+/// closes the reader's region, and one cut for length leaves a call cut, which reads the same once
+/// closed.
+#[test]
+fn compiled_calls_read_random_outputs_as_the_template_reader_does() {
+    let tools = call_tools();
+    let api: Vec<Tool> = serde_json::from_value(Value::Array(tools.clone())).unwrap();
+    let declared = Declared::of(&api);
+    let mut read = 0;
+    for (name, spec, stops, pieces) in call_templates() {
+        let template = load_response_template(&spec).unwrap();
+        let stops: Vec<&str> = stops.iter().map(String::as_str).collect();
+        let format = compile(&template, &stops)
+            .unwrap_or_else(|why| panic!("{name}: {why}"))
+            .format;
+        let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ name.len() as u64;
+        let mut next = |below: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as usize % below
+        };
+        for _ in 0..600 {
+            let count = next(16);
+            let output: String = (0..count).map(|_| pieces[next(pieces.len())]).collect();
+            let Some(expected) = read_message(&template, &output, &tools) else {
+                continue;
+            };
+            read += 1;
+            for (plan, cuts) in plans(&output, &pieces, 64).into_iter().take(40) {
+                for (finish, cut) in [(EngineFinish::Stop, false), (EngineFinish::Length, true)] {
+                    let place = format!("{name}: {output:?} ({plan}, {finish:?})");
+                    let events = run(&format, &declared, "", &output, &cuts, &finish);
+                    check_contract(&place, &output, &events);
+                    assert_eq!(said_message(&Said::of(&events), cut), expected, "{place}");
+                }
+            }
+        }
+    }
+    assert!(read > 3000, "{read} outputs read");
+}

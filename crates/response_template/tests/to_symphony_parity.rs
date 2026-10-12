@@ -559,7 +559,8 @@ fn joined(template: &ResponseTemplate, session: &Session) -> Option<Message> {
 }
 
 /// The literal text a template's delimiters write, for the cuts around markers: the literals of
-/// `open`, `close` and `start_anchor`, and the runs of literal characters of their patterns.
+/// `open`, `close` and `start_anchor`, and the runs of literal characters of their patterns and
+/// of a tag pattern.
 fn literal_texts(spec: &Value) -> Vec<String> {
     let mut out = Vec::new();
     let mut add = |value: &Value, pattern: bool| {
@@ -602,6 +603,7 @@ fn literal_texts(spec: &Value) -> Vec<String> {
         add(&field["close"], false);
         add(&field["open_pattern"], true);
         add(&field["close_pattern"], true);
+        add(&field["content_args"]["tag_pattern"], true);
     }
     out.retain(|text| text.chars().count() >= 2);
     out.sort();
