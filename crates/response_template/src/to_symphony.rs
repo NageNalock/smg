@@ -51,7 +51,12 @@
 //! the compile goes on after a refused construct, so that one compile lists every construct a
 //! template uses that no table reads. Calls whose arguments are JSON are not lowered yet
 //! ([`Construct::JsonArguments`], [`Construct::JsonEnvelope`]), nor are key-value lines.
+//!
+//! A table's structural tags write what the model's chat template renders, which the template's
+//! patterns leave open: [`layout::learn`] learns that layout from the chat template's renderings
+//! of a probe conversation, for a table whose calls are tagged parameters.
 
+pub mod layout;
 mod lower;
 mod refusal;
 mod values;

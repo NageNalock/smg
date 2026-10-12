@@ -10,6 +10,7 @@ keywords = ["llm", "parser", "response-template"]
 categories = ["parsing", "text-processing"]
 
 [dependencies]
+openai-protocol = { workspace = true, optional = true }
 regex-syntax = "0.8"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -24,7 +25,7 @@ sha2 = "0.11"
 # Glue for smg's reasoning and tool parsers (`adapter` module).
 adapter = []
 # The compile of a template into a symphony table (`to_symphony` module).
-symphony = ["dep:smg-symphony"]
+symphony = ["dep:smg-symphony", "dep:openai-protocol"]
 
 [[test]]
 name = "adapter"

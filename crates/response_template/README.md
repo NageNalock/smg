@@ -308,6 +308,47 @@ session that shows one, and the test checks each listed code by undoing it:
 A session that gives a marker back (an open whose header does not match, a
 close without its trailer) is never listed: it reads as transformers does.
 
+### A compiled table's layout
+
+A response template reads more than one spelling of a call, and a structural
+tag writes one. `to_symphony::layout::learn(&format, stops, render)` learns the
+spelling the model's chat template writes, a `symphony::shape::Layout`, from
+the chat template's renderings of a probe conversation: the probe's tools
+(`layout::tools()`) and the conversations of each `layout::Case`. The caller
+renders each case with the chat template, and `learn` reads every turn back
+through the table:
+
+- The turn with the probe's two calls must read back as exactly those calls,
+  with no content. A chat template that writes one call in a turn is read with
+  one call, and its layout holds one call in a tag. One that renders no turn
+  without a thought is read from the turns with the probe's thought.
+- Each part of a call is the text the turn wrote there: the text before the
+  call, the header with the tool's name in its place, a parameter with its key
+  and value in their places, the text before, between and after the
+  parameters, the trailer and the close. The layout also holds the text between
+  two calls and after the last, how `true` and `null` are spelled, and the text
+  around the thought and the answer.
+- Every call and parameter must be written alike, the parameters in the order
+  of the tool's schema, and the parts must write the turns again byte for byte:
+  the turns with one call and with the probe's thought write the calls and the
+  answer as the turn without them. A text the layout writes for every tool must
+  not name one.
+- The structural tags write the markers on the way into a region themselves,
+  so the text after a thought, and before the marker that opens the answer's
+  region, must hold no marker of the table, and the answer's text must stand
+  right after its opener and right before its close.
+- The template thinks first where its turns without a thought still write one,
+  with its opener, before the calls and before the answer, where it renders no
+  turn without one, or where it writes one before the calls and renders no
+  answer without one: the structural tags then write the thought first where
+  the prompt has not opened it. `Learned::apply` gives the table its layout and
+  that mark. A template that writes its own thought before the calls but not
+  before the answer, or the other way round, has no layout.
+
+Anything else gives no layout, with a stable code (`NoLayout::code`), and the
+table then has no structural tag for its calls. Only calls given as tagged
+parameters have a layout.
+
 ## Parity tests
 
 `scripts/generate_hf_fixtures.py` runs transformers itself and records what it
