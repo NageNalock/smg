@@ -504,13 +504,15 @@ fn require_prefill_guard(guard: Option<PrefillLoadGuard>) -> Result<PrefillLoadG
 /// Await a worker's answer to `call` within the request's deadline. Past it,
 /// the request is answered with the deadline's status, which the caller
 /// samples through the ledger and translates like any failed dispatch, and
-/// the call is retired off the request path (see [`retire_late_call`]).
+/// the call is retired off the request path (see [`retire_late_call`]);
+/// `finish_late` is what the retirement does with an answer that lands.
 async fn call_within<T: Send + 'static>(
     deadline: RequestDeadline,
     worker: Arc<dyn Worker>,
     worker_type: &'static str,
     request_id: String,
     mut call: Pin<Box<dyn Future<Output = Result<T, tonic::Status>> + Send>>,
+    finish_late: fn(T),
 ) -> Result<T, tonic::Status> {
     match tokio::time::timeout_at(deadline.at(), &mut call).await {
         Ok(result) => result,
@@ -535,7 +537,7 @@ async fn call_within<T: Send + 'static>(
                 deadline.timeout(),
                 false,
             );
-            retire_late_call(call, deadline.timeout(), request_id);
+            retire_late_call(call, deadline.timeout(), request_id, finish_late);
             Err(deadline.status())
         }
     }
@@ -546,8 +548,9 @@ async fn call_within<T: Send + 'static>(
 /// worker will start the moment the call lands and then run to its own end.
 /// Dropping the stream as soon as it opens is the abort path the gateway
 /// uses on a client disconnect, and the only thing that frees that slot
-/// early. A call that has not landed after one more timeout is given up:
-/// cancelling it ends it on the worker.
+/// early: `finish_late` is that drop (a decode leg's defers the abort to the
+/// stream's first item, see [`late_decode_leg`]). A call that has not landed
+/// after one more timeout is given up: cancelling it ends it on the worker.
 #[expect(
     clippy::disallowed_methods,
     reason = "the late call is retired off the request path; its wait is bounded by one more request timeout"
@@ -556,6 +559,7 @@ fn retire_late_call<T: Send + 'static>(
     call: Pin<Box<dyn Future<Output = Result<T, tonic::Status>> + Send>>,
     grace: Duration,
     request_id: String,
+    finish_late: fn(T),
 ) {
     tokio::spawn(async move {
         match tokio::time::timeout(grace, call).await {
@@ -564,7 +568,7 @@ fn retire_late_call<T: Send + 'static>(
                     request_id = %request_id,
                     "The worker answered a timed-out request's dispatch; the answer is dropped, which aborts the engine-side request"
                 );
-                drop(answer);
+                finish_late(answer);
             }
             Ok(Err(status)) => {
                 debug!(
@@ -584,8 +588,19 @@ fn retire_late_call<T: Send + 'static>(
     });
 }
 
+/// A decode leg's stream that landed after the request's deadline: dropped
+/// with its abort deferred to its first item, as its engine may be taking
+/// the prefill's KV handoff, which an immediate abort can tear down
+/// mid-transfer (the request path defers the same way on the legs it keeps
+/// and on a silent partner, see `retire_pd_leg`).
+fn late_decode_leg(stream: ProtoStream) {
+    drop(stream.defer_abort_until_first_item());
+}
+
 /// `request` sent to `worker` through `client`, under the request's deadline
-/// when the worker is known (see [`call_within`]).
+/// when the worker is known (see [`call_within`]). A decode leg's call that
+/// lands late is finished by [`late_decode_leg`]; any other is dropped as it
+/// lands, the immediate abort.
 fn dispatch_within(
     deadline: RequestDeadline,
     worker: Option<&Arc<dyn Worker>>,
@@ -594,20 +609,12 @@ fn dispatch_within(
     request: ProtoGenerateRequest,
 ) -> PdLegDispatch {
     let request_id = request.request_id().to_owned();
-    // A decode leg's stream is deferred-abort from the moment it opens: its
-    // engine may be taking the prefill's KV handoff, which an immediate
-    // abort can tear down mid-transfer, and a call that lands after the
-    // request's deadline is dropped by the retirement, not by the request
-    // path that defers the abort later.
-    let defer_abort = worker_type == metrics_labels::WORKER_DECODE;
-    let call: PdLegDispatch = Box::pin(async move {
-        let stream = client.generate(request).await?;
-        Ok(if defer_abort {
-            stream.defer_abort_until_first_item()
-        } else {
-            stream
-        })
-    });
+    let call: PdLegDispatch = Box::pin(async move { client.generate(request).await });
+    let finish_late: fn(ProtoStream) = if worker_type == metrics_labels::WORKER_DECODE {
+        late_decode_leg
+    } else {
+        drop
+    };
     match worker {
         Some(worker) => Box::pin(call_within(
             deadline,
@@ -615,6 +622,7 @@ fn dispatch_within(
             worker_type,
             request_id,
             call,
+            finish_late,
         )),
         None => call,
     }
@@ -1130,6 +1138,7 @@ async fn execute_single_embed(
                 metrics_labels::WORKER_REGULAR,
                 request_id,
                 Box::pin(async move { client.embed(proto_request).await }),
+                drop,
             )
             .await
         }
