@@ -11,6 +11,8 @@ Corpus:
   - transformers' own tests (tests/utils/test_chat_parsing.py at tag v5.18.0,
     passed with --transformers-src), recorded while they run;
   - the response templates built into `transformers serve`;
+  - the response templates huggingface/trl adds for gpt-oss and GLM-4.5
+    (`trl/chat_template_utils.py`), whose patterns use `\\S` and `\\S+?`;
   - synthetic templates: the shapes of public checkpoints written with neutral
     markers, prefix states, every load-time rule, regex dialect details;
   - prompts for those templates that end inside a region, a delimiter or the
@@ -1509,6 +1511,131 @@ def build_lookahead_corpus():
         )
 
 
+# The response templates huggingface/trl writes for gpt-oss and GLM-4.5
+# (`gptoss_template` and `glm4moe_template` in `trl/chat_template_utils.py`,
+# commit e4edcf7d7d1c), whose open patterns name the call with `\\S+?` and
+# `\\S+`. Their regex rows come after every row recorded before, from a
+# generator of their own (see `build_regex_rows`).
+TRL_SOURCE = "huggingface/trl trl/chat_template_utils.py at e4edcf7d7d1c"
+TRL_TEMPLATES = {
+    "gptoss": {
+        "defaults": {"role": "assistant"},
+        "start_anchor": "<|start|>assistant",
+        "fields": {
+            "thinking": {
+                "open": "<|channel|>analysis<|message|>",
+                "close_pattern": r"<\|end\|>\s*",
+                "content": "text",
+            },
+            "content": {
+                "open": "<|channel|>final<|message|>",
+                "close_pattern": r"<\|return\|>\s*",
+                "content": "text",
+            },
+            "tool_calls": {
+                "open_pattern": (
+                    r"to=functions\.(?P<name>\S+?)<\|channel\|>commentary\s+json<\|message\|>"
+                ),
+                "close_pattern": r"<\|call\|>\s*",
+                "repeats": True,
+                "content": "json",
+                "transform": WRAPPED,
+            },
+        },
+    },
+    "glm4moe": {
+        "defaults": {"role": "assistant"},
+        "start_anchor": "<|assistant|>",
+        "fields": {
+            "reasoning_content": {
+                "open": "<think>",
+                "close_pattern": r"</think>\s*",
+                "content": "text",
+            },
+            "tool_calls": {
+                "open_pattern": r"<tool_call>(?P<name>\S+)\n?",
+                "close_pattern": r"</tool_call>\s*",
+                "repeats": True,
+                "content": "xml-inline",
+                "content_args": {
+                    "tag_pattern": (
+                        r"<arg_key>(?P<key>[^<]+)</arg_key>\s*\n<arg_value>(?P<value>.*?)</arg_value>"
+                    ),
+                    "value_parser": {"name": "json", "args": {"allow_non_json": True}},
+                },
+                "transform": WRAPPED,
+            },
+            "content": {"close_pattern": r"<\|user\|>\s*|$", "content": "text"},
+        },
+    },
+}
+TRL_TEMPLATE_IDS: list[str] = []
+
+
+def build_trl_corpus():
+    for key, spec in TRL_TEMPLATES.items():
+        tid = add_template(f"trl/{key}", spec, f"{TRL_SOURCE} ({key}_template)")
+        TRL_TEMPLATE_IDS.append(tid)
+
+    def harmony(name: str, args: str, spaces: str = " ") -> str:
+        return f"to=functions.{name}<|channel|>commentary{spaces}json<|message|>{args}<|call|>"
+
+    analysis = "<|channel|>analysis<|message|>The user asks about the weather.<|end|>"
+    gptoss = {
+        "answer": analysis + "<|start|>assistant<|channel|>final<|message|>It is sunny.<|return|>",
+        "call": analysis + "<|start|>assistant " + harmony("get_weather", '{"city": "Paris"}'),
+        "typed": " " + harmony("get_weather", '{"city": 7, "days": "3", "ratio": "0.5"}'),
+        "two-calls": harmony("get_time", "{}")
+        + "<|start|>assistant "
+        + harmony("get_weather", '{"city": "Oslo"}', "  "),
+        "dotted-name": harmony("ns.get_weather", '{"city": "Rome"}'),
+        "unicode-name": harmony("天気", '{"city": "東京"}'),
+        "name-with-space": "to=functions.get weather<|channel|>commentary json<|message|>{}<|call|>",
+        "header-cut": analysis + "<|start|>assistant to=functions.get_weather<|chan",
+        "arguments-cut": harmony("get_weather", "")[:-8] + '{"city": "Pa',
+        "final-in-analysis": "<|channel|>analysis<|message|>to=functions.x<|end|>"
+        + "<|channel|>final<|message|>Done<|return|>",
+    }
+    for k, text in gptoss.items():
+        add_case(f"trl/gptoss#{k}", "trl/gptoss", text, tools=TOOLS)
+    add_case(
+        "trl/gptoss#prefix",
+        "trl/gptoss",
+        "<|channel|>analysis<|message|>Check.<|end|><|start|>assistant "
+        + harmony("get_time", "{}"),
+        prefix="<|start|>user<|message|>What time is it?<|end|><|start|>assistant",
+    )
+
+    def call(name: str, *args: tuple[str, str], nl: str = "\n") -> str:
+        params = "".join(f"<arg_key>{k}</arg_key>\n<arg_value>{v}</arg_value>\n" for k, v in args)
+        return f"<tool_call>{name}{nl}{params}</tool_call>"
+
+    glm = {
+        "answer": "<think>The user wants the weather.</think>\nIt is sunny.",
+        "call": "<think>Call the tool.</think>\n" + call("get_weather", ("city", "Paris")),
+        "typed": call("get_weather", ("days", "3"), ("filters", '{"a": 1}'), ("hours", "[1, 2]"))
+        + "\n",
+        "two-calls": "Checking.\n"
+        + call("get_time")
+        + "\n"
+        + call("get_weather", ("city", "Oslo")),
+        "name-without-newline": call("get_weather", ("city", "Rome"), nl=""),
+        "name-runs-into-close": "<tool_call>get_time</tool_call>",
+        "user-close": "First.<|user|>\nSecond line.\nThird.",
+        "dollar-lines": "Para one.\nPara two.\n",
+        "cut": "<think>t</think>" + call("get_weather", ("city", "Paris"))[:30],
+        "repeated-key": call("get_weather", ("city", "A"), ("city", "B")),
+    }
+    for k, text in glm.items():
+        add_case(f"trl/glm4moe#{k}", "trl/glm4moe", text, tools=TOOLS)
+    add_case(
+        "trl/glm4moe#prefix",
+        "trl/glm4moe",
+        "The user asks.</think>\n" + call("get_time"),
+        prefix="<|user|>\nWhat time is it?<|assistant|><think>",
+    )
+
+
 def build_unicode_template():
     t = {
         "start_anchor_pattern": "【助手】",
@@ -2947,6 +3074,25 @@ ESCAPE_HAYSTACKS = [
     "aa ab",
 ]
 
+# Counted repeats, greedy and lazy, and lazy repeats of one character before a
+# literal: open and close patterns are recorded at every prefix of their
+# haystacks, as a stream sees them. The module's partial matches follow its
+# own rules after a lazy repeat (see the README).
+REPEAT_ROWS = r"""
+x\w{2}< x\w{1,3}< x\w{,2}< x\w{2,}< x\d{2,3}\b x[^>]{0,2}> x\s{1,2}a xa{2}$ x.{2}a
+x\S{2}ab x\w{2,}?< x\w{1,3}?< x\d??< x[^>]{0,2}?>
+""".split()
+REPEAT_HAYSTACKS = ["xab<", "xabc<d", "xa1 <", "x12 a", "x1234 ", "xa\n<", "xab>ab"]
+LAZY_TAIL_ROWS = r"""
+x\S+?< x\S*?< x[^>]+?ab x\w*?<\|c\|> x(?P<n>\S+?)< (?P<n>x\S+?)ab x\d+?\s x\S{2,}?<
+x[^"]+?" x\s*?a x(?P<n>[^<]+?)<(?P<m>b) x\W+?ab x[\s\S]+?ab
+""".split()
+LAZY_TAIL_HAYSTACKS = ["xab<", "xa b<", "x12 a", "x<|c|>", "xa<|c", 'x"ab"', "x\n<ab", "x a<b"]
+
+
+def every_prefix(hays: list[str]) -> list[str]:
+    return sorted({h[:k] for h in hays for k in range(len(h) + 1)}, key=lambda h: (len(h), h))
+
 
 def lazy_family_patterns() -> list[str]:
     """Lazy repeats of one character in open/close patterns, in the positions
@@ -3065,6 +3211,7 @@ def build_regex_rows(
     target: list[tuple[str, str]],
     others: list[tuple[str, str]],
     late: list[tuple[str, str]],
+    trl: list[tuple[str, str]],
 ) -> list[dict]:
     rows = []
     rng = random.Random(0xFACE)
@@ -3117,10 +3264,24 @@ def build_regex_rows(
         for role in ("delimiter", "finditer"):
             rows.append(regex_row(pattern, hays, role))
     # What the matcher runs since the reader takes the module's whole syntax,
-    # after every row recorded before.
+    # after every row recorded before; the TRL patterns from a generator of
+    # their own.
     for pattern in ESCAPE_ROWS:
         for role in ("delimiter", "finditer"):
             rows.append(regex_row(pattern, ESCAPE_HAYSTACKS, role))
+    for patterns, hays in (
+        (REPEAT_ROWS, REPEAT_HAYSTACKS),
+        (LAZY_TAIL_ROWS, LAZY_TAIL_HAYSTACKS),
+    ):
+        for pattern in patterns:
+            rows.append(regex_row(pattern, every_prefix(hays), "delimiter"))
+            rows.append(regex_row(pattern, hays, "finditer"))
+    trl_rng = random.Random(0x7A1)
+    for role, pattern in trl:
+        hays = fragment_haystacks(pattern, trl_rng, 12)
+        if role == "delimiter":
+            hays = every_prefix(hays[:6])
+        rows.append(regex_row(pattern, hays, role, corpus=True))
     return rows
 
 
@@ -3657,6 +3818,7 @@ def generate(src: Path) -> dict[str, str]:
     build_tail_corpus()
     build_random_corpus(100, 10)
     build_lookahead_corpus()
+    build_trl_corpus()
 
     templates_out = []
     for tid, entry in TEMPLATES.items():
@@ -3692,12 +3854,18 @@ def generate(src: Path) -> dict[str, str]:
     others = {
         rp
         for tid, entry in TEMPLATES.items()
-        if not tid.startswith("random/") and tid not in LATE_TEMPLATES
+        if not tid.startswith("random/")
+        and tid not in LATE_TEMPLATES
+        and tid not in TRL_TEMPLATE_IDS
         for rp in template_patterns(entry["template"])
     }
     late = {rp for tid in LATE_TEMPLATES for rp in template_patterns(TEMPLATES[tid]["template"])}
+    trl = {rp for tid in TRL_TEMPLATE_IDS for rp in template_patterns(TEMPLATES[tid]["template"])}
     regex_rows = build_regex_rows(
-        sorted(target), sorted(others - target), sorted(late - others - target)
+        sorted(target),
+        sorted(others - target),
+        sorted(late - others - target),
+        sorted(trl - late - others - target),
     )
     with Hooks():
         units = build_units(recorder.units) + build_table_rows()
@@ -3723,7 +3891,8 @@ def generate(src: Path) -> dict[str, str]:
         "license": (
             "Recorded from transformers (Apache-2.0); templates and inputs under hf-tests/ come "
             "from its tests/utils/test_chat_parsing.py, templates under serve/ from "
-            "src/transformers/cli/serving/utils.py."
+            "src/transformers/cli/serving/utils.py, templates under trl/ from huggingface/trl "
+            "(Apache-2.0) trl/chat_template_utils.py."
         ),
     }
     files = {

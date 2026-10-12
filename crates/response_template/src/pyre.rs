@@ -501,6 +501,17 @@ impl Node {
     }
 }
 
+/// What the tail of a lazy repeat starts with, as the `regex` module tests
+/// it before it lets the repeat take another character (the `test` node of
+/// its `LAZY_REPEAT_ONE`): one literal character, a literal string, or
+/// something else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Test {
+    Char(char),
+    Str(Box<str>),
+    Other,
+}
+
 #[derive(Debug, Clone)]
 enum Inst {
     One(Set),
@@ -510,6 +521,24 @@ enum Inst {
         set: Set,
         greedy: bool,
         memo: usize,
+    },
+    /// `x{min,max}` (greedy) of one character.
+    Count {
+        set: Set,
+        min: u32,
+        max: Option<u32>,
+        memo: usize,
+    },
+    /// A lazy repeat of one character, run as the `regex` module runs its
+    /// `LAZY_REPEAT_ONE`: `body` and `tail` number the positions it was
+    /// entered at and its tail was tried at.
+    Lazy {
+        set: Set,
+        min: u32,
+        max: Option<u32>,
+        test: Test,
+        body: usize,
+        tail: usize,
     },
     Look(Look),
     /// `(?=...)`: its body follows, ending in a `Match`; when the body
@@ -605,12 +634,31 @@ impl Pattern {
         if role == Role::Finditer && regex.node.nullable() {
             return Err(Unsupported::EmptyMatch);
         }
-        Ok(Self::build(
+        let mut pattern = Self::build(
             &regex.node,
             role,
             regex.names.clone(),
             regex.optional.clone(),
-        ))
+        );
+        // A lazy repeat in an open or close pattern runs as the module's only
+        // before a literal tail, and not first: where a partial search starts
+        // depends on the module's own first sets there.
+        if role == Role::Delimiter && lazy_first(&pattern.prog) {
+            return Err(Unsupported::Regex(LAZY_POSITION.into()));
+        }
+        for pc in 0..pattern.prog.len() {
+            if !matches!(pattern.prog[pc], Inst::Lazy { .. }) {
+                continue;
+            }
+            let (test, branch_follows) = tail_test(&pattern.prog, pc + 1);
+            if role == Role::Delimiter && (test == Test::Other || branch_follows) {
+                return Err(Unsupported::Regex(LAZY_POSITION.into()));
+            }
+            if let Inst::Lazy { test: slot, .. } = &mut pattern.prog[pc] {
+                *slot = test;
+            }
+        }
+        Ok(pattern)
     }
 
     /// `"|".join(regex.escape(s) for s in literals)`.
@@ -643,7 +691,8 @@ impl Pattern {
             .map(|pc| match &prog[pc] {
                 Inst::Star {
                     set, greedy: true, ..
-                } => literal_firsts(&prog, pc + 1)
+                }
+                | Inst::Count { set, .. } => literal_firsts(&prog, pc + 1)
                     .is_none_or(|next| next.iter().any(|&c| set.matches(c))),
                 _ => false,
             })
@@ -770,7 +819,9 @@ impl Pattern {
     /// One backtracking run of the program from `pc` at `start`, up to the
     /// next `Match`. In a partial search, reading past the end of the
     /// haystack is a partial match, except when a lazy repeat would extend
-    /// there; entering a lazy repeat at the end is one too.
+    /// there; entering a lazy repeat at the end is one too. A lazy repeat
+    /// before a literal follows the `regex` module's own rules instead
+    /// ([`Pattern::lazy`]).
     fn run(&self, hay: &str, pc: usize, start: usize, partial: bool, run: &mut Run) -> Step {
         run.stack.push(Frame::Try(pc, start));
         while let Some(frame) = run.stack.pop() {
@@ -806,6 +857,20 @@ impl Pattern {
                     }
                     run.stack.push(Frame::Extend { pc, at: next });
                     (pc + 1, next)
+                }
+                // A lazy repeat run as the module's takes more characters.
+                Frame::Lazy { pc, pos, count } => {
+                    match self.lazy(hay, pc, pos, count, partial, run) {
+                        Lazy::Partial => {
+                            run.stack.clear();
+                            return Step::Partial;
+                        }
+                        Lazy::Fail => continue,
+                        Lazy::Match(pos, count) => {
+                            self.push_lazy(hay, pc, pos, count, run);
+                            (pc + 1, pos)
+                        }
+                    }
                 }
             };
             loop {
@@ -865,6 +930,75 @@ impl Pattern {
                         run.stack.push(Frame::Extend { pc, at });
                         pc += 1;
                     }
+                    // The module's `count_one` up to the maximum, then giving
+                    // back down to the minimum: reaching the end below the
+                    // maximum is a partial match.
+                    Inst::Count {
+                        set,
+                        min,
+                        max,
+                        memo,
+                    } => {
+                        if !run.visit(*memo, at) {
+                            break;
+                        }
+                        let (mut end, mut count, mut floor) = (at, 0, at);
+                        while max.is_none_or(|max| count < max) {
+                            let Some(c) = hay[end..].chars().next().filter(|&c| set.matches(c))
+                            else {
+                                break;
+                            };
+                            end += c.len_utf8();
+                            count += 1;
+                            if count == *min {
+                                floor = end;
+                            }
+                        }
+                        if partial && end == hay.len() && max.is_none_or(|max| count < max) {
+                            run.stack.clear();
+                            return Step::Partial;
+                        }
+                        if count < *min {
+                            break;
+                        }
+                        if end > floor && self.gives_back[pc] {
+                            let back = hay[..end].chars().next_back().map_or(0, char::len_utf8);
+                            run.stack.push(Frame::GiveBack {
+                                pc,
+                                floor,
+                                at: end - back,
+                            });
+                        }
+                        at = end;
+                        pc += 1;
+                    }
+                    // `count_one` up to the minimum (reaching the end below
+                    // it is a partial match); backtracking takes more
+                    // ([`Pattern::lazy`]).
+                    Inst::Lazy { set, min, body, .. } => {
+                        if !run.visit(*body, at) {
+                            break;
+                        }
+                        let (mut end, mut count) = (at, 0);
+                        while count < *min {
+                            let Some(c) = hay[end..].chars().next().filter(|&c| set.matches(c))
+                            else {
+                                break;
+                            };
+                            end += c.len_utf8();
+                            count += 1;
+                        }
+                        if count < *min {
+                            if partial && end == hay.len() {
+                                run.stack.clear();
+                                return Step::Partial;
+                            }
+                            break;
+                        }
+                        self.push_lazy(hay, pc, end, count, run);
+                        at = end;
+                        pc += 1;
+                    }
                     Inst::Look(look) if look.at(hay, at) => pc += 1,
                     Inst::Look(_) => break,
                     // The body runs with its own stack and memory: whether it
@@ -915,6 +1049,108 @@ impl Pattern {
         }
         Step::Fail
     }
+
+    /// Remember the lazy repeat at `pc`, now at `pos` with `count`
+    /// characters, so that backtracking can take more: while it is below its
+    /// maximum and characters are left.
+    fn push_lazy(&self, hay: &str, pc: usize, pos: usize, count: u32, run: &mut Run) {
+        if let Inst::Lazy { max, .. } = &self.prog[pc] {
+            if pos < hay.len() && max.is_none_or(|max| count < max) {
+                run.stack.push(Frame::Lazy { pc, pos, count });
+            }
+        }
+    }
+
+    /// Backtracking into the lazy repeat at `pc`, now at `pos` with `count`
+    /// characters: the next position from which its tail can match, found as
+    /// the `regex` module's `LAZY_REPEAT_ONE` finds it. Before a literal
+    /// character, a partial search is a partial match once at most one
+    /// character is left, whatever it is. Before a literal string, it is one
+    /// once no later copy of the string is left in the text (within the
+    /// maximum), whatever comes before.
+    fn lazy(
+        &self,
+        hay: &str,
+        pc: usize,
+        mut pos: usize,
+        mut count: u32,
+        partial: bool,
+        run: &mut Run,
+    ) -> Lazy {
+        let Inst::Lazy {
+            set,
+            max,
+            test,
+            tail,
+            ..
+        } = &self.prog[pc]
+        else {
+            return Lazy::Fail;
+        };
+        let below_max = |count: u32| max.is_none_or(|max| count < max);
+        match test {
+            Test::Char(ch) => loop {
+                let mut rest = hay[pos..].chars();
+                let next = rest.next();
+                let last = rest.next().is_none();
+                if partial && last {
+                    return Lazy::Partial;
+                }
+                if last || !below_max(count) {
+                    return Lazy::Fail;
+                }
+                let Some(c) = next.filter(|&c| set.matches(c)) else {
+                    return Lazy::Fail;
+                };
+                pos += c.len_utf8();
+                count += 1;
+                if hay[pos..].starts_with(*ch) && run.visit(*tail, pos) {
+                    return Lazy::Match(pos, count);
+                }
+            },
+            Test::Str(s) => loop {
+                if partial && pos >= hay.len() {
+                    return Lazy::Partial;
+                }
+                let from = pos + hay[pos..].chars().next().map_or(1, char::len_utf8);
+                let found = hay
+                    .get(from..)
+                    .and_then(|rest| rest.find(&**s))
+                    .map(|k| from + k)
+                    .filter(|&at| {
+                        max.is_none_or(|max| {
+                            u64::from(count) + hay[pos..at].chars().count() as u64 <= u64::from(max)
+                        })
+                    });
+                let Some(at) = found else {
+                    return if partial { Lazy::Partial } else { Lazy::Fail };
+                };
+                for c in hay[pos..at].chars() {
+                    if !set.matches(c) {
+                        return Lazy::Fail;
+                    }
+                    count += 1;
+                }
+                pos = at;
+                if run.visit(*tail, pos) {
+                    return Lazy::Match(pos, count);
+                }
+            },
+            Test::Other => loop {
+                if !below_max(count) {
+                    return Lazy::Fail;
+                }
+                let Some(c) = hay[pos..].chars().next().filter(|&c| set.matches(c)) else {
+                    return Lazy::Fail;
+                };
+                pos += c.len_utf8();
+                count += 1;
+                if run.visit(*tail, pos) {
+                    return Lazy::Match(pos, count);
+                }
+            },
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -924,11 +1160,21 @@ enum Step {
     Fail,
 }
 
+/// Backtracking into a lazy repeat: its tail can be tried at this position
+/// with this many characters, there is no such position, or the search is a
+/// partial match.
+enum Lazy {
+    Match(usize, u32),
+    Fail,
+    Partial,
+}
+
 enum Frame {
     Try(usize, usize),
     Restore(usize, Option<usize>),
     GiveBack { pc: usize, floor: usize, at: usize },
     Extend { pc: usize, at: usize },
+    Lazy { pc: usize, pos: usize, count: u32 },
 }
 
 /// State of one search: group slots, the backtracking stack, and the
@@ -1026,6 +1272,50 @@ fn literal_firsts(prog: &[Inst], pc: usize) -> Option<Vec<char>> {
     Some(firsts)
 }
 
+/// Whether a run from the start can reach a lazy repeat run as the module's
+/// before it reads a character.
+fn lazy_first(prog: &[Inst]) -> bool {
+    let (mut seen, mut todo) = (vec![false; prog.len()], vec![0]);
+    while let Some(pc) = todo.pop() {
+        if std::mem::replace(&mut seen[pc], true) {
+            continue;
+        }
+        match &prog[pc] {
+            Inst::Lazy { .. } => return true,
+            Inst::Look(_) | Inst::Save(_) | Inst::Star { .. } => todo.push(pc + 1),
+            Inst::Count { min: 0, .. } => todo.push(pc + 1),
+            Inst::Ahead { end } => todo.extend([pc + 1, *end]),
+            Inst::Jmp(to) => todo.push(*to),
+            Inst::Split { second, .. } => todo.extend([pc + 1, *second]),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The test of the lazy repeat whose tail starts at `pc` (past the starts and
+/// ends of groups, as the module looks past them), and whether a branch
+/// point follows its literals (where the module could move a common prefix
+/// of alternatives into them).
+fn tail_test(prog: &[Inst], mut pc: usize) -> (Test, bool) {
+    while let Some(Inst::Save(_)) = prog.get(pc) {
+        pc += 1;
+    }
+    let mut literals = String::new();
+    while let Some(Inst::One(Set::Char(c))) = prog.get(pc) {
+        literals.push(*c);
+        pc += 1;
+    }
+    let branch_follows = matches!(prog.get(pc), Some(Inst::Split { .. } | Inst::Jmp(_)));
+    let mut chars = literals.chars();
+    let test = match (chars.next(), chars.next()) {
+        (None, _) => Test::Other,
+        (Some(c), None) => Test::Char(c),
+        _ => Test::Str(literals.into()),
+    };
+    (test, branch_follows)
+}
+
 /// The longest run of literal characters in `node` that every match contains.
 fn required_literal(node: &Node, run: &mut String, longest: &mut String) {
     match node {
@@ -1065,9 +1355,9 @@ fn set_second(prog: &mut [Inst], split: usize) {
     }
 }
 
-/// Whether the `*?` at `items[i]` runs in an open or close pattern: `.*?`
-/// before a literal, or after another item and before `\b` and a literal
-/// (where partial searches match the `regex` module's).
+/// Whether the `*?` at `items[i]` keeps the matcher's own rule in an open or
+/// close pattern: `.*?` before a literal, or after another item and before
+/// `\b` and a literal (where partial searches match the `regex` module's).
 fn plain_lazy(items: &[Node], i: usize) -> bool {
     let literal = |k: usize| matches!(items.get(k), Some(Node::One(Set::Char(_))));
     let dot_literal = matches!(
@@ -1164,6 +1454,27 @@ fn compile(
                 compile(body, role, None, prog, memos);
                 set_second(prog, at);
             }
+            (Node::One(set), min, max, Quantifier::Greedy) => {
+                let memo = next_memo(memos);
+                prog.push(Inst::Count {
+                    set: set.clone(),
+                    min,
+                    max,
+                    memo,
+                });
+            }
+            (Node::One(set), min, max, Quantifier::Lazy) => {
+                let body = next_memo(memos);
+                let tail = next_memo(memos);
+                prog.push(Inst::Lazy {
+                    set: set.clone(),
+                    min,
+                    max,
+                    test: Test::Other,
+                    body,
+                    tail,
+                });
+            }
             // Refused by `check`.
             _ => {}
         },
@@ -1182,6 +1493,7 @@ fn check(regex: &Regex, role: Role) -> Result<(), String> {
         role,
         closed: vec![false; regex.groups + 1],
         ahead: false,
+        enclosed: false,
     };
     checker.node(&regex.node, None)
 }
@@ -1192,6 +1504,9 @@ struct Checker {
     closed: Vec<bool>,
     /// Inside a lookahead.
     ahead: bool,
+    /// Inside an alternative, a repeat or a lookahead, where the `regex`
+    /// module may rebuild what follows a lazy repeat.
+    enclosed: bool,
 }
 
 impl Checker {
@@ -1212,9 +1527,10 @@ impl Checker {
                 if self.role == Role::Delimiter || *behind || *negated {
                     return Err("look-around".into());
                 }
-                let ahead = std::mem::replace(&mut self.ahead, true);
+                let saved = (self.ahead, self.enclosed);
+                (self.ahead, self.enclosed) = (true, true);
                 let checked = self.node(node, None);
-                self.ahead = ahead;
+                (self.ahead, self.enclosed) = saved;
                 checked
             }
             Node::Group(group, inner) => {
@@ -1228,9 +1544,11 @@ impl Checker {
                 Ok(())
             }
             Node::Alt(branches) => {
+                let enclosed = std::mem::replace(&mut self.enclosed, true);
                 for branch in branches {
                     self.node(branch, None)?;
                 }
+                self.enclosed = enclosed;
                 // The `regex` module merges alternatives of one character into
                 // one class, and a merged class with two negated characters
                 // matches as if both were negated in one: `[^a]|[^b]` matches
@@ -1254,21 +1572,14 @@ impl Checker {
                 max,
                 kind,
             } => {
+                let enclosed = std::mem::replace(&mut self.enclosed, true);
                 self.node(body, None)?;
+                self.enclosed = enclosed;
                 if *kind == Quantifier::Possessive {
                     return Err("possessive quantifier".into());
                 }
                 let optional = (*min, *max, *kind) == (0, Some(1), Quantifier::Greedy);
                 match body.as_ref() {
-                    Node::One(_) if *kind == Quantifier::Lazy && (*min, *max) != (0, None) => {
-                        return Err("lazy quantifier other than *?".into())
-                    }
-                    Node::One(_)
-                        if *kind == Quantifier::Greedy
-                            && !matches!((*min, *max), (0 | 1, None) | (0, Some(1))) =>
-                    {
-                        return Err("counted repeat".into())
-                    }
                     Node::One(_) => {}
                     // The `regex` module does not retry a repeat's body at a
                     // position where it failed, even when the groups a
@@ -1279,11 +1590,19 @@ impl Checker {
                     Node::Group(..) if optional => {}
                     _ => return Err("repeat of a group or an assertion".into()),
                 }
-                // Partial searches match the `regex` module's for `.*?` before a
-                // literal, and for a lazy repeat after another item and before
-                // `\b` and a literal (see the README).
-                let plain = items.is_some_and(|(items, i)| plain_lazy(items, i));
-                if *kind == Quantifier::Lazy && self.role == Role::Delimiter && !plain {
+                // In an open or close pattern, partial searches match the
+                // module's for `*?` in the matcher's own positions, and for a
+                // lazy repeat without a maximum before a literal, outside
+                // alternatives, repeats and lookaheads (its tail is checked
+                // once compiled). With a maximum, the module's search for a
+                // literal that follows skips starts by the maximum's width.
+                let plain = (*min, *max) == (0, None)
+                    && items.is_some_and(|(items, i)| plain_lazy(items, i));
+                if *kind == Quantifier::Lazy
+                    && self.role == Role::Delimiter
+                    && !plain
+                    && (self.enclosed || max.is_some())
+                {
                     return Err(LAZY_POSITION.into());
                 }
                 Ok(())

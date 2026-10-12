@@ -17,8 +17,6 @@ behaviour/xml-alternative-value	content_args: tag_pattern group that can be unse
 behaviour/xml-bad-tag-pattern	regex: missing )
 behaviour/xml-optional-value	content_args: tag_pattern group that can be unset
 behaviour/xml-optional-value-parsed	content_args: tag_pattern group that can be unset
-dialect/004	regex: counted repeat
-dialect/012	regex: counted repeat
 dialect/034	regex: a group name outside ASCII
 dialect/038	regex: inline flags (?i)
 dialect/039	regex: inline flags (?i)
@@ -57,7 +55,6 @@ load/anchor-pattern-empty-match	empty match
 load/string-delims-empty	content_args: string_delims
 load/string-delims-shape	content_args: string_delims
 load/tag-pattern-empty-match	empty match
-synthetic/brace-quant	regex: counted repeat
 synthetic/lookahead-open	regex: look-around
 synthetic/multiline-caret-open	regex: inline flags (?m)
 synthetic/posix-name	regex: Unicode property or POSIX class [:alpha:]

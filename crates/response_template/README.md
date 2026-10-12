@@ -158,10 +158,17 @@ results. It runs:
 - `^`, `\A`, `$`, `\Z`, `\z`, `\b`;
 - groups, named or not, `(?:...)`, alternation, comments, and inline flags
   that change nothing a match returns (`s`, `u`, `x`, `f`, `V0`);
-- `*`, `+` and `?` after one character, and `?` after a group;
-- `*?` after one character, in open and close patterns only as `.*?` before
-  a literal, or after another item and before `\b` and a literal (other
-  positions change what a partial search reports);
+- `*`, `+`, `?` and `{m,n}` after one character, and `?` after a group;
+- `*?`, `+?`, `??` and `{m,n}?` after one character. Open and close patterns
+  are searched partially, and after a lazy repeat the module's partial
+  matches follow its own rules: before a literal character it reports a
+  partial match once at most one character is left, and before a literal
+  string once no later copy of the string is left, whatever the repeat could
+  take. The matcher reproduces them where they decide the result alone: for
+  `.*?` before a literal, for `*?` after another item and before `\b` and a
+  literal, and for a lazy repeat without a maximum (`*?`, `+?`, `{m,}?`) after
+  another item and before a literal, outside alternatives, repeats and
+  lookaheads (as in a call name read with `\S+?`);
 - backreferences in start anchors and tag patterns;
 - `(?=...)` without groups or backreferences in it, in start anchors and tag
   patterns (they are only used with `finditer`, never searched partially).
@@ -169,11 +176,12 @@ results. It runs:
 The matcher refuses everything else, naming it: lookahead in open and close
 patterns, negative lookahead and lookbehind, inline flags that change a match
 (`i`, `m`, `w`, `a`, `L`, `-s`, and the global `b`, `e`, `p`, `r`), possessive
-quantifiers, counted repeats, lazy quantifiers other than `*?`, repeats of
-groups and assertions, `*?` in other positions of open and close patterns, `\B`,
-`\m`, `\M`, `\G`, `\K`, `\X`, `\R`, `\h`, Unicode properties and POSIX classes,
-atomic groups, branch reset groups, conditionals, group calls, fuzzy settings,
-verbs, and backreferences in open and close patterns. So are alternatives two of
+quantifiers, repeats of groups and assertions, other lazy repeats in open and
+close patterns (where the module's own first sets, or its search for a literal
+that follows, decide where a partial match starts), `\B`, `\m`, `\M`, `\G`,
+`\K`, `\X`, `\R`, `\h`, Unicode properties and POSIX classes, atomic groups,
+branch reset groups, conditionals, group calls, fuzzy settings, verbs, and
+backreferences in open and close patterns. So are alternatives two of
 which can end in a negated class of one character, also before an empty group
 (the module drops empty groups, merges such alternatives into one class and
 matches `[^a]|[^b]` and `[^a](?:)|[^b]` as `[^ab]`), and a backreference inside
@@ -218,15 +226,16 @@ Both raise an explicit error where transformers returns a value:
 `scripts/generate_hf_fixtures.py` runs transformers itself and records what it
 returns in `tests/fixtures/hf/`: every parser session of transformers' own tests
 (`tests/utils/test_chat_parsing.py` at tag v5.18.0), the templates built into
-`transformers serve`, templates with the shapes of public checkpoints written
-with neutral markers, prompts for these templates that end inside a region, a
-delimiter or the start anchor (with and without tools), rules of loading and
-parsing, seeded random templates and sessions, regex rows for every pattern of
-that corpus, for Python-dialect details and for random patterns, and the Python
-built-ins and character tables the port reproduces. The tests
-replay each session whole, at every two-way split and in recorded chunkings,
-and compare values and event traces. `tests/unsupported.tsv` lists the
-recorded templates transformers accepts and this crate refuses, with the
+`transformers serve`, the templates huggingface/trl writes for gpt-oss and
+GLM-4.5 (`trl/chat_template_utils.py`), templates with the shapes of public
+checkpoints written with neutral markers, prompts for these templates that end
+inside a region, a delimiter or the start anchor (with and without tools), rules
+of loading and parsing, seeded random templates and sessions, regex rows for
+every pattern of that corpus, for Python-dialect details and for random
+patterns, and the Python built-ins and character tables the port reproduces. The
+tests replay each session whole, at every two-way split and in recorded
+chunkings, and compare values and event traces. `tests/unsupported.tsv` lists
+the recorded templates transformers accepts and this crate refuses, with the
 reason; the test fails when that changes in either direction. Every template
 transformers accepts is read, except those the reader does not read, and every
 regex row's pattern is read exactly when the `regex` module compiles it.

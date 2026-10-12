@@ -436,16 +436,16 @@ fn parse_errors_do_not_quote_the_output() {
 }
 
 /// Characters the `regex` module reads as literals where they start nothing
-/// else (`{`, `}`, `]`, and `|` or `^` inside a class), and escapes of
-/// control characters and code points, with what it returns (`regex`
-/// 2026.9.10, spans in characters). Counted repeats other than `{0,1}` are
-/// read, not run. A quantifier with nothing to repeat is rejected as the
-/// module rejects it.
+/// else (`{`, `}`, `]`, and `|` or `^` inside a class), counted repeats, and
+/// escapes of control characters and code points, with what it returns
+/// (`regex` 2026.9.10, spans in characters). A quantifier with nothing to
+/// repeat is rejected as the module rejects it.
 #[test]
 fn braces_brackets_and_escapes() {
     let hay = "aa{2}a}a]x|^y\tz a{x} {} a\tq";
     for (source, expected) in [
-        ("a{x}", &["16:20"][..]),
+        ("a{2}", &["0:2"][..]),
+        ("a{x}", &["16:20"]),
         ("a}", &["5:7"]),
         ("a]", &["7:9"]),
         (
@@ -463,6 +463,7 @@ fn braces_brackets_and_escapes() {
         ("[|^]", &["10:11", "11:12"]),
         (r"a\t", &["24:26"]),
         (r"\141\u0009", &["24:26"]),
+        (r"\x61{1,2}", &["0:2", "5:6", "7:8", "16:17", "24:25"]),
         (r"a{,1}\x7b", &["1:3", "16:18", "21:22"]),
         (r"\{\}", &["21:23"]),
         ("{}", &["21:23"]),
@@ -474,14 +475,6 @@ fn braces_brackets_and_escapes() {
                 .map(|m| span(hay, m.start, m.end))
                 .collect();
             assert_eq!(got, expected, "{source:?} ({role:?})");
-        }
-    }
-    for source in ["a{2}", r"\x61{1,2}"] {
-        for role in [Role::Delimiter, Role::Finditer] {
-            match Pattern::new(source, role) {
-                Err(Unsupported::Regex(got)) => assert_eq!(got, "counted repeat", "{source:?}"),
-                other => panic!("{source:?} ({role:?}): {other:?}"),
-            }
         }
     }
     for (source, reason) in [
