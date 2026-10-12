@@ -97,6 +97,8 @@ benchmark/mmlu/data.tar
 benchmark/llava_bench/images
 benchmark/llava_bench/mme_pack
 *.jsonl
+# Chat-template renders recorded with transformers
+!crates/response_template/tests/fixtures/chat_templates/*.jsonl
 # Parity fixtures recorded from transformers
 !crates/response_template/tests/fixtures/hf/*.jsonl
 !crates/response_template/tests/fixtures/compiled/*.jsonl
