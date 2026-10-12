@@ -265,7 +265,8 @@ for the public templates of `tests/fixtures/compiled/`, and
 `tests/to_symphony.tsv` for every template of `tests/fixtures/hf/` that loads.
 
 Where a compiled table's message differs from transformers', by design, each
-difference has a code:
+difference has a code; `tests/to_symphony_differs.tsv` lists every recorded
+session that shows one, and the test checks each listed code by undoing it:
 
 - X1: a field that does not repeat, written more than once, keeps every stay
   in order, each trimmed, where transformers keeps the last. A stream cannot
@@ -322,6 +323,8 @@ named source at a pinned revision; `--fetch-sources DIR` downloads the pinned
 files), sessions of each with transformers' whole-text reading, and how
 transformers types a call's values (`values.jsonl`), which
 `tests/to_symphony.rs` checks the value reader of a symphony table against.
+`tests/to_symphony_parity.rs` replays every session through the table its
+template compiles into, at every chunking.
 
 To move to a newer transformers: update the pins in the generator (its
 docstring and `PINNED_*`) and here, regenerate, review the fixture diff, adjust

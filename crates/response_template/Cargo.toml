@@ -34,5 +34,9 @@ required-features = ["adapter"]
 name = "to_symphony"
 required-features = ["symphony"]
 
+[[test]]
+name = "to_symphony_parity"
+required-features = ["symphony"]
+
 [lints]
 workspace = true
