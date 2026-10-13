@@ -68,9 +68,10 @@ and a client that wants the raw text back can have it.
   streaming the model's own argument bytes), the bare JSON list (xLAM), and the partial-JSON and
   prefix readers they rest on.
 - `tagged`: the assemblers for arguments written as tags: Qwen 3.5's `<function=`/`<parameter=`,
-  DeepSeek's DSML, the keyed `<arg_key>`/`<arg_value>` pairs (GLM, Ling, Hy4, IQuest), MiniMax's
-  XML tree, Kimi K3's XTML; and the value reader that turns a value's text into the JSON the
-  request's tools declare.
+  the keyed `<arg_key>`/`<arg_value>` pairs (GLM, Ling, Hy4, IQuest), the attributed
+  `<parameter name="…">` tags in four spellings (MiniMax M2, dots3, MiniCPM5, DeepSeek's DSML,
+  Kimi K3's XTML), MiniMax M3's XML tree; and the value reader that turns a value's text into the
+  JSON the request's tools declare.
 - `pythonic`: calls written as Python, `name(key=value)`.
 - `grammar`: the structural-tag derivation and its per-syntax spellings (`keyed`, `xtml`,
   `tagged`, `pythonic`, `attributed` for MiniMax M2's, dots3's, MiniCPM5's and DSML's, and `xml`

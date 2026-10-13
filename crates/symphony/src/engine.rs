@@ -143,7 +143,6 @@ fn assembler(syntax: Option<CallSyntax>, index: u32) -> Box<dyn CallAssembler> {
         Some(CallSyntax::Pythonic(_)) => Box::new(pythonic::Assembler::new(index)),
         Some(CallSyntax::JsonList) => Box::new(json::list::Assembler::new(index)),
         Some(CallSyntax::Xml) => Box::new(tagged::xml::Assembler::new(index, id)),
-        Some(CallSyntax::Xtml) => Box::new(tagged::xtml::Assembler::new(index, id)),
         Some(CallSyntax::Attributed(tags)) => {
             Box::new(tagged::attributed::Assembler::new(index, id, tags))
         }

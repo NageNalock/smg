@@ -90,7 +90,8 @@ What this table says beyond the DeepSeek one:
   otherwise, and it is the state the turn opener leaves the engine in. Content is only what the
   `response` region holds, every byte of it; the recorded answers match it exactly.
 - **Two states for the calls**, as for DSML: `tools` is the wrapping between calls, and `call`
-  is one call's arguments, read by the XTML assembler (`tagged::xtml`).
+  is one call's arguments, read by the attributed assembler with Kimi's tags (`tagged::attributed`,
+  `Tags::XTML`).
   The call tag's opening is the terminal that enters `call`, so the assembler starts inside the
   function's name; the call's closing tag leaves it, and the call's end carries its bytes. A
   second call before the first closed ends the first (`call + call_open = call`), and the

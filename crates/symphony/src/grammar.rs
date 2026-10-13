@@ -60,7 +60,7 @@ use serde_json::{json, Value};
 use crate::{
     format::{CallSyntax, Emits, Format},
     gemma::STRING as GEMMA_STRING,
-    tagged::{assembler::TAGS as TAGGED_TAGS, keyed::Tags as KeyedTags},
+    tagged::{assembler::TAGS as TAGGED_TAGS, attributed::Typing, keyed::Tags as KeyedTags},
 };
 
 mod attributed;
@@ -332,6 +332,12 @@ impl Format {
             CallSyntax::Keyed(tags) if *tags == KeyedTags::PLAIN => {
                 Self::keyed_calls(markers?, &named, at_least_one)
             }
+            // XTML's grammar is its own: the block's ways in come from the table.
+            CallSyntax::Attributed(tags) if tags.typing == Typing::TypeAttribute => {
+                let markers = markers?;
+                let ways_in = self.ways_into(markers.block.as_ref()?.state);
+                return xtml::calls(markers, &ways_in, &named, at_least_one);
+            }
             CallSyntax::Attributed(tags) => {
                 attributed::calls(markers?, tags, &named, at_least_one)?
             }
@@ -339,11 +345,6 @@ impl Format {
                 let markers = markers?;
                 let ways_in = self.ways_into_block(markers);
                 keyed::calls(markers, &ways_in, tags, &named, at_least_one)
-            }
-            CallSyntax::Xtml => {
-                let markers = markers?;
-                let ways_in = self.ways_into(markers.block.as_ref()?.state);
-                return xtml::calls(markers, &ways_in, &named, at_least_one);
             }
             CallSyntax::Tagged(spelling, _) => {
                 let markers = markers?;
@@ -383,7 +384,9 @@ impl Format {
                 tags.value_open,
                 tags.value_close,
             ],
-            Some(CallSyntax::Attributed(tags)) => &[tags.parameter_open, tags.parameter_close],
+            Some(CallSyntax::Attributed(tags)) if tags.typing != Typing::TypeAttribute => {
+                &[tags.parameter_open, tags.parameter_close]
+            }
             Some(CallSyntax::Tagged(..)) => &TAGGED_TAGS,
             Some(CallSyntax::Gemma) => &[GEMMA_STRING],
             _ => &[],
@@ -895,7 +898,7 @@ mod tests {
         assert!(into_the_block(CallSyntax::Json)
             .grammar(&tools, true, true)
             .is_none());
-        let as_xtml = into_the_block(CallSyntax::Xtml)
+        let as_xtml = into_the_block(CallSyntax::Attributed(AttributedTags::XTML))
             .grammar(&tools, true, true)
             .expect("a grammar")
             .payload();
@@ -929,7 +932,7 @@ mod tests {
             .transition("calls", "call_open", "call")
             .transition("call", "call_close", "calls")
             .transition("calls", "calls_close", "reasoning")
-            .calls(CallSyntax::Xtml);
+            .calls(CallSyntax::Attributed(AttributedTags::XTML));
         let payload = mid_thought
             .grammar(&weather_tools(), true, true)
             .expect("a grammar")
@@ -948,7 +951,7 @@ mod tests {
         // row they share makes one way in.
         let tools = weather_tools();
         let as_xtml = formats::minimax_m3()
-            .calls(CallSyntax::Xtml)
+            .calls(CallSyntax::Attributed(AttributedTags::XTML))
             .grammar(&tools, true, true)
             .expect("a grammar")
             .payload();
@@ -1002,7 +1005,7 @@ mod tests {
             .expect("a grammar")
             .payload();
         assert_eq!(as_dsml["format"]["elements"][0]["value"], "\n\n<calls>\n");
-        let as_xtml = two_doors(CallSyntax::Xtml)
+        let as_xtml = two_doors(CallSyntax::Attributed(AttributedTags::XTML))
             .grammar(&tools, true, false)
             .expect("a grammar")
             .payload();
@@ -1056,7 +1059,7 @@ mod tests {
         for (from, on, to) in rows.iter().rev() {
             reversed = reversed.transition(from, on, to);
         }
-        let reversed = reversed.calls(CallSyntax::Xtml);
+        let reversed = reversed.calls(CallSyntax::Attributed(AttributedTags::XTML));
         let tools = weather_tools();
         assert_eq!(
             reversed.grammar(&tools, true, true),

@@ -12,16 +12,15 @@
 //! [`keyed`] does the same for one call written as its name and `<arg_key>`/`<arg_value>` pairs
 //! (GLM, Hy4, Ling, IQuest), typed by the request's tools again; [`attributed`] for one invoke
 //! whose parameter tags name their key in an attribute (MiniMax M2, dots3, MiniCPM5, typed by the
-//! request's tools; DeepSeek's DSML, typed by the tag's `string` attribute); [`xml`] for one
-//! MiniMax M3 invoke, whose arguments are an XML tree, typed by the request's tools at every
-//! depth; and [`xtml`] for one Kimi K3 call, whose argument tags name each value's type.
+//! request's tools; DeepSeek's DSML, typed by the tag's `string` attribute; Kimi K3's XTML, typed
+//! by the tag's `type` attribute); and [`xml`] for one MiniMax M3 invoke, whose arguments are an
+//! XML tree, typed by the request's tools at every depth.
 
 pub mod assembler;
 pub mod attributed;
 pub mod keyed;
 pub mod value;
 pub mod xml;
-pub mod xtml;
 
 pub use assembler::{Assembler, Placement, Spelling};
 pub use value::{json, Declared, Kind};

@@ -10,7 +10,7 @@
 
 use crate::{
     format::{CallSyntax, Emits, Format},
-    tagged::xtml,
+    tagged::attributed::Tags,
 };
 
 /// The Kimi K3 table.
@@ -23,7 +23,7 @@ pub fn kimi_k3() -> Format {
         .terminal("tools_open", "<|open|>tools<|sep|>")
         .terminal("tools_close", "<|close|>tools<|sep|>")
         .terminal("call_open", "<|open|>call tool=\"")
-        .terminal("call_close", xtml::CALL_CLOSE)
+        .terminal("call_close", Tags::XTML.invoke_close)
         .terminal("message_close", "<|close|>message<|sep|>")
         .structural_token("<|open|>")
         .structural_token("<|close|>")
@@ -50,7 +50,7 @@ pub fn kimi_k3() -> Format {
         .transition("tools", "tools_close", "message")
         .transition("tools", "message_close", "message")
         .transition("message", "message_close", "message")
-        .calls(CallSyntax::Xtml)
+        .calls(CallSyntax::Attributed(Tags::XTML))
         .opens_turn("<|open|>message role=\"assistant\"<|sep|>")
 }
 
@@ -195,7 +195,7 @@ mod tests {
             arguments_of(&events, 0),
             r#"{"drink_id": "latte", "new_preferences": {"size": "large", "temperature": "hot"}}"#
         );
-        assert_eq!(ends(&events), [xtml::CALL_CLOSE]);
+        assert_eq!(ends(&events), [Tags::XTML.invoke_close]);
         assert_eq!(content(&events), "");
         assert!(events.contains(&dropped("<|close|>tools<|sep|>")));
         assert!(events.contains(&dropped("<|close|>message<|sep|>")));
@@ -302,7 +302,7 @@ mod tests {
         assert_eq!(arguments_of(&events, 1), "{}");
         // The block's close cut `h` inside a string: the string and the object are closed.
         assert_eq!(arguments_of(&events, 2), r#"{"b": "x"}"#);
-        assert_eq!(ends(&events), [xtml::CALL_CLOSE, "", ""]);
+        assert_eq!(ends(&events), [Tags::XTML.invoke_close, "", ""]);
         assert!(matches!(
             events.last(),
             Some(Event::Finish { tool_calls: 3, .. })

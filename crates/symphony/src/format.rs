@@ -73,16 +73,11 @@ pub enum CallSyntax {
     Xml,
     /// Parameters named by an attribute: the arguments state is one `<invoke name="…">` block
     /// whose `<parameter name="…">` tags carry the key in the attribute, typed by the request's
-    /// tools or by the tag's `string` attribute, in the family's spelling of the tags: MiniMax M2,
-    /// dots3, MiniCPM5, DeepSeek's DSML. The terminal that enters the state is the invoke tag's
-    /// opening, and the one that leaves it is the invoke's closing tag, which the call's end
-    /// carries.
+    /// tools or by an attribute of the tag, in the family's spelling of the tags: MiniMax M2,
+    /// dots3, MiniCPM5, DeepSeek's DSML, Kimi K3's XTML. The terminal that enters the state is the
+    /// invoke tag's opening, and the one that leaves it is the invoke's closing tag, which the
+    /// call's end carries.
     Attributed(tagged::attributed::Tags),
-    /// Kimi K3's XTML: the arguments state is one `<|open|>call tool="…" index="N"<|sep|>` block,
-    /// whose argument tags carry a `type` attribute that types each value (`string`, `number`,
-    /// `boolean`, `null`, `array`, `object`). The terminal that enters the state is the call tag's
-    /// opening, and the one that leaves it is `<|close|>call<|sep|>`, which the call's end carries.
-    Xtml,
     /// The tool's name as text, then this marker, then one JSON object `{"name": …, "args": …}`:
     /// Inkling, whose every message starts the arguments state and says what it is only after
     /// its opener (`<|content_thinking|>`, `<|content_text|>`, or the name and the marker). The

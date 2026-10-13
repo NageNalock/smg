@@ -1,6 +1,6 @@
 //! Parameters named by an attribute: the events of one `<invoke name="NAME">` block whose
 //! arguments are `<parameter name="KEY">VALUE</parameter>` tags, typed by the request's tools or,
-//! in DeepSeek's DSML, by a `string` attribute on the tag.
+//! in DeepSeek's DSML and Kimi K3's XTML, by an attribute on the tag.
 //!
 //! MiniMax M2 writes a call as
 //!
@@ -28,13 +28,23 @@
 //! </｜DSML｜ invoke>
 //! ```
 //!
-//! inside a `<｜DSML｜ calls>` block. The engine's table owns the block's and the invoke's markers
-//! ([`formats::minimax_m2`], [`formats::minicpm5`], [`formats::dots3`],
-//! [`formats::deepseek_v4_1`]): it enters this assembler at `<invoke name="` (`<function
-//! name="`) and leaves it at the invoke's closing tag, so the assembler starts inside the
-//! function's name and never sees that tag; the engine hands it the tag's bytes as the call's end.
-//! Between those two the assembler reads the parameter tags itself, in the family's spelling
-//! ([`Tags`]).
+//! inside a `<｜DSML｜ calls>` block; Kimi K3 writes it in XTML, every tag an `<|open|>` or
+//! `<|close|>` token, a word and the `<|sep|>` token,
+//!
+//! ```text
+//! <|open|>call tool="get_weather" index="1"<|sep|>
+//! <|open|>argument key="city" type="string"<|sep|>Paris<|close|>argument<|sep|>
+//! <|open|>argument key="days" type="number"<|sep|>3<|close|>argument<|sep|>
+//! <|close|>call<|sep|>
+//! ```
+//!
+//! without the newlines, which stand here for the reader. The engine's table owns the block's and
+//! the invoke's markers ([`formats::minimax_m2`], [`formats::minicpm5`], [`formats::dots3`],
+//! [`formats::deepseek_v4_1`], [`formats::kimi_k3`]): it enters this assembler at `<invoke name="`
+//! (`<function name="`, `<|open|>call tool="`) and leaves it at the invoke's closing tag, so the
+//! assembler starts inside the function's name and never sees that tag; the engine hands it the
+//! tag's bytes as the call's end. Between those two the assembler reads the parameter tags
+//! itself, in the family's spelling ([`Tags`]).
 //!
 //! What the syntax says, and what the assembler does with it:
 //!
@@ -49,6 +59,14 @@
 //!   model wrote, written whole at the close through [`json`]'s inference. The request's tools are
 //!   not consulted: the model says the type. A parameter tag with another attribute, or none, is
 //!   no parameter tag.
+//! - **Or the tag's `type` attribute types the value** ([`Typing::TypeAttribute`], XTML), with
+//!   every type: `string` streams, `number`, `boolean`, `null`, `array` and `object` are written
+//!   whole through [`json`]'s inference; a type that is none of the six is no parameter tag.
+//! - **A tag ends at `>`, or at a marker** ([`TagEnd`]): XTML's `<|sep|>` is a token of its own
+//!   and may arrive in pieces, so the scanner holds it like the other tags, and inside a value it
+//!   is the value's text. XTML's call tag carries the model's count of the turn's calls,
+//!   ` index="N"`, which the family's tags allow ([`Tags::indexed_calls`]); the assembler keeps
+//!   its own index, as every assembler does.
 //! - **Inside a value only `</parameter>` is a tag**; `<parameter name="` there is the value's
 //!   text.
 //! - **A value may be a CDATA section** where the family's template writes one ([`Tags::cdata`]):
@@ -72,6 +90,7 @@
 //! [`formats::minicpm5`]: crate::formats::minicpm5()
 //! [`formats::dots3`]: crate::formats::dots3()
 //! [`formats::deepseek_v4_1`]: crate::formats::deepseek_v4_1()
+//! [`formats::kimi_k3`]: crate::formats::kimi_k3()
 
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
@@ -88,6 +107,8 @@ const CDATA_CLOSE: &str = "]]>";
 
 const OPEN: usize = 0;
 const CLOSE: usize = 1;
+/// The marker that ends a tag's tail, where the family has one ([`TagEnd::Marker`]).
+const END: usize = 2;
 const TEXT_BETWEEN_TAGS: &str = "text between a call's tags";
 const TAG_OUT_OF_PLACE: &str = "a tag where the call's syntax has none";
 const TAG_CUT_SHORT: &str = "a tag that another tag cut short";
@@ -97,6 +118,8 @@ const CLOSED_EARLY: &str = "an invoke that closed before its function name close
 /// The two tails a DSML parameter tag has after the name's quote: the attribute that types it.
 const STRING_TRUE: &str = " string=\"true\"";
 const STRING_FALSE: &str = " string=\"false\"";
+/// The types an XTML `type` attribute may name; `string` streams, the rest are written whole.
+const TYPES: [&str; 6] = ["string", "number", "boolean", "null", "array", "object"];
 
 /// Where a value's type comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +130,28 @@ pub enum Typing {
     /// A `string="true"` or `string="false"` attribute after the parameter's name: the model says
     /// whether the value is its text or JSON.
     StringAttribute,
+    /// A `type="…"` attribute after the parameter's name, one of `string`, `number`, `boolean`,
+    /// `null`, `array` and `object`: the model says the type, and only `string` streams.
+    TypeAttribute,
+}
+
+/// What ends a call tag's or a parameter tag's tail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TagEnd {
+    /// The `>` character, as in `<invoke name="NAME">`.
+    Angle,
+    /// A marker of its own, which may arrive in pieces: XTML's `<|sep|>`.
+    Marker(&'static str),
+}
+
+impl TagEnd {
+    /// The bytes that end the tail.
+    fn text(self) -> &'static str {
+        match self {
+            Self::Angle => ">",
+            Self::Marker(marker) => marker,
+        }
+    }
 }
 
 /// How a family spells the syntax: the parameter tag's opening up to the name's quote and its
@@ -137,6 +182,10 @@ pub struct Tags {
     /// What the template writes before the opener of a block around a turn's calls: a newline, or
     /// DSML's two. The grammar writes it; the assembler never sees it.
     pub before_block: &'static str,
+    /// What ends a tag's tail.
+    pub tag_end: TagEnd,
+    /// Whether a call tag's tail may be the model's count of the turn's calls, ` index="N"`.
+    pub indexed_calls: bool,
 }
 
 impl Tags {
@@ -151,6 +200,8 @@ impl Tags {
         block_per_call: false,
         typing: Typing::Declared,
         before_block: "\n",
+        tag_end: TagEnd::Angle,
+        indexed_calls: false,
     };
     /// dots3's: MiniMax M2's tags, a block around each call, every value on a line of its own.
     pub const DOTS3: Self = Self {
@@ -163,6 +214,8 @@ impl Tags {
         block_per_call: true,
         typing: Typing::Declared,
         before_block: "\n",
+        tag_end: TagEnd::Angle,
+        indexed_calls: false,
     };
     /// MiniCPM5's: `<param name="…">`, `</param>` and `</function>`, a value a CDATA section when
     /// it holds `<`, `&` or a newline.
@@ -176,6 +229,8 @@ impl Tags {
         block_per_call: false,
         typing: Typing::Declared,
         before_block: "\n",
+        tag_end: TagEnd::Angle,
+        indexed_calls: false,
     };
     /// DeepSeek's DSML: `<｜DSML｜ parameter name="…" string="…">`, `</｜DSML｜ parameter>`
     /// and `</｜DSML｜ invoke>`, each tag on a line of its own, the value typed by its `string`
@@ -190,10 +245,42 @@ impl Tags {
         block_per_call: false,
         typing: Typing::StringAttribute,
         before_block: "\n\n",
+        tag_end: TagEnd::Angle,
+        indexed_calls: false,
+    };
+    /// Kimi K3's XTML: `<|open|>argument key="…" type="…"<|sep|>`, `<|close|>argument<|sep|>` and
+    /// `<|close|>call<|sep|>`, nothing between the tags, the value typed by its `type` attribute,
+    /// the call tag carrying the model's index. The grammar is the `xtml` module's own.
+    pub const XTML: Self = Self {
+        parameter_open: "<|open|>argument key=\"",
+        parameter_close: "<|close|>argument<|sep|>",
+        invoke_close: "<|close|>call<|sep|>",
+        cdata: false,
+        value_on_its_own_line: false,
+        tags_on_their_own_lines: false,
+        block_per_call: false,
+        typing: Typing::TypeAttribute,
+        before_block: "",
+        tag_end: TagEnd::Marker("<|sep|>"),
+        indexed_calls: true,
     };
 
+    /// The markers the scanner reads inside an invoke: the two parameter tags, and the tail's end
+    /// where it is a marker.
+    fn markers(&self) -> Vec<&'static str> {
+        let mut markers = vec![self.parameter_open, self.parameter_close];
+        if let TagEnd::Marker(marker) = self.tag_end {
+            markers.push(marker);
+        }
+        markers
+    }
+
     fn text(&self, tag: usize) -> &'static str {
-        [self.parameter_open, self.parameter_close][tag]
+        match tag {
+            OPEN => self.parameter_open,
+            CLOSE => self.parameter_close,
+            _ => self.tag_end.text(),
+        }
     }
 }
 
@@ -281,7 +368,7 @@ impl Assembler {
             index,
             id: id.into(),
             tags,
-            scanner: Scanner::new([tags.parameter_open, tags.parameter_close]),
+            scanner: Scanner::new(tags.markers()),
             carried: String::new(),
             stage: Stage::FunctionName,
             function: None,
@@ -389,8 +476,12 @@ impl Assembler {
         let bytes = self.tags.text(tag);
         match &self.stage {
             Stage::Between => self.tag_between(tag, out),
+            // The tail of an invoke or parameter tag ends at the family's marker.
+            Stage::FunctionTail { .. } | Stage::ParameterTail { .. } if tag == END => {
+                self.end_tail(declared, out);
+            }
             Stage::Value(_) if tag == CLOSE => self.close_value(bytes, out),
-            // Inside a value, the other tag is the value's text.
+            // Inside a value, the other tags are the value's text.
             Stage::Value(_) => self.text(bytes, declared, out),
             // A tag cuts a name or a tag's tail short: the bytes so far are reported, and the tag
             // is read where they began.
@@ -448,6 +539,12 @@ impl Assembler {
                 }
                 None => self.carried.push_str(text),
             },
+            // A tail that ends at a marker is carried whole; the marker arrives as a tag.
+            Stage::FunctionTail { .. } | Stage::ParameterTail { .. }
+                if matches!(self.tags.tag_end, TagEnd::Marker(_)) =>
+            {
+                self.carried.push_str(text);
+            }
             Stage::FunctionTail { name, start } => {
                 let (name, start) = (name.clone(), *start);
                 match text.split_once('>') {
@@ -500,6 +597,24 @@ impl Assembler {
         }
     }
 
+    /// The marker that ends an invoke tag's or a parameter tag's tail.
+    fn end_tail(&mut self, declared: &Declared, out: &mut Events) {
+        let marker = self.tags.tag_end.text();
+        match std::mem::replace(&mut self.stage, Stage::Between) {
+            Stage::FunctionTail { name, start } => {
+                let tail = self.carried[start..].to_string();
+                self.carried.push_str(marker);
+                self.start_call(name, &tail, out);
+            }
+            Stage::ParameterTail { key, start } => {
+                let tail = self.carried[start..].to_string();
+                self.carried.push_str(marker);
+                self.open_value(key, &tail, declared, out);
+            }
+            other => self.stage = other,
+        }
+    }
+
     /// Text where the syntax has tags: whitespace is the template's, anything else is reported.
     fn text_between(&mut self, text: &str, out: &mut Events) {
         let mut rest = text;
@@ -522,10 +637,11 @@ impl Assembler {
         }
     }
 
-    /// The invoke tag is whole: the call starts. A tail after the name's quote is reported first.
+    /// The invoke tag is whole: the call starts. A tail after the name's quote is reported first,
+    /// unless it is the model's index of the call and the family's tags carry one.
     fn start_call(&mut self, name: String, tail: &str, out: &mut Events) {
         self.function = Some(name.clone());
-        if tail.is_empty() {
+        if tail.is_empty() || (self.tags.indexed_calls && is_index(tail)) {
             out.push(Event::ToolCallStart {
                 index: self.index,
                 id: self.id.clone(),
@@ -533,10 +649,12 @@ impl Assembler {
                 source: Text::uncounted(std::mem::take(&mut self.carried)),
             });
         } else {
-            // The tag's bytes up to the tail stay as the start's source; the tail is reported.
-            let tag_end = self.carried.len() - tail.len() - 1;
+            // The tag's bytes up to the tail stay as the start's source; the tail is reported, and
+            // the tag's end stays carried.
+            let end = self.tags.tag_end.text();
+            let tag_end = self.carried.len() - tail.len() - end.len();
             let mut after = self.carried.split_off(tag_end);
-            let close = after.pop();
+            let close = after.split_off(after.len() - end.len());
             out.push(Event::ToolCallStart {
                 index: self.index,
                 id: self.id.clone(),
@@ -547,7 +665,7 @@ impl Assembler {
                 text: Text::uncounted(after),
                 why: MalformedReason::Other(TAG_TAIL.to_string()),
             });
-            self.carried.extend(close);
+            self.carried.push_str(&close);
         }
         self.stage = Stage::Between;
     }
@@ -570,6 +688,10 @@ impl Assembler {
             }
             (Typing::StringAttribute, STRING_TRUE) => (None, Mode::Streaming { opened: false }),
             (Typing::StringAttribute, STRING_FALSE) => (None, Mode::Whole),
+            (Typing::TypeAttribute, tail) if typed(tail).is_some_and(|kind| kind == "string") => {
+                (None, Mode::Streaming { opened: false })
+            }
+            (Typing::TypeAttribute, tail) if typed(tail).is_some() => (None, Mode::Whole),
             _ => {
                 self.report(TAG_TAIL, out);
                 self.stage = Stage::Between;
@@ -854,6 +976,20 @@ impl Assembler {
     }
 }
 
+/// Whether a call tag's tail is the model's index of the call, ` index="N"`.
+fn is_index(tail: &str) -> bool {
+    tail.strip_prefix(" index=\"")
+        .and_then(|rest| rest.strip_suffix('"'))
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The type an XTML parameter tag's tail names, ` type="…"`, when it is one of the six.
+fn typed(tail: &str) -> Option<&str> {
+    tail.strip_prefix(" type=\"")
+        .and_then(|rest| rest.strip_suffix('"'))
+        .filter(|kind| TYPES.contains(kind))
+}
+
 impl crate::engine::CallAssembler for Assembler {
     fn feed(&mut self, text: &str, declared: &Declared, out: &mut Events) -> usize {
         self.feed(text, declared, out);
@@ -957,6 +1093,166 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A recorded Kimi K3 call, from after `<|open|>call tool="`: a string, a number and an object.
+    const XTML_CALL: &str = concat!(
+        "get_user_info\" index=\"1\"<|sep|>",
+        "<|open|>argument key=\"user_id\" type=\"number\"<|sep|>7890<|close|>argument<|sep|>",
+        "<|open|>argument key=\"special\" type=\"string\"<|sep|>black<|close|>argument<|sep|>",
+        "<|open|>argument key=\"prefs\" type=\"object\"<|sep|>{\"size\": \"large\"}",
+        "<|close|>argument<|sep|>"
+    );
+
+    /// No fragment is empty and no `Malformed` or `Dropped` text is empty: an empty report would
+    /// claim a byte where none was.
+    fn nothing_empty(events: &[Event]) {
+        for event in events {
+            match event {
+                Event::ToolCallArguments { json, .. } => assert!(!json.is_empty(), "{event:?}"),
+                Event::Malformed { text, .. } | Event::Dropped { text, .. } => {
+                    assert!(!text.text.is_empty(), "{event:?}");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn an_xtml_call_gives_its_name_its_typed_arguments_and_every_byte_however_it_is_cut() {
+        let whole = run_with(Tags::XTML, &[XTML_CALL], false);
+        nothing_empty(&whole);
+        assert!(matches!(
+            &whole[0],
+            Event::ToolCallStart { name, id, .. } if name == "get_user_info" && id == "call_0"
+        ));
+        assert_eq!(
+            arguments(&whole),
+            r#"{"user_id": 7890, "special": "black", "prefs": {"size": "large"}}"#
+        );
+        assert!(matches!(whole.last(), Some(Event::ToolCallEnd { .. })));
+        let all = format!("{XTML_CALL}{}", Tags::XTML.invoke_close);
+        assert_eq!(bytes(&whole), all);
+        for cut in (1..XTML_CALL.len()).filter(|&cut| XTML_CALL.is_char_boundary(cut)) {
+            let events = run_with(Tags::XTML, &[&XTML_CALL[..cut], &XTML_CALL[cut..]], false);
+            nothing_empty(&events);
+            assert_eq!(arguments(&events), arguments(&whole), "cut at {cut}");
+            assert_eq!(bytes(&events), all, "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn the_six_xtml_types_are_written_as_the_model_wrote_them_and_a_string_streams() {
+        let call = concat!(
+            "f\" index=\"2\"<|sep|>",
+            "<|open|>argument key=\"s\" type=\"string\"<|sep|>12<|close|>argument<|sep|>",
+            "<|open|>argument key=\"n\" type=\"number\"<|sep|>1.5<|close|>argument<|sep|>",
+            "<|open|>argument key=\"b\" type=\"boolean\"<|sep|>true<|close|>argument<|sep|>",
+            "<|open|>argument key=\"z\" type=\"null\"<|sep|>null<|close|>argument<|sep|>",
+            "<|open|>argument key=\"a\" type=\"array\"<|sep|>[1, \"x\"]<|close|>argument<|sep|>",
+            "<|open|>argument key=\"o\" type=\"object\"<|sep|>{\"k\": null}<|close|>argument<|sep|>"
+        );
+        let events = run_with(Tags::XTML, &[call], false);
+        assert_eq!(
+            arguments(&events),
+            r#"{"s": "12", "n": 1.5, "b": true, "z": null, "a": [1, "x"], "o": {"k": null}}"#
+        );
+        // The string streamed in pieces, each its own fragment.
+        let streamed = run_with(
+            Tags::XTML,
+            &[
+                "f\" index=\"2\"<|sep|><|open|>argument key=\"s\" type=\"string\"<|sep|>he",
+                "llo<|close|>argument<|sep|>",
+            ],
+            false,
+        );
+        let fragments: Vec<&str> = streamed
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fragments, [r#"{"s": ""#, "he", "llo", "\"", "}"]);
+    }
+
+    #[test]
+    fn an_xtml_type_the_syntax_lacks_and_a_tail_that_is_no_index_are_reported() {
+        let call = concat!(
+            "f\" index=\"x\"<|sep|>",
+            "<|open|>argument key=\"a\" type=\"date\"<|sep|>2026<|close|>argument<|sep|>",
+            "<|open|>argument key=\"b\" type=\"number\"<|sep|>2<|close|>argument<|sep|>"
+        );
+        let events = run_with(Tags::XTML, &[call], false);
+        assert_eq!(arguments(&events), r#"{"b": 2}"#);
+        let reported: Vec<String> = malformed(&events)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+        assert!(
+            reported.contains(&" index=\"x\"".to_string()),
+            "{reported:?}"
+        );
+        // The call tag's separator, carried after its tail was reported, leads the bad tag's bytes.
+        assert!(
+            reported
+                .contains(&"<|sep|><|open|>argument key=\"a\" type=\"date\"<|sep|>".to_string()),
+            "{reported:?}"
+        );
+        assert_eq!(bytes(&events), format!("{call}{}", Tags::XTML.invoke_close));
+    }
+
+    #[test]
+    fn an_xtml_call_tag_without_an_index_is_a_call_all_the_same() {
+        let call = concat!(
+            "f\"<|sep|>",
+            "<|open|>argument key=\"a\" type=\"number\"<|sep|>1<|close|>argument<|sep|>"
+        );
+        let events = run_with(Tags::XTML, &[call], false);
+        assert!(matches!(
+            &events[0],
+            Event::ToolCallStart { name, source, .. } if name == "f" && source.text == "f\"<|sep|>"
+        ));
+        assert_eq!(arguments(&events), r#"{"a": 1}"#);
+        assert!(malformed(&events).is_empty());
+    }
+
+    #[test]
+    fn an_xtml_stream_cut_inside_a_value_closes_nothing_and_a_call_cut_short_closes_its_object() {
+        let cut = run_with(
+            Tags::XTML,
+            &["f\" index=\"1\"<|sep|><|open|>argument key=\"s\" type=\"string\"<|sep|>par"],
+            true,
+        );
+        nothing_empty(&cut);
+        assert_eq!(arguments(&cut), r#"{"s": "par"#);
+        assert!(matches!(
+            cut.last(),
+            Some(Event::ToolCallEnd { source, .. }) if source.text.is_empty()
+        ));
+
+        let mut assembler = Assembler::new(0, "call_0", Tags::XTML);
+        let mut out = Events::new();
+        assembler.feed(
+            "f\" index=\"1\"<|sep|><|open|>argument key=\"n\" type=\"number\"<|sep|>12",
+            &declared(),
+            &mut out,
+        );
+        assembler.close("", &mut out);
+        let events = out.drain();
+        nothing_empty(&events);
+        assert_eq!(arguments(&events), "{}");
+        assert!(malformed(&events)
+            .iter()
+            .any(|(text, _)| text.ends_with("12")));
+    }
+
+    #[test]
+    fn an_xtml_separator_split_across_pieces_still_ends_the_tag() {
+        let whole = arguments(&run_with(Tags::XTML, &[XTML_CALL], false));
+        let at = XTML_CALL.find("<|sep|>").expect("a separator") + 3;
+        let events = run_with(Tags::XTML, &[&XTML_CALL[..at], &XTML_CALL[at..]], false);
+        assert_eq!(arguments(&events), whole);
     }
 
     #[test]
