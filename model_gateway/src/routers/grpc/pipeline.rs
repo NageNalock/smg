@@ -4222,6 +4222,7 @@ mod request_release_tests {
             multimodal: None,
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
+            request_timeout: Duration::from_secs(60),
         });
 
         let response = pipeline
