@@ -536,8 +536,12 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         labels
             .get("max_num_seqs")
             .or_else(|| labels.get("max_running_requests"))
-            .and_then(|s| s.parse::<u16>().ok())
+            .and_then(|s| s.parse::<u64>().ok())
             .filter(|n| *n > 0)
+            // A figure wider than the count (an explicit flag above 65535 on
+            // a large engine) saturates: a window that wide is the widest the
+            // gate and the capacity sum can use, not no window at all.
+            .map(|n| u16::try_from(n).unwrap_or(u16::MAX))
     }
 
     /// Whether this worker can serve the Realtime API (WS/WebRTC/REST
@@ -5249,5 +5253,43 @@ mod tests {
         runtime.note_admitted();
         assert_eq!(runtime.warmup_growth(900), 0);
         assert_eq!(runtime.warmup_growth(1300), 400);
+    }
+}
+
+#[cfg(test)]
+mod running_window_label_tests {
+    use std::collections::HashMap;
+
+    use crate::worker::{BasicWorkerBuilder, Worker};
+
+    fn with_labels(pairs: &[(&str, &str)]) -> impl Worker {
+        BasicWorkerBuilder::new("http://w:1")
+            .labels(
+                pairs
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                    .collect::<HashMap<_, _>>(),
+            )
+            .build()
+    }
+
+    /// A window label wider than the count's type (an explicit flag above
+    /// 65535 on a large engine) saturates, as the widest window the gate and
+    /// the capacity sum can use, instead of reading as no window at all; a
+    /// zero or a word still reads as none, and `max_num_seqs` still wins.
+    #[test]
+    fn a_window_label_wider_than_the_count_saturates_instead_of_reading_as_none() {
+        for (value, expected) in [
+            ("8", Some(8)),
+            ("65535", Some(65535)),
+            ("70000", Some(65535)),
+            ("0", None),
+            ("none", None),
+        ] {
+            let worker = with_labels(&[("max_running_requests", value)]);
+            assert_eq!(worker.max_running_requests(), expected, "{value}");
+        }
+        let both = with_labels(&[("max_num_seqs", "16"), ("max_running_requests", "70000")]);
+        assert_eq!(both.max_running_requests(), Some(16));
     }
 }

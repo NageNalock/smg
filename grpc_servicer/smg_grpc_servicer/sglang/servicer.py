@@ -592,17 +592,16 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         )
 
     def _attention_dp_size(self) -> int:
-        """How many attention-DP workers the flag is split across: ``dp_size``
-        under ``--enable-dp-attention``, else 1 (plain data parallelism runs the
-        whole flag on every scheduler)."""
-        if not EngineConfigView(self.server_args).server_args.enable_dp_attention:
-            return 1
-        return self._rank_count()
+        """How many attention-DP workers the flag is split across, on either
+        engine release (see `ServerArgsSection.attention_dp_width`: the pinned
+        release's ``dp_size`` under ``--enable-dp-attention``, the newer
+        releases' resolved ``attn_dp_size``)."""
+        return EngineConfigView(self.server_args).server_args.attention_dp_width
 
     def _rank_count(self) -> int:
-        """How many schedulers publish a load snapshot: ``dp_size``, 1 when
-        the server arguments do not carry it."""
-        return EngineConfigView(self.server_args).server_args.dp_size or 1
+        """How many schedulers publish a load snapshot, on either engine
+        release (see `ServerArgsSection.scheduler_count`)."""
+        return EngineConfigView(self.server_args).server_args.scheduler_count
 
     def _running_window(self) -> int:
         """The running window the schedulers enforce, in the flag's units: the

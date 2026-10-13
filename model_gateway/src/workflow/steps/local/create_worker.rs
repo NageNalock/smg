@@ -257,7 +257,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                     .health_config(health_config.clone())
                     .health_endpoint(health_endpoint)
                     .overload_defaults(overload_defaults)
-                    .labels(labels.clone());
+                    .labels(labels_for_rank(&labels, dp, &config.labels));
 
                 if let Some((rank, size)) = dp {
                     builder = builder.dp_config(rank, size);
@@ -724,14 +724,69 @@ fn validate_zmq_worker_type(
     Ok(())
 }
 
-/// Reject a data-parallel worker the ZMQ path cannot serve.
-///
-/// dp-aware expansion creates one rank-pinned worker per DP rank, but each
-/// ZMQ worker owns its own socket bind — N expanded workers would fight over
-/// the same ipc paths. ZMQ DP runs as a *grouped* worker instead (`dp_size: N`
-/// on the worker spec: one worker, one socket set, N engines dialing in), so
-/// reject the expansion loudly and point at the grouped form. gRPC/HTTP
-/// expansion and single-engine ZMQ are fine.
+/// The labels of one dp-aware rank worker: the engine's labels as they are,
+/// except the running window of an engine that splits it across its
+/// attention-DP workers (the `enable_dp_attention` / `attn_dp_size` labels:
+/// the flag and the servicer's computed figure alike name the whole engine's
+/// window), which becomes the rank's share, so the PD admission gate and the
+/// capacity sum bound each rank worker by what its rank runs instead of the
+/// whole engine's window `size` times over. Engines whose figure is per rank
+/// already (`max_num_seqs`) carry no such label and keep theirs; an
+/// unexpanded worker stands for the whole engine and keeps the whole window.
+/// A window the operator set by hand on the worker (`set_by_hand`, the
+/// spec's own labels, which win the merge) is the operator's statement
+/// about each rank worker and stays as set; only a discovered window is
+/// shared.
+fn labels_for_rank(
+    labels: &HashMap<String, String>,
+    dp: Option<(usize, usize)>,
+    set_by_hand: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut labels = labels.clone();
+    let Some((_, size)) = dp.filter(|(_, size)| *size > 1) else {
+        return labels;
+    };
+    let Some(width) = attention_dp_width(&labels, size) else {
+        return labels;
+    };
+    for key in ["max_running_requests", "max_num_seqs"] {
+        if set_by_hand.contains_key(key) {
+            continue;
+        }
+        let Some(window) = labels
+            .get(key)
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|window| *window > 0)
+        else {
+            continue;
+        };
+        let share = (window / width).max(1);
+        labels.insert(key.to_string(), share.to_string());
+    }
+    labels
+}
+
+/// How many attention-DP workers the engine's labels say its running window
+/// is split across, `None` for an engine that runs the whole window on every
+/// rank: `attn_dp_size` above one (the engine's newer releases resolve the
+/// flag into it, and `dp_size` then counts replicas, each running the whole
+/// window, so the dp-aware width of `dp_size x attn_dp_size` ranks is not the
+/// divisor), else the dp-aware width `size` under `enable_dp_attention` (the
+/// pinned release, where `dp_size` is the attention-DP width).
+fn attention_dp_width(labels: &HashMap<String, String>, size: usize) -> Option<u64> {
+    let resolved = labels
+        .get("attn_dp_size")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|width| *width > 1);
+    if resolved.is_some() {
+        return resolved;
+    }
+    labels
+        .get("enable_dp_attention")
+        .is_some_and(|value| value == "true")
+        .then_some(size as u64)
+}
+
 /// Ranks to register for a dp-aware worker. A width above one expands into
 /// one dp-annotated worker per rank. A width-1 advertisement (older
 /// servicers emit it as a capability signal) and a missing one both
@@ -754,6 +809,14 @@ fn dp_rank_expansion(
     }
 }
 
+/// Reject a data-parallel worker the ZMQ path cannot serve.
+///
+/// dp-aware expansion creates one rank-pinned worker per DP rank, but each
+/// ZMQ worker owns its own socket bind — N expanded workers would fight over
+/// the same ipc paths. ZMQ DP runs as a *grouped* worker instead (`dp_size: N`
+/// on the worker spec: one worker, one socket set, N engines dialing in), so
+/// reject the expansion loudly and point at the grouped form. gRPC/HTTP
+/// expansion and single-engine ZMQ are fine.
 fn validate_zmq_dp(
     connection_mode: ConnectionMode,
     dp_size: usize,
@@ -1704,5 +1767,105 @@ mod tests {
         // Absent factories skip validation (parsers unused in that config).
         let card = ModelCard::new("m").with_tool_parser("definitely-not-a-parser");
         assert!(validate_parser_overrides(&card, "http://w:1", None, None).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod rank_window_tests {
+    use std::collections::HashMap;
+
+    use super::labels_for_rank;
+
+    fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    /// The rank's labels when every label was discovered (none set by hand).
+    fn discovered(
+        engine: &HashMap<String, String>,
+        dp: Option<(usize, usize)>,
+    ) -> HashMap<String, String> {
+        labels_for_rank(engine, dp, &HashMap::new())
+    }
+
+    /// A window the operator set by hand on the worker is the operator's
+    /// statement about each rank worker: it stays as set, while a
+    /// discovered window next to it is still shared.
+    #[test]
+    fn a_window_the_operator_set_by_hand_stays_as_set() {
+        let by_hand = labels(&[("max_running_requests", "2048")]);
+        let engine = labels(&[
+            ("max_running_requests", "2048"),
+            ("max_num_seqs", "8192"),
+            ("enable_dp_attention", "true"),
+            ("dp_size", "8"),
+        ]);
+        let rank = labels_for_rank(&engine, Some((3, 8)), &by_hand);
+        assert_eq!(
+            rank.get("max_running_requests").map(String::as_str),
+            Some("2048")
+        );
+        assert_eq!(rank.get("max_num_seqs").map(String::as_str), Some("1024"));
+    }
+
+    /// An engine that splits its running window across its attention-DP
+    /// workers advertises the whole engine's window; each of its rank
+    /// workers gets its share, whichever way the engine's release spells
+    /// the split; the other labels ride along. Replicas of attention-DP
+    /// groups (`dp_size` next to a resolved `attn_dp_size`) each run the
+    /// whole window: the share is by the attention-DP width, not by the
+    /// dp-aware width of every rank.
+    #[test]
+    fn an_attention_dp_engines_window_is_each_ranks_share() {
+        let engine = labels(&[
+            ("max_running_requests", "16384"),
+            ("enable_dp_attention", "true"),
+            ("dp_size", "8"),
+        ]);
+        let rank = discovered(&engine, Some((3, 8)));
+        assert_eq!(
+            rank.get("max_running_requests").map(String::as_str),
+            Some("2048")
+        );
+        assert_eq!(rank.get("dp_size").map(String::as_str), Some("8"));
+        let newer = labels(&[("max_running_requests", "16384"), ("attn_dp_size", "8")]);
+        assert_eq!(
+            discovered(&newer, Some((0, 8)))
+                .get("max_running_requests")
+                .map(String::as_str),
+            Some("2048")
+        );
+        let replicas_of_groups = labels(&[
+            ("max_running_requests", "4096"),
+            ("dp_size", "2"),
+            ("attn_dp_size", "4"),
+        ]);
+        assert_eq!(
+            discovered(&replicas_of_groups, Some((5, 8)))
+                .get("max_running_requests")
+                .map(String::as_str),
+            Some("1024")
+        );
+    }
+
+    /// Plain data parallelism runs the whole flag on every rank, an engine
+    /// whose figure is per rank already keeps it, and a worker that stands
+    /// for the whole engine (no expansion, or a width of one) keeps the
+    /// whole window.
+    #[test]
+    fn a_per_rank_window_and_an_unexpanded_worker_keep_their_labels() {
+        let replicas = labels(&[("max_running_requests", "2048"), ("dp_size", "8")]);
+        assert_eq!(discovered(&replicas, Some((1, 8))), replicas);
+        let per_rank = labels(&[("max_num_seqs", "256"), ("dp_size", "4")]);
+        assert_eq!(discovered(&per_rank, Some((0, 4))), per_rank);
+        let attention = labels(&[
+            ("max_running_requests", "16384"),
+            ("enable_dp_attention", "true"),
+        ]);
+        assert_eq!(discovered(&attention, None), attention);
+        assert_eq!(discovered(&attention, Some((0, 1))), attention);
     }
 }

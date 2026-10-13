@@ -42,6 +42,11 @@ class ServerArgsSection:
     # The data-parallel width when the args carry a count, else ``None``.
     dp_size: int | None
     enable_dp_attention: bool
+    # The attention-DP width when the args carry it resolved, else ``None``.
+    # The engine's newer releases rewrite ``--dp-size N --enable-dp-attention``
+    # into ``attn_dp_size=N, dp_size=1, enable_dp_attention=False``; the pinned
+    # release has no such attribute and keeps the flag as given.
+    attn_dp_size: int | None
     kv_events_config: Any
     disaggregation_mode: str
     language_only: bool
@@ -59,11 +64,33 @@ class ServerArgsSection:
             max_running_requests=_positive_int(getattr(server_args, "max_running_requests", None)),
             dp_size=_positive_int(getattr(server_args, "dp_size", None)),
             enable_dp_attention=bool(getattr(server_args, "enable_dp_attention", False)),
+            attn_dp_size=_positive_int(getattr(server_args, "attn_dp_size", None)),
             kv_events_config=getattr(server_args, "kv_events_config", None),
             disaggregation_mode=getattr(server_args, "disaggregation_mode", "null") or "null",
             language_only=bool(getattr(server_args, "language_only", False)),
             encoder_only=bool(getattr(server_args, "encoder_only", False)),
         )
+
+    @property
+    def attention_dp_width(self) -> int:
+        """How many attention-DP workers ``--max-running-requests`` is split
+        across, on either engine release: ``attn_dp_size`` when it is resolved
+        above one, else ``dp_size`` under ``enable_dp_attention`` (the pinned
+        release, where ``dp_size`` is the attention-DP width), else 1 (plain
+        data parallelism runs the whole flag on every scheduler)."""
+        if self.attn_dp_size is not None and self.attn_dp_size > 1:
+            return self.attn_dp_size
+        if self.enable_dp_attention:
+            return self.dp_size or 1
+        return 1
+
+    @property
+    def scheduler_count(self) -> int:
+        """How many schedulers the engine runs, one load snapshot each: the
+        data-parallel width times the attention-DP width the newer releases
+        resolve (1 when absent, as on the pinned release, where ``dp_size``
+        already counts every scheduler)."""
+        return (self.dp_size or 1) * (self.attn_dp_size or 1)
 
 
 @dataclasses.dataclass(frozen=True)
