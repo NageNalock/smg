@@ -38,17 +38,28 @@ use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerS
 #[derive(Clone)]
 struct TestOtelCollector {
     span_count: Arc<AtomicUsize>,
+    /// The name of every exported span, in arrival order.
+    span_names: Arc<Mutex<Vec<String>>>,
 }
 
 impl TestOtelCollector {
     fn new() -> Self {
         Self {
             span_count: Arc::new(AtomicUsize::new(0)),
+            span_names: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     fn get_span_count(&self) -> usize {
         self.span_count.load(Ordering::SeqCst)
+    }
+
+    /// The exported spans other than those named `name`.
+    fn span_count_excluding(&self, name: &str) -> usize {
+        self.span_names
+            .lock()
+            .map(|names| names.iter().filter(|n| n.as_str() != name).count())
+            .unwrap_or(0)
     }
 }
 
@@ -65,6 +76,9 @@ impl TraceService for TestOtelCollector {
         for resource_span in &req.resource_spans {
             for scope_span in &resource_span.scope_spans {
                 total_spans += scope_span.spans.len();
+                if let Ok(mut names) = self.span_names.lock() {
+                    names.extend(scope_span.spans.iter().map(|span| span.name.clone()));
+                }
             }
         }
 
@@ -202,6 +216,23 @@ async fn test_router_with_tracing() {
     tokio::time::sleep(Duration::from_millis(3000)).await;
     println!("Workers initialized");
 
+    // Entering a traced span does not activate the OpenTelemetry context:
+    // the gateway takes a span's context from the span itself, and the
+    // activation would be paid on every poll of every request. The probe is
+    // a traced span (the layer must see it), so it is exported too; the span
+    // count below leaves it out by name.
+    {
+        let probe = info_span!(target: "smg::otel-trace", "context_probe");
+        let _entered = probe.enter();
+        assert!(
+            !opentelemetry::Context::current()
+                .span()
+                .span_context()
+                .is_valid(),
+            "entering a traced span activated the OpenTelemetry context"
+        );
+    }
+
     // 9. create router
     let router = RouterFactory::create_router(&app_context)
         .await
@@ -246,9 +277,13 @@ async fn test_router_with_tracing() {
         Err(e) => println!("Failed to flush spans: {e:?}"),
     }
 
-    // 12. Verify that the spans were exported to the collector
-    let span_count = collector.get_span_count();
-    println!("Total spans received by collector: {span_count}");
+    // 12. Verify that the spans were exported to the collector (the context
+    // probe above is a span of its own and is not counted)
+    let span_count = collector.span_count_excluding("context_probe");
+    println!(
+        "Total spans received by collector: {} ({span_count} besides the context probe)",
+        collector.get_span_count()
+    );
 
     // Only assert span count if we initialized OTEL with our own collector
     // When OTEL was pre-initialized by another test, spans go to that collector instead

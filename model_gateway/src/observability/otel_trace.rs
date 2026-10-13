@@ -174,6 +174,13 @@ where
 
     let layer = tracing_opentelemetry::layer()
         .with_tracer(tracer)
+        // The gateway reads a span's trace context through the span itself
+        // (`OpenTelemetrySpanExt::context` on `Span::current()`), never through
+        // `opentelemetry::Context::current()`; activating the context on every
+        // enter and exit of a traced span, the layer's default, would only
+        // cost a lock, a thread-local swap and a guard per poll of the
+        // request's future. The exported spans are the same either way.
+        .with_context_activation(false)
         .with_filter(CustomOtelFilter::new());
 
     Ok(Box::new(layer))
