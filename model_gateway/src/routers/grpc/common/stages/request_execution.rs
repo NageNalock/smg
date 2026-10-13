@@ -580,9 +580,15 @@ fn attribute_pd_legs(result: ExecutionResult, workers: &WorkerSelection) -> Exec
         Some(worker) => stream.tracked(Arc::clone(worker), 0, false),
         None => stream,
     };
+    // The sequential path tracks its decode leg itself, at the dispatch,
+    // so it can wait for the leg's first token under the leg's bound: a leg
+    // already on a worker is left as it is (a second layer would sample its
+    // success twice).
     let decode = match workers.decode_worker() {
-        Some(worker) => (*decode).tracked_decode_leg(Arc::clone(worker)),
-        None => *decode,
+        Some(worker) if decode.worker().is_none() => {
+            (*decode).tracked_decode_leg(Arc::clone(worker))
+        }
+        _ => *decode,
     };
     ExecutionResult::PrefillDecode {
         prefill: attribute(prefill, workers.prefill_worker()),
@@ -1317,6 +1323,12 @@ enum Retirement {
     /// Its late result is neither sampled nor counted, whatever it is. A
     /// late stream is aborted, a late error noted.
     Silent,
+    /// Its own first-token bound passed while a KV handoff may still be
+    /// written into it (the decode leg of the sequential dispatch): charged
+    /// as [`Self::Silent`] is, and its abort deferred as
+    /// [`Self::PartnerSilent`]'s, since the handoff must not be torn down
+    /// mid-write.
+    HandoffSilent,
 }
 
 impl Retirement {
@@ -1325,11 +1337,12 @@ impl Retirement {
             Self::PartnerFailed => "its partner failed",
             Self::PartnerSilent => "its partner fell silent",
             Self::Silent => "its silence bound passed",
+            Self::HandoffSilent => "its first-token bound passed during the handoff",
         }
     }
 
     fn defer_abort(self) -> bool {
-        matches!(self, Self::PartnerSilent)
+        matches!(self, Self::PartnerSilent | Self::HandoffSilent)
     }
 
     /// Whether the late result is this request's word on the worker.
@@ -1420,6 +1433,11 @@ const PREFILL_SILENCE_MESSAGE: &str = "prefill leg produced nothing within";
 /// The message of the verdict that puts a prefill leg's silence on its
 /// stalled decode partner (see [`decode_partner_silent`]).
 const DECODE_SILENCE_MESSAGE: &str = "decode worker produced nothing within";
+
+/// The message a sequential decode leg's silence verdict starts with (see
+/// [`decode_leg_silent`]); it tells the verdict from an engine's own
+/// `DEADLINE_EXCEEDED`.
+const DECODE_LEG_SILENCE_MESSAGE: &str = "decode leg produced nothing within";
 
 /// The bound on one prefill leg's silence, counted from its dispatch (see
 /// [`liveness::prefill_leg_bound`]).
@@ -1740,6 +1758,194 @@ async fn first_prefill_response_within(
     }
 }
 
+/// The bound on a sequential decode leg's first token, counted from its
+/// dispatch (see [`liveness::decode_leg_bound`]).
+#[derive(Clone, Copy, Debug)]
+struct DecodeLegBound {
+    deadline: Instant,
+    bound: Duration,
+}
+
+impl DecodeLegBound {
+    /// The bound for a leg of `prompt_tokens` dispatched at `dispatched`,
+    /// sized from `prefills`, the worker whose prefill of the prompt stands
+    /// before the leg's first token (see [`liveness::decode_leg_bound`]);
+    /// `None` when the rule is off.
+    fn at(prefills: &Arc<dyn Worker>, prompt_tokens: u64, dispatched: Instant) -> Option<Self> {
+        let bound = liveness::decode_leg_bound(prefills, prompt_tokens)?;
+        // A bound past the clock's range never expires: the leg stays unbounded.
+        let deadline = dispatched.checked_add(bound)?;
+        Some(Self { deadline, bound })
+    }
+}
+
+/// The worker whose prefill of the prompt stands before a sequential decode
+/// leg's first token, which sizes the leg's bound: the prefill worker when
+/// the decode leg pulls its prompt KV from it, which takes both a handoff
+/// and a request the KV parameters were relayed for (`handed_off` alone does
+/// not say so: the legacy Mooncake arm hands off a fan-out in name only and
+/// the decode engine recomputes the prompt); else the decode worker, which
+/// recomputes the prompt itself (a fan-out, or a prefill that returned no
+/// transfer parameters). The decode worker's prefill rate is never measured
+/// under PD (its decode legs book no prefill), so that bound follows the
+/// cold rate with an empty backlog, the conservative side.
+fn worker_prefilling_before_decode(
+    workers: &WorkerSelection,
+    handed_off: bool,
+    relay_kv_params: bool,
+) -> Option<&Arc<dyn Worker>> {
+    if handed_off && relay_kv_params {
+        workers.prefill_worker()
+    } else {
+        workers.decode_worker()
+    }
+}
+
+/// The verdict on a sequential decode leg that produced nothing within its
+/// first-token bound, in `phase` (`dispatch`: the call returned no stream;
+/// `first_response`: the stream yielded nothing): one WARN naming the
+/// worker and the request, the worker-error counter under the timeout
+/// class, and the status the leg's failure is reported with. The prefill
+/// leg has answered by then, so its silence bound no longer covers the
+/// request, and nothing else bounds this wait below the request's own
+/// timeout: the engines' health probes keep passing while the KV handoff
+/// waits on a prefill engine that stalled right after answering, and the
+/// admission gate only gated the dispatch. The attempt fails here; the
+/// retry layer takes the request to another decode worker when one is
+/// available (see [`decode_silence_response`]).
+fn decode_leg_silent(
+    worker: &Arc<dyn Worker>,
+    connection: &'static str,
+    request_id: &str,
+    prompt_tokens: u64,
+    bound: Duration,
+    phase: &'static str,
+) -> tonic::Status {
+    warn!(
+        request_id = %request_id,
+        worker = worker.url(),
+        worker_type = metrics_labels::WORKER_DECODE,
+        phase,
+        prompt_tokens,
+        bound_ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
+        "PD decode leg produced nothing within its first-token bound after the prefill leg had answered (the handoff did not complete, or the decode engine never scheduled it); giving up on it"
+    );
+    Metrics::record_worker_error(
+        metrics_labels::WORKER_DECODE,
+        connection,
+        metrics_labels::ERROR_TIMEOUT,
+    );
+    tonic::Status::deadline_exceeded(format!(
+        "{DECODE_LEG_SILENCE_MESSAGE} {bound:.1?} of its dispatch ({phase})"
+    ))
+}
+
+/// Whether `status` is a sequential decode leg's silence verdict. Its
+/// client answer is the one a stalled decode partner gets on the parallel
+/// shape ([`decode_silence_response`]): a 504 `decode_worker_silent`,
+/// replayable on another decode worker, this one excluded.
+fn is_decode_leg_silence(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::DeadlineExceeded
+        && status.message().starts_with(DECODE_LEG_SILENCE_MESSAGE)
+}
+
+/// Await a sequential decode leg's dispatch within its bound. Past the
+/// deadline the still-pending call is retired off the request path (its
+/// room is aborted once the handoff it may be in the middle of has produced
+/// a first item, or the deferral's cap passes) and the silence verdict takes
+/// its place. Without a bound or a worker to charge, the call is awaited as
+/// it is. No reprieve: unlike a prefill leg queued on a busy worker, a
+/// decode leg was admitted to a room before its dispatch, so nothing of the
+/// worker's other legs stands between it and its first token.
+async fn dispatch_decode_within(
+    bound: Option<DecodeLegBound>,
+    mut dispatch: PdLegDispatch,
+    worker: Option<Arc<dyn Worker>>,
+    connection: &'static str,
+    request_id: String,
+    prompt_tokens: u64,
+) -> StreamResult {
+    let (Some(bound), Some(worker)) = (bound, worker) else {
+        return dispatch.await;
+    };
+    match tokio::time::timeout_at(bound.deadline.into(), &mut dispatch).await {
+        Ok(result) => result,
+        Err(_) => {
+            retire_pd_leg(
+                PdLeg::Decode,
+                connection,
+                Arc::clone(&worker),
+                dispatch,
+                Retirement::HandoffSilent,
+            );
+            Err(decode_leg_silent(
+                &worker,
+                connection,
+                &request_id,
+                prompt_tokens,
+                bound.bound,
+                "dispatch",
+            ))
+        }
+    }
+}
+
+/// Wait for a sequential decode leg's first item within what is left of its
+/// bound, and say what it was. The item stays on the stream for its reader;
+/// past the bound, the silence verdict (the caller drops the leg, whose
+/// abort is deferred past the handoff). Without a bound nothing is pulled
+/// ahead and the leg counts as answered, as its dispatch did.
+async fn first_decode_response_within(
+    stream: &mut ProtoStream,
+    bound: Option<DecodeLegBound>,
+    worker: Option<&Arc<dyn Worker>>,
+    connection: &'static str,
+    request_id: &str,
+    prompt_tokens: u64,
+) -> Result<FirstItem, tonic::Status> {
+    let (Some(bound), Some(worker)) = (bound, worker) else {
+        return Ok(FirstItem::Response);
+    };
+    match stream.first_response_within(bound.deadline).await {
+        Ok(first) => Ok(first),
+        Err(_) => Err(decode_leg_silent(
+            worker,
+            connection,
+            request_id,
+            prompt_tokens,
+            bound.bound,
+            "first_response",
+        )),
+    }
+}
+
+/// The attempt's answer for a decode leg that failed to start or fell
+/// silent on the sequential path: the breaker sample, the worker-error
+/// counter (the silence verdict counted itself) and the client response.
+fn sequential_decode_failure(
+    e: &tonic::Status,
+    workers: &WorkerSelection,
+    ledger: &AttemptLedger,
+    connection: &'static str,
+) -> Response {
+    if let Some(status) = e.breaker_status() {
+        workers.record_outcome_decode(ledger, status);
+    }
+    if is_decode_leg_silence(e) {
+        if let Some(decode) = workers.decode_worker() {
+            return decode_silence_response(e, decode);
+        }
+    }
+    UpstreamClass::account_dispatch_failure(metrics_labels::WORKER_DECODE, connection, e);
+    account_pd_leg_failure(metrics_labels::WORKER_DECODE, e);
+    start_failure_response(
+        e,
+        "execute_sequential_pd",
+        PdLeg::Decode.error_message(),
+        PdLeg::Decode.error_code(),
+    )
+}
+
 /// The attempt's answer for a prefill leg that failed to start or fell
 /// silent on the sequential path: the breaker sample, the worker-error
 /// counter (the silence verdict counted itself) and the client response.
@@ -1861,6 +2067,7 @@ async fn execute_sequential_pd(
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
+    let streaming = proto_request.stream();
     let runtime = workers
         .disaggregated_runtime_type()
         .map(|r| r.as_str())
@@ -2227,23 +2434,68 @@ async fn execute_sequential_pd(
     // call so a worker that holds its response headers until the first token
     // still lands in the decode phase.
     let decode_sent = Instant::now();
-    let decode_stream = decode_client.generate(decode_request).await.map_err(|e| {
-        if let Some(status) = e.breaker_status() {
-            workers.record_outcome_decode(ledger, status);
-        }
-        UpstreamClass::account_dispatch_failure(metrics_labels::WORKER_DECODE, decode_label, &e);
-        account_pd_leg_failure(metrics_labels::WORKER_DECODE, &e);
-        start_failure_response(
-            &e,
-            "execute_sequential_pd",
-            PdLeg::Decode.error_message(),
-            PdLeg::Decode.error_code(),
-        )
-    })?;
+    // The decode leg owes its first token within a bound counted from here
+    // (see `liveness::decode_leg_bound`): the KV handoff from the prefill
+    // leg and the decode engine's first step. The prefill leg has answered,
+    // so its silence bound no longer covers the request, and nothing else
+    // bounds this wait below the request's own timeout while the engines'
+    // health probes keep passing (a prefill engine that stalls right after
+    // answering leaves the handoff waiting on it).
+    // The bound covers a streaming request only: a non-streaming leg's first
+    // item is its whole generation (the servicers send nothing of a
+    // non-streaming request before it finishes), no first-token signal. Its
+    // size follows the worker whose prefill of the prompt stands before the
+    // first token (see `worker_prefilling_before_decode`).
+    let decode_bound = if streaming {
+        worker_prefilling_before_decode(workers, handed_off, relay_kv_params)
+            .and_then(|worker| DecodeLegBound::at(worker, prompt_tokens, decode_sent))
+    } else {
+        None
+    };
+    let decode_worker = workers.decode_worker().cloned();
+    let mut decode_client = decode_client.clone();
+    let decode_stream = dispatch_decode_within(
+        decode_bound,
+        Box::pin(async move { decode_client.generate(decode_request).await }),
+        decode_worker.clone(),
+        decode_label,
+        request_id.clone(),
+        prompt_tokens,
+    )
+    .await
+    .map_err(|e| sequential_decode_failure(&e, workers, ledger, decode_label))?;
 
-    // The decode worker's breaker success is sampled at the leg's first
-    // response, by the tracked leg (`attribute_pd_legs`): the call returning
-    // its stream says nothing about the handoff the first token waits for.
+    // Prefill has completed and its KV blocks are held pending decode's
+    // transfer; aborting decode mid-transfer on a client disconnect can
+    // crash or leak on the engine side. Defer the abort until the first
+    // decode response proves the handoff finished (see the parallel PD
+    // path for the same invariant). The leg is tracked on its worker here,
+    // before its first item is waited for: its responses are the worker's
+    // progress, it joins no pile (its silence is bounded per request), and
+    // the worker's breaker success is sampled at the leg's first response
+    // (`ProtoStream::tracked_decode_leg`), never at the dispatch; the
+    // attribution stage leaves a leg tracked here as it is.
+    let mut decode_stream = match &decode_worker {
+        Some(worker) => decode_stream
+            .defer_abort_until_first_item()
+            .tracked_decode_leg(Arc::clone(worker)),
+        None => decode_stream.defer_abort_until_first_item(),
+    };
+    // Without a bound nothing is pulled ahead and the leg counts as answered,
+    // as before; a first item that is a failure, or an end with nothing on
+    // the stream, is met by the reader and earns no success either way.
+    if let Err(e) = first_decode_response_within(
+        &mut decode_stream,
+        decode_bound,
+        decode_worker.as_ref(),
+        decode_label,
+        &request_id,
+        prompt_tokens,
+    )
+    .await
+    {
+        return Err(sequential_decode_failure(&e, workers, ledger, decode_label));
+    }
     // Decode established: record the success-only PD metrics here.
     Metrics::record_pd_kv_connector_mode(kv_connector_label);
     Metrics::record_pd_prefill_duration(
@@ -2259,17 +2511,10 @@ async fn execute_sequential_pd(
         decode_sent.duration_since(prefill_done),
     );
 
-    // Prefill has completed and its KV blocks are held pending decode's
-    // transfer; aborting decode mid-transfer on a client disconnect can
-    // crash or leak on the engine side. Defer the abort until the first
-    // decode response proves the handoff finished (see the parallel PD
-    // path for the same invariant). The client's prompt-side usage is the
-    // prefill leg's: the decode leg's responses carry the prefix-cache hit
-    // the prefill leg reported, not the transfer the decode leg counts as
-    // cached.
-    let decode_stream = decode_stream
-        .defer_abort_until_first_item()
-        .decode_leg(prefill_cached_tokens);
+    // The client's prompt-side usage is the prefill leg's: the decode leg's
+    // responses carry the prefix-cache hit the prefill leg reported, not the
+    // transfer the decode leg counts as cached.
+    let decode_stream = decode_stream.decode_leg(prefill_cached_tokens);
 
     // Surface the PD shape (not `Single`) so the streaming layer anchors TTFT
     // at prefill dispatch. Without this, the decode stream is established only
@@ -3152,6 +3397,122 @@ mod tests {
         assert_eq!(decode.circuit_breaker_state(), CircuitState::Closed);
     }
 
+    fn three_second_decode_bound() -> DecodeLegBound {
+        DecodeLegBound {
+            deadline: Instant::now() + Duration::from_secs(3),
+            bound: Duration::from_secs(3),
+        }
+    }
+
+    /// A sequential decode call that has returned no stream by its bound is
+    /// given up on at the bound, not at the request's timeout: the verdict
+    /// names the silence, and the attempt answers a 504 under its own code
+    /// that the retry layer may take to another decode worker, this one
+    /// excluded.
+    #[tokio::test(start_paused = true)]
+    async fn a_sequential_decode_dispatch_past_its_bound_is_given_up_on_at_the_bound() {
+        let workers = tokenspeed_pair();
+        let decode = Arc::clone(workers.decode_worker().expect("a pair"));
+        let started = tokio::time::Instant::now();
+        let result = dispatch_decode_within(
+            Some(three_second_decode_bound()),
+            never_answers(),
+            Some(Arc::clone(&decode)),
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-decode-silent".to_string(),
+            256,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(4),
+            "given up on at the bound, not later: {elapsed:?}"
+        );
+        let status = failure(result);
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+        assert!(is_decode_leg_silence(&status), "{status:?}");
+        assert!(!is_prefill_silence(&status), "{status:?}");
+
+        let ledger = AttemptLedger::default();
+        let response =
+            sequential_decode_failure(&status, &workers, &ledger, metrics_labels::CONNECTION_GRPC);
+        assert_eq!(response.status(), http::StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .and_then(|value| value.to_str().ok()),
+            Some("decode_worker_silent")
+        );
+        assert!(
+            response.extensions().get::<FailedLeg>().is_some(),
+            "the retry window closes on the decode worker alone"
+        );
+        assert!(
+            is_retryable_response(&response),
+            "another decode worker may take the request"
+        );
+    }
+
+    /// A decode call that answers, or fails on its own, within its bound
+    /// passes through as it is; an engine's own deadline is not the verdict;
+    /// without a bound the call is awaited as before.
+    #[tokio::test(start_paused = true)]
+    async fn a_decode_that_answers_within_its_bound_passes_through() {
+        let workers = tokenspeed_pair();
+        let decode = Arc::clone(workers.decode_worker().expect("a pair"));
+        let status = failure(
+            dispatch_decode_within(
+                Some(three_second_decode_bound()),
+                answers_after(Duration::from_secs(1)),
+                Some(decode),
+                metrics_labels::CONNECTION_GRPC,
+                "chatcmpl-decode-late".to_string(),
+                256,
+            )
+            .await,
+        );
+        assert_eq!(status.message(), "late leg");
+        assert!(!is_decode_leg_silence(&status));
+        assert!(!is_decode_leg_silence(&tonic::Status::deadline_exceeded(
+            "bootstrap timeout"
+        )));
+        let status = failure(
+            dispatch_decode_within(
+                None,
+                fails_now("refused"),
+                None,
+                metrics_labels::CONNECTION_GRPC,
+                "chatcmpl-decode-unbounded".to_string(),
+                256,
+            )
+            .await,
+        );
+        assert_eq!(status.message(), "refused");
+    }
+
+    /// A decode stream that answers (here: ends) within its bound is left
+    /// for its reader as it was, and what came is named.
+    #[tokio::test]
+    async fn a_decode_stream_that_answers_within_its_bound_is_left_for_its_reader() {
+        let workers = tokenspeed_pair();
+        let decode = Arc::clone(workers.decode_worker().expect("a pair"));
+        let mut stream = ProtoStream::Fanout(FanoutStream::new(Vec::new()))
+            .tracked_decode_leg(Arc::clone(&decode));
+        let first = first_decode_response_within(
+            &mut stream,
+            Some(three_second_decode_bound()),
+            Some(&decode),
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-decode-ended",
+            256,
+        )
+        .await
+        .expect("ended within the bound");
+        assert_eq!(first, FirstItem::End);
+        assert!(stream.next().await.is_none(), "the end is replayed");
+    }
+
     /// Admission and the load guards read the same count, so a batched plan
     /// claims one room per prompt instead of walking past a gate that only
     /// asked about one.
@@ -3197,6 +3558,53 @@ mod tests {
                 metrics_labels::CONNECTION_GRPC
             ),
             "each PD leg must carry its own transport label"
+        );
+    }
+
+    /// The decode leg's first-token bound is sized from the prefill worker
+    /// only when the decode leg pulls its prompt KV from it: a handoff on a
+    /// request the KV parameters were relayed for. A fan-out the legacy
+    /// Mooncake arm hands off in name only, and any leg without a handoff,
+    /// recompute the prompt on the decode worker, whose rate sizes the bound.
+    #[test]
+    fn the_decode_bound_follows_the_worker_that_prefills_the_prompt() {
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill:30000")
+                .worker_type(WorkerType::Prefill)
+                .connection_mode(ConnectionMode::Grpc)
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:30000")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .build(),
+        );
+        let selection = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill,
+            decode,
+            runtime_type: RuntimeType::Vllm,
+        };
+        let prefilling = |handed_off, relay_kv_params| {
+            worker_prefilling_before_decode(&selection, handed_off, relay_kv_params)
+                .map(|worker| worker.url().to_string())
+        };
+        assert_eq!(
+            prefilling(true, true).as_deref(),
+            Some("grpc://prefill:30000")
+        );
+        assert_eq!(
+            prefilling(true, false).as_deref(),
+            Some("grpc://decode:30000")
+        );
+        assert_eq!(
+            prefilling(false, true).as_deref(),
+            Some("grpc://decode:30000")
+        );
+        assert_eq!(
+            prefilling(false, false).as_deref(),
+            Some("grpc://decode:30000")
         );
     }
 

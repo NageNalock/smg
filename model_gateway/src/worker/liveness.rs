@@ -158,6 +158,22 @@ fn prefill_leg_bound_with(
     (!wedge.is_zero()).then(|| bound_over(wedge, worker.prefill_eta(prompt_tokens)))
 }
 
+/// How long a sequential disaggregated decode leg of `prompt_tokens`
+/// dispatched now may produce nothing before its request gives up on it:
+/// the prefill leg's bound for the same prompt on `prefills`, the worker
+/// whose prefill of the prompt stands before the leg's first token
+/// ([`prefill_leg_bound`]): the prefill worker when the leg was handed its
+/// KV (the handoff moves what that prefill produced), the decode worker when
+/// it recomputes the prompt itself (no handoff: a fan-out, or a prefill that
+/// returned no transfer parameters). The configured threshold for a short
+/// prompt, the time the worker's measured prefill rate says a long prompt
+/// takes, and nothing more than the cap. The leg was admitted to a room on
+/// its decode worker before its dispatch. `None` when the rule is off (a
+/// zero threshold).
+pub(crate) fn decode_leg_bound(prefills: &Arc<dyn Worker>, prompt_tokens: u64) -> Option<Duration> {
+    prefill_leg_bound(prefills, prompt_tokens)
+}
+
 /// Whether a prefill leg past its own bound waits on, and how much longer.
 /// A leg is given up on only when its worker is silent as a whole, with no
 /// first response on any prompt within the bound, as the pile rule judges
