@@ -222,7 +222,6 @@ class RouterArgs:
     mesh_advertise_host: str | None = None
     mesh_port: int = 39527
     mesh_peer_urls: list[str] = dataclasses.field(default_factory=list)
-    mesh_disable_worker_sync: bool = False
     # Append new fields here to preserve positional callers.
     model_aliases: dict[str, str] = dataclasses.field(default_factory=dict)
     worker_startup_delay: int = 0
@@ -373,6 +372,7 @@ class RouterArgs:
     history_memory_max_responses: int = 10000
     history_memory_max_items: int = 100000
     history_memory_retention_secs: int = 86400
+    mesh_disable_worker_sync: bool = False
 
     @staticmethod
     def add_cli_args(

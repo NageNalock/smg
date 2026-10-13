@@ -1831,6 +1831,7 @@ class TestRouterArgsFieldOrder:
         "history_memory_max_responses",
         "history_memory_max_items",
         "history_memory_retention_secs",
+        "mesh_disable_worker_sync",
     ]
 
     def test_complete_field_sequence_is_frozen(self):

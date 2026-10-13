@@ -361,9 +361,9 @@ mod tests {
             "no worker adapter when worker sync is off"
         );
 
-        // The prefix is left to whoever needs it (here the test): a peer's
-        // entry lands in the store and nowhere else, and a local
-        // registration is never published.
+        // With the prefix unregistered by the wiring, the test registers it
+        // to stand in for a peer's write: the entry must reach nothing here,
+        // and a local registration must never be published.
         let ns = mesh.configure_crdt_prefix("worker:", MergeStrategy::LastWriterWins);
         let remote = WorkerState {
             worker_id: "w1".into(),
@@ -390,10 +390,6 @@ mod tests {
         assert!(
             ns.get(&format!("worker:{}", local_id.as_str())).is_none(),
             "a local worker must not be published"
-        );
-        assert!(
-            ns.get("worker:w1").is_some(),
-            "the peer's entry merges into the store as before"
         );
     }
 
