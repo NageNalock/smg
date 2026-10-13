@@ -1047,19 +1047,7 @@ async fn execute_parallel_pd(
 
     match dispatch_pd_legs(prefill_dispatch, decode_dispatch).await {
         PdDispatchOutcome::Both(prefill_result, decode_result) => {
-            // Record circuit breaker outcomes (client errors don't count as
-            // failures). A prefill dispatch that succeeded is sampled once
-            // its first response is in (below), as the sequential path
-            // samples it after the drain: a leg that was accepted into
-            // silence is one failure of its worker, not a success and then a
-            // failure, which would reset the breaker's streak every time.
-            workers.record_prefill_decode_outcomes(
-                ledger,
-                prefill_result
-                    .breaker_status()
-                    .filter(|_| prefill_result.is_err()),
-                decode_result.breaker_status(),
-            );
+            record_pd_dispatch_outcomes(workers, ledger, &prefill_result, &decode_result);
 
             // Both legs are translated before either is propagated: a
             // decode-side failure is logged and counted even when the prefill
@@ -1554,6 +1542,34 @@ fn decode_silence_response(status: &tonic::Status, decode: &Arc<dyn Worker>) -> 
     );
     mark_failed_leg(&mut response, decode.as_ref());
     response
+}
+
+/// The breaker samples of a parallel dispatch whose two legs both answered
+/// (client errors don't count as failures). A prefill dispatch that
+/// succeeded is sampled once its first response is in, as the sequential
+/// path samples it after the drain: a leg that was accepted into silence is
+/// one failure of its worker, not a success and then a failure, which would
+/// reset the breaker's streak every time. A prefill dispatch that ended
+/// with the decode verdict (its partner had stalled while the decode's own
+/// call had already returned its stream) is charged where the verdict put
+/// it, the decode, and that decode's dispatch is no success beside the
+/// verdict that gave up on it.
+fn record_pd_dispatch_outcomes(
+    workers: &WorkerSelection,
+    ledger: &AttemptLedger,
+    prefill_result: &StreamResult,
+    decode_result: &StreamResult,
+) {
+    match prefill_result {
+        Err(e) if is_decode_silence(e) => record_silence_outcome(workers, ledger, e),
+        _ => workers.record_prefill_decode_outcomes(
+            ledger,
+            prefill_result
+                .breaker_status()
+                .filter(|_| prefill_result.is_err()),
+            decode_result.breaker_status(),
+        ),
+    }
 }
 
 /// The breaker sample of a prefill leg's silence verdict: on the worker the
@@ -2951,6 +2967,88 @@ mod tests {
             2.0,
             "the two verdicts that stayed the prefill's:\n{rendered}"
         );
+    }
+
+    /// When the decode's call returned its stream before the prefill's
+    /// dispatch ended with a verdict, both legs answered and the dispatch's
+    /// samples are taken together: a decode verdict is the decode worker's
+    /// breaker failure and no success for its dispatch, the prefill
+    /// untouched; a prefill verdict stays the prefill's, with the decode's
+    /// dispatch sampled as before.
+    #[test]
+    fn a_decode_verdict_on_the_prefills_dispatch_is_charged_to_the_decode_when_both_legs_answered()
+    {
+        use crate::worker::circuit_breaker::CircuitState;
+        let pair = || {
+            let leg = |url: &str, worker_type: WorkerType| -> Arc<dyn Worker> {
+                Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .worker_type(worker_type)
+                        .runtime_type(RuntimeType::TokenSpeed)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .circuit_breaker_config(CircuitBreakerConfig {
+                            failure_threshold: 1,
+                            ..Default::default()
+                        })
+                        .build(),
+                )
+            };
+            WorkerSelection::Disaggregated {
+                encode_assignments: None,
+                prefill: leg("grpc://prefill:30000", WorkerType::Prefill),
+                decode: leg("grpc://decode:30000", WorkerType::Decode),
+                runtime_type: RuntimeType::TokenSpeed,
+            }
+        };
+        let decode_stream = || Ok(ProtoStream::Fanout(FanoutStream::new(Vec::new())));
+        let bound = Duration::from_secs(3);
+
+        let workers = pair();
+        let (prefill, decode) = workers.disaggregated_pair().expect("a pair");
+        let verdict = decode_partner_silent(
+            prefill,
+            decode,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-both-decode",
+            bound,
+            bound,
+            "dispatch",
+        );
+        record_pd_dispatch_outcomes(
+            &workers,
+            &AttemptLedger::default(),
+            &Err(verdict),
+            &decode_stream(),
+        );
+        assert_eq!(
+            decode.circuit_breaker_state(),
+            CircuitState::Open,
+            "the verdict is the decode's breaker failure"
+        );
+        assert_eq!(
+            prefill.circuit_breaker_state(),
+            CircuitState::Closed,
+            "the prefill waited on its partner"
+        );
+
+        let workers = pair();
+        let (prefill, decode) = workers.disaggregated_pair().expect("a pair");
+        let verdict = prefill_leg_silent(
+            prefill,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-both-prefill",
+            256,
+            bound,
+            "dispatch",
+        );
+        record_pd_dispatch_outcomes(
+            &workers,
+            &AttemptLedger::default(),
+            &Err(verdict),
+            &decode_stream(),
+        );
+        assert_eq!(prefill.circuit_breaker_state(), CircuitState::Open);
+        assert_eq!(decode.circuit_breaker_state(), CircuitState::Closed);
     }
 
     /// Admission and the load guards read the same count, so a batched plan

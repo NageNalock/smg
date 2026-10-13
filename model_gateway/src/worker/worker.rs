@@ -683,7 +683,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// a worker that does not track it. The signal a disaggregated request
     /// reads on its decode partner when its prefill leg's silence bound
     /// passes on the parallel dispatch shape, where the prefill's first
-    /// response waits for the decode side.
+    /// response waits for the decode side. The age is that of the last
+    /// response the gateway read, not of the engine's last production: a
+    /// stream whose reader stops polling (a client that stays connected and
+    /// stops reading its bounded channel) keeps its open count and ages, so
+    /// a decode whose only open producing streams belong to such readers
+    /// can read as silent while a frozen prefill is the cause; the two
+    /// conditions together are the limit of this signal.
     fn output_silence(&self) -> Option<Duration> {
         None
     }

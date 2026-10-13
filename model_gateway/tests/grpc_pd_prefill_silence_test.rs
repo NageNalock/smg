@@ -386,6 +386,10 @@ enum ParallelShape {
     /// The first call is answered at once; every later call's stream stays
     /// empty for good (a prefill whose legs wait on a stalled decode side).
     AnswerFirstThenHold,
+    /// The first call is answered at once; every later call never returns
+    /// its stream (a servicer that sends its headers with the first message,
+    /// in front of a prefill whose legs wait on a stalled decode side).
+    AnswerFirstThenHoldHeaders,
     /// Every call streams its tokens at once and then stalls without a
     /// completion (a decode engine that stopped mid-stream).
     StreamThenStall,
@@ -429,6 +433,13 @@ impl TokenSpeedScheduler for QueuedEngine {
                 produce_at_turn(tx, self.gate.clone(), request_id);
             }
             ParallelShape::AnswerFirstThenHold => hold_open(tx),
+            ParallelShape::AnswerFirstThenHoldHeaders if call == 1 => {
+                produce_at_turn(tx, self.gate.clone(), request_id);
+            }
+            ParallelShape::AnswerFirstThenHoldHeaders => {
+                tokio::time::sleep(FOREVER).await;
+                drop(tx);
+            }
             ParallelShape::StreamThenStall => produce_then_stall(tx, request_id),
         }
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -1028,6 +1039,77 @@ fn a_parallel_prefill_waiting_on_a_decode_that_stalled_mid_stream_is_charged_to_
             workers[1].circuit_breaker_state(),
             CircuitState::Open,
             "the stalled decode worker is the one charged"
+        );
+    });
+    assert_eq!(
+        worker_errors(&rendered, "decode", "timeout"),
+        1.0,
+        "one timeout on the stalled decode worker:\n{rendered}"
+    );
+    assert_eq!(
+        worker_errors(&rendered, "prefill", "timeout"),
+        0.0,
+        "nothing on the prefill worker:\n{rendered}"
+    );
+}
+
+/// The same stall, met in the prefill's dispatch phase: the prefill's second
+/// call never returns its stream (its servicer sends the headers with the
+/// first message), while the decode's call had returned at once, so both
+/// legs' outcomes are judged together once the prefill's bound passes. The
+/// verdict is still the decode's: 504 `decode_worker_silent`, the decode's
+/// breaker (set to one) open, the prefill's closed, the timeout on the
+/// decode.
+#[test]
+fn a_parallel_prefill_held_in_its_dispatch_by_a_stalled_decode_is_charged_to_the_decode() {
+    let rendered = render_after(|| async {
+        let (prefill_port, prefill) =
+            start_queued_grpc_worker(ParallelShape::AnswerFirstThenHoldHeaders).await;
+        let (decode_port, _decode) = start_queued_grpc_worker(ParallelShape::StreamThenStall).await;
+        let (router, workers) = build_pd_router_with(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (decode_port, WorkerType::Decode),
+            ],
+            RuntimeType::TokenSpeed,
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let first = async {
+            tokio::select! {
+                answer = one_streaming_chat(router.as_ref()) => {
+                    panic!("the stalled stream must not end on its own: {answer:?}")
+                }
+                _ = done_rx => {}
+            }
+        };
+        let second = async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let answer = one_streaming_chat(router.as_ref()).await;
+            let _ = done_tx.send(());
+            answer
+        };
+        let ((), (status, body, elapsed)) = tokio::join!(first, second);
+        assert_eq!(status, http::StatusCode::GATEWAY_TIMEOUT, "{body}");
+        assert!(body.contains("decode_worker_silent"), "{body}");
+        assert!(
+            elapsed >= BOUND && elapsed < BOUND + SLACK,
+            "given up on at the bound: {elapsed:?}"
+        );
+        assert_eq!(prefill.calls(), 2, "both prefill legs were dispatched");
+        assert_eq!(
+            workers[1].circuit_breaker_state(),
+            CircuitState::Open,
+            "the stalled decode worker is the one charged, in the dispatch phase too"
+        );
+        assert_eq!(
+            workers[0].circuit_breaker_state(),
+            CircuitState::Closed,
+            "the prefill worker was waiting on its partner"
         );
     });
     assert_eq!(
