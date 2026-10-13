@@ -14,7 +14,7 @@ use dashmap::{mapref::entry::Entry, DashMap};
 use metrics::{counter, histogram};
 use once_cell::sync::Lazy;
 
-const BOUNDED_LABEL_SENTINEL: &str = "other";
+const BOUNDED_LABEL_SENTINEL: &str = metrics_labels::MODEL_OTHER;
 
 /// Max distinct client-supplied model labels retained before collapsing to the
 /// sentinel. A gateway fronts far fewer real models than this; the cap only bites
@@ -106,6 +106,12 @@ pub const fn bool_to_static_str(b: bool) -> &'static str {
 }
 
 pub mod metrics_labels {
+    /// The `model` label of a request that names no served model: an unknown
+    /// name refused with 404, or a value past the model-label cap. One fixed
+    /// value, as the `path` label is `other` for an unmatched route, so a
+    /// client cannot mint label values.
+    pub const MODEL_OTHER: &str = "other";
+
     // Router types
     pub const ROUTER_OPENAI: &str = "openai";
     pub const ROUTER_HTTP: &str = "http";
@@ -224,6 +230,11 @@ pub mod metrics_labels {
     /// turned the request away for now. Named as the client reads it in the
     /// error body's `type`.
     pub const ERROR_RATE_LIMIT: &str = "rate_limit_error";
+    /// A refusal the gateway answered on its own, before any worker took the
+    /// request: every worker of the model unavailable (unhealthy or behind an
+    /// open circuit breaker), the overload shed, a wait past the selection
+    /// queue's bound. No backend answered, so it is not a backend's error.
+    pub const ERROR_UNAVAILABLE: &str = "unavailable";
     pub const ERROR_INTERNAL: &str = "internal_error";
     /// The engine itself reported that the request failed (its finish
     /// reason was `error`), as opposed to a failed call to the worker.

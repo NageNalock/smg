@@ -5,10 +5,10 @@ use smg_mcp::McpConfig;
 
 use super::{
     CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind, MetricsConfig,
-    OracleConfig, PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig,
-    RouterConfig, RoutingKeyOverrideConfig, RoutingMode, TenantApiKeyEntry, TokenizerCacheConfig,
-    TraceConfig,
+    HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind, MemoryConfig,
+    MetricsConfig, OracleConfig, PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig,
+    RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, TenantApiKeyEntry,
+    TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::{ConnectionMode, RuntimeType};
 
@@ -247,6 +247,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn sse_keepalive_secs(mut self, secs: u64) -> Self {
+        self.config.sse_keepalive_secs = secs;
+        self
+    }
+
     pub fn worker_startup_timeout_secs(mut self, timeout: u64) -> Self {
         self.config.worker_startup_timeout_secs = timeout;
         self
@@ -397,6 +402,21 @@ impl RouterConfigBuilder {
     /// Serve cached pixels over RDMA (legacy switch for the RDMA lane).
     pub fn mm_pixel_rdma(mut self, enabled: bool) -> Self {
         self.config.mm_pixel_rdma = enabled;
+        self
+    }
+
+    /// Hosts the router's own media pipeline may fetch client-supplied media
+    /// URLs from, by name (every redirect hop included); `None` is any host
+    /// the address policy passes.
+    pub fn mm_allowed_media_domains(mut self, domains: Option<Vec<String>>) -> Self {
+        self.config.mm_allowed_media_domains = domains;
+        self
+    }
+
+    /// Allow client-supplied media URLs on loopback, link-local or private
+    /// addresses (a deployment whose media origin is internal).
+    pub fn mm_allow_private_media_hosts(mut self, allowed: bool) -> Self {
+        self.config.mm_allow_private_media_hosts = allowed;
         self
     }
 
@@ -940,6 +960,12 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Bounds of the memory history backend.
+    pub fn memory_config(mut self, memory: MemoryConfig) -> Self {
+        self.config.memory = Some(memory);
+        self
+    }
+
     pub fn maybe_reasoning_parser(mut self, parser: Option<impl Into<String>>) -> Self {
         self.config.reasoning_parser = parser.map(|p| p.into());
         self
@@ -1077,6 +1103,7 @@ impl RouterConfigBuilder {
                 }
 
                 self.config.client_identity = Some(combined);
+                self.config.client_key_path = Some(key_path.clone());
             }
             (None, None) => {
                 // No client cert configured, that's fine
@@ -1113,6 +1140,7 @@ impl RouterConfigBuilder {
                 })?;
                 self.config.server_cert = Some(cert);
                 self.config.server_key = Some(key);
+                self.config.server_key_path = Some(key_path.clone());
             }
             (None, None) => {}
             _ => {

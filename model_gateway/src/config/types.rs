@@ -9,7 +9,7 @@ pub use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use serde::{de, Deserialize, Deserializer, Serialize};
 // Re-export storage config types from data_connector
 pub use smg_data_connector::{
-    HistoryBackend, OracleConfig, PostgresConfig, RedisConfig, SchemaConfig,
+    HistoryBackend, MemoryConfig, OracleConfig, PostgresConfig, RedisConfig, SchemaConfig,
 };
 
 use super::{validation::ConfigValidator, ConfigResult};
@@ -91,10 +91,22 @@ pub struct RouterConfig {
     /// this many seconds; an open streaming response counts as in flight.
     /// The bound starts with the connection's first request: a connection
     /// that never sends one is bounded by `header_read_timeout_secs` alone.
-    /// `0` keeps idle connections until the client closes them.
+    /// Keep it above the idle timeout of any proxy or load balancer in front
+    /// of the gateway, so that side closes an idle connection first; otherwise
+    /// a request can be sent on a connection the gateway is closing and fail
+    /// with a reset. A connection the proxy opened ahead of time and never
+    /// used is bounded by `header_read_timeout_secs` instead: keep the proxy's
+    /// idle timeout under that too, or do not pre-open. `0` keeps idle
+    /// connections until the client closes them.
     #[serde(default = "default_idle_connection_timeout_secs")]
     pub idle_connection_timeout_secs: u64,
     pub request_timeout_secs: u64,
+    /// Seconds of upstream silence after which an open SSE stream carries a
+    /// keep-alive frame (an SSE comment; the `ping` event on the Messages
+    /// API), so an idle-timeout proxy does not cut a stream that is waiting
+    /// on a long prefill. Nothing is sent while frames flow. `0` sends none.
+    #[serde(default = "default_sse_keepalive_secs")]
+    pub sse_keepalive_secs: u64,
     /// Idle timeout for pooled upstream connections. Must stay below the
     /// backend HTTP server's keep-alive timeout (the engines default to
     /// 5s), or the pool hands out connections the server has already closed
@@ -124,7 +136,11 @@ pub struct RouterConfig {
     pub worker_stall_secs: u64,
     /// Seconds without a token or a completion from a worker that still
     /// answers polls, with requests in flight and a growing queue, after which
-    /// new requests stop being routed to it until it makes progress.
+    /// new requests stop being routed to it until it makes progress. The same
+    /// bound caps how long a disaggregated prefill leg may produce nothing,
+    /// with its worker answering no other leg, before its request fails over
+    /// to another prefill worker; on the parallel dispatch shape it must
+    /// cover the decode-side wait a leg's first response may see.
     #[serde(default = "default_worker_wedge_secs")]
     pub worker_wedge_secs: u64,
     /// Seconds without any contact from a worker whose KV-event stream pushes
@@ -138,6 +154,8 @@ pub struct RouterConfig {
     /// `worker_warmup_blocks` blocks, one cache miss in `1 / share` goes to it.
     #[serde(default = "default_worker_warmup_secs")]
     pub worker_warmup_secs: u64,
+    /// The share of cache misses offered to warming workers: a finite value
+    /// from 0.0 to 1.0.
     #[serde(default = "default_worker_warmup_share")]
     pub worker_warmup_share: f32,
     #[serde(default = "default_worker_warmup_blocks")]
@@ -147,7 +165,7 @@ pub struct RouterConfig {
     /// the warm-up slice until it has grown by `worker_warmup_blocks`,
     /// whatever emptied it (a resync after a publisher restart, an
     /// out-of-range or data-loss resubscription, an engine that came back
-    /// empty). 0 keeps the age rule alone.
+    /// empty). A finite value from 0.0 to 1.0; 0 keeps the age rule alone.
     #[serde(default = "default_worker_warmup_thin_ratio")]
     pub worker_warmup_thin_ratio: f32,
     /// One cache hit in this many is diverted to a thin worker although
@@ -241,7 +259,8 @@ pub struct RouterConfig {
     /// larger than the whole budget gets 413 straight away. A request waiting
     /// for room still holds its media, and the queue is capped at one budget
     /// as well, so size memory for about twice this value. Unset leaves it
-    /// unbounded; zero is refused rather than read as unset.
+    /// unbounded; counted in whole KiB, so a value under 1024 (one 1 KiB unit,
+    /// zero included) is refused rather than read as unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multimodal_max_inflight_bytes: Option<usize>,
     /// Per-request image-count limit applied to every model, replacing each
@@ -261,6 +280,17 @@ pub struct RouterConfig {
     /// = rdma` is the first-class one); when unset, falls back to `SMG_MM_PIXEL_RDMA`.
     #[serde(default)]
     pub mm_pixel_rdma: bool,
+    /// Hosts the router's own media pipeline may fetch client-supplied media
+    /// URLs from, by name, every redirect hop included; unset (or empty)
+    /// allows any host the address policy passes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_allowed_media_domains: Option<Vec<String>>,
+    /// Allow client-supplied media URLs that name or resolve to a loopback,
+    /// link-local or private address (a deployment whose media origin is
+    /// internal); off, such URLs are refused before anything is connected.
+    /// When unset, falls back to `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS`.
+    #[serde(default)]
+    pub mm_allow_private_media_hosts: bool,
     /// Listener IP for the RDMA metadata exchange; when unset, falls back to
     /// `SMG_RDMA_LISTEN_IP`, and without either the lane stays on the inline path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -278,13 +308,20 @@ pub struct RouterConfig {
     pub dp_minimum_tokens_scheduler: bool,
     pub api_key: Option<String>,
     /// Per-tenant API keys for serving-path auth, layered on top of
-    /// `api_key` rather than replacing it.
+    /// `api_key` rather than replacing it. Stored responses and conversations
+    /// are scoped to the tenant that created them (see
+    /// [`TenantResolutionConfig`]).
     #[serde(default)]
     pub tenant_api_keys: Vec<TenantApiKeyEntry>,
     #[serde(default, deserialize_with = "deserialize_discovery")]
     pub discovery: Option<DiscoveryConfig>,
     pub metrics: Option<MetricsConfig>,
     pub trace_config: Option<TraceConfig>,
+    /// Directory for the gateway's log files, created at logging start-up
+    /// when missing; an existing path must be a directory the gateway can
+    /// write, a missing one must sit under such a directory (checked at
+    /// configuration validation, which creates nothing). `None` logs to the
+    /// console only.
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
     /// Directory for the heap profiles `POST /heap_profile` writes, on a
@@ -384,10 +421,19 @@ pub struct RouterConfig {
     /// RL control plane (`/v1/rl/*`); inert unless `rl.enabled`.
     #[serde(default)]
     pub rl: smg_rl::RlConfig,
-    /// Can be a HuggingFace model ID or local path
+    /// Can be a HuggingFace model ID or local path. A local path (absolute,
+    /// explicitly relative, or present on disk) that exists must hold a
+    /// tokenizer layout at configuration validation; one that does not exist
+    /// is left to the worker fallback where a gRPC worker can still register
+    /// (gRPC worker URLs, IGW mode, worker discovery) and refused otherwise;
+    /// a model ID is fetched lazily. Not read as a tokenizer
+    /// source when `tokenizer_path` is set; not checked with
+    /// `disable_tokenizer_autoload`.
     pub model_path: Option<String>,
-    /// Overrides model_path tokenizer if provided
+    /// Overrides model_path tokenizer if provided; the same rule applies.
     pub tokenizer_path: Option<String>,
+    /// Path of the chat template file: must exist, be readable and not be
+    /// empty at configuration validation.
     pub chat_template: Option<String>,
     /// Alias → canonical model ID map. At worker creation, every alias whose
     /// canonical ID equals the worker's model ID is added to that model's
@@ -411,6 +457,12 @@ pub struct RouterConfig {
     /// Required when history_backend = "redis"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redis: Option<RedisConfig>,
+    /// Bounds of the memory history backend (`history_backend = "memory"`):
+    /// the most stored responses and conversation items it keeps and how long
+    /// it keeps a record; unset = the defaults (10,000 responses, 100,000
+    /// items, one day).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryConfig>,
     /// For reasoning models (e.g., deepseek-r1, qwen3)
     pub reasoning_parser: Option<String>,
     /// For tool-call interactions
@@ -423,6 +475,14 @@ pub struct RouterConfig {
     /// Server TLS private key (PEM)
     #[serde(skip)]
     pub server_key: Option<Vec<u8>>,
+    /// Path the server TLS private key was read from: the start-up check of
+    /// who else can read that file names it (the key itself is `server_key`)
+    #[serde(skip)]
+    pub server_key_path: Option<String>,
+    /// Path the mTLS client private key was read from, for the same check
+    /// (the key itself is in `client_identity`)
+    #[serde(skip)]
+    pub client_key_path: Option<String>,
     /// Combined certificate + key in PEM format, loaded from client_cert_path and client_key_path during config creation
     #[serde(skip)]
     pub client_identity: Option<Vec<u8>>,
@@ -449,6 +509,13 @@ pub struct RouterConfig {
     pub storage_hook_wasm_path: Option<String>,
 }
 
+/// How a request's tenant is resolved on the serving path. The tenant scopes
+/// the stored state: a response or conversation created under a tenant (a
+/// trusted tenant header, a tenant API key) is read, continued, written into
+/// and deleted by that tenant only; another tenant's id answers 404. A record
+/// stored without a tenant identity (no tenant resolution configured, a caller
+/// known by its address only, records from before tenants were stored) stays
+/// readable by every caller.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct TenantResolutionConfig {
@@ -974,11 +1041,16 @@ pub enum PolicyConfig {
         cache_threshold: f32,
         /// Spill gate, absolute part: the selected worker spills to
         /// least-loaded when its load exceeds the healthy-fleet mean by this
-        /// many requests AND by `balance_rel_threshold`.
+        /// many requests AND by `balance_rel_threshold`; capped at the
+        /// in-flight count's natural swing at the pool's current mean (two
+        /// standard deviations, never under four requests unless this value
+        /// is lower), so a small pool
+        /// can spill at all.
         #[serde(alias = "spill_abs_threshold")]
         balance_abs_threshold: usize,
-        /// Spill gate, relative part (multiple of the healthy-fleet mean);
-        /// fires only together with `balance_abs_threshold`.
+        /// Spill gate, relative part (multiple of the healthy-fleet mean;
+        /// finite, at least 1.0); fires only together with
+        /// `balance_abs_threshold`.
         #[serde(alias = "spill_rel_threshold")]
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
@@ -1129,7 +1201,8 @@ pub enum PolicyConfig {
         #[serde(default = "default_prefix_token_count")]
         prefix_token_count: usize,
         /// Relative load threshold - a worker is overloaded when its load
-        /// exceeds both avg * factor and the absolute margin (default: 1.25)
+        /// exceeds both avg * factor and the absolute margin (finite, at
+        /// least 1.0; default: 1.25)
         #[serde(default = "default_load_factor")]
         load_factor: f64,
         /// Absolute load difference over average a worker must also exceed
@@ -1186,6 +1259,10 @@ fn default_header_read_timeout_secs() -> u64 {
 
 fn default_idle_connection_timeout_secs() -> u64 {
     90
+}
+
+fn default_sse_keepalive_secs() -> u64 {
+    15
 }
 
 fn default_max_buffered_request_bytes() -> u64 {
@@ -1390,7 +1467,8 @@ impl Default for KubernetesDiscoveryConfig {
     }
 }
 
-/// How often the file-discovery manifest is reread when no interval is given.
+/// How often the file-discovery manifest is reread, changed or not, when no
+/// interval is given.
 pub const DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS: u64 = 30;
 
 fn default_file_discovery_check_interval_secs() -> u64 {
@@ -1399,8 +1477,9 @@ fn default_file_discovery_check_interval_secs() -> u64 {
 
 /// File worker discovery: the workers listed in a JSON manifest on disk.
 ///
-/// The manifest is reread in full every `check_interval_secs`, and may be
-/// absent at startup: discovery keeps retrying until a writer creates it.
+/// The manifest is reread in full whenever it changes, and every
+/// `check_interval_secs` in case a change went unreported. It may be absent at
+/// startup: discovery reads it once a writer creates it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileDiscoveryConfig {
     pub path: PathBuf,
@@ -1410,12 +1489,19 @@ pub struct FileDiscoveryConfig {
 
 pub use smg_external_router::RetryConfig;
 
-/// Health check configuration for worker monitoring
+/// Health check configuration for worker monitoring. The four counts and
+/// periods are at least 1 (checked at configuration validation): none of
+/// them has a meaning at 0, and a zero interval would make the checker a
+/// busy loop. `disable_health_check` turns probing off.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthCheckConfig {
+    /// Consecutive failed probes before a worker leaves rotation; at least 1.
     pub failure_threshold: u32,
+    /// Consecutive passed probes before a worker returns; at least 1.
     pub success_threshold: u32,
+    /// Seconds a single probe may take; at least 1.
     pub timeout_secs: u64,
+    /// Seconds between the probes of a worker; at least 1.
     pub check_interval_secs: u64,
     pub endpoint: String,
     pub disable_health_check: bool,
@@ -1569,6 +1655,7 @@ impl Default for RouterConfig {
             header_read_timeout_secs: default_header_read_timeout_secs(),
             idle_connection_timeout_secs: default_idle_connection_timeout_secs(),
             request_timeout_secs: 1800, // 30 minutes
+            sse_keepalive_secs: default_sse_keepalive_secs(),
             upstream_pool_idle_timeout_secs: default_upstream_pool_idle_timeout_secs(),
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
             worker_startup_delay_secs: 0,
@@ -1601,6 +1688,8 @@ impl Default for RouterConfig {
             mm_processing: None,
             mm_pixel_cache_mb: None,
             mm_pixel_rdma: false,
+            mm_allowed_media_domains: None,
+            mm_allow_private_media_hosts: false,
             rdma_listen_ip: None,
             rdma_slot_ttl_s: None,
             log_mm_timing: false,
@@ -1655,6 +1744,7 @@ impl Default for RouterConfig {
             oracle: None,
             postgres: None,
             redis: None,
+            memory: None,
             reasoning_parser: None,
             tool_call_parser: None,
             tokenizer_cache: TokenizerCacheConfig::default(),
@@ -1666,6 +1756,8 @@ impl Default for RouterConfig {
             storage_hook_wasm_path: None,
             server_cert: None,
             server_key: None,
+            server_key_path: None,
+            client_key_path: None,
         }
     }
 }
@@ -1903,6 +1995,7 @@ mod tests {
         for key in [
             "mm_processing",
             "mm_pixel_cache_mb",
+            "mm_allowed_media_domains",
             "rdma_listen_ip",
             "rdma_slot_ttl_s",
         ] {
@@ -1913,11 +2006,14 @@ mod tests {
         let mut without: serde_json::Value = serde_json::from_str(&json).unwrap();
         let object = without.as_object_mut().unwrap();
         object.remove("mm_pixel_rdma").unwrap();
+        object.remove("mm_allow_private_media_hosts").unwrap();
         object.remove("log_mm_timing").unwrap();
         let without: RouterConfig = serde_json::from_value(without).unwrap();
         assert_eq!(without.mm_processing, None);
         assert_eq!(without.mm_pixel_cache_mb, None);
         assert!(!without.mm_pixel_rdma);
+        assert_eq!(without.mm_allowed_media_domains, None);
+        assert!(!without.mm_allow_private_media_hosts);
         assert_eq!(without.rdma_listen_ip, None);
         assert_eq!(without.rdma_slot_ttl_s, None);
         assert!(!without.log_mm_timing);
@@ -1928,6 +2024,8 @@ mod tests {
             .mm_processing(Some(MmProcessingMode::Worker))
             .mm_pixel_cache_mb(Some(512))
             .mm_pixel_rdma(true)
+            .mm_allowed_media_domains(Some(vec!["media.example".to_string()]))
+            .mm_allow_private_media_hosts(true)
             .rdma_listen_ip(Some("10.0.0.7"))
             .rdma_slot_ttl_s(Some(600))
             .log_mm_timing(true)
@@ -1938,6 +2036,11 @@ mod tests {
         assert_eq!(with.mm_processing, Some(MmProcessingMode::Worker));
         assert_eq!(with.mm_pixel_cache_mb, Some(512));
         assert!(with.mm_pixel_rdma);
+        assert_eq!(
+            with.mm_allowed_media_domains.as_deref(),
+            Some(&["media.example".to_string()][..])
+        );
+        assert!(with.mm_allow_private_media_hosts);
         assert_eq!(with.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
         assert_eq!(with.rdma_slot_ttl_s, Some(600));
         assert!(with.log_mm_timing);
@@ -2022,6 +2125,27 @@ mod tests {
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.header_read_timeout_secs, 0);
         assert_eq!(with.idle_connection_timeout_secs, 0);
+    }
+
+    #[test]
+    fn test_sse_keepalive_serde_default_and_roundtrip() {
+        // Config files predating the field deserialize to the 15 s default.
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("sse_keepalive_secs")
+            .unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(without.sse_keepalive_secs, 15);
+
+        // The disabling zero round-trips instead of reverting to the default.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .sse_keepalive_secs(0)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.sse_keepalive_secs, 0);
     }
 
     #[test]

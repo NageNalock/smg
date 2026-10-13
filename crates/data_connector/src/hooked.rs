@@ -27,7 +27,8 @@ use crate::{
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Run the before-hook, returning the extra columns on success or mapping
-/// `Reject` / errors to the appropriate storage error via `map_err`.
+/// `Reject` to the store's `Rejected` error via `map_err` (a refusal on purpose,
+/// never the store being unavailable); a hook that fails is logged and skipped.
 async fn run_before<E>(
     hook: &dyn StorageHook,
     op: StorageOperation,
@@ -76,6 +77,10 @@ impl HookedConversationStorage {
 
 #[async_trait]
 impl ConversationStorage for HookedConversationStorage {
+    fn stored_record_count(&self) -> Option<usize> {
+        self.inner.stored_record_count()
+    }
+
     async fn create_conversation(
         &self,
         input: NewConversation,
@@ -85,7 +90,7 @@ impl ConversationStorage for HookedConversationStorage {
             &*self.hook,
             StorageOperation::CreateConversation,
             &payload,
-            ConversationStorageError::StorageError,
+            ConversationStorageError::Rejected,
         )
         .await?;
 
@@ -114,7 +119,7 @@ impl ConversationStorage for HookedConversationStorage {
             &*self.hook,
             StorageOperation::GetConversation,
             &payload,
-            ConversationStorageError::StorageError,
+            ConversationStorageError::Rejected,
         )
         .await?;
 
@@ -143,7 +148,7 @@ impl ConversationStorage for HookedConversationStorage {
             &*self.hook,
             StorageOperation::UpdateConversation,
             &payload,
-            ConversationStorageError::StorageError,
+            ConversationStorageError::Rejected,
         )
         .await?;
 
@@ -169,7 +174,7 @@ impl ConversationStorage for HookedConversationStorage {
             &*self.hook,
             StorageOperation::DeleteConversation,
             &payload,
-            ConversationStorageError::StorageError,
+            ConversationStorageError::Rejected,
         )
         .await?;
 
@@ -206,6 +211,10 @@ impl HookedConversationItemStorage {
 
 #[async_trait]
 impl ConversationItemStorage for HookedConversationItemStorage {
+    fn stored_record_count(&self) -> Option<usize> {
+        self.inner.stored_record_count()
+    }
+
     async fn create_item(
         &self,
         item: NewConversationItem,
@@ -215,7 +224,7 @@ impl ConversationItemStorage for HookedConversationItemStorage {
             &*self.hook,
             StorageOperation::CreateItem,
             &payload,
-            ConversationItemStorageError::StorageError,
+            ConversationItemStorageError::Rejected,
         )
         .await?;
 
@@ -245,7 +254,7 @@ impl ConversationItemStorage for HookedConversationItemStorage {
             &*self.hook,
             StorageOperation::LinkItem,
             &payload,
-            ConversationItemStorageError::StorageError,
+            ConversationItemStorageError::Rejected,
         )
         .await?;
 
@@ -278,7 +287,7 @@ impl ConversationItemStorage for HookedConversationItemStorage {
             &*self.hook,
             StorageOperation::LinkItems,
             &payload,
-            ConversationItemStorageError::StorageError,
+            ConversationItemStorageError::Rejected,
         )
         .await?;
 
@@ -308,7 +317,7 @@ impl ConversationItemStorage for HookedConversationItemStorage {
             &*self.hook,
             StorageOperation::ListItems,
             &payload,
-            ConversationItemStorageError::StorageError,
+            ConversationItemStorageError::Rejected,
         )
         .await?;
 
@@ -336,7 +345,7 @@ impl ConversationItemStorage for HookedConversationItemStorage {
             &*self.hook,
             StorageOperation::GetItem,
             &payload,
-            ConversationItemStorageError::StorageError,
+            ConversationItemStorageError::Rejected,
         )
         .await?;
 
@@ -365,7 +374,7 @@ impl ConversationItemStorage for HookedConversationItemStorage {
             &*self.hook,
             StorageOperation::IsItemLinked,
             &payload,
-            ConversationItemStorageError::StorageError,
+            ConversationItemStorageError::Rejected,
         )
         .await?;
 
@@ -394,7 +403,7 @@ impl ConversationItemStorage for HookedConversationItemStorage {
             &*self.hook,
             StorageOperation::DeleteItem,
             &payload,
-            ConversationItemStorageError::StorageError,
+            ConversationItemStorageError::Rejected,
         )
         .await?;
 
@@ -430,13 +439,17 @@ impl HookedResponseStorage {
 
 #[async_trait]
 impl ResponseStorage for HookedResponseStorage {
+    fn stored_record_count(&self) -> Option<usize> {
+        self.inner.stored_record_count()
+    }
+
     async fn store_response(&self, response: StoredResponse) -> ResponseResult<ResponseId> {
         let payload = serde_json::to_value(&response).unwrap_or_default();
         let extra = run_before(
             &*self.hook,
             StorageOperation::StoreResponse,
             &payload,
-            ResponseStorageError::StorageError,
+            ResponseStorageError::Rejected,
         )
         .await?;
 
@@ -464,7 +477,7 @@ impl ResponseStorage for HookedResponseStorage {
             &*self.hook,
             StorageOperation::GetResponse,
             &payload,
-            ResponseStorageError::StorageError,
+            ResponseStorageError::Rejected,
         )
         .await?;
 
@@ -489,7 +502,7 @@ impl ResponseStorage for HookedResponseStorage {
             &*self.hook,
             StorageOperation::DeleteResponse,
             &payload,
-            ResponseStorageError::StorageError,
+            ResponseStorageError::Rejected,
         )
         .await?;
 
@@ -517,7 +530,7 @@ impl ResponseStorage for HookedResponseStorage {
             &*self.hook,
             StorageOperation::GetResponseChain,
             &payload,
-            ResponseStorageError::StorageError,
+            ResponseStorageError::Rejected,
         )
         .await?;
 
@@ -558,7 +571,7 @@ impl ResponseStorage for HookedResponseStorage {
             &*self.hook,
             StorageOperation::GetResponse,
             &payload,
-            ResponseStorageError::StorageError,
+            ResponseStorageError::Rejected,
         )
         .await
         else {
@@ -582,20 +595,22 @@ impl ResponseStorage for HookedResponseStorage {
     async fn list_identifier_responses(
         &self,
         identifier: &str,
+        tenant: Option<&str>,
         limit: Option<usize>,
     ) -> ResponseResult<Vec<StoredResponse>> {
-        let payload = serde_json::json!({ "identifier": identifier, "limit": limit });
+        let payload =
+            serde_json::json!({ "identifier": identifier, "tenant": tenant, "limit": limit });
         let extra = run_before(
             &*self.hook,
             StorageOperation::ListIdentifierResponses,
             &payload,
-            ResponseStorageError::StorageError,
+            ResponseStorageError::Rejected,
         )
         .await?;
 
         let result = self
             .inner
-            .list_identifier_responses(identifier, limit)
+            .list_identifier_responses(identifier, tenant, limit)
             .await?;
 
         let result_json = serde_json::to_value(&result).unwrap_or_default();
@@ -611,17 +626,39 @@ impl ResponseStorage for HookedResponseStorage {
         Ok(result)
     }
 
-    async fn delete_identifier_responses(&self, identifier: &str) -> ResponseResult<usize> {
-        let payload = serde_json::json!({ "identifier": identifier });
+    async fn expire_response(
+        &self,
+        response_id: &ResponseId,
+        after: std::time::Duration,
+    ) -> ResponseResult<()> {
+        self.inner.expire_response(response_id, after).await
+    }
+
+    /// Delegated without the hooks: the sweep is the store's own housekeeping
+    /// over records whose clients asked for nothing to be kept, and it names no
+    /// record before the store finds them, so no hook runs for its deletions.
+    async fn delete_unstored_older_than(&self, cutoff: DateTime<Utc>) -> ResponseResult<usize> {
+        self.inner.delete_unstored_older_than(cutoff).await
+    }
+
+    async fn delete_identifier_responses(
+        &self,
+        identifier: &str,
+        tenant: Option<&str>,
+    ) -> ResponseResult<usize> {
+        let payload = serde_json::json!({ "identifier": identifier, "tenant": tenant });
         let extra = run_before(
             &*self.hook,
             StorageOperation::DeleteIdentifierResponses,
             &payload,
-            ResponseStorageError::StorageError,
+            ResponseStorageError::Rejected,
         )
         .await?;
 
-        let result = self.inner.delete_identifier_responses(identifier).await?;
+        let result = self
+            .inner
+            .delete_identifier_responses(identifier, tenant)
+            .await?;
 
         let result_json = serde_json::to_value(result).unwrap_or_default();
         run_after(
@@ -650,6 +687,7 @@ mod tests {
     use super::*;
     use crate::{
         context::{with_request_context, RequestContext},
+        core::StorageFailure,
         hooks::HookError,
         memory::{MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage},
     };
@@ -744,6 +782,13 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("not allowed"));
+        // A refusal on purpose: the store is fine, so it is not the 503 of a
+        // store that is not available.
+        assert!(
+            matches!(err, ConversationStorageError::Rejected(_)),
+            "{err:?}"
+        );
+        assert!(!err.is_unavailable(), "{err}");
         assert_eq!(hook.before_calls(), 1);
         assert_eq!(hook.after_calls(), 0); // after not called on rejection
     }
@@ -904,6 +949,7 @@ mod tests {
                 role: Some("user".to_string()),
                 content: json!([]),
                 status: Some("completed".to_string()),
+                tenant: None,
             })
             .await
             .unwrap();
@@ -1138,18 +1184,22 @@ mod tests {
             async fn list_identifier_responses(
                 &self,
                 identifier: &str,
+                tenant: Option<&str>,
                 limit: Option<usize>,
             ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
                 self.inner
-                    .list_identifier_responses(identifier, limit)
+                    .list_identifier_responses(identifier, tenant, limit)
                     .await
             }
 
             async fn delete_identifier_responses(
                 &self,
                 identifier: &str,
+                tenant: Option<&str>,
             ) -> Result<usize, ResponseStorageError> {
-                self.inner.delete_identifier_responses(identifier).await
+                self.inner
+                    .delete_identifier_responses(identifier, tenant)
+                    .await
             }
         }
 
@@ -1385,7 +1435,7 @@ mod tests {
         assert_eq!(hook.after_calls(), 2);
 
         let listed = hooked
-            .list_identifier_responses("user-1", None)
+            .list_identifier_responses("user-1", None, None)
             .await
             .unwrap();
         assert_eq!(listed.len(), 2, "should list both responses for user-1");
@@ -1414,14 +1464,17 @@ mod tests {
         assert_eq!(hook.after_calls(), 2);
 
         // Delete all responses for user-1
-        let deleted = hooked.delete_identifier_responses("user-1").await.unwrap();
+        let deleted = hooked
+            .delete_identifier_responses("user-1", None)
+            .await
+            .unwrap();
         assert_eq!(deleted, 2, "should delete both responses");
         assert_eq!(hook.before_calls(), 3);
         assert_eq!(hook.after_calls(), 3);
 
         // Verify list is now empty
         let listed = hooked
-            .list_identifier_responses("user-1", None)
+            .list_identifier_responses("user-1", None, None)
             .await
             .unwrap();
         assert!(listed.is_empty(), "no responses should remain after delete");
@@ -1493,6 +1546,7 @@ mod tests {
                 role: Some("user".to_string()),
                 content: json!("hello"),
                 status: None,
+                tenant: None,
             })
             .await
             .unwrap();
@@ -1566,6 +1620,7 @@ mod tests {
                 role: Some("user".to_string()),
                 content: json!("test"),
                 status: None,
+                tenant: None,
             })
             .await
             .unwrap();

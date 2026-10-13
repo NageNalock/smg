@@ -78,6 +78,9 @@ pub struct NewConversation {
     pub id: Option<ConversationId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ConversationMetadata>,
+    /// The tenant the conversation is scoped to (see [`Conversation::tenant`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 /// Stored conversation data structure
@@ -87,6 +90,12 @@ pub struct Conversation {
     pub created_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ConversationMetadata>,
+    /// The tenant the conversation is scoped to: the identity the gateway
+    /// resolved for the request that created it, when it resolved one. A
+    /// conversation stored under a tenant is served only to that tenant; one
+    /// stored under none is served as before (see [`tenant_scope_allows`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 impl Conversation {
@@ -95,6 +104,7 @@ impl Conversation {
             id: new_conversation.id.unwrap_or_default(),
             created_at: Utc::now(),
             metadata: new_conversation.metadata,
+            tenant: new_conversation.tenant,
         }
     }
 
@@ -102,13 +112,51 @@ impl Conversation {
         id: ConversationId,
         created_at: DateTime<Utc>,
         metadata: Option<ConversationMetadata>,
+        tenant: Option<String>,
     ) -> Self {
         Self {
             id,
             created_at,
             metadata,
+            tenant,
         }
     }
+
+    /// Whether a caller the gateway resolved `tenant` for may read, write
+    /// into or delete this conversation (see [`tenant_scope_allows`]).
+    pub fn is_visible_to(&self, tenant: Option<&str>) -> bool {
+        tenant_scope_allows(self.tenant.as_deref(), tenant)
+    }
+}
+
+/// The one rule of tenant scope, for responses and conversations alike: a
+/// record stored under a tenant is served only to a caller of that tenant; a
+/// record stored under none is served to every caller, as every record was
+/// before records carried a tenant. A record has no tenant when the gateway
+/// runs without tenant identity, when it resolved none for the request that
+/// stored it (a caller known by its address only, or anonymous), or when it
+/// was stored before this field existed.
+pub fn tenant_scope_allows(record: Option<&str>, caller: Option<&str>) -> bool {
+    match record {
+        None => true,
+        Some(record) => Some(record) == caller,
+    }
+}
+
+/// The responses of a chain (oldest first, as [`ResponseStorage::get_response_chain`]
+/// answers it) that a caller of `tenant` may see: the newest records down to
+/// the first one stored under another tenant, where the history ends as it
+/// would at a missing record. Empty when the chain's head itself is not
+/// visible.
+pub fn visible_chain(
+    mut responses: Vec<StoredResponse>,
+    tenant: Option<&str>,
+) -> Vec<StoredResponse> {
+    let hidden_up_to = responses
+        .iter()
+        .rposition(|response| !response.is_visible_to(tenant))
+        .map_or(0, |index| index + 1);
+    responses.split_off(hidden_up_to)
 }
 
 /// Result alias for conversation storage operations
@@ -122,6 +170,23 @@ pub enum ConversationStorageError {
 
     #[error("Storage error: {0}")]
     StorageError(String),
+
+    /// The call exceeded the store's bound (`op_timeout_secs`): the store did
+    /// not answer in time.
+    #[error("Storage timeout: {0}")]
+    Timeout(String),
+
+    /// The store itself is not available: no connection to be had, the
+    /// connection gone, an I/O or protocol failure beneath the call, the
+    /// server shutting down or out of connections. Answered `503
+    /// storage_unavailable`, as a timed-out call is.
+    #[error("Storage unavailable: {0}")]
+    Unavailable(String),
+
+    /// A storage hook refused the operation on purpose: the endpoint's own
+    /// failure, not an outage.
+    #[error("Rejected by the storage hook: {0}")]
+    Rejected(String),
 
     #[error("Serialization error: {0}")]
     SerializationError(#[from] serde_json::Error),
@@ -145,6 +210,12 @@ pub trait ConversationStorage: Send + Sync + 'static {
     ) -> ConversationResult<Option<Conversation>>;
 
     async fn delete_conversation(&self, id: &ConversationId) -> ConversationResult<bool>;
+
+    /// How many conversations the store holds, for a store that can tell
+    /// without a query (the in-memory backend); `None` otherwise.
+    fn stored_record_count(&self) -> Option<usize> {
+        None
+    }
 }
 
 // ============================================================================
@@ -181,6 +252,21 @@ pub struct ConversationItem {
     pub content: Value,
     pub status: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// The tenant the item is scoped to: the identity the gateway resolved
+    /// for the request that created it (a conversation write, a stored
+    /// response), when it resolved one. An item is referenced by id (an
+    /// `item_reference`, an item added under its own id) only by its tenant;
+    /// one stored under none is served as before (see [`tenant_scope_allows`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+}
+
+impl ConversationItem {
+    /// Whether a caller the gateway resolved `tenant` for may reference or
+    /// adopt this item by its id (see [`tenant_scope_allows`]).
+    pub fn is_visible_to(&self, tenant: Option<&str>) -> bool {
+        tenant_scope_allows(self.tenant.as_deref(), tenant)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +278,9 @@ pub struct NewConversationItem {
     pub role: Option<String>,
     pub content: Value,
     pub status: Option<String>,
+    /// The tenant the item is scoped to (see [`ConversationItem::tenant`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -247,6 +336,23 @@ pub enum ConversationItemStorageError {
     #[error("Storage error: {0}")]
     StorageError(String),
 
+    /// The call exceeded the store's bound (`op_timeout_secs`): the store did
+    /// not answer in time.
+    #[error("Storage timeout: {0}")]
+    Timeout(String),
+
+    /// The store itself is not available: no connection to be had, the
+    /// connection gone, an I/O or protocol failure beneath the call, the
+    /// server shutting down or out of connections. Answered `503
+    /// storage_unavailable`, as a timed-out call is.
+    #[error("Storage unavailable: {0}")]
+    Unavailable(String),
+
+    /// A storage hook refused the operation on purpose: the endpoint's own
+    /// failure, not an outage.
+    #[error("Rejected by the storage hook: {0}")]
+    Rejected(String),
+
     #[error("Serialization error: {0}")]
     SerializationError(#[from] serde_json::Error),
 }
@@ -258,6 +364,11 @@ pub trait ConversationItemStorage: Send + Sync + 'static {
         item: NewConversationItem,
     ) -> ConversationItemResult<ConversationItem>;
 
+    /// Link `item_id` into the conversation at `added_at`. An item the
+    /// conversation already has is moved, neither duplicated nor refused: its
+    /// one link takes the new stamp, so the item lists once, at its new
+    /// position, on every backend (the SQL stores upsert on the
+    /// (conversation, item) key).
     async fn link_item(
         &self,
         conversation_id: &ConversationId,
@@ -265,9 +376,10 @@ pub trait ConversationItemStorage: Send + Sync + 'static {
         added_at: DateTime<Utc>,
     ) -> ConversationItemResult<()>;
 
-    /// Batch-link multiple items to a conversation in a single operation.
-    /// Default implementation loops over `link_item`; backends may override
-    /// with a more efficient batched approach.
+    /// Batch-link multiple items to a conversation in a single operation,
+    /// each link as [`Self::link_item`] (an item the conversation already
+    /// has moves). Default implementation loops over `link_item`; backends
+    /// may override with a more efficient batched approach.
     async fn link_items(
         &self,
         conversation_id: &ConversationId,
@@ -304,6 +416,12 @@ pub trait ConversationItemStorage: Send + Sync + 'static {
         conversation_id: &ConversationId,
         item_id: &ConversationItemId,
     ) -> ConversationItemResult<()>;
+
+    /// How many items the store holds, for a store that can tell without a
+    /// query (the in-memory backend); `None` otherwise.
+    fn stored_record_count(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Helper to build id prefix based on item_type
@@ -394,6 +512,14 @@ pub struct StoredResponse {
     /// Raw OpenAI response payload
     #[serde(default)]
     pub raw_response: Value,
+
+    /// The tenant the response is scoped to: the identity the gateway
+    /// resolved for the request that stored it, when it resolved one. A
+    /// response stored under a tenant is read, continued and deleted only by
+    /// that tenant; one stored under none is served as before (see
+    /// [`tenant_scope_allows`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 impl StoredResponse {
@@ -407,7 +533,14 @@ impl StoredResponse {
             model: None,
             conversation_id: None,
             raw_response: Value::Null,
+            tenant: None,
         }
+    }
+
+    /// Whether a caller the gateway resolved `tenant` for may read, continue
+    /// or delete this response (see [`tenant_scope_allows`]).
+    pub fn is_visible_to(&self, tenant: Option<&str>) -> bool {
+        tenant_scope_allows(self.tenant.as_deref(), tenant)
     }
 }
 
@@ -453,11 +586,220 @@ pub enum ResponseStorageError {
     #[error("Storage error: {0}")]
     StorageError(String),
 
+    /// The call exceeded the store's bound (`op_timeout_secs`): the store did
+    /// not answer in time.
+    #[error("Storage timeout: {0}")]
+    Timeout(String),
+
+    /// The store itself is not available: no connection to be had, the
+    /// connection gone, an I/O or protocol failure beneath the call, the
+    /// server shutting down or out of connections. Answered `503
+    /// storage_unavailable`, as a timed-out call is.
+    #[error("Storage unavailable: {0}")]
+    Unavailable(String),
+
+    /// A storage hook refused the operation on purpose: the endpoint's own
+    /// failure, not an outage.
+    #[error("Rejected by the storage hook: {0}")]
+    Rejected(String),
+
     #[error("Serialization error: {0}")]
     SerializationError(#[from] serde_json::Error),
 }
 
 pub type ResponseResult<T> = Result<T, ResponseStorageError>;
+
+/// What a caller can tell about a failed store call without reading the
+/// backend's text.
+pub trait StorageFailure {
+    /// The call exceeded the store's bound (`op_timeout_secs`): the store is
+    /// not answering for now.
+    fn timed_out(&self) -> bool;
+    /// Whether the store itself is not available: not answering within its
+    /// bound, no connection to be had, the connection gone or failing beneath
+    /// the call, the server shutting down or refusing connections. The API
+    /// reports that as a 503 the client may retry; anything the store decided
+    /// or anything about the record (a constraint it refused, a hook's
+    /// rejection, a record not found or undecodable, an invalid chain) keeps
+    /// the endpoint's own answer. The backends classify at the source (see
+    /// [`Failure`]).
+    fn is_unavailable(&self) -> bool;
+}
+
+macro_rules! storage_failure_impl {
+    ($error:ty) => {
+        impl StorageFailure for $error {
+            fn timed_out(&self) -> bool {
+                matches!(self, Self::Timeout(_))
+            }
+            fn is_unavailable(&self) -> bool {
+                matches!(self, Self::Timeout(_) | Self::Unavailable(_))
+            }
+        }
+
+        impl $error {
+            /// The error for a classified backend failure.
+            pub fn from_failure(failure: Failure) -> Self {
+                match failure {
+                    Failure::Unavailable(text) => Self::Unavailable(text),
+                    Failure::Storage(text) => Self::StorageError(text),
+                }
+            }
+
+            /// The error for a failure to take a connection from the pool.
+            pub fn pool_unavailable(error: &dyn std::error::Error) -> Self {
+                Self::from_failure(Failure::pool(error))
+            }
+
+            /// The error for a Redis failure, classified.
+            pub fn from_redis(error: redis::RedisError) -> Self {
+                Self::from_failure(Failure::redis(&error))
+            }
+
+            /// The error for a Postgres failure, classified.
+            pub fn from_pg(error: tokio_postgres::Error) -> Self {
+                Self::from_failure(Failure::postgres(&error))
+            }
+        }
+    };
+}
+storage_failure_impl!(ResponseStorageError);
+storage_failure_impl!(ConversationStorageError);
+storage_failure_impl!(ConversationItemStorageError);
+
+/// A backend failure, classified where it happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Failure {
+    /// The store is not available.
+    Unavailable(String),
+    /// The store answered with a failure of the operation.
+    Storage(String),
+}
+
+impl Failure {
+    /// The failure of taking a connection from the pool: the store is not
+    /// available, whatever the pool's reason (no connection, a timeout); the
+    /// cause chain stays in the text (`error connecting to server: Connection
+    /// refused`, not the kind alone).
+    pub fn pool(error: &dyn std::error::Error) -> Self {
+        Self::Unavailable(format!(
+            "no connection from the pool: {}",
+            crate::common::describe_error(error)
+        ))
+    }
+
+    /// A Redis error: the connection and I/O kinds (refused, dropped, timed
+    /// out, the cluster unreachable, a protocol failure the client cannot
+    /// recover from) are the store being unavailable; the rest (a wrong
+    /// type, a refused command) are the store's answer.
+    pub fn redis(error: &redis::RedisError) -> Self {
+        let text = error.to_string();
+        if error.is_connection_refusal()
+            || error.is_connection_dropped()
+            || error.is_io_error()
+            || error.is_timeout()
+            || error.is_cluster_error()
+            || error.is_unrecoverable_error()
+        {
+            Self::Unavailable(text)
+        } else {
+            Self::Storage(text)
+        }
+    }
+
+    /// A Postgres error: one without a server answer (the connection closed,
+    /// a timeout, an I/O or protocol failure) is the store being unavailable,
+    /// and so is a server answer that says the server is not serving: a
+    /// connection exception (class 08), insufficient resources such as too
+    /// many connections (class 53), an operator intervention such as a
+    /// shutdown or `cannot_connect_now` (57P..), or a write that reached a
+    /// read-only standby after a failover (`25006`). Any other server answer
+    /// (a constraint, a refused statement) is the store's own.
+    pub fn postgres(error: &tokio_postgres::Error) -> Self {
+        let text = crate::common::describe_error(error);
+        let Some(db) = error.as_db_error() else {
+            return Self::Unavailable(text);
+        };
+        let code = db.code().code();
+        if code.starts_with("08")
+            || code.starts_with("53")
+            || code.starts_with("57P")
+            || *db.code() == tokio_postgres::error::SqlState::READ_ONLY_SQL_TRANSACTION
+        {
+            Self::Unavailable(text)
+        } else {
+            Self::Storage(text)
+        }
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+
+    #[test]
+    fn a_redis_connection_or_io_failure_is_unavailable_and_an_answer_is_not() {
+        let gone = redis::RedisError::from((redis::ErrorKind::Io, "connection reset"));
+        assert!(matches!(Failure::redis(&gone), Failure::Unavailable(_)));
+        let refused = redis::RedisError::from(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "refused",
+        ));
+        assert!(matches!(Failure::redis(&refused), Failure::Unavailable(_)));
+        let wrong_type =
+            redis::RedisError::from((redis::ErrorKind::UnexpectedReturnType, "WRONGTYPE"));
+        assert!(matches!(Failure::redis(&wrong_type), Failure::Storage(_)));
+        // A protocol parse failure leaves the connection unusable: the client
+        // library counts it unrecoverable, and so does the classification.
+        let broken = redis::RedisError::from((redis::ErrorKind::Parse, "bad frame"));
+        assert!(matches!(Failure::redis(&broken), Failure::Unavailable(_)));
+    }
+
+    #[test]
+    fn a_pool_failure_keeps_its_cause_chain() {
+        #[derive(Debug)]
+        struct Outer(std::io::Error);
+        impl Display for Outer {
+            fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                f.write_str("error connecting to server")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let error = Outer(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "Connection refused (os error 111)",
+        ));
+        let Failure::Unavailable(text) = Failure::pool(&error) else {
+            panic!("a pool failure is unavailable");
+        };
+        assert!(
+            text.contains("error connecting to server: Connection refused (os error 111)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn only_a_timeout_or_an_unavailable_store_is_unavailable() {
+        assert!(ResponseStorageError::Timeout("bound".into()).is_unavailable());
+        assert!(ResponseStorageError::Timeout("bound".into()).timed_out());
+        assert!(ResponseStorageError::Unavailable("gone".into()).is_unavailable());
+        assert!(!ResponseStorageError::Unavailable("gone".into()).timed_out());
+        assert!(!ConversationStorageError::StorageError("duplicate key".into()).is_unavailable());
+        assert!(!ConversationStorageError::Rejected("tenant".into()).is_unavailable());
+        assert!(
+            !ConversationItemStorageError::from_failure(Failure::Storage("x".into()))
+                .is_unavailable()
+        );
+        assert!(
+            ConversationItemStorageError::from_failure(Failure::Unavailable("x".into()))
+                .is_unavailable()
+        );
+    }
+}
 
 /// Trait for response storage
 #[async_trait]
@@ -540,15 +882,82 @@ pub trait ResponseStorage: Send + Sync {
         Ok(None)
     }
 
-    /// List recent responses for a safety identifier
+    /// List recent responses for a safety identifier: those a caller of
+    /// `tenant` may see (see [`StoredResponse::is_visible_to`]), newest first.
     async fn list_identifier_responses(
         &self,
         identifier: &str,
+        tenant: Option<&str>,
         limit: Option<usize>,
     ) -> ResponseResult<Vec<StoredResponse>>;
 
-    /// Delete all responses for a safety identifier
-    async fn delete_identifier_responses(&self, identifier: &str) -> ResponseResult<usize>;
+    /// Delete the responses for a safety identifier that a caller of `tenant`
+    /// may see; answers how many went.
+    async fn delete_identifier_responses(
+        &self,
+        identifier: &str,
+        tenant: Option<&str>,
+    ) -> ResponseResult<usize>;
+
+    /// Ask the store to drop the response under `response_id` on its own
+    /// once `after` has passed, where the store can keep such a deadline (a
+    /// key with a time to live). The default keeps none: the gateway's own
+    /// timer deletes the record while it runs, and a store without deadlines
+    /// answers through [`Self::delete_unstored_older_than`].
+    async fn expire_response(
+        &self,
+        response_id: &ResponseId,
+        after: std::time::Duration,
+    ) -> ResponseResult<()> {
+        let _ = (response_id, after);
+        Ok(())
+    }
+
+    /// Delete the records whose object says `store: false` and that reached a
+    /// terminal status before `cutoff` (see [`unstored_terminal_before`]):
+    /// what a gateway that stopped inside such a record's polling window, or
+    /// died, left behind in a store that outlives it. The default deletes
+    /// nothing: a store without a query over the stored object answers 0.
+    async fn delete_unstored_older_than(&self, cutoff: DateTime<Utc>) -> ResponseResult<usize> {
+        let _ = cutoff;
+        Ok(0)
+    }
+
+    /// How many responses the store holds, for a store that can tell without
+    /// a query (the in-memory backend); `None` otherwise.
+    fn stored_record_count(&self) -> Option<usize> {
+        None
+    }
+}
+
+/// Whether `response` is the record of a response its client asked not to
+/// store (`store: false` in its object): a background run's record, kept for
+/// its polling window only. Such a record is no previous response and its
+/// items are no stored items, as the public API answers for an unstored id.
+pub fn is_unstored(response: &StoredResponse) -> bool {
+    response.raw_response.get("store").and_then(Value::as_bool) == Some(false)
+}
+
+/// Whether `response` is [unstored](is_unstored) and reached a terminal
+/// status (the statuses a response does not leave: completed, incomplete,
+/// failed, cancelled) before `cutoff`: at its object's `completed_at` when it
+/// carries one, at the record's creation otherwise.
+pub fn unstored_terminal_before(response: &StoredResponse, cutoff: DateTime<Utc>) -> bool {
+    let raw = &response.raw_response;
+    if !is_unstored(response) {
+        return false;
+    }
+    if !matches!(
+        raw.get("status").and_then(Value::as_str),
+        Some("completed" | "incomplete" | "failed" | "cancelled")
+    ) {
+        return false;
+    }
+    let ended = raw
+        .get("completed_at")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| response.created_at.timestamp());
+    ended < cutoff.timestamp()
 }
 
 impl Default for StoredResponse {
@@ -809,6 +1218,7 @@ mod tests {
         let conv = Conversation::new(NewConversation {
             id: None,
             metadata: None,
+            tenant: None,
         });
         assert!(
             conv.id.0.starts_with("conv_"),
@@ -823,6 +1233,7 @@ mod tests {
         let conv = Conversation::new(NewConversation {
             id: Some(custom_id.clone()),
             metadata: None,
+            tenant: None,
         });
         assert_eq!(conv.id, custom_id, "should use the provided ConversationId");
     }
@@ -834,11 +1245,85 @@ mod tests {
         let mut metadata = ConversationMetadata::new();
         metadata.insert("key".to_string(), Value::String("value".to_string()));
 
-        let conv = Conversation::with_parts(id.clone(), created_at, Some(metadata.clone()));
+        let conv = Conversation::with_parts(
+            id.clone(),
+            created_at,
+            Some(metadata.clone()),
+            Some("header:team-red".to_string()),
+        );
 
         assert_eq!(conv.id, id);
         assert_eq!(conv.created_at, created_at);
         assert_eq!(conv.metadata, Some(metadata));
+        assert_eq!(conv.tenant.as_deref(), Some("header:team-red"));
+    }
+
+    /// A chain is served down to the first record of another tenant; a head
+    /// of another tenant hides the whole chain.
+    #[test]
+    fn a_chain_is_cut_at_the_first_record_of_another_tenant() {
+        let stored = |id: &str, tenant: Option<&str>| {
+            let mut stored = StoredResponse::new(None);
+            stored.id = ResponseId::from(id);
+            stored.tenant = tenant.map(str::to_string);
+            stored
+        };
+        let ids = |chain: Vec<StoredResponse>| {
+            chain
+                .into_iter()
+                .map(|stored| stored.id.0)
+                .collect::<Vec<_>>()
+        };
+        let a = Some("header:a");
+        let chain = || {
+            vec![
+                stored("resp_1", None),
+                stored("resp_2", Some("header:b")),
+                stored("resp_3", a),
+                stored("resp_4", a),
+            ]
+        };
+        assert_eq!(ids(visible_chain(chain(), a)), ["resp_3", "resp_4"]);
+        assert!(
+            visible_chain(chain(), Some("header:b")).is_empty(),
+            "the head is a's"
+        );
+        assert!(visible_chain(chain(), None).is_empty());
+        let shared = vec![stored("resp_1", None), stored("resp_2", None)];
+        assert_eq!(
+            ids(visible_chain(shared, Some("header:b"))),
+            ["resp_1", "resp_2"],
+            "records without a tenant are served as before"
+        );
+        assert!(visible_chain(Vec::new(), a).is_empty());
+    }
+
+    /// A record stored under a tenant is served to that tenant only; a record
+    /// stored under none is served to every caller, as before.
+    #[test]
+    fn tenant_scope_serves_a_tenanted_record_to_its_tenant_only() {
+        assert!(tenant_scope_allows(None, None));
+        assert!(tenant_scope_allows(None, Some("header:b")));
+        assert!(tenant_scope_allows(Some("header:a"), Some("header:a")));
+        assert!(!tenant_scope_allows(Some("header:a"), Some("header:b")));
+        assert!(!tenant_scope_allows(Some("header:a"), None));
+
+        let mut response = StoredResponse::new(None);
+        assert!(response.is_visible_to(Some("auth:anyone")));
+        response.tenant = Some("auth:team-red".to_string());
+        assert!(response.is_visible_to(Some("auth:team-red")));
+        assert!(!response.is_visible_to(Some("auth:team-blue")));
+        assert!(!response.is_visible_to(None));
+
+        let conversation = Conversation::new(NewConversation {
+            id: None,
+            metadata: None,
+            tenant: Some("header:team-red".to_string()),
+        });
+        assert_eq!(conversation.tenant.as_deref(), Some("header:team-red"));
+        assert!(conversation.is_visible_to(Some("header:team-red")));
+        assert!(!conversation.is_visible_to(Some("header:team-blue")));
+        assert!(!conversation.is_visible_to(None));
     }
 
     // ========================================================================

@@ -1,3 +1,4 @@
+pub(crate) mod bounds;
 pub mod builder;
 pub mod types;
 pub(crate) mod validation;
@@ -5,7 +6,8 @@ pub(crate) mod validation;
 pub use builder::*;
 pub use types::*;
 pub use validation::{
-    bind_socket_addr, parse_bind_host, validate_mesh_server_name, validate_worker_url,
+    bind_socket_addr, parse_bind_host, validate_mesh_listener_port, validate_mesh_server_name,
+    validate_worker_url,
 };
 
 #[derive(Debug, thiserror::Error)]

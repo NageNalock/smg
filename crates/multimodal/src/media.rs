@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     io::Write,
     path::{Path, PathBuf},
     process::{Output, Stdio},
@@ -12,20 +11,28 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use bytes::{Bytes, BytesMut};
+use image::{codecs::jpeg::JpegDecoder, ImageDecoder as _};
 #[cfg(feature = "opencv-video")]
 use opencv::{
     core::{Mat, Vector},
     prelude::*,
     videoio,
 };
-use reqwest::Client;
+use reqwest::{header::LOCATION, redirect, Client, StatusCode};
 use tokio::{fs, io::AsyncReadExt, process::Command, task, time};
 use tracing::info;
 use url::Url;
 
-use crate::audio::decode_audio_mono_f32;
+use crate::{
+    audio::decode_audio_mono_f32,
+    fetch_policy::{MediaHostPolicy, MediaHostResolver},
+    vision::transforms::resize_catmull_rom_rgb,
+};
 
 const DEFAULT_VIDEO_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
+/// Redirects one media URL may lead through before the fetch is refused:
+/// reqwest's own default count, followed here hop by hop under the policy.
+const MAX_REDIRECTS: usize = 10;
 const DEFAULT_IMAGE_MAX_INPUT_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_VIDEO_MAX_INPUT_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_VIDEO_MAX_DECODED_BYTES: usize = 1024 * 1024 * 1024;
@@ -68,7 +75,18 @@ pub const DEFAULT_VIDEO_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct MediaConnectorConfig {
+    /// Host names media may be fetched from, every redirect hop included;
+    /// `None` is any host the address policy passes.
     pub allowed_domains: Option<Vec<String>>,
+    /// Whether media may be fetched from a host that names or resolves to a
+    /// loopback, link-local, private or otherwise non-public address. Off,
+    /// such a URL is refused before anything is connected: a gateway that
+    /// fetches on a client's behalf must not be made to reach what only it
+    /// can reach. On, for a deployment whose media origin is internal, a
+    /// host is admitted by its name alone (the allow-list still holds) and
+    /// resolved by the HTTP client as before, through an egress proxy where
+    /// there is one.
+    pub allow_private_hosts: bool,
     pub allowed_local_media_path: Option<PathBuf>,
     /// Budget for one image or audio fetch by URL, connect to last byte;
     /// zero leaves only the HTTP client's own timeout.
@@ -82,6 +100,7 @@ impl Default for MediaConnectorConfig {
     fn default() -> Self {
         Self {
             allowed_domains: None,
+            allow_private_hosts: false,
             allowed_local_media_path: None,
             fetch_timeout: DEFAULT_FETCH_TIMEOUT,
             video_fetch_timeout: DEFAULT_VIDEO_FETCH_TIMEOUT,
@@ -113,6 +132,12 @@ pub enum FrameSampling {
     Even,
     /// One frame per sampling interval from the start, plus the last frame.
     Interval,
+    /// `trunc(duration x rate)` frames, at least `min_frames`, at most
+    /// `max_frames` and never more than the clip has, each the nearest frame
+    /// of `linspace(0, n - 1, count)` (ties to even, as numpy rounds): the
+    /// rule of the Qwen3-VL family's reference video processor, whose prompt
+    /// stamps every temporal group with the times of the frames it picked.
+    EvenRounded,
     /// Every frame of a clip with at most `max_frames`; a longer clip gives
     /// `max_frames` spread evenly from the first frame to the last
     /// (`numpy.linspace(0, n - 1, max_frames)` truncated to integers), the
@@ -223,20 +248,32 @@ impl FetchSource {
 #[derive(Clone)]
 pub struct MediaConnector {
     client: Client,
-    allowed_domains: Option<HashSet<String>>,
+    policy: Arc<MediaHostPolicy>,
+    resolver: Arc<MediaHostResolver>,
     allowed_local_media_path: Option<PathBuf>,
     fetch_timeout: Duration,
     video_fetch_timeout: Duration,
 }
 
 impl MediaConnector {
-    pub fn new(client: Client, config: MediaConnectorConfig) -> Result<Self, MediaConnectorError> {
-        let allowed_domains = config.allowed_domains.map(|domains| {
-            domains
-                .into_iter()
-                .map(|d| d.to_ascii_lowercase())
-                .collect::<HashSet<_>>()
-        });
+    /// The connector over the HTTP client `client` builds, finished here: the
+    /// client follows no redirect by itself (the connector follows them hop by
+    /// hop, each under the host policy) and resolves names through the
+    /// connector's resolver, which hands it the addresses the policy checked.
+    /// Nothing else about the client changes.
+    pub fn new(
+        client: reqwest::ClientBuilder,
+        config: MediaConnectorConfig,
+    ) -> Result<Self, MediaConnectorError> {
+        let policy = Arc::new(MediaHostPolicy::new(
+            config.allowed_domains,
+            config.allow_private_hosts,
+        ));
+        let resolver = Arc::new(MediaHostResolver::default());
+        let client = client
+            .redirect(redirect::Policy::none())
+            .dns_resolver(Arc::clone(&resolver))
+            .build()?;
 
         let allowed_local_media_path = if let Some(path) = config.allowed_local_media_path {
             Some(std::fs::canonicalize(path).map_err(MediaConnectorError::Io)?)
@@ -246,7 +283,8 @@ impl MediaConnector {
 
         Ok(Self {
             client,
-            allowed_domains,
+            policy,
+            resolver,
             allowed_local_media_path,
             fetch_timeout: config.fetch_timeout,
             video_fetch_timeout: config.video_fetch_timeout,
@@ -332,7 +370,6 @@ impl MediaConnector {
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
         let parsed =
             Url::parse(url).map_err(|_| MediaConnectorError::InvalidUrl(url.to_string()))?;
-        self.ensure_domain_allowed(&parsed)?;
 
         let bytes = self
             .fetch_http_bytes(
@@ -452,7 +489,6 @@ impl MediaConnector {
     ) -> Result<Arc<VideoClip>, MediaConnectorError> {
         let parsed =
             Url::parse(url).map_err(|_| MediaConnectorError::InvalidUrl(url.to_string()))?;
-        self.ensure_domain_allowed(&parsed)?;
 
         let bytes = self
             .fetch_http_bytes(
@@ -475,7 +511,6 @@ impl MediaConnector {
     async fn fetch_http_audio(&self, url: &str) -> Result<Arc<AudioClip>, MediaConnectorError> {
         let parsed =
             Url::parse(url).map_err(|_| MediaConnectorError::InvalidUrl(url.to_string()))?;
-        self.ensure_domain_allowed(&parsed)?;
 
         let bytes = self
             .fetch_http_bytes(
@@ -498,6 +533,14 @@ impl MediaConnector {
     /// body, with the body held to `limit` bytes. Running out of the budget
     /// in either phase (before the headers, or while the body arrives) is
     /// reported as the timeout it is, with the URL and the budget.
+    ///
+    /// Every hop is admitted under the host policy before it is connected:
+    /// the URL the request named and each redirect target, by name against
+    /// the allow-list and by address against the address policy, with the
+    /// checked addresses pinned for the client's resolver while the hop
+    /// connects. A redirect the policy refuses is reported with its target;
+    /// the chain is followed at most [`MAX_REDIRECTS`] times, under the one
+    /// budget.
     async fn fetch_http_bytes(
         &self,
         url: &Url,
@@ -505,30 +548,79 @@ impl MediaConnector {
         limit: usize,
         media: &'static str,
     ) -> Result<Bytes, MediaConnectorError> {
-        let mut req = self.client.get(url.as_str());
-        if budget > Duration::ZERO {
-            req = req.timeout(budget);
-        }
+        let started = Instant::now();
         let timed_out = || MediaConnectorError::Timeout {
             url: url.to_string(),
             budget,
         };
-
-        let resp = req.send().await.map_err(|err| {
-            if err.is_timeout() {
-                timed_out()
-            } else {
-                MediaConnectorError::Http(err)
+        // What is left of the budget (`None` without one), or its end.
+        let remaining = || -> Result<Option<Duration>, MediaConnectorError> {
+            if budget.is_zero() {
+                return Ok(None);
             }
-        })?;
+            budget
+                .checked_sub(started.elapsed())
+                .filter(|remaining| !remaining.is_zero())
+                .map(Some)
+                .ok_or_else(timed_out)
+        };
+        let mut current = url.clone();
+        let mut redirects = 0;
+        loop {
+            // The admission spends the budget too: the lookup it makes for a
+            // name is part of "connect to last byte", and a lookup that
+            // stalls past the budget's end is the timeout it is.
+            let _hop = within_budget(remaining()?, self.resolver.admit(&self.policy, &current))
+                .await
+                .ok_or_else(timed_out)?
+                .map_err(|reason| {
+                    if redirects == 0 {
+                        reason
+                    } else {
+                        MediaConnectorError::DisallowedRedirect {
+                            url: url.to_string(),
+                            target: current.to_string(),
+                            reason: reason.to_string(),
+                        }
+                    }
+                })?;
+            let mut req = self.client.get(current.as_str());
+            if let Some(remaining) = remaining()? {
+                req = req.timeout(remaining);
+            }
 
-        let resp = resp.error_for_status()?;
-        collect_http_body_with_limit(resp, limit, media)
-            .await
-            .map_err(|err| match err {
-                MediaConnectorError::Http(http) if http.is_timeout() => timed_out(),
-                other => other,
-            })
+            let resp = req.send().await.map_err(|err| {
+                if err.is_timeout() {
+                    timed_out()
+                } else {
+                    MediaConnectorError::Http(err)
+                }
+            })?;
+
+            if let Some(target) = redirect_target(&resp) {
+                redirects += 1;
+                if redirects > MAX_REDIRECTS {
+                    return Err(MediaConnectorError::TooManyRedirects {
+                        url: url.to_string(),
+                        limit: MAX_REDIRECTS,
+                    });
+                }
+                current = target.map_err(|reason| MediaConnectorError::DisallowedRedirect {
+                    url: url.to_string(),
+                    target: reason.target,
+                    reason: reason.reason,
+                })?;
+                continue;
+            }
+
+            let resp = resp.error_for_status()?;
+            return collect_http_body_with_limit(resp, limit, media)
+                .await
+                .map_err(|err| match err {
+                    MediaConnectorError::Http(http) if http.is_timeout() => timed_out(),
+                    other => other,
+                });
+        }
     }
 
     async fn fetch_video_file(
@@ -573,19 +665,6 @@ impl MediaConnector {
         let bytes = read_file_with_limit(&canonical, audio_max_input_bytes(), "audio").await?;
         self.decode_audio(bytes, AudioSource::File { path: canonical })
             .await
-    }
-
-    fn ensure_domain_allowed(&self, url: &Url) -> Result<(), MediaConnectorError> {
-        if let Some(allowed) = &self.allowed_domains {
-            let host = url
-                .host_str()
-                .map(|h| h.to_ascii_lowercase())
-                .ok_or_else(|| MediaConnectorError::InvalidUrl(url.to_string()))?;
-            if !allowed.contains(&host) {
-                return Err(MediaConnectorError::DisallowedDomain(host));
-            }
-        }
-        Ok(())
     }
 
     fn decode_image(
@@ -686,6 +765,88 @@ impl MediaConnector {
         }
         .with_max_long_side_pixel(cfg.max_long_side_pixel);
         Ok(Arc::new(clip))
+    }
+}
+
+/// A redirect the client cannot follow: where to, and why.
+struct RefusedRedirect {
+    target: String,
+    reason: String,
+}
+
+/// Where a redirect response sends the fetch next, resolved against the URL
+/// that was fetched: `None` for a response that is no redirect (a status
+/// other than 301, 302, 303, 307 or 308, or one without a `Location`),
+/// which is then read as the media itself, as a client that follows no
+/// redirects reads it. A target that is not a URL, or not an `http`/`https`
+/// one, is a refused redirect.
+fn redirect_target(response: &reqwest::Response) -> Option<Result<Url, RefusedRedirect>> {
+    if !matches!(
+        response.status(),
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    ) {
+        return None;
+    }
+    let location = response.headers().get(LOCATION)?;
+    let Ok(location) = location.to_str() else {
+        return Some(Err(RefusedRedirect {
+            target: String::from_utf8_lossy(location.as_bytes()).into_owned(),
+            reason: "the redirect location is not text".to_string(),
+        }));
+    };
+    let Ok(target) = response.url().join(location) else {
+        return Some(Err(RefusedRedirect {
+            target: location.to_string(),
+            reason: "the redirect location is not a URL".to_string(),
+        }));
+    };
+    if !matches!(target.scheme(), "http" | "https") {
+        return Some(Err(RefusedRedirect {
+            reason: format!("unsupported media scheme: {}", target.scheme()),
+            target: target.to_string(),
+        }));
+    }
+    Some(Ok(target))
+}
+
+/// `future` under what is left of the fetch budget: its output, or `None`
+/// when the budget ran out first. Without a budget, its output.
+async fn within_budget<T>(
+    remaining: Option<Duration>,
+    future: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    match remaining {
+        Some(remaining) => time::timeout(remaining, future).await.ok(),
+        None => Some(future.await),
+    }
+}
+
+#[cfg(test)]
+mod hop_budget_tests {
+    use super::*;
+
+    /// The admission of a hop is held to the fetch budget: an answer in time
+    /// is the answer, one that stalls past the budget's end is the budget's
+    /// end, and without a budget the answer is waited for.
+    #[tokio::test]
+    async fn an_admission_is_held_to_the_fetch_budget() {
+        assert_eq!(within_budget(None, async { 7 }).await, Some(7));
+        assert_eq!(
+            within_budget(Some(Duration::from_secs(5)), async { 7 }).await,
+            Some(7)
+        );
+        assert_eq!(
+            within_budget(
+                Some(Duration::from_millis(10)),
+                std::future::pending::<i32>()
+            )
+            .await,
+            None
+        );
     }
 }
 
@@ -1480,12 +1641,15 @@ fn adaptive_decoder_threads(available_cpus: usize, active_decodes: usize) -> i32
     (decoder_budget.max(1) / active_decodes).clamp(1, max_threads) as i32
 }
 
-/// Source index per output frame; short clips repeat frames up to `min_frames`.
-fn sampled_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
+/// Source index per output frame of a clip of `total_frames` at `fps` under
+/// `cfg`, in order, duplicates kept; the `Even` and `Interval` rules repeat
+/// frames up to `min_frames` on short clips.
+pub fn sampled_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
     match cfg.sampling {
         FrameSampling::UpTo { max_frames } => up_to_frame_indices(total_frames, max_frames),
         _ if total_frames == 0 => Vec::new(),
         FrameSampling::Even => even_frame_indices(total_frames, fps, cfg),
+        FrameSampling::EvenRounded => even_rounded_frame_indices(total_frames, fps, cfg),
         FrameSampling::Interval => interval_frame_indices(total_frames, fps, cfg),
     }
 }
@@ -1541,6 +1705,44 @@ fn spread_evenly(total_frames: usize, count: usize) -> Vec<usize> {
     let denom = (count - 1) as f64;
     (0..count)
         .map(|idx| ((idx as f64 * last) / denom).floor() as usize)
+        .collect()
+}
+
+/// The Qwen3-VL family's reference video processor sampling at `cfg.sample_fps`:
+/// `trunc(duration x rate)` frames, at least `min_frames`, at most `max_frames`
+/// and never more than the clip has; a clip whose rate is unknown gets
+/// `max_frames`. The reference then repeats its last pick up to a whole
+/// temporal group, which the processor's own temporal padding does here.
+fn even_rounded_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
+    let target_frames = if fps.is_finite() && fps > 0.0 {
+        (total_frames as f64 / fps * f64::from(cfg.sample_fps)).trunc() as usize
+    } else {
+        cfg.max_frames
+    };
+    let count = target_frames
+        .max(cfg.min_frames)
+        .min(cfg.max_frames)
+        .min(total_frames);
+    spread_evenly_rounded(total_frames, count)
+}
+
+/// `count` frames from the first to the last, each the nearest frame of
+/// `numpy.linspace(0, total_frames - 1, count)`: `i * step` for
+/// `step = (total_frames - 1) / (count - 1)` rounded with ties to even, as
+/// numpy rounds, and the last one the last frame itself.
+fn spread_evenly_rounded(total_frames: usize, count: usize) -> Vec<usize> {
+    if count <= 1 {
+        return vec![0];
+    }
+    let step = (total_frames - 1) as f64 / (count - 1) as f64;
+    (0..count)
+        .map(|idx| {
+            if idx + 1 == count {
+                total_frames - 1
+            } else {
+                (idx as f64 * step).round_ties_even() as usize
+            }
+        })
         .collect()
 }
 
@@ -2359,7 +2561,7 @@ impl FrameSelection {
                     loader_frame_indices(claimed, visible, max_frames),
                 )
             }
-            FrameSampling::Even | FrameSampling::Interval => {
+            FrameSampling::Even | FrameSampling::EvenRounded | FrameSampling::Interval => {
                 let total_frames = metadata.total_frames.filter(|total| *total > 0)?;
                 (
                     total_frames,
@@ -2426,7 +2628,17 @@ impl FrameSelection {
     ///
     /// `None` unless it picks out exactly the selection it is standing in for,
     /// so a selection it cannot describe still gets the explicit list and the
-    /// caller's existing fallback.
+    /// caller's existing fallback. Two spreads are described: the floored one
+    /// (`Even`) and the nearest-frame one (`EvenRounded`). The connector
+    /// rounds the nearest frame's ties to even, as the reference does, where
+    /// ffmpeg's `round` is half away from zero, and a tie whose floor is even
+    /// is common (about one clip in five between 101 and 767 picks), so the
+    /// nearest-frame expression spells ties-to-even out of `floor`, `gt`, `eq`
+    /// and `mod`: `floor(x) + (frac > 0.5) + (frac == 0.5 and floor(x) odd)`.
+    /// Its position is `step * (last / denom)`, the picker's own arithmetic
+    /// (`i * step` with the stride rounded once, as the reference's linspace
+    /// computes it): `(step * last) / denom` lands on the other side of a tie
+    /// for some steps, and ffmpeg evaluates in the same doubles.
     fn spread_select_filter(&self) -> Option<String> {
         let last = self.total_frames.checked_sub(1).filter(|last| *last > 0)?;
         let denom = self
@@ -2434,8 +2646,27 @@ impl FrameSelection {
             .len()
             .checked_sub(1)
             .filter(|denom| *denom > 0)?;
+        let floored = |step: f64| (step * last as f64 / denom as f64).floor() as usize;
+        let stride = last as f64 / denom as f64;
+        let nearest_to_even = |step: f64| (step * stride).round_ties_even() as usize;
+        if self.is_described_by(last, denom, floored) {
+            return Some(format!(
+                "select='eq(n\\,floor(round(n*{denom}/{last})*{last}/{denom}))'"
+            ));
+        }
+        if self.is_described_by(last, denom, nearest_to_even) {
+            let x = format!("round(n*{denom}/{last})*({last}/{denom})");
+            return Some(format!(
+                "select='eq(n\\,floor({x})+gt({x}-floor({x})\\,0.5)+eq({x}-floor({x})\\,0.5)*mod(floor({x})\\,2))'"
+            ));
+        }
+        None
+    }
+
+    /// Whether `eq(n, frame_at(round(n * denom / last)))` over the stream picks
+    /// out exactly this selection's distinct frames.
+    fn is_described_by(&self, last: usize, denom: usize, frame_at: impl Fn(f64) -> usize) -> bool {
         let step_of = |index: usize| (index as f64 * denom as f64 / last as f64).round();
-        let frame_at = |step: f64| (step * last as f64 / denom as f64).floor() as usize;
         // A fixed point is by definition something the formula produces, and the
         // formula produces one frame per step, so the candidates are counted by
         // the frames asked for rather than by the frames the file claims to hold.
@@ -2447,15 +2678,9 @@ impl FrameSelection {
                 described.push(index);
             }
         }
-        if !described
+        described
             .iter()
             .eq(self.unique_frames.iter().map(|(index, _)| index))
-        {
-            return None;
-        }
-        Some(format!(
-            "select='eq(n\\,floor(round(n*{denom}/{last})*{last}/{denom}))'"
-        ))
     }
 
     /// Repeat each distinct decoded frame so the result lines up with `frame_indices`.
@@ -3294,6 +3519,41 @@ mod tests {
     }
 
     #[test]
+    fn even_rounded_sampling_picks_the_reference_processors_frames() {
+        // The frames the Qwen3-VL family's reference video processor picks at
+        // its 2 fps rate, as the engine's own loader recorded them for these
+        // clips: trunc(duration x 2) frames, at least 4, never more than the
+        // clip has, at the nearest frames of an even spread (ties to even).
+        let cfg = VideoFetchConfig {
+            sampling: FrameSampling::EvenRounded,
+            ..VideoFetchConfig::default()
+        };
+        assert_eq!(
+            super::sampled_frame_indices(24, 24.0, cfg),
+            vec![0, 8, 15, 23]
+        );
+        assert_eq!(
+            super::sampled_frame_indices(120, 24.0, cfg),
+            vec![0, 13, 26, 40, 53, 66, 79, 93, 106, 119]
+        );
+        let thirty_seconds = super::sampled_frame_indices(720, 24.0, cfg);
+        assert_eq!(thirty_seconds.len(), 60);
+        assert_eq!(&thirty_seconds[..6], &[0, 12, 24, 37, 49, 61]);
+        let ten_minutes = super::sampled_frame_indices(14400, 24.0, cfg);
+        assert_eq!(ten_minutes.len(), 768);
+        assert_eq!(&ten_minutes[..8], &[0, 19, 38, 56, 75, 94, 113, 131]);
+        assert_eq!(ten_minutes[767], 14399);
+        // A clip shorter than the minimum gives each of its frames once.
+        assert_eq!(super::sampled_frame_indices(1, 30.0, cfg), vec![0]);
+        assert_eq!(super::sampled_frame_indices(3, 10.0, cfg), vec![0, 1, 2]);
+        // An unknown rate takes the maximum, bounded by the clip.
+        assert_eq!(
+            super::sampled_frame_indices(5, 0.0, cfg),
+            vec![0, 1, 2, 3, 4]
+        );
+    }
+
+    #[test]
     fn ffmpeg_decodes_carry_the_thread_budget_ahead_of_the_input() {
         let args = |autorotate: bool| {
             super::ffmpeg_decode_command(3, autorotate)
@@ -3340,7 +3600,7 @@ mod tests {
     #[tokio::test]
     async fn decode_video_rejects_an_invalid_long_side_cap() {
         let connector = MediaConnector::new(
-            crate::test_support::http_client(),
+            crate::test_support::http_client_builder(),
             MediaConnectorConfig::default(),
         )
         .expect("default connector");
@@ -3705,51 +3965,159 @@ mod video_sampling_tests {
 
     #[test]
     fn a_long_selection_is_described_rather_than_listed() {
-        let long = VideoFetchConfig {
-            max_frames: 768,
-            ..cfg()
-        };
-        let selection = FrameSelection::from_metadata(metadata(Some(30.0), Some(18_000)), long)
-            .expect("frame rate and count are known");
-        assert!(selection.unique_count() > FFMPEG_MAX_SELECT_TERMS);
+        // The nearest-frame spread spells ties-to-even out of floor, gt, eq and
+        // mod, as spread_select_filter documents; x is the picker's own position.
+        let x = "round(n*767/17999)*(17999/767)";
+        for (sampling, expected) in [
+            (
+                FrameSampling::Even,
+                r"select='eq(n\,floor(round(n*767/17999)*17999/767))'".to_string(),
+            ),
+            (
+                FrameSampling::EvenRounded,
+                format!(
+                    r"select='eq(n\,floor({x})+gt({x}-floor({x})\,0.5)+eq({x}-floor({x})\,0.5)*mod(floor({x})\,2))'"
+                ),
+            ),
+        ] {
+            let long = VideoFetchConfig {
+                max_frames: 768,
+                sampling,
+                ..cfg()
+            };
+            let selection = FrameSelection::from_metadata(metadata(Some(30.0), Some(18_000)), long)
+                .expect("frame rate and count are known");
+            assert!(selection.unique_count() > FFMPEG_MAX_SELECT_TERMS);
 
-        let filter = selection.select_filter();
-        assert_eq!(
-            filter,
-            r"select='eq(n\,floor(round(n*767/17999)*17999/767))'"
-        );
-        assert!(
-            filter.matches('+').count() < FFMPEG_MAX_SELECT_TERMS,
-            "ffmpeg refuses an expression this long as a list"
-        );
+            let filter = selection.select_filter();
+            assert_eq!(filter, expected, "{sampling:?}");
+            assert!(
+                filter.matches('+').count() < FFMPEG_MAX_SELECT_TERMS,
+                "ffmpeg refuses an expression this long as a list"
+            );
+        }
     }
 
     #[test]
     fn the_described_selection_covers_the_same_frames() {
-        for (total, max_frames) in [(9_000, 768), (18_000, 768), (36_000, 768), (7_500, 300)] {
-            let selection = FrameSelection::from_metadata(
-                metadata(Some(30.0), Some(total)),
-                VideoFetchConfig {
-                    max_frames,
-                    ..cfg()
-                },
-            )
-            .expect("frame rate and count are known");
-            let last = total - 1;
-            let denom = selection.frame_indices.len() - 1;
-            let described: Vec<usize> = (0..total)
-                .filter(|index| {
-                    let step = ((index * denom) as f64 / last as f64).round();
-                    (step * last as f64 / denom as f64).floor() as usize == *index
-                })
-                .collect();
-            let listed: Vec<usize> = selection
-                .unique_frames
-                .iter()
-                .map(|(index, _)| *index)
-                .collect();
-            assert_eq!(described, listed, "total={total} max_frames={max_frames}");
+        // ffmpeg evaluates the expression per frame with its own `round` (half
+        // away from zero); the clips include the parity set's 10-minute clip at
+        // 24 fps and the shapes the nearest-frame spread is checked against.
+        let cases = [
+            (30.0, 9_000, 768),
+            (30.0, 18_000, 768),
+            (30.0, 36_000, 768),
+            (30.0, 7_500, 300),
+            (24.0, 14_400, 768),
+            (30.0, 1_800, 768),
+            (24.0, 2_400, 768),
+            (24.0, 1_500, 768),
+            // 103 picks over 1238 frames: pick 51 falls on 618.5 exactly, a tie
+            // whose floor is even (the connector takes 618, ffmpeg's `round`
+            // would take 619).
+            (24.0, 1_238, 768),
+            (25.0, 1_289, 768),
+            // 139 picks over 1672 frames: step 69 is a tie in exact arithmetic
+            // (835.5) that the picker's `i * step` lands just under (835).
+            (24.0, 1_672, 768),
+        ];
+        for sampling in [FrameSampling::Even, FrameSampling::EvenRounded] {
+            for (fps, total, max_frames) in cases {
+                let selection = FrameSelection::from_metadata(
+                    metadata(Some(fps), Some(total)),
+                    VideoFetchConfig {
+                        max_frames,
+                        sampling,
+                        ..cfg()
+                    },
+                )
+                .expect("frame rate and count are known");
+                assert!(selection.unique_count() > FFMPEG_MAX_SELECT_TERMS);
+                let last = total - 1;
+                let denom = selection.frame_indices.len() - 1;
+                let frame_at = |step: f64| match sampling {
+                    // The picker's arithmetic: the stride rounded once, then scaled.
+                    FrameSampling::EvenRounded => {
+                        (step * (last as f64 / denom as f64)).round_ties_even() as usize
+                    }
+                    _ => (step * last as f64 / denom as f64).floor() as usize,
+                };
+                let described: Vec<usize> = (0..total)
+                    .filter(|index| {
+                        let step = ((index * denom) as f64 / last as f64).round();
+                        frame_at(step) == *index
+                    })
+                    .collect();
+                let listed: Vec<usize> = selection
+                    .unique_frames
+                    .iter()
+                    .map(|(index, _)| *index)
+                    .collect();
+                assert_eq!(
+                    described, listed,
+                    "{sampling:?} total={total} max_frames={max_frames}"
+                );
+                assert!(
+                    selection.spread_select_filter().is_some(),
+                    "{sampling:?} total={total} max_frames={max_frames}: not described"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn a_nearest_frame_tie_is_described_to_even() {
+        // 10 frames at 4 fps, 5 picks at 0, 2.25, 4.5, 6.75 and 9: the connector
+        // takes 0, 2, 4 (the tie, to even), 7 and 9. ffmpeg's `round` would take
+        // the tie to 5 and its `floor` would take 6.75 to 6; the ties-to-even
+        // expression picks this set. Five frames are still listed (under the
+        // term limit), but the description is there for a longer clip.
+        let rounded = VideoFetchConfig {
+            sampling: FrameSampling::EvenRounded,
+            ..cfg()
+        };
+        assert_eq!(sampled_frame_indices(10, 4.0, rounded), vec![0, 2, 4, 7, 9]);
+        let selection = FrameSelection::from_metadata(metadata(Some(4.0), Some(10)), rounded)
+            .expect("frame rate and count are known");
+        let described = selection
+            .spread_select_filter()
+            .expect("a tie to even is described");
+        assert!(described.contains("mod(floor("), "{described}");
+        assert_eq!(
+            selection.select_filter(),
+            r"select='eq(n\,0)+eq(n\,2)+eq(n\,4)+eq(n\,7)+eq(n\,9)'"
+        );
+    }
+
+    /// Every nearest-frame spread over the term limit is described, ties
+    /// included: a sweep over the clip lengths from 51 s to 400 s at the
+    /// common frame rates (every length at 24 fps, every 13th at the others),
+    /// where the half-away-from-zero form left about one clip in five listed.
+    #[test]
+    fn every_nearest_frame_spread_over_the_term_limit_is_described() {
+        let rounded = VideoFetchConfig {
+            max_frames: 768,
+            sampling: FrameSampling::EvenRounded,
+            ..cfg()
+        };
+        let mut checked = 0usize;
+        for (fps, stride) in [(24usize, 1usize), (25, 13), (30, 13), (60, 13)] {
+            for total in (51 * fps..=400 * fps).step_by(stride) {
+                let selection =
+                    FrameSelection::from_metadata(metadata(Some(fps as f64), Some(total)), rounded)
+                        .expect("frame rate and count are known");
+                if selection.unique_count() <= FFMPEG_MAX_SELECT_TERMS {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    selection.spread_select_filter().is_some(),
+                    "{fps} fps, {total} frames ({} picks): listed, not described",
+                    selection.unique_count()
+                );
+            }
+        }
+        assert!(checked > 8_000, "{checked} selections checked");
     }
 
     #[test]
@@ -4339,33 +4707,91 @@ fn validate_max_long_side_pixel(value: Option<u32>) -> Result<(), MediaConnector
 /// engine that decodes with PIL bit for bit; the pure-Rust decoder differs by
 /// a few levels, which the vision encoder amplifies), everything else and any
 /// turbojpeg failure through the `image` crate; then the long-side cap.
+///
+/// CMYK and YCCK JPEGs follow the same rule: with libjpeg-turbo they are
+/// decompressed as CMYK and converted with PIL's arithmetic
+/// (`jpeg_turbo::pil_cmyk_to_rgb`); without it the `image` crate's decoder
+/// also treats the ink values as Adobe-inverted and multiplies them the same
+/// way for plain CMYK, but its DCT and upsampling are its own and YCCK goes
+/// through its own YCbCr step, so those pixels are close to PIL's, not equal.
 pub(crate) fn decode_image_bytes(
     bytes: &[u8],
     max_long_side_pixel: Option<u32>,
 ) -> Result<image::DynamicImage, MediaConnectorError> {
-    let image = match crate::jpeg_turbo::decode_jpeg_rgb(bytes) {
-        Some(image) => image,
-        None => image::ImageReader::new(std::io::Cursor::new(bytes))
-            .with_guessed_format()
-            .map_err(MediaConnectorError::Io)?
-            .decode()?,
+    // The orientation tag is applied the way the engine's own loader applies
+    // it, so a photo stored sideways reaches the model upright on both paths.
+    let mut image = match crate::jpeg_turbo::decode_jpeg_rgb(bytes) {
+        Some(mut image) => {
+            // libjpeg-turbo yields pixels only; the tag comes from the header.
+            image.apply_orientation(jpeg_orientation(bytes));
+            image
+        }
+        None => {
+            let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
+                .with_guessed_format()
+                .map_err(MediaConnectorError::Io)?
+                .into_decoder()?;
+            // `ImageReader::decode` reserves the decoded buffer against the
+            // crate's allocation limit (512 MiB by default) before it decodes;
+            // `into_decoder` does not, so the reservation is made here. A file
+            // whose header declares more than the limit (a decompression bomb,
+            // or a JPEG the turbojpeg path handed over for its size) is refused
+            // without the allocation.
+            let mut limits = image::Limits::default();
+            limits.reserve(decoder.total_bytes())?;
+            decoder.set_limits(limits)?;
+            let orientation = decoder
+                .orientation()
+                .unwrap_or(image::metadata::Orientation::NoTransforms);
+            let mut image = image::DynamicImage::from_decoder(decoder)?;
+            image.apply_orientation(orientation);
+            image
+        }
     };
-    Ok(apply_max_long_side_pixel(image, max_long_side_pixel))
+    image = apply_max_long_side_pixel(image, max_long_side_pixel);
+    Ok(image)
 }
 
-/// The dimensions the decode will produce, from the header alone.
+/// The dimensions the decode will produce, from the header alone (after the
+/// orientation tag, which swaps the axes for the 90-degree rotations).
 pub(crate) fn encoded_image_size(
     bytes: &[u8],
     max_long_side_pixel: Option<u32>,
 ) -> Result<crate::types::ImageSize, MediaConnectorError> {
-    let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
+    let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(MediaConnectorError::Io)?
-        .into_dimensions()?;
+        .into_decoder()?;
+    let (width, height) = decoder.dimensions();
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let (width, height) = if orientation_swaps_axes(orientation) {
+        (height, width)
+    } else {
+        (width, height)
+    };
     let (width, height) = max_long_side_pixel
         .and_then(|cap| capped_dimensions(width, height, cap))
         .unwrap_or((width, height));
     Ok(crate::types::ImageSize::new(width, height))
+}
+
+/// The EXIF orientation of a JPEG, from its header alone; absent or
+/// unreadable metadata means no transform.
+fn jpeg_orientation(bytes: &[u8]) -> image::metadata::Orientation {
+    JpegDecoder::new(std::io::Cursor::new(bytes))
+        .and_then(|mut decoder| decoder.orientation())
+        .unwrap_or(image::metadata::Orientation::NoTransforms)
+}
+
+/// Whether applying the orientation exchanges width and height.
+fn orientation_swaps_axes(orientation: image::metadata::Orientation) -> bool {
+    use image::metadata::Orientation::{Rotate270, Rotate270FlipH, Rotate90, Rotate90FlipH};
+    matches!(
+        orientation,
+        Rotate90 | Rotate270 | Rotate90FlipH | Rotate270FlipH
+    )
 }
 
 fn apply_max_long_side_pixel(
@@ -4375,10 +4801,99 @@ fn apply_max_long_side_pixel(
     // The same fit `encoded_image_size` promised from the header.
     match max_long_side_pixel.and_then(|cap| capped_dimensions(image.width(), image.height(), cap))
     {
-        Some((width, height)) => {
-            image.resize_exact(width, height, image::imageops::FilterType::CatmullRom)
-        }
+        Some((width, height)) => match image {
+            image::DynamicImage::ImageRgb8(rgb) => {
+                image::DynamicImage::ImageRgb8(resize_catmull_rom_rgb(&rgb, width, height))
+            }
+            other => other.resize_exact(width, height, image::imageops::FilterType::CatmullRom),
+        },
         None => image,
+    }
+}
+
+#[cfg(test)]
+mod exif_orientation_tests {
+    use image::{codecs::jpeg::JpegEncoder, GenericImageView, Rgb};
+
+    use super::*;
+
+    /// A 4x2 JPEG, red on the left and blue on the right, carrying the given
+    /// EXIF orientation in an APP1 segment (TIFF little-endian, one IFD0
+    /// entry: tag 0x0112, SHORT, count 1).
+    fn jpeg_with_orientation(orientation: u8) -> Vec<u8> {
+        let mut img = image::RgbImage::new(4, 2);
+        for (x, _, pixel) in img.enumerate_pixels_mut() {
+            *pixel = if x < 2 {
+                Rgb([255, 0, 0])
+            } else {
+                Rgb([0, 0, 255])
+            };
+        }
+        let mut jpeg = Vec::new();
+        JpegEncoder::new_with_quality(&mut jpeg, 100)
+            .encode_image(&img)
+            .expect("encode");
+        let mut app1 = vec![0xFF, 0xE1, 0x00, 0x22];
+        app1.extend_from_slice(b"Exif\0\0");
+        app1.extend_from_slice(b"II*\0\x08\0\0\0");
+        app1.extend_from_slice(&[0x01, 0x00]);
+        app1.extend_from_slice(&[0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00]);
+        app1.extend_from_slice(&[orientation, 0x00, 0x00, 0x00]);
+        app1.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        let mut out = jpeg[..2].to_vec();
+        out.extend_from_slice(&app1);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
+    fn is_red(pixel: image::Rgba<u8>) -> bool {
+        pixel[0] > 128 && pixel[2] < 128
+    }
+
+    fn is_blue(pixel: image::Rgba<u8>) -> bool {
+        pixel[2] > 128 && pixel[0] < 128
+    }
+
+    #[test]
+    fn a_jpeg_stored_sideways_is_decoded_upright_like_the_engine_loader() {
+        // Orientation 6: rotate 90 degrees clockwise for display, so the
+        // 4x2 picture is a 2x4 one with the red half on top.
+        let bytes = jpeg_with_orientation(6);
+        let size = encoded_image_size(&bytes, None).expect("size");
+        assert_eq!((size.width, size.height), (2, 4));
+        let img = decode_image_bytes(&bytes, None).expect("decode");
+        assert_eq!(img.dimensions(), (2, 4));
+        assert!(is_red(img.get_pixel(0, 0)) && is_red(img.get_pixel(1, 0)));
+        assert!(is_blue(img.get_pixel(0, 3)) && is_blue(img.get_pixel(1, 3)));
+    }
+
+    #[test]
+    fn a_mirrored_jpeg_keeps_its_size_and_swaps_its_halves() {
+        // Orientation 2: flipped horizontally.
+        let bytes = jpeg_with_orientation(2);
+        let size = encoded_image_size(&bytes, None).expect("size");
+        assert_eq!((size.width, size.height), (4, 2));
+        let img = decode_image_bytes(&bytes, None).expect("decode");
+        assert!(is_blue(img.get_pixel(0, 0)) && is_red(img.get_pixel(3, 0)));
+    }
+
+    #[test]
+    fn an_upright_jpeg_and_a_png_are_left_alone() {
+        let bytes = jpeg_with_orientation(1);
+        let img = decode_image_bytes(&bytes, None).expect("decode");
+        assert_eq!(img.dimensions(), (4, 2));
+        assert!(is_red(img.get_pixel(0, 0)) && is_blue(img.get_pixel(3, 0)));
+
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(4, 2)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("png");
+        assert_eq!(
+            decode_image_bytes(&png, None).expect("decode").dimensions(),
+            (4, 2)
+        );
+        let size = encoded_image_size(&png, None).expect("size");
+        assert_eq!((size.width, size.height), (4, 2));
     }
 }
 
@@ -4796,5 +5311,79 @@ mod video_frame_cap_tests {
         };
         assert_eq!((frames[0].width(), frames[0].height()), (504, 284));
         assert_eq!(capped, Some(sampling(1)));
+    }
+}
+
+#[cfg(test)]
+mod decode_limit_tests {
+    use super::*;
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in bytes {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    0xEDB8_8320 ^ (crc >> 1)
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    fn png_chunk(out: &mut Vec<u8>, kind: [u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let mut body = kind.to_vec();
+        body.extend_from_slice(data);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&crc32(&body).to_be_bytes());
+    }
+
+    /// A PNG whose header declares a `side` x `side` RGB8 image, with the
+    /// smallest IDAT a decoder accepts as a start (the stored zlib block of a
+    /// single filter byte): a few dozen bytes on the wire, `side * side * 3`
+    /// bytes once decoded.
+    fn png_declaring(side: u32) -> Vec<u8> {
+        let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&side.to_be_bytes());
+        ihdr.extend_from_slice(&side.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        png_chunk(&mut out, *b"IHDR", &ihdr);
+        png_chunk(
+            &mut out,
+            *b"IDAT",
+            &[
+                0x78, 0x01, 0x01, 0x01, 0x00, 0xFE, 0xFF, 0x00, 0x00, 0x01, 0x00, 0x01,
+            ],
+        );
+        png_chunk(&mut out, *b"IEND", &[]);
+        out
+    }
+
+    #[test]
+    fn a_decoded_size_over_the_allocation_limit_is_refused_before_the_allocation() {
+        // 30000 x 30000 x 3 = 2.7 GB declared by a 70-byte file.
+        let bomb = png_declaring(30_000);
+        match decode_image_bytes(&bomb, None) {
+            Err(MediaConnectorError::Image(image::ImageError::Limits(_))) => {}
+            other => panic!("expected the crate's limit error, got {other:?}"),
+        }
+        // The header is still readable on its own: the size probe does not
+        // allocate the pixels.
+        let size = encoded_image_size(&bomb, None).expect("header read");
+        assert_eq!((size.width, size.height), (30_000, 30_000));
+    }
+
+    #[test]
+    fn a_small_png_still_decodes_through_the_limit_check() {
+        let mut png = Vec::new();
+        image::RgbImage::from_pixel(3, 2, image::Rgb([10, 20, 30]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode");
+        let image = decode_image_bytes(&png, None).expect("decode");
+        assert_eq!((image.width(), image.height()), (3, 2));
     }
 }

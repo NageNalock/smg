@@ -4,12 +4,25 @@ The Kubernetes lane's scenarios (e2e_test/kind_discovery/test_kind_discovery.py)
 as they apply to a manifest: registration and provenance, round-robin over
 the discovered fleet, one edit adding or removing several workers, a gateway
 restart, a new instance at a reused address, an engine failing its health
-checks, a forty-worker fleet, gRPC endpoints, and PD metadata.
+checks, a forty-worker fleet, gRPC endpoints, and PD metadata. These reread
+every second, as a gateway without a working watch would.
+
+The watcher's own scenarios run with no periodic reread due for an hour, so
+a change that applies was read because the gateway saw it happen: a
+replaced manifest, an in-place rewrite, a manifest created after startup,
+and an invalid edit and its fix.
 """
 
 from __future__ import annotations
 
-from .harness import MODEL, free_port_range, served_by
+import time
+
+from .harness import MODEL, NO_REREAD_SECS, free_port_range, served_by
+
+# How long a watched change may take to apply: the event settling, one read,
+# and registration. Far below NO_REREAD_SECS, so no periodic reread can pass
+# for the watcher.
+WATCHED = 15.0
 
 PROVIDER = "smg.ai/discovery-provider"
 ID = "smg.ai/discovery-id"
@@ -184,3 +197,100 @@ def test_pd_metadata_reaches_the_registered_workers(gateway, manifest, mock_work
         assert worker.get("kv_connector") == connector, worker
         assert worker.get("kv_role") == role, worker
         assert worker.get("kv_engine_id") == engine_id, worker
+
+
+def test_an_in_place_edit_takes_effect(gateway, manifest, mock_worker):
+    """Fixing a record in place, keeping its id, reaches the registry. The
+    case that motivated it: a prefill worker's bootstrap port corrected."""
+    base = free_port_range(2)
+    mock_worker(
+        *("--host", "127.0.0.1", "--http-base-port", str(base), "--http-count", "2"),
+        *("--model", MODEL),
+        ready_port=base + 1,
+    )
+    prefill, decode = f"http://127.0.0.1:{base}", f"http://127.0.0.1:{base + 1}"
+
+    def write(bootstrap_port: int) -> None:
+        manifest.write(
+            [
+                {
+                    "id": "prefill-a",
+                    "url": prefill,
+                    "worker_type": "prefill",
+                    "bootstrap_port": bootstrap_port,
+                },
+                {"id": "decode-a", "url": decode, "worker_type": "decode"},
+            ]
+        )
+
+    def prefill_registrations(workers: list[dict]) -> list[tuple[str, int | None]]:
+        return [
+            (w.get("labels", {}).get(ID, ""), w.get("bootstrap_port"))
+            for w in workers
+            if w["url"] == prefill
+        ]
+
+    write(29700)
+    gateway.start("--pd-disaggregation")
+    gateway.wait_for(
+        "the prefill worker on bootstrap port 29700",
+        lambda workers: prefill_registrations(workers) == [("prefill-a", 29700)],
+    )
+
+    write(29711)
+    workers = gateway.wait_for(
+        "the corrected bootstrap port registered",
+        lambda workers: prefill_registrations(workers) == [("prefill-a", 29711)],
+    )
+    assert {w["url"] for w in workers} == {prefill, decode}
+
+
+def wait_for_log(gateway, needle: str, what: str) -> None:
+    deadline = time.monotonic() + WATCHED
+    while needle not in gateway.log_path.read_text():
+        assert time.monotonic() < deadline, f"timed out waiting for {what}; {gateway.log_tail()}"
+        time.sleep(0.25)
+
+
+def test_changes_apply_as_they_happen(gateway, manifest, engines):
+    a, b, c = engines(3)
+    manifest.write([{"url": a.url}])
+    gateway.start(check_interval_secs=NO_REREAD_SECS)
+    gateway.wait_for_urls({a.url}, "the startup read registering a")
+
+    # A writer renaming a complete file over the manifest.
+    manifest.write([{"url": a.url}, {"url": b.url}])
+    gateway.wait_for_urls({a.url, b.url}, "the replaced manifest adding b", within=WATCHED)
+
+    # An editor overwriting the manifest itself.
+    manifest.rewrite_in_place([{"url": b.url}, {"url": c.url}])
+    gateway.wait_for_urls({b.url, c.url}, "the rewritten manifest swapping a for c", within=WATCHED)
+
+    manifest.write([])
+    gateway.wait_for_urls(set(), "the empty manifest clearing the fleet", within=WATCHED)
+
+
+def test_a_manifest_created_after_startup_applies_when_it_appears(gateway, manifest, engines):
+    (engine,) = engines(1)
+    gateway.start(check_interval_secs=NO_REREAD_SECS)
+    wait_for_log(gateway, "cannot read discovery manifest", "the startup read finding no manifest")
+    assert gateway.workers() == []
+
+    manifest.write([{"url": engine.url}])
+    gateway.wait_for_urls({engine.url}, "the new manifest's worker registered", within=WATCHED)
+
+
+def test_an_invalid_edit_is_rejected_at_once_and_its_fix_applies(gateway, manifest, engines):
+    a, b = engines(2)
+    manifest.write([{"url": a.url}])
+    gateway.start(check_interval_secs=NO_REREAD_SECS)
+    gateway.wait_for_urls({a.url}, "the startup read registering a")
+
+    manifest.write([{"url": b.url, "worker_typ": "regular"}])
+    # The log line proves the watcher read the bad edit, so the unchanged
+    # fleet is the provider keeping the last good manifest.
+    wait_for_log(gateway, "unknown field `worker_typ`", "the invalid edit rejected")
+    assert {w["url"] for w in gateway.workers() or []} == {a.url}
+
+    manifest.write([{"url": b.url}])
+    gateway.wait_for_urls({b.url}, "the fixed manifest applied", within=WATCHED)

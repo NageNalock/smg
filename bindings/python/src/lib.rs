@@ -330,21 +330,30 @@ pub struct PyRedisConfig {
     pub pool_max: usize,
     #[pyo3(get, set)]
     pub retention_days: Option<u64>,
+    /// Bound in seconds on each call to the store (default 5).
+    #[pyo3(get, set)]
+    pub op_timeout_secs: u64,
 }
 
 #[pymethods]
 impl PyRedisConfig {
     #[new]
-    #[pyo3(signature = (url, pool_max = 16, retention_days = Some(30)))]
+    #[pyo3(signature = (url, pool_max = 16, retention_days = Some(30), op_timeout_secs = 5))]
     #[expect(
         clippy::unnecessary_wraps,
         reason = "PyO3 #[new] method signature requires PyResult"
     )]
-    fn new(url: String, pool_max: usize, retention_days: Option<u64>) -> PyResult<Self> {
+    fn new(
+        url: String,
+        pool_max: usize,
+        retention_days: Option<u64>,
+        op_timeout_secs: u64,
+    ) -> PyResult<Self> {
         Ok(PyRedisConfig {
             url,
             pool_max,
             retention_days,
+            op_timeout_secs,
         })
     }
 }
@@ -354,6 +363,7 @@ impl PyRedisConfig {
         config::RedisConfig {
             url: self.url.clone(),
             pool_max: self.pool_max,
+            op_timeout_secs: self.op_timeout_secs,
             retention_days: self.retention_days,
             schema: None,
         }
@@ -368,18 +378,26 @@ pub struct PyPostgresConfig {
 
     #[pyo3(get, set)]
     pub pool_max: usize,
+
+    /// Bound in seconds on each call to the store (default 5).
+    #[pyo3(get, set)]
+    pub op_timeout_secs: u64,
 }
 
 #[pymethods]
 impl PyPostgresConfig {
     #[new]
-    #[pyo3(signature = (db_url = None,pool_max = 16,))]
+    #[pyo3(signature = (db_url = None, pool_max = 16, op_timeout_secs = 5))]
     #[expect(
         clippy::unnecessary_wraps,
         reason = "PyO3 #[new] method signature requires PyResult"
     )]
-    fn new(db_url: Option<String>, pool_max: usize) -> PyResult<Self> {
-        Ok(PyPostgresConfig { db_url, pool_max })
+    fn new(db_url: Option<String>, pool_max: usize, op_timeout_secs: u64) -> PyResult<Self> {
+        Ok(PyPostgresConfig {
+            db_url,
+            pool_max,
+            op_timeout_secs,
+        })
     }
 }
 
@@ -388,6 +406,7 @@ impl PyPostgresConfig {
         config::PostgresConfig {
             db_url: self.db_url.clone().unwrap_or_default(),
             pool_max: self.pool_max,
+            op_timeout_secs: self.op_timeout_secs,
             schema: None,
         }
     }
@@ -482,6 +501,10 @@ struct Router {
     queue_timeout_secs: u64,
     rate_limit_tokens_per_second: Option<i32>,
     max_background_responses: usize,
+    sse_keepalive_secs: u64,
+    history_memory_max_responses: usize,
+    history_memory_max_items: usize,
+    history_memory_retention_secs: u64,
     connection_mode: worker::ConnectionMode,
     model_path: Option<String>,
     tokenizer_path: Option<String>,
@@ -591,6 +614,8 @@ struct Router {
     priority_scheduler_tenant_metric_top_n: u32,
     tenant_rate_limit_enabled: bool,
     tenant_rate_limit_config: Option<String>,
+    mm_allowed_media_domains: Option<Vec<String>>,
+    mm_allow_private_media_hosts: bool,
     /// The keyword-only `discovery` mapping, read by the same rules as
     /// `RouterConfig.discovery`.
     discovery: Option<config::DiscoveryConfig>,
@@ -1073,6 +1098,12 @@ impl Router {
             })
             .disable_tokenizer_autoload(self.disable_tokenizer_autoload)
             .history_backend(history_backend)
+            .memory_config(config::MemoryConfig {
+                max_responses: self.history_memory_max_responses,
+                max_items: self.history_memory_max_items,
+                retention_secs: (self.history_memory_retention_secs > 0)
+                    .then_some(self.history_memory_retention_secs),
+            })
             .maybe_api_key(self.api_key.as_ref())
             .tenant_api_keys(
                 self.tenant_api_keys
@@ -1101,6 +1132,7 @@ impl Router {
             )
             .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
             .max_background_responses(self.max_background_responses)
+            .sse_keepalive_secs(self.sse_keepalive_secs)
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
@@ -1127,6 +1159,8 @@ impl Router {
             .mm_processing(mm_processing)
             .mm_pixel_cache_mb(self.mm_pixel_cache_mb)
             .mm_pixel_rdma(self.mm_pixel_rdma)
+            .mm_allowed_media_domains(self.mm_allowed_media_domains.clone())
+            .mm_allow_private_media_hosts(self.mm_allow_private_media_hosts)
             .rdma_listen_ip(self.rdma_listen_ip.clone())
             .rdma_slot_ttl_s(self.rdma_slot_ttl_s)
             .log_mm_timing(self.log_mm_timing)
@@ -1352,6 +1386,12 @@ impl Router {
         max_background_responses = 1024,
         header_read_timeout_secs = 30,
         idle_connection_timeout_secs = 90,
+        mm_allowed_media_domains = None,
+        mm_allow_private_media_hosts = false,
+        sse_keepalive_secs = 15,
+        history_memory_max_responses = 10000,
+        history_memory_max_items = 100000,
+        history_memory_retention_secs = 86400,
         token_dump_dir = None,
         token_dump_on_start = false,
         token_dump_max_mb = 1024,
@@ -1551,6 +1591,12 @@ impl Router {
         max_background_responses: usize,
         header_read_timeout_secs: u64,
         idle_connection_timeout_secs: u64,
+        mm_allowed_media_domains: Option<Vec<String>>,
+        mm_allow_private_media_hosts: bool,
+        sse_keepalive_secs: u64,
+        history_memory_max_responses: usize,
+        history_memory_max_items: usize,
+        history_memory_retention_secs: u64,
         token_dump_dir: Option<String>,
         token_dump_on_start: bool,
         token_dump_max_mb: u64,
@@ -1679,6 +1725,10 @@ impl Router {
             queue_timeout_secs,
             rate_limit_tokens_per_second,
             max_background_responses,
+            sse_keepalive_secs,
+            history_memory_max_responses,
+            history_memory_max_items,
+            history_memory_retention_secs,
             connection_mode,
             model_path,
             tokenizer_path,
@@ -1779,6 +1829,8 @@ impl Router {
             priority_scheduler_tenant_metric_top_n,
             tenant_rate_limit_enabled,
             tenant_rate_limit_config,
+            mm_allowed_media_domains,
+            mm_allow_private_media_hosts,
             discovery,
             mesh_tls_ca_cert,
             mesh_tls_cert,

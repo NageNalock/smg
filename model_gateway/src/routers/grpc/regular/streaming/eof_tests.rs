@@ -142,7 +142,7 @@ pub(super) fn complete_with_prompt(
 
 /// The mock server accepts the client connection. This test supplies the
 /// response frames and controls EOF.
-pub(super) async fn scripted_stream(
+pub(crate) async fn scripted_stream(
     responses: Vec<proto::GenerateResponse>,
     grpc_status: &'static str,
 ) -> (ProtoStream, JoinHandle<()>) {
@@ -184,7 +184,7 @@ pub(super) async fn gated_stream(
 }
 
 /// One length-prefixed gRPC data frame carrying `response`.
-fn data_frame(response: &proto::GenerateResponse) -> Frame<Bytes> {
+pub(super) fn data_frame<M: ProstMessage>(response: &M) -> Frame<Bytes> {
     let encoded = response.encode_to_vec();
     let mut frame = Vec::with_capacity(encoded.len() + 5);
     frame.put_u8(0);
@@ -194,10 +194,26 @@ fn data_frame(response: &proto::GenerateResponse) -> Frame<Bytes> {
 }
 
 /// The trailers frame that ends a gRPC response with `grpc_status`.
-fn trailers_frame(grpc_status: &'static str) -> Frame<Bytes> {
+pub(super) fn trailers_frame(grpc_status: &'static str) -> Frame<Bytes> {
     let mut trailers = HeaderMap::new();
     trailers.insert("grpc-status", HeaderValue::from_static(grpc_status));
     Frame::trailers(trailers)
+}
+
+/// A decoded gRPC response stream of `M` frames over `body`.
+pub(super) fn decoded_stream<M, S>(body: S) -> tonic::Streaming<M>
+where
+    M: ProstMessage + Default + Send + 'static,
+    S: futures::Stream<Item = Result<Frame<Bytes>, tonic::Status>> + Send + 'static,
+{
+    let mut codec = tonic_prost::ProstCodec::<M, M>::default();
+    tonic::Streaming::new_response(
+        codec.decoder(),
+        StreamBody::new(body),
+        StatusCode::OK,
+        None,
+        None,
+    )
 }
 
 /// A decoded response stream over `body`, owned by `client` as a worker
@@ -206,28 +222,20 @@ fn response_stream<S>(body: S, client: VllmEngineClient) -> ProtoStream
 where
     S: futures::Stream<Item = Result<Frame<Bytes>, tonic::Status>> + Send + 'static,
 {
-    let mut codec =
-        tonic_prost::ProstCodec::<proto::GenerateResponse, proto::GenerateResponse>::default();
-    let stream = tonic::Streaming::new_response(
-        codec.decoder(),
-        StreamBody::new(body),
-        StatusCode::OK,
-        None,
-        None,
-    );
-    let stream = AbortOnDropStream::new(stream, "eof-test".to_string(), client);
+    let stream = AbortOnDropStream::new(decoded_stream(body), "eof-test".to_string(), client);
     // No generation was sent to the mock, so there is nothing to cancel.
     stream.mark_completed();
     ProtoStream::Vllm(stream)
 }
 
-/// The mock worker a test's client connects to. The test supplies the
-/// response frames itself; the server only accepts the connection.
+/// The mock worker a test's client connects to, as its URL and its server
+/// task. The test supplies the response frames itself; the server only
+/// accepts the connection.
 #[expect(
     clippy::disallowed_methods,
     reason = "bounded test fixture; server task is explicitly aborted"
 )]
-async fn mock_client() -> (VllmEngineClient, JoinHandle<()>) {
+pub(super) async fn mock_worker_endpoint() -> (String, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock worker");
@@ -252,7 +260,12 @@ async fn mock_client() -> (VllmEngineClient, JoinHandle<()>) {
         ..mock_worker::config::Config::default()
     });
     let server = tokio::spawn(mock_worker::grpc::serve_with_listener(config, listener));
-    let client = VllmEngineClient::connect(&format!("http://127.0.0.1:{port}"))
+    (format!("http://127.0.0.1:{port}"), server)
+}
+
+async fn mock_client() -> (VllmEngineClient, JoinHandle<()>) {
+    let (url, server) = mock_worker_endpoint().await;
+    let client = VllmEngineClient::connect(&url)
         .await
         .expect("connect mock worker");
     (client, server)
@@ -1614,6 +1627,64 @@ async fn chat_stream_keeps_logprobs_on_reasoning_deltas() {
         }
     }
     assert!(with_text >= 2, "{events:?}");
+}
+
+/// A unary response's logprobs cover its content's tokens, as the content
+/// deltas of a stream do: not the reasoning, its delimiters, or the tokens
+/// after a stop sequence.
+#[tokio::test]
+async fn chat_unary_logprobs_cover_the_content_only() {
+    let text = "<think>why</think>okSTOPmore";
+    let token_ids: Vec<u32> = text.chars().map(u32::from).collect();
+    let mut last = complete(0, "stop");
+    if let Some(GenerationEvent::Complete(complete)) = &mut last.response {
+        complete.output_logprobs = Some(proto::OutputLogProbs {
+            token_logprobs: (0..token_ids.len()).map(|i| -(i as f32)).collect(),
+            token_ids: token_ids.clone(),
+            top_logprobs: Vec::new(),
+        });
+        complete.output_ids = token_ids;
+    }
+    let (stream, server) = scripted_stream(vec![last], "0").await;
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let stop = Some(StringOrArray::String("STOP".to_string()));
+    let mut decoder =
+        utils::create_stop_decoder(&tokenizer, stop.as_ref(), None, false, false, false);
+    let response = ResponseProcessor::new(
+        ToolParserFactory::new(),
+        ReasoningParserFactory::new(),
+        utils::ParserResolver::new(
+            Arc::new(WorkerRegistry::new()),
+            None,
+            Some("qwen3".to_string()),
+        ),
+    )
+    .process_non_streaming_chat_response(
+        context::ExecutionResult::Single { stream },
+        chat_spec(false),
+        dispatch(),
+        tokenizer,
+        &mut decoder,
+        false,
+    )
+    .await
+    .unwrap_or_else(|response| panic!("{}", response.status()));
+    server.abort();
+    let choice = &serde_json::to_value(response).unwrap()["choices"][0];
+    assert_eq!(choice["message"]["reasoning_content"], "why");
+    assert_eq!(choice["message"]["content"], "ok");
+    let logprobs: Vec<(&str, f64)> = choice["logprobs"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            (
+                item["token"].as_str().unwrap(),
+                item["logprob"].as_f64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(logprobs, [("o", -18.0), ("k", -19.0)]);
 }
 
 #[tokio::test]

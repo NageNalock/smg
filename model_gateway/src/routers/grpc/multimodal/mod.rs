@@ -67,15 +67,17 @@ pub(crate) use assemble::{
     assemble_tokenspeed_for_encode, encode_routing_hashes,
 };
 pub(crate) use capability::{
-    ensure_backend_supports_modalities, ensure_model_accepts_media, worker_language_model_only,
-    SUPPORTS_VISION_LABEL,
+    ensure_backend_supports_modalities, ensure_model_accepts_media, request_needs_vision,
+    worker_language_model_only, SUPPORTS_VISION_LABEL,
 };
 pub(crate) use config::{
     load_image_preprocessor_config, load_video_preprocessor_config, MultimodalComponents,
     MultimodalConfigRegistry, MultimodalModelConfig,
 };
 pub(crate) use detect::{media_plan_chat, media_plan_messages};
-pub(crate) use inflight::{reserve_multimodal_inflight, InflightPermit};
+pub(crate) use inflight::{
+    reserve_multimodal_inflight, InflightPermit, UNIT_BYTES as INFLIGHT_UNIT_BYTES,
+};
 pub(crate) use item_limits::engine_item_limits;
 pub(crate) use plan::{
     prepare_placeholder_tokens, resolve_media_part_order, validate_rendered_media_anchors,

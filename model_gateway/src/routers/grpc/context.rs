@@ -51,6 +51,7 @@ use crate::{
     worker::{
         ConnectionMode, PrefillLoadGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
     },
+    workflow::TokenizerLoadFailures,
 };
 
 /// Ingress-phase request context: owns the parsed request.
@@ -199,6 +200,16 @@ pub(crate) struct SharedComponents {
     pub parser_resolver: ParserResolver,
     /// Multimodal processing components (initialized at router creation)
     pub multimodal: Option<Arc<MultimodalComponents>>,
+    /// Whether the gateway loads tokenizers itself, at start-up and when a
+    /// worker registers. While it does, a served model without a registered
+    /// tokenizer is a transient not-ready state (the one `/readiness` reports
+    /// as "tokenizer not yet registered"), not a fault of the gateway.
+    pub tokenizer_autoload: bool,
+    /// The served models whose tokenizer load was skipped or failed for good,
+    /// as the registration workflow recorded them: a request for one of them
+    /// is answered 503 `tokenizer_load_failed` without a retry hint, instead
+    /// of the not-ready 503 of a load in flight.
+    pub tokenizer_load_failures: Arc<TokenizerLoadFailures>,
     /// The token dump, when `--token-dump-dir` enables it.
     pub token_dump: Option<Arc<TokenDump>>,
 }
@@ -270,6 +281,12 @@ pub(crate) struct RoutingSnapshot {
     pub rid_key: Option<String>,
     /// The request's cache namespace, derived once at first selection.
     pub cache_namespace: Option<CacheNamespace>,
+    /// The request carries pixel media (an image or a video), noted at first
+    /// selection: a retry keeps the workers that take it (regular mode's
+    /// single worker; the prefill leg of prefill/decode mode, see worker
+    /// selection's `prefill_leg_needs_vision`) on ones with a vision encoder,
+    /// as the first attempt did.
+    pub needs_vision: bool,
     /// The request's disaggregated decode leg needs a worker with a vision
     /// encoder (worker selection's `decode_leg_needs_vision`: prefill/decode
     /// mode only), noted at first selection so a retry re-selects under the
