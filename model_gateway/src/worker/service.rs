@@ -949,7 +949,8 @@ mod tests {
             assert!(err.to_string().contains(field), "{body}: {err}");
         }
         // A window wider than 65535 passes the boundary: the routers saturate
-        // it, or divide an attention-DP engine's window below it per rank.
+        // it. A window set here is kept as set on every dp-aware rank worker;
+        // only a discovered one is divided per rank.
         let spec: WorkerSpec = serde_json::from_value(json!({
             "url": url, "cost": 2.5, "kv_block_size": 16, "dp_rank": 1, "dp_size": 2,
             "labels": {

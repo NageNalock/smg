@@ -735,8 +735,11 @@ fn validate_zmq_worker_type(
 /// unexpanded worker stands for the whole engine and keeps the whole window.
 /// A window the operator set by hand on the worker (`set_by_hand`, the
 /// spec's own labels, which win the merge) is the operator's statement
-/// about each rank worker and stays as set; only a discovered window is
-/// shared.
+/// about each rank worker: it stays as set and is the rank worker's only
+/// window (a discovered window under the other name is dropped, since the
+/// reader prefers `max_num_seqs` to `max_running_requests` and would
+/// otherwise take the engine's figure over the operator's); only a
+/// discovered window is shared.
 fn labels_for_rank(
     labels: &HashMap<String, String>,
     dp: Option<(usize, usize)>,
@@ -749,10 +752,18 @@ fn labels_for_rank(
     let Some(width) = attention_dp_width(&labels, size) else {
         return labels;
     };
-    for key in ["max_running_requests", "max_num_seqs"] {
-        if set_by_hand.contains_key(key) {
-            continue;
+    if WINDOW_LABELS
+        .iter()
+        .any(|key| set_by_hand.contains_key(*key))
+    {
+        for key in WINDOW_LABELS {
+            if !set_by_hand.contains_key(key) {
+                labels.remove(key);
+            }
         }
+        return labels;
+    }
+    for key in WINDOW_LABELS {
         let Some(window) = labels
             .get(key)
             .and_then(|value| value.parse::<u64>().ok())
@@ -765,6 +776,10 @@ fn labels_for_rank(
     }
     labels
 }
+
+/// The labels that name a worker's running window, in the order the reader
+/// prefers them.
+const WINDOW_LABELS: [&str; 2] = ["max_num_seqs", "max_running_requests"];
 
 /// How many attention-DP workers the engine's labels say its running window
 /// is split across, `None` for an engine that runs the whole window on every
@@ -1793,7 +1808,9 @@ mod rank_window_tests {
 
     /// A window the operator set by hand on the worker is the operator's
     /// statement about each rank worker: it stays as set, while a
-    /// discovered window next to it is still shared.
+    /// discovered window under the other name is dropped rather than
+    /// divided, so the reader's preference between the names cannot
+    /// override the operator's figure; the other labels ride along.
     #[test]
     fn a_window_the_operator_set_by_hand_stays_as_set() {
         let by_hand = labels(&[("max_running_requests", "2048")]);
@@ -1808,7 +1825,18 @@ mod rank_window_tests {
             rank.get("max_running_requests").map(String::as_str),
             Some("2048")
         );
-        assert_eq!(rank.get("max_num_seqs").map(String::as_str), Some("1024"));
+        assert_eq!(rank.get("max_num_seqs"), None);
+        assert_eq!(rank.get("dp_size").map(String::as_str), Some("8"));
+
+        let by_hand = labels(&[("max_num_seqs", "512")]);
+        let engine = labels(&[
+            ("max_running_requests", "16384"),
+            ("max_num_seqs", "512"),
+            ("attn_dp_size", "8"),
+        ]);
+        let rank = labels_for_rank(&engine, Some((0, 8)), &by_hand);
+        assert_eq!(rank.get("max_num_seqs").map(String::as_str), Some("512"));
+        assert_eq!(rank.get("max_running_requests"), None);
     }
 
     /// An engine that splits its running window across its attention-DP
