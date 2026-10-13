@@ -13,7 +13,8 @@
 //!   the key and the value stand;
 //! - what comes between two calls and after the last;
 //! - how a value that is not a string is spelled ([`Spellings`]);
-//! - what a thought and an answer are written with around the table's terminals ([`Message`]).
+//! - what a thought and an answer are written with around the table's terminals, and the terminal
+//!   that closes each, of the ones the table has ([`Message`]).
 //!
 //! Whoever compiles a table learns its layout from a rendering of the chat template (a probe
 //! conversation, read back through the table) and gives it to the table
@@ -149,6 +150,12 @@ pub struct Message {
     /// Whether the stream's stop ends the region (a stop token, which the stop decoder hides)
     /// rather than a terminal the template writes.
     pub stops: bool,
+    /// The terminal that closes the region as the rendering wrote it, which the tags write: a
+    /// template may close a region more than one way (a response template's `close` given as a
+    /// list), and the table's rows do not say which one its chat template renders. `None` where
+    /// the stop ends the region, or where the layout does not say: the tags then write the
+    /// region's first row out in the table.
+    pub close: Option<Box<str>>,
 }
 
 /// How a template writes `true`, `false` and `null`.
@@ -280,7 +287,8 @@ impl Layout {
     /// parameters holds no literal a parameter begins with; the call's close is a terminal with a
     /// row out of the call's state, or, for none, the table's stop row closes the call; and the
     /// table has a thought and an answer where the layout writes them, the stop ending the answer
-    /// only where a stop token closes it.
+    /// only where a stop token closes it, and a close the layout names for either a terminal with
+    /// a row out of its state.
     pub fn check(&self, format: &Format) -> Result<(), LayoutError> {
         let Some(CallSyntax::Shaped(shape)) = format.call_syntax() else {
             return Err(LayoutError::Calls);
@@ -412,7 +420,8 @@ impl Layout {
         )
     }
 
-    /// The rows the layout names: the call's close, the thought's and the answer's states.
+    /// The rows the layout names: the call's close, the thought's and the answer's states, and
+    /// the closes it names for them.
     fn check_rows(&self, format: &Format) -> Result<(), LayoutError> {
         let calls = (0..format.states()).find(|&s| format.emits(s) == Emits::Arguments);
         let Some(calls) = calls else {
@@ -428,10 +437,16 @@ impl Layout {
             None if !format.stop_closes(calls) => return Err(LayoutError::Close("call's stop")),
             _ => {}
         }
-        if self.thought.is_some()
-            && !(0..format.states()).any(|s| format.emits(s) == Emits::Reasoning)
-        {
-            return Err(LayoutError::Region("thought"));
+        if let Some(thought) = &self.thought {
+            let reasoning = (0..format.states()).find(|&s| format.emits(s) == Emits::Reasoning);
+            let Some(reasoning) = reasoning else {
+                return Err(LayoutError::Region("thought"));
+            };
+            if let Some(close) = &thought.close {
+                if !closes(reasoning, close) {
+                    return Err(LayoutError::Close("thought's close"));
+                }
+            }
         }
         if let Some(answer) = &self.answer {
             let state = (0..format.states())
@@ -444,6 +459,11 @@ impl Layout {
             });
             if answer.stops && state != 0 && !stopped {
                 return Err(LayoutError::Close("answer's stop"));
+            }
+            if let Some(close) = &answer.close {
+                if !closes(state, close) {
+                    return Err(LayoutError::Close("answer's close"));
+                }
             }
         }
         Ok(())
@@ -744,6 +764,29 @@ mod tests {
         assert_eq!(
             layout().check(&unstopped),
             Err(LayoutError::Region("thought"))
+        );
+        let mut thought = layout();
+        thought.thought = Some(Message {
+            close: Some("</t>".into()),
+            ..Message::default()
+        });
+        assert_eq!(thought.check(&format), Ok(()));
+        thought.thought = Some(Message {
+            close: Some("<a>".into()),
+            ..Message::default()
+        });
+        assert_eq!(
+            thought.check(&format),
+            Err(LayoutError::Close("thought's close"))
+        );
+        let mut answer = layout();
+        answer.answer = Some(Message {
+            close: Some("</t>".into()),
+            ..Message::default()
+        });
+        assert_eq!(
+            answer.check(&format),
+            Err(LayoutError::Close("answer's close"))
         );
     }
 

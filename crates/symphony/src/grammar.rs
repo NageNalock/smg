@@ -15,7 +15,8 @@
 //! row for is the end of the turn, which ends whatever is open and closes no region of its own.
 //! So the call markers are the rows into and out of the arguments state, the block markers the
 //! rows into and out of the wrapper state the calls sit in, and the thought's close the row from
-//! the reasoning state back to where the thought opened; the request's tools give each call its
+//! the reasoning state back to where the thought opened, the one the table's layout names where
+//! the template closes the thought more than one way; the request's tools give each call its
 //! name and schema. What the syntax inside the markers constrains comes from the call syntax: a
 //! JSON object around each tool's schema for the JSON family; the engines' `glm_xml` style of a
 //! schema for keyed arguments in the compact spelling, and the table's own tags written one pair
@@ -774,18 +775,34 @@ impl Format {
         };
         // The thought's own markers stay writable: the model closes its thought inside the
         // prefix where the engine applies the grammar from the first token, and an engine that
-        // runs a reasoning parser has consumed them before the grammar starts.
+        // runs a reasoning parser has consumed them before the grammar starts. They are its
+        // opener and every close back to where it opened, since the model writes the one its chat
+        // template renders, whichever the tags would write.
         let thought = self.region(reasoning, |state| self.is_call_state(state))?;
-        let excludes = self.excluded_but(&[thought.open, thought.close]);
+        let turn_close = self.turn_close();
+        let own: Vec<&str> = std::iter::once(thought.open)
+            .chain(
+                self.transitions()
+                    .filter(|&(source, on, target)| {
+                        source == reasoning
+                            && target == thought.home
+                            && Some(on) != turn_close
+                            && !self.stops(on)
+                    })
+                    .map(|(_, on, _)| self.terminal_text(on)),
+            )
+            .collect();
+        let excludes = self.excluded_but(&own);
         Some(Grammar::Sequence(vec![Grammar::AnyText { excludes }, body]))
     }
 
-    /// What free text before a tag may not write: the table's terminals, but `kept`, and the call
-    /// syntax's inner tags.
+    /// What free text before a tag may not write: the table's terminals, but `kept` and those
+    /// written inside one of them (a kept close `<e></t>` holds the terminal `<e>`, and free text
+    /// that excluded `<e>` could never write the close), and the call syntax's inner tags.
     fn excluded_but(&self, kept: &[&str]) -> Vec<String> {
         let mut excludes: Vec<String> = self
             .terminal_texts()
-            .filter(|text| !kept.contains(text))
+            .filter(|text| !kept.iter().any(|kept| kept.contains(text)))
             .map(str::to_string)
             .collect();
         let inner = self
@@ -1079,17 +1096,28 @@ impl Format {
     /// back to a state it is entered from, other than the end of the turn and a stop token (the
     /// model's stop ends the region there, with no text a tag could write), and its opener the
     /// terminal of that state's row into `state`; that state is its home. The states name the
-    /// markers, not the order of the rows. The turn's own state, where the opener leaves the
-    /// engine, is no region: the rows back into it close the regions it holds.
+    /// markers, not the order of the rows. Where the template closes the region more than one way,
+    /// the close is the one the table's layout names for a thought or an answer, the one its chat
+    /// template renders, and otherwise the first such row. The turn's own state, where the opener
+    /// leaves the engine, is no region: the rows back into it close the regions it holds.
     fn region(&self, state: usize, within: impl Fn(usize) -> bool + Copy) -> Option<Region<'_>> {
         if state == 0 {
             return None;
         }
         let from = self.entered_from(state, within);
         let turn_close = self.turn_close();
-        let (_, close, home) = self.transitions().find(|&(source, on, target)| {
-            source == state && from.contains(&target) && Some(on) != turn_close && !self.stops(on)
-        })?;
+        let closes = || {
+            self.transitions().filter(|&(source, on, target)| {
+                source == state
+                    && from.contains(&target)
+                    && Some(on) != turn_close
+                    && !self.stops(on)
+            })
+        };
+        let written = self.written_close(state);
+        let (_, close, home) = written
+            .and_then(|text| closes().find(|&(_, on, _)| self.terminal_text(on) == text))
+            .or_else(|| closes().next())?;
         let (_, open, _) = self
             .transitions()
             .find(|&(source, _, target)| source == home && target == state)?;
@@ -1098,6 +1126,20 @@ impl Format {
             close: self.terminal_text(close),
             home,
         })
+    }
+
+    /// The close the table's layout names for the region `state` is, the thought or the answer:
+    /// the terminal its chat template renders there.
+    fn written_close(&self, state: usize) -> Option<&str> {
+        let layout = self.layout()?;
+        let message = if Some(state) == self.state_emitting(Emits::Reasoning) {
+            layout.thought.as_ref()
+        } else if Some(state) == self.answer_state() {
+            layout.answer.as_ref()
+        } else {
+            None
+        };
+        message?.close.as_deref()
     }
 
     /// The ways into the block `state` is, one per state with a path into it (a row into it, or
@@ -2980,6 +3022,99 @@ mod tests {
             answer(&format, false).map(|payload| payload["format"]["begin"].clone()),
             Some(value!(" <a>"))
         );
+    }
+
+    /// A thought the template closes two ways, `<u>` or `<e></t>`, the row on `<u>` first in the
+    /// table; `<e>` alone closes the answer; calls of JSON between `<c>` and `</c>`. The template
+    /// writes the thought before every call and answer.
+    fn closed_two_ways() -> Format {
+        Format::new("closed two ways")
+            .terminal("think_open", "<t>")
+            .terminal("think_close", "<u>")
+            .terminal("think_end", "<e></t>")
+            .terminal("answer_open", "<a>")
+            .terminal("answer_close", "<e>")
+            .terminal("call_open", "<c>")
+            .terminal("call_close", "</c>")
+            .state("outside", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("content", Emits::Content)
+            .state("call", Emits::Arguments)
+            .transition("outside", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "outside")
+            .transition("reasoning", "think_end", "outside")
+            .transition("outside", "answer_open", "content")
+            .transition("content", "answer_close", "outside")
+            .transition("outside", "call_open", "call")
+            .transition("call", "call_close", "outside")
+            .calls(CallSyntax::Json)
+            .framing("outside")
+            .thinks_first()
+    }
+
+    #[test]
+    fn a_thought_closed_more_than_one_way_is_closed_as_its_layout_says_the_template_writes_it() {
+        let format = closed_two_ways();
+        assert_eq!(format.validate(), Ok(()));
+        let thought_end = |format: &Format| {
+            answer(format, false).map(|payload| payload["format"]["elements"][0]["end"].clone())
+        };
+        // Without a layout that names one, the tags write the first row out of the thought.
+        assert_eq!(thought_end(&format), Some(value!("<u>")));
+        // The layout names the close the chat template renders: the thought written first ends
+        // with it, and with the thought open the way into the answer starts with it.
+        let format = format.with_layout(Layout {
+            thought: Some(Message {
+                close: Some("<e></t>".into()),
+                ..Message::default()
+            }),
+            ..Layout::default()
+        });
+        assert_eq!(thought_end(&format), Some(value!("<e></t>")));
+        assert_eq!(
+            answer(&format, true).map(|payload| payload["format"]["begin"].clone()),
+            Some(value!("<e></t><a>"))
+        );
+        // With the thought open, the prefix a forced call takes keeps both of the thought's closes
+        // writable, and `<e>` inside the one the template renders, but no other marker.
+        let wrapped = format
+            .grammar(&weather_tools(), true, true)
+            .expect("a grammar")
+            .to_json();
+        assert_eq!(
+            wrapped["elements"][0],
+            value!({"type": "any_text", "excludes": ["<a>", "<c>", "</c>"]})
+        );
+        // Either close ends the thought, and `<e>` alone is the thought's text.
+        let json = "{\"city\": \"Paris\"}";
+        let message = read(&format, &[], "<t>", &format!("plan<e></t><a>{json}<e>"));
+        assert_eq!(message["reasoning"], value!("plan"));
+        assert_eq!(message["content"], value!(json));
+        let message = read(&format, &[], "<t>", "plan<e>more<u><a>x<e>");
+        assert_eq!(message["reasoning"], value!("plan<e>more"));
+        assert_eq!(message["content"], value!("x"));
+    }
+
+    #[test]
+    fn an_answer_closed_more_than_one_way_ends_as_its_layout_says_the_template_writes_it() {
+        // `closed_two_ways` with its answer closed by `</a>` as well, the row on `<e>` first.
+        let format = closed_two_ways().terminal("answer_end", "</a>");
+        let format = format.transition("content", "answer_end", "outside");
+        assert_eq!(format.validate(), Ok(()));
+        let answer_end = |format: &Format| {
+            answer(format, false).map(|payload| payload["format"]["elements"][1]["end"].clone())
+        };
+        // Without a layout that names one, the answer ends with the first row out of it.
+        assert_eq!(answer_end(&format), Some(value!("<e>")));
+        // The layout names the close the chat template renders, and the answer ends with it.
+        let format = format.with_layout(Layout {
+            answer: Some(Message {
+                close: Some("</a>".into()),
+                ..Message::default()
+            }),
+            ..Layout::default()
+        });
+        assert_eq!(answer_end(&format), Some(value!("</a>")));
     }
 
     /// Every node of `payload` of `kind`, depth first.

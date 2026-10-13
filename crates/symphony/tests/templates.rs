@@ -1104,11 +1104,13 @@ fn muse_layout() -> Layout {
             before: " ".into(),
             after: "<|start|>assistant".into(),
             stops: false,
+            close: Some("<|eom|>".into()),
         }),
         answer: Some(Message {
             before: " ".into(),
             after: "".into(),
             stops: true,
+            close: None,
         }),
     }
 }
@@ -1147,11 +1149,13 @@ fn serve_qwen3_5_layout() -> Layout {
             before: "".into(),
             after: "\n\n".into(),
             stops: false,
+            close: Some("</think>".into()),
         }),
         answer: Some(Message {
             before: "".into(),
             after: "".into(),
             stops: true,
+            close: None,
         }),
     }
 }

@@ -572,6 +572,7 @@ mod tests {
                 before: " ".into(),
                 after: "".into(),
                 stops: false,
+                close: None,
             }),
         }
     }
