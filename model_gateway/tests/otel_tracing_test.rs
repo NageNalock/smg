@@ -224,6 +224,13 @@ async fn test_router_with_tracing() {
     {
         let probe = info_span!(target: "smg::otel-trace", "context_probe");
         let _entered = probe.enter();
+        // The positive control first: the probe's own context, read the way
+        // the gateway reads a span's, is valid only when the layer saw it, so
+        // the assertion below cannot pass for want of a layer.
+        assert!(
+            probe.context().span().span_context().is_valid(),
+            "the probe is not seen by the OpenTelemetry layer"
+        );
         assert!(
             !opentelemetry::Context::current()
                 .span()
