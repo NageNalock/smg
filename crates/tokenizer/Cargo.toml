@@ -93,3 +93,7 @@ harness = false
 [[bench]]
 name = "prefix_cache"
 harness = false
+
+[[bench]]
+name = "parallel_encode"
+harness = false
