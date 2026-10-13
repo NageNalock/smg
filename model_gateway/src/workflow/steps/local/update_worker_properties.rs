@@ -7,6 +7,7 @@ use openai_protocol::worker::WorkerStatus;
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
+use super::create_worker::labels_for_rank;
 use crate::{
     worker::{
         overload::OverloadThresholds, service::MAX_WORKER_LABELS, BasicWorker, BasicWorkerBuilder,
@@ -28,6 +29,18 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
         context: &mut WorkflowContext<WorkerUpdateWorkflowData>,
     ) -> WorkflowResult<StepResult> {
         let request = &context.data.config;
+        // A label refresh replaces what discovery read before with what the
+        // engine reports now (an operator's own labels keep their values) and
+        // rebuilds a worker only when that changes something; an API update
+        // merges the request's labels into the existing ones.
+        let refresh = context.data.refresh_discovered_labels;
+        let fresh_engine_labels = context.data.fresh_engine_labels.clone();
+        let snapshot = context.data.snapshot.clone();
+        if refresh && fresh_engine_labels.is_none() {
+            debug!("No engine labels were re-read; nothing to update");
+            context.data.updated_workers = Some(Vec::new());
+            return Ok(StepResult::Skip);
+        }
         let app_context = context
             .data
             .app_context
@@ -60,6 +73,13 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             .iter()
             .map(|worker| {
                 let existing = &worker.metadata().spec.labels;
+                if let (true, Some(fresh)) = (refresh, fresh_engine_labels.as_ref()) {
+                    return Ok(refreshed_labels(
+                        existing,
+                        &worker.metadata().discovered_labels,
+                        &fresh_in_rank_space(worker, fresh),
+                    ));
+                }
                 let mut updated_labels = existing.clone();
                 if let Some(ref new_labels) = request.labels {
                     for (key, value) in new_labels {
@@ -82,7 +102,23 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             })
             .collect::<Result<_, _>>()?;
 
-        for (worker, updated_labels) in workers_to_update.iter().zip(merged_labels) {
+        for (index, (worker, updated_labels)) in
+            workers_to_update.iter().zip(merged_labels).enumerate()
+        {
+            if refresh && updated_labels == worker.metadata().spec.labels {
+                debug!(
+                    worker_url = %worker.url(),
+                    "Engine labels unchanged; the worker is kept as it is"
+                );
+                continue;
+            }
+            // A refresh follows the labels; the model card built from them at
+            // registration (context length, model type, architectures) is not
+            // re-derived here (a follow-up).
+            let discovered_labels = match (refresh, fresh_engine_labels.as_ref()) {
+                (true, Some(fresh)) => fresh_in_rank_space(worker, fresh),
+                _ => (*worker.metadata().discovered_labels).clone(),
+            };
             // Resolve priority and cost: use update value if specified, otherwise keep existing
             let updated_priority = request.priority.unwrap_or_else(|| worker.priority());
             let updated_cost = request.cost.unwrap_or_else(|| worker.cost());
@@ -129,6 +165,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             let mut builder = BasicWorkerBuilder::from_spec((*worker.metadata().spec).clone())
                 .http2(worker.http2())
                 .labels(updated_labels)
+                .discovered_labels(discovered_labels)
                 .health_config(updated_health_config.clone())
                 .health_endpoint(&health_endpoint)
                 .resilience(worker.resilience().clone())
@@ -170,10 +207,37 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             }
             let new_worker: Arc<dyn Worker> = Arc::new(new_worker);
 
-            // Replace the worker in the registry (overwrite-then-diff)
-            let worker_id = app_context
-                .worker_registry
-                .register_or_replace(new_worker.clone());
+            // Replace the worker in the registry (overwrite-then-diff). A
+            // refresh writes back a snapshot taken before a network read,
+            // against the id and revision the find step captured: a worker
+            // updated or replaced meanwhile fails the guard and is left as it
+            // is, one removed (or removed and registered again at the same
+            // address, under a new id) is not touched; the next transition
+            // into service refreshes again.
+            let worker_id = if refresh {
+                match snapshot.as_ref().and_then(|entries| entries.get(index)) {
+                    Some((id, expected))
+                        if app_context.worker_registry.replace_claiming_local(
+                            id,
+                            new_worker.clone(),
+                            *expected,
+                        ) =>
+                    {
+                        id.clone()
+                    }
+                    _ => {
+                        debug!(
+                            worker_url = %worker.url(),
+                            "Worker changed or left during the label refresh; not rebuilt"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                app_context
+                    .worker_registry
+                    .register_or_replace(new_worker.clone())
+            };
 
             // Same-URL replace preserves the existing shared runtime. If the
             // update disables health checks, force the lifecycle to Ready so
@@ -203,6 +267,135 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         false
+    }
+}
+
+/// The engine's fresh labels as `worker` records them: on an attention-DP
+/// rank worker the window label is the rank's share, the way registration
+/// recorded the discovered set (with no operator labels, so the operator's
+/// own window still differs from the record and wins the merge below); any
+/// other worker takes them as reported.
+fn fresh_in_rank_space(
+    worker: &Arc<dyn Worker>,
+    fresh: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    labels_for_rank(
+        fresh,
+        worker.dp_rank().zip(worker.dp_size()),
+        &std::collections::HashMap::new(),
+    )
+}
+
+/// The labels a worker carries once its engine reports `fresh`: every label
+/// whose value came from discovery (`discovered_before`, still unchanged
+/// since) follows the engine, disappearing when the engine no longer reports
+/// it; a label the operator set or overrode (its value differs from what
+/// discovery read, or discovery never read it) keeps its value; a key the
+/// engine reports for the first time is added unless the operator already
+/// set it.
+pub(crate) fn refreshed_labels(
+    current: &std::collections::HashMap<String, String>,
+    discovered_before: &std::collections::HashMap<String, String>,
+    fresh: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    let mut labels = current.clone();
+    for (key, before) in discovered_before {
+        if current.get(key) != Some(before) {
+            // The operator overrode (or removed) it: theirs stands.
+            continue;
+        }
+        match fresh.get(key) {
+            Some(now) => {
+                labels.insert(key.clone(), now.clone());
+            }
+            None => {
+                labels.remove(key);
+            }
+        }
+    }
+    for (key, now) in fresh {
+        if !discovered_before.contains_key(key) && !current.contains_key(key) {
+            labels.insert(key.clone(), now.clone());
+        }
+    }
+    labels
+}
+
+#[cfg(test)]
+mod refreshed_labels_tests {
+    use std::collections::HashMap;
+
+    use super::refreshed_labels;
+
+    fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn engine_sourced_labels_follow_the_engine() {
+        let discovered = map(&[("max_num_seqs", "256"), ("page_size", "128")]);
+        let current = map(&[
+            ("max_num_seqs", "256"),
+            ("page_size", "128"),
+            ("tier", "gold"),
+        ]);
+        let fresh = map(&[
+            ("max_num_seqs", "8"),
+            ("page_size", "1152"),
+            ("supports_vision", "true"),
+        ]);
+        assert_eq!(
+            refreshed_labels(&current, &discovered, &fresh),
+            map(&[
+                ("max_num_seqs", "8"),
+                ("page_size", "1152"),
+                ("supports_vision", "true"),
+                ("tier", "gold"),
+            ]),
+            "engine keys follow the engine, a new engine key is added, the operator's label stays"
+        );
+    }
+
+    #[test]
+    fn an_operator_override_keeps_its_value() {
+        let discovered = map(&[("served_model_name", "/models/x"), ("max_num_seqs", "256")]);
+        let current = map(&[("served_model_name", "m1"), ("max_num_seqs", "256")]);
+        let fresh = map(&[("served_model_name", "/models/y"), ("max_num_seqs", "8")]);
+        assert_eq!(
+            refreshed_labels(&current, &discovered, &fresh),
+            map(&[("served_model_name", "m1"), ("max_num_seqs", "8")]),
+            "a value the operator set over discovery's is kept; the untouched one follows"
+        );
+    }
+
+    #[test]
+    fn a_label_the_engine_no_longer_reports_is_dropped_unless_the_operator_set_it() {
+        let discovered = map(&[("mm_processor", "inprocess"), ("supports_vision", "true")]);
+        let current = map(&[
+            ("mm_processor", "inprocess"),
+            ("supports_vision", "true"),
+            ("extra", "1"),
+        ]);
+        let fresh = map(&[("supports_vision", "false")]);
+        assert_eq!(
+            refreshed_labels(&current, &discovered, &fresh),
+            map(&[("supports_vision", "false"), ("extra", "1")]),
+            "a vanished engine key goes, a flipped one follows, an operator key stays"
+        );
+    }
+
+    #[test]
+    fn a_new_engine_key_does_not_override_an_operator_label() {
+        let discovered = HashMap::new();
+        let current = map(&[("weight_version", "pinned")]);
+        let fresh = map(&[("weight_version", "v7"), ("vocab_size", "32000")]);
+        assert_eq!(
+            refreshed_labels(&current, &discovered, &fresh),
+            map(&[("weight_version", "pinned"), ("vocab_size", "32000")]),
+        );
     }
 }
 
@@ -318,8 +511,361 @@ mod tests {
             app_context: Some(app_context),
             workers_to_update: Some(vec![worker]),
             updated_workers: None,
+            refresh_discovered_labels: false,
+            fresh_engine_labels: None,
+            snapshot: None,
         };
         WorkflowContext::new(WorkflowInstanceId::new(), data)
+    }
+
+    fn make_refresh_context(
+        app_context: Arc<AppContext>,
+        worker: Arc<dyn Worker>,
+        fresh: HashMap<String, String>,
+    ) -> WorkflowContext<WorkerUpdateWorkflowData> {
+        let snapshot = vec![(
+            app_context
+                .worker_registry
+                .get_id_by_url(worker.url())
+                .expect("the worker is registered"),
+            worker.revision(),
+        )];
+        let data = WorkerUpdateWorkflowData {
+            config: WorkerUpdateRequest {
+                priority: None,
+                cost: None,
+                labels: None,
+                api_key: None,
+                health: None,
+            },
+            worker_url: worker.url().to_string(),
+            app_context: Some(app_context),
+            workers_to_update: Some(vec![worker]),
+            updated_workers: None,
+            refresh_discovered_labels: true,
+            fresh_engine_labels: Some(fresh),
+            snapshot: Some(snapshot),
+        };
+        WorkflowContext::new(WorkflowInstanceId::new(), data)
+    }
+
+    fn labels_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    /// A label refresh replaces what discovery read before with what the
+    /// engine reports now, keeps the operator's labels and the worker's
+    /// status, records the new discovered set, and lets the decode admission
+    /// window follow; the same report again rebuilds nothing.
+    #[tokio::test]
+    async fn a_label_refresh_follows_the_engine_and_keeps_the_operators_labels() {
+        let discovered = labels_of(&[("max_num_seqs", "256"), ("page_size", "128")]);
+        let mut labels = discovered.clone();
+        labels.insert("tier".to_string(), "gold".to_string());
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:8000")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .labels(labels)
+                .discovered_labels(discovered)
+                .status(WorkerStatus::Ready)
+                .build(),
+        );
+        assert_eq!(worker.max_running_requests(), Some(256));
+        let app_ctx = make_app_context(std::slice::from_ref(&worker));
+
+        let fresh = labels_of(&[
+            ("max_num_seqs", "8"),
+            ("page_size", "1152"),
+            ("supports_vision", "true"),
+        ]);
+        let mut refresh =
+            make_refresh_context(Arc::clone(&app_ctx), Arc::clone(&worker), fresh.clone());
+        assert_eq!(
+            UpdateWorkerPropertiesStep
+                .execute(&mut refresh)
+                .await
+                .unwrap(),
+            StepResult::Success
+        );
+        let rebuilt = app_ctx
+            .worker_registry
+            .get_by_url("grpc://decode:8000")
+            .expect("the worker stays registered");
+        assert_eq!(
+            rebuilt.metadata().spec.labels,
+            labels_of(&[
+                ("max_num_seqs", "8"),
+                ("page_size", "1152"),
+                ("supports_vision", "true"),
+                ("tier", "gold"),
+            ]),
+            "engine labels follow the engine, the operator's label stays"
+        );
+        assert_eq!(*rebuilt.metadata().discovered_labels, fresh);
+        assert_eq!(
+            rebuilt.max_running_requests(),
+            Some(8),
+            "the decode admission window follows the engine"
+        );
+        assert_eq!(
+            rebuilt.status(),
+            WorkerStatus::Ready,
+            "a refresh keeps the worker routable"
+        );
+
+        // The same report again changes nothing: no rebuild, no updated worker.
+        let revision = rebuilt.revision();
+        let mut again = make_refresh_context(Arc::clone(&app_ctx), Arc::clone(&rebuilt), fresh);
+        assert_eq!(
+            UpdateWorkerPropertiesStep
+                .execute(&mut again)
+                .await
+                .unwrap(),
+            StepResult::Success
+        );
+        assert_eq!(
+            app_ctx
+                .worker_registry
+                .get_by_url("grpc://decode:8000")
+                .unwrap()
+                .revision(),
+            revision,
+            "an unchanged engine report rebuilds nothing"
+        );
+        assert!(again.data.updated_workers.as_ref().unwrap().is_empty());
+    }
+
+    /// On an attention-DP rank worker the window label is the rank's share,
+    /// recorded in rank space at registration; a refresh maps the engine's
+    /// fresh labels through the same rule, so the share follows the engine's
+    /// new window, and an operator's hand-set window still wins.
+    #[tokio::test]
+    async fn a_rank_workers_window_follows_the_engine_in_rank_space() {
+        // The engine runs attention DP over 8 ranks with a window of 256: a
+        // rank worker carries the share, 32, and records it in rank space.
+        let discovered = labels_for_rank(
+            &labels_of(&[("max_running_requests", "256"), ("attn_dp_size", "8")]),
+            Some((0, 8)),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            discovered.get("max_running_requests").map(String::as_str),
+            Some("32")
+        );
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:8000")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .dp_config(0, 8)
+                .labels(discovered.clone())
+                .discovered_labels(discovered.clone())
+                .status(WorkerStatus::Ready)
+                .build(),
+        );
+        assert_eq!(worker.max_running_requests(), Some(32));
+        // The operator pinned another rank's window by hand: registration kept
+        // only the hand-set key (`labels_for_rank` with the operator's labels).
+        let pinned: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:8000")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .dp_config(1, 8)
+                .labels(labels_of(&[("max_num_seqs", "16"), ("attn_dp_size", "8")]))
+                .discovered_labels(discovered)
+                .status(WorkerStatus::Ready)
+                .build(),
+        );
+        assert_eq!(pinned.max_running_requests(), Some(16));
+        let app_ctx = make_app_context(&[Arc::clone(&worker), Arc::clone(&pinned)]);
+
+        // The engine restarts with a window of 512: the share is 64.
+        let fresh = labels_of(&[("max_running_requests", "512"), ("attn_dp_size", "8")]);
+        for rank in [&worker, &pinned] {
+            let mut refresh =
+                make_refresh_context(Arc::clone(&app_ctx), Arc::clone(rank), fresh.clone());
+            assert_eq!(
+                UpdateWorkerPropertiesStep
+                    .execute(&mut refresh)
+                    .await
+                    .unwrap(),
+                StepResult::Success
+            );
+        }
+        let rebuilt = app_ctx
+            .worker_registry
+            .get_by_url(worker.url())
+            .expect("the rank stays registered");
+        assert_eq!(
+            rebuilt.max_running_requests(),
+            Some(64),
+            "the rank's share follows the engine's new window"
+        );
+        assert_eq!(
+            rebuilt
+                .metadata()
+                .discovered_labels
+                .get("max_running_requests")
+                .map(String::as_str),
+            Some("64"),
+            "the discovered record stays in rank space"
+        );
+        let pinned_now = app_ctx
+            .worker_registry
+            .get_by_url(pinned.url())
+            .expect("the pinned rank stays registered");
+        assert_eq!(
+            pinned_now.max_running_requests(),
+            Some(16),
+            "the operator's hand-set window wins over the engine's share"
+        );
+        assert_eq!(
+            pinned_now.revision(),
+            pinned.revision(),
+            "nothing to follow on the pinned rank: it is not rebuilt"
+        );
+    }
+
+    /// A rank registered from a provisional read (no attention-DP label yet)
+    /// carries the whole window; once the engine's answer names the width,
+    /// the refresh moves the rank to its share instead of the whole figure.
+    #[tokio::test]
+    async fn a_rank_registered_from_a_provisional_read_takes_its_share_on_refresh() {
+        let discovered = labels_of(&[("max_running_requests", "256")]);
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:8001")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .dp_config(3, 8)
+                .labels(discovered.clone())
+                .discovered_labels(discovered)
+                .status(WorkerStatus::Ready)
+                .build(),
+        );
+        assert_eq!(worker.max_running_requests(), Some(256));
+        let app_ctx = make_app_context(std::slice::from_ref(&worker));
+
+        let fresh = labels_of(&[("max_running_requests", "256"), ("attn_dp_size", "8")]);
+        let mut refresh = make_refresh_context(Arc::clone(&app_ctx), Arc::clone(&worker), fresh);
+        assert_eq!(
+            UpdateWorkerPropertiesStep
+                .execute(&mut refresh)
+                .await
+                .unwrap(),
+            StepResult::Success
+        );
+        let rebuilt = app_ctx
+            .worker_registry
+            .get_by_url(worker.url())
+            .expect("the rank stays registered");
+        assert_eq!(
+            rebuilt.max_running_requests(),
+            Some(32),
+            "the rank takes its share once the engine names its width"
+        );
+        assert_eq!(
+            rebuilt
+                .metadata()
+                .spec
+                .labels
+                .get("attn_dp_size")
+                .map(String::as_str),
+            Some("8")
+        );
+    }
+
+    /// A refresh writes back against the revision it read: a worker that
+    /// changed during the read (an update, a replacement) is left as it is,
+    /// and one that was removed is not re-added.
+    #[tokio::test]
+    async fn a_label_refresh_is_dropped_when_the_worker_changed_or_left_during_the_read() {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode-b:8000")
+                .connection_mode(ConnectionMode::Grpc)
+                .labels(labels_of(&[("max_num_seqs", "256")]))
+                .discovered_labels(labels_of(&[("max_num_seqs", "256")]))
+                .status(WorkerStatus::Ready)
+                .build(),
+        );
+        let app_ctx = make_app_context(std::slice::from_ref(&worker));
+        let fresh = labels_of(&[("max_num_seqs", "8")]);
+
+        // Changed during the read: the snapshot's revision is stale.
+        let mut refresh =
+            make_refresh_context(Arc::clone(&app_ctx), Arc::clone(&worker), fresh.clone());
+        // An operator update lands while the read is in flight: the registry
+        // replaces the worker and bumps its revision.
+        let id = app_ctx
+            .worker_registry
+            .get_id_by_url("grpc://decode-b:8000")
+            .unwrap();
+        let patched: Arc<dyn Worker> = Arc::new(
+            worker
+                .as_any()
+                .downcast_ref::<BasicWorker>()
+                .expect("a BasicWorker")
+                .clone(),
+        );
+        assert!(app_ctx.worker_registry.replace(&id, patched));
+        assert_eq!(
+            UpdateWorkerPropertiesStep
+                .execute(&mut refresh)
+                .await
+                .unwrap(),
+            StepResult::Success
+        );
+        assert_eq!(
+            app_ctx
+                .worker_registry
+                .get_by_url("grpc://decode-b:8000")
+                .unwrap()
+                .max_running_requests(),
+            Some(256),
+            "a stale snapshot is not written back"
+        );
+        assert!(refresh.data.updated_workers.as_ref().unwrap().is_empty());
+
+        // Removed during the read, and registered again at the same address:
+        // the refresh must neither bring the old worker back nor touch the new
+        // one (a fresh registration starts at the revision the snapshot had).
+        let current = app_ctx
+            .worker_registry
+            .get_by_url("grpc://decode-b:8000")
+            .unwrap();
+        let mut refresh = make_refresh_context(Arc::clone(&app_ctx), Arc::clone(&current), fresh);
+        let id = app_ctx
+            .worker_registry
+            .get_id_by_url("grpc://decode-b:8000")
+            .unwrap();
+        app_ctx.worker_registry.remove(&id);
+        let replacement: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode-b:8000")
+                .connection_mode(ConnectionMode::Grpc)
+                .labels(labels_of(&[("max_num_seqs", "999")]))
+                .status(WorkerStatus::Ready)
+                .build(),
+        );
+        app_ctx.worker_registry.register(replacement).unwrap();
+        assert_eq!(
+            UpdateWorkerPropertiesStep
+                .execute(&mut refresh)
+                .await
+                .unwrap(),
+            StepResult::Success
+        );
+        assert_eq!(
+            app_ctx
+                .worker_registry
+                .get_by_url("grpc://decode-b:8000")
+                .unwrap()
+                .max_running_requests(),
+            Some(999),
+            "a worker registered again at the address keeps its own labels"
+        );
+        assert!(refresh.data.updated_workers.as_ref().unwrap().is_empty());
     }
 
     /// The cap is held where the labels are merged, not only at the admin
@@ -753,6 +1299,9 @@ mod tests {
             app_context: Some(Arc::clone(&app_ctx)),
             workers_to_update: Some(vec![Arc::clone(&first), Arc::clone(&second)]),
             updated_workers: None,
+            refresh_discovered_labels: false,
+            fresh_engine_labels: None,
+            snapshot: None,
         };
         let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
         let err = UpdateWorkerPropertiesStep

@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fmt,
     sync::{
         atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering},
@@ -1250,6 +1250,14 @@ pub struct WorkerMetadata {
     /// What this worker offers a PD rendezvous partner, derived once from
     /// the spec and its discovered labels (#2483).
     pub pd_pairing: PdPairing,
+    /// The labels discovery read from the engine when the worker was
+    /// registered or last refreshed, before the operator's own labels were
+    /// merged over them. A refresh on the engine's next transition into
+    /// service replaces exactly these (see the update step's
+    /// `refreshed_labels`), so a label the operator set or overrode keeps its
+    /// value. Empty for a worker that was not discovered (a mesh import, a
+    /// test fixture).
+    pub discovered_labels: Arc<HashMap<String, String>>,
 }
 
 impl WorkerMetadata {
@@ -3480,7 +3488,7 @@ mod tests {
 
     #[test]
     fn test_worker_with_labels() {
-        let mut labels = std::collections::HashMap::new();
+        let mut labels = HashMap::new();
         labels.insert("env".to_string(), "prod".to_string());
         labels.insert("zone".to_string(), "us-west".to_string());
 
@@ -3496,7 +3504,7 @@ mod tests {
     #[test]
     fn test_max_running_requests_parses_from_label() {
         use crate::worker::BasicWorkerBuilder;
-        let mut labels = std::collections::HashMap::new();
+        let mut labels = HashMap::new();
         labels.insert("max_running_requests".to_string(), "256".to_string());
         let worker = BasicWorkerBuilder::new("http://w:9000")
             .labels(labels)
@@ -3514,7 +3522,7 @@ mod tests {
     #[test]
     fn test_max_running_requests_returns_none_on_bad_value() {
         use crate::worker::BasicWorkerBuilder;
-        let mut labels = std::collections::HashMap::new();
+        let mut labels = HashMap::new();
         labels.insert(
             "max_running_requests".to_string(),
             "not-a-number".to_string(),
@@ -3528,7 +3536,7 @@ mod tests {
     #[test]
     fn test_max_running_requests_zero_treated_as_none() {
         use crate::worker::BasicWorkerBuilder;
-        let mut labels = std::collections::HashMap::new();
+        let mut labels = HashMap::new();
         labels.insert("max_running_requests".to_string(), "0".to_string());
         let worker = BasicWorkerBuilder::new("http://w:9000")
             .labels(labels)
@@ -3543,7 +3551,7 @@ mod tests {
         // TokenSpeed advertises the same scheduler window as `max_num_seqs`;
         // without this a TokenSpeed worker looks like a non-reporter to both
         // fleet capacity and PD admission.
-        let mut labels = std::collections::HashMap::new();
+        let mut labels = HashMap::new();
         labels.insert("max_num_seqs".to_string(), "16".to_string());
         let worker = BasicWorkerBuilder::new("grpc://w:30000")
             .labels(labels)
@@ -3557,7 +3565,7 @@ mod tests {
         // The servicer's `running_window` resolves in the same order, so a
         // worker reporting both spellings cannot have its discovery label
         // disagree with its GetLoads report.
-        let mut labels = std::collections::HashMap::new();
+        let mut labels = HashMap::new();
         labels.insert("max_running_requests".to_string(), "256".to_string());
         labels.insert("max_num_seqs".to_string(), "16".to_string());
         let worker = BasicWorkerBuilder::new("grpc://w:30000")
@@ -3704,7 +3712,7 @@ mod tests {
     #[test]
     fn test_is_realtime_capable_true_from_label() {
         use crate::worker::BasicWorkerBuilder;
-        let mut labels = std::collections::HashMap::new();
+        let mut labels = HashMap::new();
         labels.insert("realtime".to_string(), "true".to_string());
         let worker = BasicWorkerBuilder::new("http://w:9000")
             .labels(labels)
@@ -3722,7 +3730,7 @@ mod tests {
     #[test]
     fn test_is_realtime_capable_false_on_non_true_value() {
         use crate::worker::BasicWorkerBuilder;
-        let mut labels = std::collections::HashMap::new();
+        let mut labels = HashMap::new();
         labels.insert("realtime".to_string(), "1".to_string());
         let worker = BasicWorkerBuilder::new("http://w:9000")
             .labels(labels)
@@ -4415,6 +4423,7 @@ mod tests {
             health_endpoint: "/health".to_string(),
             overload: OverloadThresholds::default(),
             http2: false,
+            discovered_labels: Arc::default(),
         };
 
         // Empty models list should accept any model
@@ -4441,6 +4450,7 @@ mod tests {
             health_endpoint: "/health".to_string(),
             overload: OverloadThresholds::default(),
             http2: false,
+            discovered_labels: Arc::default(),
         };
 
         // Find by primary ID

@@ -51,6 +51,9 @@ pub struct BasicWorkerBuilder {
     /// against. Default empty: a spec block alone still enables protection
     /// for this worker.
     overload_defaults: OverloadThresholds,
+    /// The labels discovery read from the engine, recorded on the worker so a
+    /// later refresh replaces exactly these; empty when none were discovered.
+    discovered_labels: HashMap<String, String>,
 }
 
 impl BasicWorkerBuilder {
@@ -68,6 +71,7 @@ impl BasicWorkerBuilder {
             initial_status: None,
             connect_signal_tx: None,
             overload_defaults: OverloadThresholds::default(),
+            discovered_labels: HashMap::new(),
         }
     }
 
@@ -85,6 +89,7 @@ impl BasicWorkerBuilder {
             initial_status: None,
             connect_signal_tx: None,
             overload_defaults: OverloadThresholds::default(),
+            discovered_labels: HashMap::new(),
         }
     }
 
@@ -104,6 +109,7 @@ impl BasicWorkerBuilder {
             initial_status: None,
             connect_signal_tx: None,
             overload_defaults: OverloadThresholds::default(),
+            discovered_labels: HashMap::new(),
         }
     }
 
@@ -147,6 +153,14 @@ impl BasicWorkerBuilder {
     /// Set labels for worker identification
     pub fn labels(mut self, labels: HashMap<String, String>) -> Self {
         self.spec.labels = labels;
+        self
+    }
+
+    /// Record the labels discovery read from the engine for this worker
+    /// (before the operator's labels were merged over them). A later refresh
+    /// replaces exactly these; `labels` stays the merged set the worker shows.
+    pub fn discovered_labels(mut self, labels: HashMap<String, String>) -> Self {
+        self.discovered_labels = labels;
         self
     }
 
@@ -327,6 +341,7 @@ impl BasicWorkerBuilder {
             health_config,
             health_endpoint: self.health_endpoint,
             http2: self.http2,
+            discovered_labels: Arc::new(self.discovered_labels),
         };
 
         // OnceCell for lock-free client access after initialization; ArcSwap so

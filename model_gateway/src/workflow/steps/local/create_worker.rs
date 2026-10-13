@@ -248,6 +248,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         spec.kv_role = None;
         spec.kv_engine_id = None;
 
+        let discovered_labels = context.data.discovered_labels.clone();
         let workers: Vec<Arc<dyn Worker>> = dp_ranks
             .into_iter()
             .map(|dp| {
@@ -262,7 +263,8 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                     .health_config(health_config.clone())
                     .health_endpoint(health_endpoint)
                     .overload_defaults(overload_defaults)
-                    .labels(labels_for_rank(&labels, dp, &config.labels));
+                    .labels(labels_for_rank(&labels, dp, &config.labels))
+                    .discovered_labels(labels_for_rank(&discovered_labels, dp, &HashMap::new()));
 
                 if let Some((rank, size)) = dp {
                     builder = builder.dp_config(rank, size);
@@ -746,8 +748,10 @@ fn validate_zmq_worker_type(
 /// window (a discovered window under the other name is dropped, since the
 /// reader prefers `max_num_seqs` to `max_running_requests` and would
 /// otherwise take the engine's figure over the operator's); only a
-/// discovered window is shared.
-fn labels_for_rank(
+/// discovered window is shared. The discovered record and a refresh's fresh
+/// labels pass through the same rule (with no operator labels), so a refresh
+/// compares like with like in rank space.
+pub(super) fn labels_for_rank(
     labels: &HashMap<String, String>,
     dp: Option<(usize, usize)>,
     set_by_hand: &HashMap<String, String>,
