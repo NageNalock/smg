@@ -222,6 +222,7 @@ class RouterArgs:
     mesh_advertise_host: str | None = None
     mesh_port: int = 39527
     mesh_peer_urls: list[str] = dataclasses.field(default_factory=list)
+    mesh_disable_worker_sync: bool = False
     # Append new fields here to preserve positional callers.
     model_aliases: dict[str, str] = dataclasses.field(default_factory=dict)
     worker_startup_delay: int = 0
@@ -2336,6 +2337,16 @@ class RouterArgs:
             action="extend",
             default=[],
             help="Peer mesh server addresses to join (format: host:port)",
+        )
+        mesh_group.add_argument(
+            f"--{prefix}mesh-disable-worker-sync",
+            action="store_true",
+            default=False,
+            help=(
+                "Keep the mesh's cache-tree and rate-limit sync but neither publish"
+                " this router's workers to peers nor import theirs (for deployments"
+                " where every router discovers its own workers)"
+            ),
         )
         mesh_group.add_argument(
             f"--{prefix}mesh-tls-ca-cert",

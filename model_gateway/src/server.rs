@@ -1001,6 +1001,10 @@ pub struct ServerConfig {
     /// Control plane authentication configuration
     pub control_plane_auth: Option<smg_auth::ControlPlaneAuthConfig>,
     pub mesh_server_config: Option<MeshServerConfig>,
+    /// Whether the mesh publishes this node's workers to peers and imports
+    /// theirs. `false` keeps the mesh, the cache-tree sync and the
+    /// rate-limit sync, and nothing else; the default is `true`.
+    pub mesh_worker_sync: bool,
     /// Bind address for WebRTC UDP sockets.
     /// `None` means use the default (0.0.0.0, auto-detect candidate IP).
     pub webrtc_bind_addr: Option<std::net::IpAddr>,
@@ -1585,6 +1589,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             app_context.worker_registry.clone(),
             handler.state.clone(),
             app_context.policy_registry.clone(),
+            config.mesh_worker_sync,
         )
     });
 
@@ -2877,6 +2882,7 @@ mod tests {
             shutdown_grace_period_secs: 5,
             control_plane_auth: None,
             mesh_server_config: None,
+            mesh_worker_sync: true,
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
         }

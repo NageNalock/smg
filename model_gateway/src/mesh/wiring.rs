@@ -12,7 +12,7 @@ use std::{fmt, sync::Arc};
 use smg_mesh::{
     gossip::NodeStatus, ClusterState, MergeStrategy, MeshKV, StreamConfig, StreamRouting,
 };
-use tracing::debug;
+use tracing::{debug, info};
 
 use super::adapters::{
     tree_sync::{
@@ -45,10 +45,12 @@ const REPAIR_PAGE_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 
 /// Owns the started mesh sync adapters. Mesh on means every adapter here is
 /// constructed, its namespace registered, and its inbound loop running —
-/// mesh off is represented by the absence of the whole struct.
+/// mesh off is represented by the absence of the whole struct, and worker
+/// sync off (`--mesh-disable-worker-sync`) by the absence of the worker
+/// adapter alone.
 #[derive(Debug)]
 pub struct MeshAdapters {
-    worker: Arc<WorkerSyncAdapter>,
+    worker: Option<Arc<WorkerSyncAdapter>>,
     rate_limit: Arc<RateLimitSyncAdapter>,
     tree: Arc<TreeSyncAdapter>,
 }
@@ -69,6 +71,13 @@ impl MeshAdapters {
     /// which propagates it (and flips `populate_hash_index` on) to every
     /// existing and future [`CacheAwarePolicy`] instance.
     ///
+    /// With `worker_sync` off the worker adapter is not built and the
+    /// `worker:` prefix is left unregistered: a peer's entries merge through
+    /// the store's default last-writer-wins engine (the engine worker sync
+    /// registers) and nothing on this node reads them, and this node's
+    /// workers are never published. For deployments where every router
+    /// discovers its own workers and only the routing state is shared.
+    ///
     /// # Panics
     ///
     /// Panics if any adapter's `start` invariants are violated — the
@@ -83,8 +92,8 @@ impl MeshAdapters {
         worker_registry: Arc<WorkerRegistry>,
         cluster_state: ClusterState,
         policy_registry: Arc<PolicyRegistry>,
+        worker_sync: bool,
     ) -> Arc<Self> {
-        let worker_ns = mesh_kv.configure_crdt_prefix("worker:", MergeStrategy::LastWriterWins);
         let rl_ns = mesh_kv.configure_crdt_prefix("rl:", MergeStrategy::EpochMaxWins);
         let td_ns = mesh_kv.configure_stream_prefix(
             TENANT_DELTA_PREFIX,
@@ -107,7 +116,10 @@ impl MeshAdapters {
                 routing: StreamRouting::Targeted,
             },
         );
-        let worker = WorkerSyncAdapter::new(worker_ns, worker_registry);
+        let worker = worker_sync.then(|| {
+            let worker_ns = mesh_kv.configure_crdt_prefix("worker:", MergeStrategy::LastWriterWins);
+            WorkerSyncAdapter::new(worker_ns, worker_registry)
+        });
         let rate_limit = RateLimitSyncAdapter::new(rl_ns, node_name.clone());
         let peers: Arc<dyn PeerList> =
             Arc::new(ClusterStatePeerList::new(cluster_state, node_name.clone()));
@@ -121,7 +133,10 @@ impl MeshAdapters {
             peers,
             node_name,
         );
-        worker.start();
+        match &worker {
+            Some(worker) => worker.start(),
+            None => info!("mesh worker sync is off: workers are neither published nor imported"),
+        }
         rate_limit.start();
         tree.start();
         // Only after the adapter is subscribed to the `td:` stream do we
@@ -135,9 +150,9 @@ impl MeshAdapters {
         })
     }
 
-    /// Worker sync adapter.
-    pub fn worker(&self) -> &Arc<WorkerSyncAdapter> {
-        &self.worker
+    /// Worker sync adapter; `None` when worker sync is off.
+    pub fn worker(&self) -> Option<&Arc<WorkerSyncAdapter>> {
+        self.worker.as_ref()
     }
 
     /// Rate-limit sync adapter.
@@ -325,7 +340,61 @@ mod tests {
             Arc::new(WorkerRegistry::new()),
             empty_cluster_state(),
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            true,
         )
+    }
+
+    #[tokio::test]
+    async fn worker_sync_off_neither_imports_nor_publishes() {
+        let mesh = MeshKV::new("node-a".into());
+        let registry = Arc::new(WorkerRegistry::new());
+        let adapters = MeshAdapters::start(
+            &mesh,
+            "node-a".into(),
+            registry.clone(),
+            empty_cluster_state(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            false,
+        );
+        assert!(
+            adapters.worker().is_none(),
+            "no worker adapter when worker sync is off"
+        );
+
+        // The prefix is left to whoever needs it (here the test): a peer's
+        // entry lands in the store and nowhere else, and a local
+        // registration is never published.
+        let ns = mesh.configure_crdt_prefix("worker:", MergeStrategy::LastWriterWins);
+        let remote = WorkerState {
+            worker_id: "w1".into(),
+            model_id: "llama-3".into(),
+            url: "http://remote:8080".into(),
+            health: true,
+            load: 0.0,
+            version: 1,
+            spec: vec![],
+        };
+        ns.put("worker:w1", bincode::serialize(&remote).unwrap());
+        let local: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://local:8080")
+                .model(openai_protocol::model_card::ModelCard::new("llama-3"))
+                .build(),
+        );
+        let local_id = registry.register(local).unwrap();
+        sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            registry.get_by_url("http://remote:8080").is_none(),
+            "a peer's worker state must not be imported"
+        );
+        assert!(
+            ns.get(&format!("worker:{}", local_id.as_str())).is_none(),
+            "a local worker must not be published"
+        );
+        assert!(
+            ns.get("worker:w1").is_some(),
+            "the peer's entry merges into the store as before"
+        );
     }
 
     #[tokio::test]
@@ -338,6 +407,7 @@ mod tests {
             registry.clone(),
             empty_cluster_state(),
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            true,
         );
 
         // A put through the adapter echoes back through the namespace
@@ -352,7 +422,10 @@ mod tests {
             version: 1,
             spec: vec![],
         };
-        adapters.worker().on_worker_changed("w1", &state);
+        adapters
+            .worker()
+            .expect("worker sync is on")
+            .on_worker_changed("w1", &state);
 
         for _ in 0..100 {
             if registry.get_by_url("http://remote:8080").is_some() {
@@ -386,6 +459,7 @@ mod tests {
             Arc::new(WorkerRegistry::new()),
             empty_cluster_state(),
             policy_registry.clone(),
+            true,
         );
 
         // A fresh model → policy created on demand should inherit the
@@ -457,6 +531,7 @@ mod tests {
             Arc::new(WorkerRegistry::new()),
             empty_cluster_state(),
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            true,
         );
     }
 
@@ -505,6 +580,7 @@ mod tests {
             Arc::new(WorkerRegistry::new()),
             empty_cluster_state(),
             policy_registry.clone(),
+            true,
         );
 
         assert!(
@@ -526,6 +602,7 @@ mod tests {
             Arc::new(WorkerRegistry::new()),
             empty_cluster_state(),
             policy_registry.clone(),
+            true,
         );
         let policy = policy_registry.get_policy_or_default("llama-3");
         let cache_aware = policy
@@ -558,6 +635,7 @@ mod tests {
             Arc::new(WorkerRegistry::new()),
             empty_cluster_state(),
             policy_registry.clone(),
+            true,
         );
 
         // Workers with no model_id → select_worker derives

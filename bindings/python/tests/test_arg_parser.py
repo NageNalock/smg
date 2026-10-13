@@ -1387,6 +1387,15 @@ class TestParseRouterArgs:
         assert router_args.mesh_port == 39527
         assert router_args.mesh_peer_urls == ["10.0.0.43:39527"]
 
+    def test_parse_mesh_disable_worker_sync(self):
+        """The opt-out keeps the mesh and turns only the worker sync off; off by default."""
+        assert parse_router_args(["--enable-mesh"]).mesh_disable_worker_sync is False
+
+        router_args = parse_router_args(["--enable-mesh", "--mesh-disable-worker-sync"])
+
+        assert router_args.enable_mesh is True
+        assert router_args.mesh_disable_worker_sync is True
+
     def test_parse_mesh_tls_args(self):
         """The mesh TLS flags land in the dataclass; absent, they stay None."""
         router_args = parse_router_args(

@@ -616,6 +616,9 @@ struct Router {
     /// The keyword-only `discovery` mapping, read by the same rules as
     /// `RouterConfig.discovery`.
     discovery: Option<config::DiscoveryConfig>,
+    /// Keyword-only: keep the mesh's cache-tree and rate-limit sync but
+    /// neither publish this router's workers nor import peers'.
+    mesh_disable_worker_sync: bool,
     /// Keyword-only: the mesh CA, this node's certificate and key (PEM
     /// paths); all three or none.
     mesh_tls_ca_cert: Option<String>,
@@ -1393,6 +1396,7 @@ impl Router {
         mesh_tls_key = None,
         power_of_two_load_metric = String::from("expected_wait"),
         discovery = None,
+        mesh_disable_worker_sync = false,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -1593,6 +1597,7 @@ impl Router {
         mesh_tls_key: Option<String>,
         power_of_two_load_metric: String,
         discovery: Option<Bound<'_, PyAny>>,
+        mesh_disable_worker_sync: bool,
     ) -> PyResult<Self> {
         // Two spellings of one choice: refuse both rather than pick one.
         if service_discovery && discovery.is_some() {
@@ -1817,6 +1822,7 @@ impl Router {
             mm_allowed_media_domains,
             mm_allow_private_media_hosts,
             discovery,
+            mesh_disable_worker_sync,
             mesh_tls_ca_cert,
             mesh_tls_cert,
             mesh_tls_key,
@@ -1942,6 +1948,7 @@ impl Router {
                 } else {
                     None
                 },
+                mesh_worker_sync: !self.mesh_disable_worker_sync,
                 webrtc_bind_addr: None,
                 webrtc_stun_server: None,
             }))

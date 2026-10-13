@@ -2335,6 +2335,7 @@ mod tests {
             Arc::new(WorkerRegistry::new()),
             Arc::new(RwLock::new(BTreeMap::new())),
             Arc::clone(&registry),
+            true,
         );
 
         let prefill = cache_aware_policy();

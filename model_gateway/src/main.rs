@@ -1533,6 +1533,13 @@ struct CliArgs {
     #[arg(long, num_args = 0..)]
     mesh_peer_urls: Vec<String>,
 
+    /// Keep the mesh's cache-tree and rate-limit sync but neither publish this
+    /// router's workers to peers nor import theirs. Right for deployments
+    /// where every router discovers (or is configured with) its own workers,
+    /// so only the routing state needs to be shared.
+    #[arg(long, default_value_t = false)]
+    mesh_disable_worker_sync: bool,
+
     /// The CA certificate (PEM) the mesh peers' certificates chain to. With
     /// `--mesh-tls-cert` and `--mesh-tls-key` the mesh listener serves TLS
     /// and requires peer certificates, and every dial presents this node's.
@@ -2736,6 +2743,7 @@ impl CliArgs {
             shutdown_grace_period_secs: self.shutdown_grace_period_secs,
             control_plane_auth,
             mesh_server_config,
+            mesh_worker_sync: !self.mesh_disable_worker_sync,
             webrtc_bind_addr: self.webrtc_bind_addr,
             webrtc_stun_server: self.webrtc_stun_server.clone(),
         })
@@ -3829,6 +3837,31 @@ mod tests {
         let server = cli.to_server_config(router).unwrap();
         let mesh = server.mesh_server_config.expect("mesh server config");
         assert_eq!(mesh.advertise_addr.port(), 39527);
+    }
+
+    #[test]
+    fn mesh_disable_worker_sync_turns_only_the_worker_sync_off() {
+        let cli = cli_args_from(&["--enable-mesh", "--mesh-advertise-host", "10.0.0.1"]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        let server = cli.to_server_config(router).unwrap();
+        assert!(server.mesh_worker_sync, "worker sync is on by default");
+
+        let cli = cli_args_from(&[
+            "--enable-mesh",
+            "--mesh-advertise-host",
+            "10.0.0.1",
+            "--mesh-disable-worker-sync",
+        ]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        let server = cli.to_server_config(router).unwrap();
+        assert!(
+            server.mesh_server_config.is_some(),
+            "the mesh itself stays on"
+        );
+        assert!(
+            !server.mesh_worker_sync,
+            "the flag turns the worker sync off"
+        );
     }
 
     #[test]
