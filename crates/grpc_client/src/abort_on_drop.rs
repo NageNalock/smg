@@ -90,9 +90,10 @@ pub struct AbortOnDropStream<T: Send + 'static, C: AbortOnDropClient> {
 }
 
 impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
-    /// Wrap a streaming response so it auto-aborts on drop. Past `deadline`,
-    /// with no message arrived, the stream yields the deadline's status once
-    /// and ends (the abort-on-drop and its deferral stay with the drop).
+    /// Wrap a streaming response so it auto-aborts on drop. Once `deadline`
+    /// has passed, the next poll yields the deadline's status, even if a
+    /// message is buffered, and the stream ends (the abort-on-drop and its
+    /// deferral stay with the drop).
     pub fn new(
         stream: Streaming<T>,
         request_id: String,
