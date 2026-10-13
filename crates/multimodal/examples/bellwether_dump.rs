@@ -298,7 +298,9 @@ fn process(
         EncoderInput::U8 { patches, .. } => {
             Some(patches.as_standard_layout().iter().copied().collect())
         }
-        EncoderInput::F32(_) => None,
+        // The u8 patches exist on the two-pass path alone; `preprocess` never
+        // yields the one-pass wire layout, and a float tensor carries none.
+        EncoderInput::F32(_) | EncoderInput::Wire { .. } => None,
     };
     Ok(Artifacts {
         width,
