@@ -588,6 +588,14 @@ impl QwenVLProcessorBase {
             w_bar = ((width as f64 * beta / factor as f64).ceil() as usize) * factor;
         }
 
+        // A side that rounded to nothing is lifted to one factor: with a
+        // pixel budget of zero (reachable through `mm_processor_kwargs`) the
+        // branch above never fires, and an empty resize would plan a grid of
+        // no patches. Both branches leave every other side at the factor or
+        // above, so nothing else changes.
+        h_bar = h_bar.max(factor);
+        w_bar = w_bar.max(factor);
+
         Ok((h_bar, w_bar))
     }
 
@@ -1957,6 +1965,29 @@ mod tests {
                 permissive.smart_resize_video(2, height, width).unwrap()
             );
         }
+    }
+
+    /// A pixel budget of zero (reachable through `mm_processor_kwargs`) used
+    /// to plan an empty resize: a side under half the factor rounds to
+    /// nothing and the `min_pixels` branch never fires for a budget of zero.
+    /// The side is lifted to one factor; with a budget, the branch itself
+    /// lifts both sides as the reference does.
+    #[test]
+    fn smart_resize_never_returns_a_zero_side_under_a_zero_pixel_budget() {
+        let processor = QwenVLProcessorBase::new(QwenVLConfig {
+            min_pixels: 0,
+            ..create_test_config()
+        });
+        assert_eq!(processor.smart_resize(1, 100).unwrap(), (28, 112));
+        assert_eq!(processor.smart_resize(100, 1).unwrap(), (112, 28));
+        assert_eq!(processor.smart_resize(13, 13).unwrap(), (28, 28));
+
+        let processor = QwenVLProcessorBase::new(create_test_config());
+        let (h, w) = processor.smart_resize(1, 100).unwrap();
+        assert!(
+            h >= 28 && w >= 28 && h * w >= processor.min_pixels(),
+            "{h}x{w}"
+        );
     }
 
     #[test]
