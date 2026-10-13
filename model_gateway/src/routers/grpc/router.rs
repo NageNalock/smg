@@ -980,7 +980,7 @@ impl GrpcRouter {
             );
         };
         let canonical = self.resolve_canonical_model_id(model_id);
-        if canonical == openai_protocol::UNKNOWN_MODEL_ID {
+        if canonical == UNKNOWN_MODEL_ID {
             return error::model_not_found(model_id);
         }
         let Some(snapshot) = self.worker_registry.model_routing_snapshot(&canonical) else {
