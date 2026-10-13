@@ -1191,6 +1191,17 @@ struct CliArgs {
     #[arg(long, default_value_t = 1024, help_heading = "Rate Limiting")]
     max_background_responses: usize,
 
+    /// How long the lease this gateway holds on a background response it runs
+    /// stays valid without a renewal, in seconds: a response whose gateway
+    /// stopped is closed as failed by any gateway sharing the response store
+    /// within one and a half times this value. The gateways sharing a store
+    /// compare their clocks through the lease: keep them within a third of
+    /// this value of each other (a gateway running ahead by more than two
+    /// thirds of it closes live responses as lost). 0 writes no lease and
+    /// runs no reaper; 1 to 5 are rejected (too short to be renewed).
+    #[arg(long, default_value_t = 30, help_heading = "Rate Limiting")]
+    background_lease_ttl_secs: u64,
+
     // ==================== Retry Configuration ====================
     /// Maximum number of retry attempts
     #[arg(long, default_value_t = 5, help_heading = "Retry Configuration")]
@@ -2719,6 +2730,7 @@ impl CliArgs {
             .tenant_header_name(&self.tenant_header_name)
             .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
             .max_background_responses(self.max_background_responses)
+            .background_lease_ttl_secs(self.background_lease_ttl_secs)
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())

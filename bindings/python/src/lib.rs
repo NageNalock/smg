@@ -502,6 +502,7 @@ struct Router {
     history_memory_max_responses: usize,
     history_memory_max_items: usize,
     history_memory_retention_secs: u64,
+    background_lease_ttl_secs: u64,
     connection_mode: worker::ConnectionMode,
     model_path: Option<String>,
     tokenizer_path: Option<String>,
@@ -1127,6 +1128,7 @@ impl Router {
             .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
             .max_background_responses(self.max_background_responses)
             .sse_keepalive_secs(self.sse_keepalive_secs)
+            .background_lease_ttl_secs(self.background_lease_ttl_secs)
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
@@ -1386,6 +1388,7 @@ impl Router {
         history_memory_max_responses = 10000,
         history_memory_max_items = 100000,
         history_memory_retention_secs = 86400,
+        background_lease_ttl_secs = 30,
         // Keyword-only, so it never takes a positional slot.
         *,
         mesh_tls_ca_cert = None,
@@ -1588,6 +1591,7 @@ impl Router {
         history_memory_max_responses: usize,
         history_memory_max_items: usize,
         history_memory_retention_secs: u64,
+        background_lease_ttl_secs: u64,
         mesh_tls_ca_cert: Option<String>,
         mesh_tls_cert: Option<String>,
         mesh_tls_key: Option<String>,
@@ -1714,6 +1718,7 @@ impl Router {
             history_memory_max_responses,
             history_memory_max_items,
             history_memory_retention_secs,
+            background_lease_ttl_secs,
             connection_mode,
             model_path,
             tokenizer_path,

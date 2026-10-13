@@ -530,6 +530,7 @@ class TestRouterPositionalSignature:
             "history_memory_max_responses",
             "history_memory_max_items",
             "history_memory_retention_secs",
+            "background_lease_ttl_secs",
         ]
 
 
