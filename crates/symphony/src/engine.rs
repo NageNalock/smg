@@ -57,7 +57,10 @@
 //!   again from there, as a regular expression's search goes on after the place its pattern
 //!   failed at. None of those bytes was emitted, so the tokens are still counted in the output's
 //!   order. A closing terminal closes a shaped call only where the call's trailer ends right
-//!   before it, the stream's stop too; any other is the call's text.
+//!   before it; any other is the call's text. The stream's stop, where the table says it closes
+//!   the call, closes one JSON value or object where its trailer ends with the stream, and tagged
+//!   parameters wherever the trailer stands, as a template's reader closes the region at the end
+//!   of its text.
 //! - With the tagged syntax, a value's type comes from the request's tools ([`Declared`]): a
 //!   declared string streams, every other value is written at its close. A call to a function the
 //!   request did not declare has every value inferred. A shaped call's values read through the
@@ -1063,7 +1066,8 @@ impl Engine {
             Emits::Reasoning => out.push(Event::ReasoningEnd),
             Emits::Arguments => {
                 // The stop token that closes the call is hidden, so the call's end has no bytes. A
-                // shaped call's trailer must end where the stream does.
+                // shaped call of one JSON value or object needs its trailer to end where the stream
+                // does; tagged parameters close wherever it stands.
                 let closed = if matches!(finish, EngineFinish::Stop)
                     && self.format.stop_closes(self.state)
                     && self.call_closes("")

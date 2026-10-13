@@ -32,7 +32,9 @@
 //!   for the stop token and close the call on, with whatever arguments had arrived; a driver that
 //!   knows a stop sequence ended the stream hands the end over as another finish
 //!   (`EngineFinish::Other`), and the call stays cut, since a stop sequence never completes a
-//!   call.
+//!   call. A table read from a response template may name it for any call, since the template's
+//!   reader closes a region at the end of its text whatever the region's closing pattern: a call
+//!   given as data closes there as [`CallSyntax::Shaped`] says.
 //! - A **framing row** names a content or wrapper state whose text the template discards: the
 //!   space around a response template's fields, which Hugging Face's parser drops (its null sink),
 //!   or a field the API has no place for. Every byte of text there, a terminal with no row from
@@ -165,8 +167,10 @@ pub enum CallSyntax {
     /// [`CallShape`]). The terminal that enters the state opens a call only when the header after
     /// it matches; otherwise it is the text of the state it came in. A closing terminal closes the
     /// region only where the trailer ends right before it, and is the call's end; otherwise it is
-    /// the call's text. The shape is [`intern`](crate::shape::intern)ed, so the syntax stays
-    /// `Copy`.
+    /// the call's text. The stream's stop, where [`Format::closes_at_stop`] names the state, closes
+    /// one JSON value or object where the trailer ends with the stream, and tagged parameters
+    /// wherever the trailer stands. The shape is [`intern`](crate::shape::intern)ed, so the syntax
+    /// stays `Copy`.
     Shaped(&'static CallShape),
 }
 
@@ -339,7 +343,8 @@ impl Format {
     }
 
     /// The arguments state `state` closes its call when the stream stops in it: the family ends
-    /// its last call with a stop token, which the stop decoder hides. A stream cut for length,
+    /// its last call with a stop token, which the stop decoder hides, or a response template's
+    /// reader closes the call's region at the end of its text. A stream cut for length,
     /// aborted, or ended with any finish but `Stop` is still cut; a driver hands a stop sequence of
     /// the request's over as such a finish (see the stop row in [`crate::format`]). The state must
     /// already be in the table.

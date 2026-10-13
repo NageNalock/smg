@@ -210,7 +210,8 @@ pub struct CallShape {
     /// What comes after the arguments, right before the region's closing terminal:
     /// `</function>\s*`, or the `}` of an object the header opened. A closing terminal the
     /// trailer does not end at closes nothing, and is the call's text. An empty trailer ends
-    /// wherever the terminal comes.
+    /// wherever the terminal comes. The stream's stop, where the table says it closes the call,
+    /// closes tagged parameters wherever the trailer stands.
     pub trailer: Pattern,
     /// The characters `\b` reads as a word's: the template dialect's `\w`, which whoever lowered
     /// the shape resolved.

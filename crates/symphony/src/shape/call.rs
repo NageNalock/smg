@@ -30,7 +30,10 @@
 //!   the call as its text, as the template's closing pattern reads past it. An empty trailer ends
 //!   wherever the terminal comes. Until the region closes, the bytes after the arguments are
 //!   held, since they may turn out to be the trailer; with an empty trailer they are classified as
-//!   they arrive.
+//!   they arrive. The stream's stop, where the table says it closes the call, is checked the same
+//!   way for one JSON value or object, whose text the template's reader parses whole; tagged
+//!   parameters close there wherever the trailer stands, since that reader closes the region at the
+//!   end of its text and `finditer` passes over what no parameter takes.
 //!
 //! Every byte lands in one event. The header's bytes are the start's source (dropped as wrapping
 //! when the arguments' object names the call, since its start carries that object's head); the
@@ -312,7 +315,8 @@ impl Assembler {
     /// Whether the region closes at `terminal`, a closing terminal that just came (empty for the
     /// stream's stop): whether the trailer ends right before it, starting no earlier than where
     /// the arguments' bytes end. When it does not, the terminal closes nothing, and the engine
-    /// feeds it to the call as its text.
+    /// feeds it to the call as its text. The stream's stop closes tagged parameters wherever the
+    /// trailer stands.
     pub fn closes(&mut self, terminal: &str) -> bool {
         let shape = self.shape;
         let Stage::Body(body) = &mut self.stage else {
@@ -1451,6 +1455,77 @@ mod tests {
                 finish(1),
             ],
             "a value the trailer cut short is no parameter; the trailer's bytes are the end's"
+        );
+    }
+
+    #[test]
+    fn a_stop_closes_tagged_parameters_wherever_the_trailer_stands() {
+        let format = table(tagged(closed_by_tag(), closing_f())).closes_at_stop("call");
+        assert_eq!(
+            run(&format, "<c><k=a>1</k>\n</c>"),
+            [
+                wrapper("<c>"),
+                start("f", ""),
+                member("{\"a\": 1", "<k=a>1</k>"),
+                wrapper("\n</c>"),
+                closed(),
+                end(""),
+                finish(1),
+            ],
+            "a close the trailer does not end at is the call's text, and the stop closes the call"
+        );
+        assert_eq!(
+            run(&format, "<c><k=a>1</k>\n</f>\n"),
+            [
+                wrapper("<c>"),
+                start("f", ""),
+                member("{\"a\": 1", "<k=a>1</k>"),
+                wrapper("\n</f>\n"),
+                closed(),
+                end(""),
+                finish(1),
+            ],
+            "a trailer that ends with the stream closes the call as before"
+        );
+        assert_eq!(
+            run(&format, "<c><k=a>1</k><k=b>2"),
+            [
+                wrapper("<c>"),
+                start("f", ""),
+                member("{\"a\": 1", "<k=a>1</k>"),
+                wrapper("<k=b>2"),
+                closed(),
+                end(""),
+                finish(1),
+            ],
+            "a parameter the stop came inside is no parameter, as at the end of the text"
+        );
+        let cut = |reason| {
+            vec![
+                wrapper("<c>"),
+                start("f", ""),
+                member("{\"a\": 1", "<k=a>1</k>"),
+                wrapper("\n</c>"),
+                end(""),
+                Event::Finish {
+                    reason,
+                    tool_calls: 1,
+                    reasoning_tokens: 0,
+                },
+            ]
+        };
+        assert_eq!(
+            run(
+                &table(tagged(closed_by_tag(), closing_f())),
+                "<c><k=a>1</k>\n</c>"
+            ),
+            cut(crate::event::FinishReason::Stop),
+            "without the row the stop does not close the call, which is cut"
+        );
+        assert_eq!(
+            run_after(&format, "", "<c><k=a>1</k>\n</c>", EngineFinish::Length),
+            cut(crate::event::FinishReason::Length),
+            "a stream cut for length leaves the call cut"
         );
     }
 

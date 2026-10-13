@@ -406,6 +406,19 @@ fn ends_at(consume: impl IntoIterator<Item = Atom>, ahead: impl IntoIterator<Ite
 /// trailer `</function>\s*` and `</tool_call>`, their parameters tags with a key and a value up
 /// to `\s*</parameter>`, typed by the request's tools.
 fn qwen3_5_serve_shaped() -> Box<dyn Parser> {
+    Box::new(Engine::new(qwen3_5_serve_table(), keyed_tools()))
+}
+
+/// The Qwen 3.5 serve template where the stream's stop closes a call, as the template's reader
+/// closes a region at the end of its text, whatever the trailer.
+fn qwen3_5_serve_closed_at_stop() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        qwen3_5_serve_table().closes_at_stop("call"),
+        keyed_tools(),
+    ))
+}
+
+fn qwen3_5_serve_table() -> Format {
     let name = none_of(">\n");
     let shape = shape::intern(CallShape {
         header: Pattern(
@@ -443,25 +456,22 @@ fn qwen3_5_serve_shaped() -> Box<dyn Parser> {
         word: word(),
         hold_cap: 8192,
     });
-    Box::new(Engine::new(
-        Format::new("qwen 3.5 serve template")
-            .terminal("think_open", "<think>")
-            .terminal("think_close", "</think>")
-            .terminal("call_open", "<tool_call>")
-            .terminal("call_close", "</tool_call>")
-            .state("content", Emits::Content)
-            .state("reasoning", Emits::Reasoning)
-            .state("call", Emits::Arguments)
-            .transition("content", "think_open", "reasoning")
-            .transition("reasoning", "think_close", "content")
-            .transition("content", "call_open", "call")
-            .transition("call", "call_close", "content")
-            .calls(CallSyntax::Shaped(shape))
-            .turn_anchor("<|im_start|>assistant\n")
-            .trims("content")
-            .trims("reasoning"),
-        keyed_tools(),
-    ))
+    Format::new("qwen 3.5 serve template")
+        .terminal("think_open", "<think>")
+        .terminal("think_close", "</think>")
+        .terminal("call_open", "<tool_call>")
+        .terminal("call_close", "</tool_call>")
+        .state("content", Emits::Content)
+        .state("reasoning", Emits::Reasoning)
+        .state("call", Emits::Arguments)
+        .transition("content", "think_open", "reasoning")
+        .transition("reasoning", "think_close", "content")
+        .transition("content", "call_open", "call")
+        .transition("call", "call_close", "content")
+        .calls(CallSyntax::Shaped(shape))
+        .turn_anchor("<|im_start|>assistant\n")
+        .trims("content")
+        .trims("reasoning")
 }
 
 /// The response template of `meta-models/Muse-Glimmer-30B` (its `tokenizer_config.json`) with its
@@ -742,6 +752,11 @@ const FORMATS: &[Subject] = &[
     Subject {
         name: "qwen 3.5 serve template, its calls as a shape",
         new: qwen3_5_serve_shaped,
+        outputs: QWEN3_5_SERVE_OUTPUTS,
+    },
+    Subject {
+        name: "qwen 3.5 serve template, its calls as a shape, closed at stop",
+        new: qwen3_5_serve_closed_at_stop,
         outputs: QWEN3_5_SERVE_OUTPUTS,
     },
     Subject {

@@ -19,9 +19,13 @@
 //! begins, which is known only when a closing terminal comes, so the reader keeps the trailer's
 //! search over the bytes after the last parameter; when the region closes, what is still
 //! undecided before the trailer is decided as `finditer` decides it at the end of the text, and the
-//! arguments' object is closed. When the stream cuts the region, what is undecided is decided the
-//! same way at the end of what arrived, the object is left open, and the bytes no parameter took
-//! come back as `Malformed` with `UnterminatedRegion`.
+//! arguments' object is closed. The stream's stop, where the table says it closes the call, closes
+//! it wherever the trailer stands: the template's reader closes a region at the end of its text
+//! whether or not the closing pattern matched, and `finditer` passes over a trailer the stream
+//! never finished, or a closing terminal given back to the call, as over any text no parameter
+//! takes. When the stream cuts the region, what is undecided is decided the same way at the end of
+//! what arrived, the object is left open, and the bytes no parameter took come back as `Malformed`
+//! with `UnterminatedRegion`.
 
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
@@ -146,7 +150,9 @@ impl Params {
     }
 
     /// Whether the region closes at `terminal` (empty for the stream's stop): whether the trailer
-    /// ends right before it, starting no earlier than the last parameter's end.
+    /// ends right before it, starting no earlier than the last parameter's end. The stream's stop
+    /// closes it either way, as the end of the text closes the template's region: with no trailer
+    /// there, every byte after the last parameter is the call's text.
     pub(crate) fn closes(&mut self, terminal: &str) -> bool {
         let at = if self.shape.trailer.0.is_empty() {
             Some(self.since_floor)
@@ -158,7 +164,7 @@ impl Params {
             }
         };
         self.trailer_at = at;
-        at.is_some()
+        at.is_some() || terminal.is_empty()
     }
 
     /// The region closed where [`closes`](Self::closes) said: what is undecided before the
