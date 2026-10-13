@@ -4764,6 +4764,7 @@ pub(crate) fn decode_image_bytes(
         },
     };
     image = narrow_sixteen_bit_colour(image);
+    image = clip_sixteen_bit_grey(image);
     image = apply_max_long_side_pixel(image, max_long_side_pixel);
     Ok(image)
 }
@@ -4852,6 +4853,65 @@ mod sixteen_bit_colour_tests {
         assert!(matches!(
             narrow_sixteen_bit_colour(rgb),
             image::DynamicImage::ImageRgb8(_)
+        ));
+    }
+}
+
+/// Bring 16-bit greyscale samples down to 8 bits the way the serving engine's
+/// own loader converts them: each sample is clipped to 255, not scaled (its
+/// 16-bit greyscale mode converts to RGB through a clip). A 16-bit greyscale
+/// photograph therefore reaches the model almost entirely white on both
+/// paths; this keeps the gateway bit-identical to the engine, which is the
+/// pipeline's rule. Scaling (`v * 255 / 65535`, what the `image` crate's
+/// conversion does) would be the visually faithful image.
+fn clip_sixteen_bit_grey(image: image::DynamicImage) -> image::DynamicImage {
+    match image {
+        image::DynamicImage::ImageLuma16(wide) => {
+            let (width, height) = wide.dimensions();
+            let bytes: Vec<u8> = wide
+                .into_raw()
+                .into_iter()
+                .map(|sample| sample.min(255) as u8)
+                .collect();
+            #[expect(
+                clippy::expect_used,
+                reason = "one byte per 16-bit sample, the same pixel count"
+            )]
+            image::DynamicImage::ImageLuma8(
+                image::GrayImage::from_raw(width, height, bytes)
+                    .expect("buffer matches image dimensions"),
+            )
+        }
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod sixteen_bit_grey_tests {
+    use super::*;
+
+    #[test]
+    fn greyscale_samples_are_clipped_not_scaled() {
+        let wide = image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_raw(
+            6,
+            1,
+            vec![0, 1, 254, 255, 256, 0xFFFF],
+        )
+        .expect("6x1 grey16");
+        match clip_sixteen_bit_grey(image::DynamicImage::ImageLuma16(wide)) {
+            image::DynamicImage::ImageLuma8(narrow) => {
+                assert_eq!(narrow.as_raw(), &[0, 1, 254, 255, 255, 255]);
+            }
+            other => panic!("expected grey8, got {:?}", other.color()),
+        }
+    }
+
+    #[test]
+    fn other_layouts_pass_through_untouched() {
+        let rgb = image::DynamicImage::new_rgb16(2, 2);
+        assert!(matches!(
+            clip_sixteen_bit_grey(rgb),
+            image::DynamicImage::ImageRgb16(_)
         ));
     }
 }
