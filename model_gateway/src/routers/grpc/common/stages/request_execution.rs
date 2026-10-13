@@ -1037,6 +1037,7 @@ async fn execute_parallel_pd(
         bound,
         Box::pin(async move { prefill_client.generate(prefill_request).await }),
         prefill_worker.cloned(),
+        workers.decode_worker().cloned(),
         prefill_label,
         request_id.clone(),
         prompt_tokens,
@@ -1091,6 +1092,7 @@ async fn execute_parallel_pd(
                 &mut prefill_stream,
                 bound,
                 prefill_worker,
+                workers.decode_worker(),
                 prefill_label,
                 &request_id,
                 prompt_tokens,
@@ -1104,9 +1106,7 @@ async fn execute_parallel_pd(
                     // not be torn down mid-write.
                     drop(prefill_stream);
                     drop(decode_stream.defer_abort_until_first_item());
-                    if let Some(status) = e.breaker_status() {
-                        workers.record_outcome_prefill(ledger, status);
-                    }
+                    record_silence_outcome(workers, ledger, &e);
                     return Err(pd_leg_error(PdLeg::Prefill, prefill_label, &e, workers));
                 }
                 // The leg answered: the success its dispatch's sample waited
@@ -1154,9 +1154,7 @@ async fn execute_parallel_pd(
             // it when it finally does.
             let (label, partner_label, partner_worker) = match leg {
                 PdLeg::Prefill => {
-                    if let Some(status) = status {
-                        workers.record_outcome_prefill(ledger, status);
-                    }
+                    record_silence_outcome(workers, ledger, &error);
                     (prefill_label, decode_label, workers.decode_worker())
                 }
                 PdLeg::Decode => {
@@ -1171,7 +1169,9 @@ async fn execute_parallel_pd(
                 // its abort deferred (that prefill may yet start the handoff
                 // the decode is waiting for) and uncharged: a late failure
                 // of a handoff that never came is not the decode's fault.
-                let retirement = if is_prefill_silence(&error) {
+                // The decode partner the verdict charged for stalling is
+                // retired the same way: charged once, at the verdict.
+                let retirement = if is_prefill_silence(&error) || is_decode_silence(&error) {
                     Retirement::PartnerSilent
                 } else {
                     Retirement::PartnerFailed
@@ -1271,6 +1271,11 @@ fn pd_leg_error(
             return prefill_silence_response(error, prefill);
         }
     }
+    if leg == PdLeg::Prefill && is_decode_silence(error) {
+        if let Some(decode) = workers.decode_worker() {
+            return decode_silence_response(error, decode);
+        }
+    }
     UpstreamClass::account_dispatch_failure(leg.name(), connection, error);
     account_pd_leg_failure(leg.name(), error);
     start_failure_response(
@@ -1296,10 +1301,12 @@ enum Retirement {
     /// neither sampled nor counted. Its abort is deferred: the prefill may
     /// yet start the handoff, which must not be torn down mid-write.
     PartnerSilent,
-    /// Its own silence bound passed. The request charged its worker once,
+    /// Its own silence bound passed. The request charged a worker once,
     /// where the bound passed (the breaker sample through the ledger, the
-    /// `timeout` worker error): its late result is neither sampled nor
-    /// counted, whatever it is. A late stream is aborted, a late error noted.
+    /// `timeout` worker error): this leg's, or its decode partner's when
+    /// the partner had stalled mid-stream (see [`decode_partner_silent`]).
+    /// Its late result is neither sampled nor counted, whatever it is. A
+    /// late stream is aborted, a late error noted.
     Silent,
 }
 
@@ -1396,6 +1403,10 @@ fn retire_pd_leg(
 /// `DEADLINE_EXCEEDED`.
 const PREFILL_SILENCE_MESSAGE: &str = "prefill leg produced nothing within";
 
+/// The message of the verdict that puts a prefill leg's silence on its
+/// stalled decode partner (see [`decode_partner_silent`]).
+const DECODE_SILENCE_MESSAGE: &str = "decode worker produced nothing within";
+
 /// The bound on one prefill leg's silence, counted from its dispatch (see
 /// [`liveness::prefill_leg_bound`]).
 #[derive(Clone, Copy, Debug)]
@@ -1464,6 +1475,103 @@ fn is_prefill_silence(status: &tonic::Status) -> bool {
         && status.message().starts_with(PREFILL_SILENCE_MESSAGE)
 }
 
+/// The decode partner of a prefill leg whose silence bound passed, when the
+/// silence is the partner's: on the parallel dispatch shape the prefill
+/// leg's first response waits for the decode side, so a decode worker that
+/// stopped producing makes every prefill leg look silent and the prefill
+/// worker answer no leg at all. A decode worker that still holds streams it
+/// had been producing for and has produced nothing for the bound has
+/// stalled ([`Worker::output_silence`]); one that is still producing, or
+/// holds no such stream (its streams ended, or its in-flight work has shown
+/// nothing yet: a frozen prefill in front of an idle decode looks like that,
+/// and the prefill keeps the verdict as before), is not read as the cause.
+/// `None` without a partner (the sequential shape sends the decode leg
+/// after the prefill answered, so a silent prefill there is its own).
+fn stalled_decode_partner(
+    partner: Option<&Arc<dyn Worker>>,
+    bound: Duration,
+) -> Option<(Arc<dyn Worker>, Duration)> {
+    let decode = partner?;
+    let silence = decode
+        .output_silence()
+        .filter(|silence| *silence >= bound)?;
+    Some((Arc::clone(decode), silence))
+}
+
+/// The verdict on a prefill leg that produced nothing within its bound
+/// while its decode partner had stalled mid-stream (see
+/// [`stalled_decode_partner`]): one WARN naming the decode worker, the
+/// prefill worker and the request, the worker-error counter under the
+/// timeout class for the DECODE worker, and the status the attempt fails
+/// with, which the retry layer may take to another decode worker (see
+/// [`decode_silence_response`]). Nothing is charged to the prefill worker,
+/// which was waiting on its partner.
+fn decode_partner_silent(
+    prefill: &Arc<dyn Worker>,
+    decode: &Arc<dyn Worker>,
+    connection: &'static str,
+    request_id: &str,
+    bound: Duration,
+    silence: Duration,
+    phase: &'static str,
+) -> tonic::Status {
+    warn!(
+        request_id = %request_id,
+        worker = decode.url(),
+        worker_type = metrics_labels::WORKER_DECODE,
+        prefill_worker = prefill.url(),
+        phase,
+        bound_ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
+        decode_silence_ms = u64::try_from(silence.as_millis()).unwrap_or(u64::MAX),
+        "PD decode worker has produced nothing for the silence bound on the streams it was serving, and the prefill leg waits on it; giving up on the pair and charging the decode worker"
+    );
+    Metrics::record_worker_error(
+        metrics_labels::WORKER_DECODE,
+        connection,
+        metrics_labels::ERROR_TIMEOUT,
+    );
+    tonic::Status::deadline_exceeded(format!(
+        "{DECODE_SILENCE_MESSAGE} {bound:.1?} of the prefill leg's dispatch ({phase}): the prefill \
+         leg waited on it (decode silent for {silence:.1?})"
+    ))
+}
+
+/// Whether `status` is the verdict of [`decode_partner_silent`].
+fn is_decode_silence(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::DeadlineExceeded
+        && status.message().starts_with(DECODE_SILENCE_MESSAGE)
+}
+
+/// The client answer for a pair given up on for its stalled decode partner:
+/// a 504 under its own code, replayable on another decode worker. The
+/// decode worker is marked on the response so the retry window closes on it
+/// alone (the prefill stays selectable) and the answer stands when no other
+/// decode worker is available.
+fn decode_silence_response(status: &tonic::Status, decode: &Arc<dyn Worker>) -> Response {
+    let mut response = error::gateway_timeout(
+        "decode_worker_silent",
+        format!("Decode worker silent: {}", status.message()),
+    );
+    mark_failed_leg(&mut response, decode.as_ref());
+    response
+}
+
+/// The breaker sample of a prefill leg's silence verdict: on the worker the
+/// verdict charged (the decode partner that stalled, else the prefill).
+fn record_silence_outcome(
+    workers: &WorkerSelection,
+    ledger: &AttemptLedger,
+    error: &tonic::Status,
+) {
+    if let Some(status) = error.breaker_status() {
+        if is_decode_silence(error) {
+            workers.record_outcome_decode(ledger, status);
+        } else {
+            workers.record_outcome_prefill(ledger, status);
+        }
+    }
+}
+
 /// The client answer for a prefill leg's silence: a 504 under its own error
 /// code, replayable on another prefill worker. The leg's worker is marked on
 /// the response so the retry window closes on it alone (its decode partner
@@ -1484,12 +1592,15 @@ fn prefill_silence_response(status: &tonic::Status, prefill: &Arc<dyn Worker>) -
 /// [`liveness::prefill_leg_reprieve`]); once the worker has answered
 /// nothing for a bound, the still-pending call is retired off the request
 /// path (its room is aborted when it lands) and the silence verdict takes
-/// its place. Without a bound or a worker to charge, the call is awaited as
-/// it is.
+/// its place: the prefill's, or its decode `partner`'s when the partner had
+/// stalled mid-stream (see [`stalled_decode_partner`]; the parallel shape
+/// passes the decode worker, the sequential shape none). Without a bound or
+/// a worker to charge, the call is awaited as it is.
 async fn dispatch_prefill_within(
     bound: Option<PrefillLegBound>,
     mut dispatch: PdLegDispatch,
     worker: Option<Arc<dyn Worker>>,
+    partner: Option<Arc<dyn Worker>>,
     connection: &'static str,
     request_id: String,
     prompt_tokens: u64,
@@ -1510,14 +1621,27 @@ async fn dispatch_prefill_within(
                 dispatch,
                 Retirement::Silent,
             );
-            return Err(prefill_leg_silent(
-                &worker,
-                connection,
-                &request_id,
-                prompt_tokens,
-                bound.bound,
-                "dispatch",
-            ));
+            return Err(
+                match stalled_decode_partner(partner.as_ref(), bound.bound) {
+                    Some((decode, silence)) => decode_partner_silent(
+                        &worker,
+                        &decode,
+                        connection,
+                        &request_id,
+                        bound.bound,
+                        silence,
+                        "dispatch",
+                    ),
+                    None => prefill_leg_silent(
+                        &worker,
+                        connection,
+                        &request_id,
+                        prompt_tokens,
+                        bound.bound,
+                        "dispatch",
+                    ),
+                },
+            );
         };
         deadline = Instant::now() + more;
     }
@@ -1533,6 +1657,7 @@ async fn first_prefill_response_within(
     stream: &mut ProtoStream,
     bound: Option<PrefillLegBound>,
     worker: Option<&Arc<dyn Worker>>,
+    partner: Option<&Arc<dyn Worker>>,
     connection: &'static str,
     request_id: &str,
     prompt_tokens: u64,
@@ -1546,14 +1671,25 @@ async fn first_prefill_response_within(
             return Ok(first);
         }
         let Some(more) = liveness::prefill_leg_reprieve(worker, bound.bound) else {
-            return Err(prefill_leg_silent(
-                worker,
-                connection,
-                request_id,
-                prompt_tokens,
-                bound.bound,
-                "first_response",
-            ));
+            return Err(match stalled_decode_partner(partner, bound.bound) {
+                Some((decode, silence)) => decode_partner_silent(
+                    worker,
+                    &decode,
+                    connection,
+                    request_id,
+                    bound.bound,
+                    silence,
+                    "first_response",
+                ),
+                None => prefill_leg_silent(
+                    worker,
+                    connection,
+                    request_id,
+                    prompt_tokens,
+                    bound.bound,
+                    "first_response",
+                ),
+            });
         };
         deadline = Instant::now() + more;
     }
@@ -1849,6 +1985,7 @@ async fn execute_sequential_pd(
         bound,
         Box::pin(async move { prefill_client.generate(prefill_request).await }),
         prefill_worker.cloned(),
+        None,
         prefill_label,
         request_id.clone(),
         prompt_tokens,
@@ -1868,6 +2005,7 @@ async fn execute_sequential_pd(
         &mut prefill_stream,
         bound,
         prefill_worker,
+        None,
         prefill_label,
         &request_id,
         prompt_tokens,
@@ -2526,6 +2664,7 @@ mod tests {
             Some(three_second_bound()),
             never_answers(),
             Some(Arc::clone(&prefill)),
+            None,
             metrics_labels::CONNECTION_GRPC,
             "chatcmpl-silent".to_string(),
             256,
@@ -2576,6 +2715,7 @@ mod tests {
                 Some(three_second_bound()),
                 answers_after(Duration::from_secs(1)),
                 Some(prefill),
+                None,
                 metrics_labels::CONNECTION_GRPC,
                 "chatcmpl-late".to_string(),
                 256,
@@ -2591,6 +2731,7 @@ mod tests {
             dispatch_prefill_within(
                 None,
                 fails_now("refused"),
+                None,
                 None,
                 metrics_labels::CONNECTION_GRPC,
                 "chatcmpl-unbounded".to_string(),
@@ -2614,6 +2755,7 @@ mod tests {
             &mut stream,
             Some(three_second_bound()),
             Some(&prefill),
+            None,
             metrics_labels::CONNECTION_GRPC,
             "chatcmpl-ended",
             256,
@@ -2650,6 +2792,7 @@ mod tests {
                 }),
                 never_answers(),
                 Some(Arc::clone(&prefill)),
+                None,
                 metrics_labels::CONNECTION_GRPC,
                 "chatcmpl-queued".to_string(),
                 256,
@@ -2662,6 +2805,151 @@ mod tests {
         assert!(
             elapsed >= answered_at + bound && elapsed < answered_at + 3 * bound,
             "given up on a bound after the worker's latest answer, not at its own bound: {elapsed:?}"
+        );
+    }
+
+    /// On the parallel shape a prefill leg's first response waits for the
+    /// decode side, so a decode worker that stopped producing mid-stream
+    /// makes the prefill look silent. At the prefill's exhausted reprieve
+    /// the decode partner is read: holding a stream it had been producing
+    /// for and quiet for the bound, it takes the verdict (504
+    /// `decode_worker_silent`, the retry window closing on the decode
+    /// worker, one `timeout` on the decode's worker-error family and none on
+    /// the prefill's); a decode still producing, or one with no open
+    /// producing stream, leaves the verdict on the prefill as before. (Real
+    /// time: the workers' clocks are the gateway's.)
+    #[test]
+    fn a_parallel_prefill_past_its_bound_is_charged_to_a_decode_partner_that_stalled_mid_stream() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let bound = Duration::from_secs(1);
+        let at = |started: Instant| {
+            Some(PrefillLegBound {
+                deadline: started + bound,
+                bound,
+            })
+        };
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                let workers = tokenspeed_pair();
+                let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+                let decode = Arc::clone(workers.decode_worker().expect("a pair"));
+
+                // The decode holds a stream it had been producing for, and
+                // has produced nothing since: stalled mid-stream.
+                decode.note_output_started();
+                decode.note_token_progress();
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let started = Instant::now();
+                let status = failure(
+                    dispatch_prefill_within(
+                        at(started),
+                        never_answers(),
+                        Some(Arc::clone(&prefill)),
+                        Some(Arc::clone(&decode)),
+                        metrics_labels::CONNECTION_GRPC,
+                        "chatcmpl-stalled-decode".to_string(),
+                        256,
+                    )
+                    .await,
+                );
+                let elapsed = started.elapsed();
+                assert!(
+                    elapsed >= bound && elapsed < 2 * bound,
+                    "the verdict comes at the prefill's bound, as before: {elapsed:?}"
+                );
+                assert!(is_decode_silence(&status), "{status:?}");
+                assert!(!is_prefill_silence(&status), "{status:?}");
+                let response = pd_leg_error(
+                    PdLeg::Prefill,
+                    metrics_labels::CONNECTION_GRPC,
+                    &status,
+                    &workers,
+                );
+                assert_eq!(response.status(), http::StatusCode::GATEWAY_TIMEOUT);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(error::HEADER_X_SMG_ERROR_CODE)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("decode_worker_silent")
+                );
+                assert!(
+                    response.extensions().get::<FailedLeg>().is_some(),
+                    "the retry window closes on the decode worker alone"
+                );
+                assert!(
+                    is_retryable_response(&response),
+                    "another decode worker may take the request"
+                );
+
+                // The same decode still producing while the prefill leg
+                // waits: the prefill's verdict, as before. (The producer runs
+                // beside the dispatch and ends with it.)
+                let producing = async {
+                    loop {
+                        decode.note_token_progress();
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                };
+                let status = tokio::select! {
+                    result = dispatch_prefill_within(
+                        at(Instant::now()),
+                        never_answers(),
+                        Some(Arc::clone(&prefill)),
+                        Some(Arc::clone(&decode)),
+                        metrics_labels::CONNECTION_GRPC,
+                        "chatcmpl-live-decode".to_string(),
+                        256,
+                    ) => failure(result),
+                    () = producing => unreachable!("the producer never ends on its own"),
+                };
+                assert!(is_prefill_silence(&status), "{status:?}");
+
+                // The decode's producing stream ended (quiet since, but with
+                // nothing in flight it had shown output on): the prefill's
+                // verdict.
+                decode.note_output_ended();
+                assert!(decode.output_silence().is_none());
+                let status = failure(
+                    dispatch_prefill_within(
+                        at(Instant::now()),
+                        never_answers(),
+                        Some(Arc::clone(&prefill)),
+                        Some(Arc::clone(&decode)),
+                        metrics_labels::CONNECTION_GRPC,
+                        "chatcmpl-idle-decode".to_string(),
+                        256,
+                    )
+                    .await,
+                );
+                assert!(is_prefill_silence(&status), "{status:?}");
+            });
+        });
+        let rendered = handle.render();
+        let count = |worker_type: &str| -> f64 {
+            rendered
+                .lines()
+                .filter(|line| line.starts_with("smg_worker_errors_total{"))
+                .filter(|line| line.contains(&format!("worker_type=\"{worker_type}\"")))
+                .filter(|line| line.contains("error_type=\"timeout\""))
+                .filter_map(|line| line.rsplit(' ').next())
+                .filter_map(|value| value.parse::<f64>().ok())
+                .sum()
+        };
+        assert_eq!(
+            count("decode"),
+            1.0,
+            "one timeout on the stalled decode:\n{rendered}"
+        );
+        assert_eq!(
+            count("prefill"),
+            2.0,
+            "the two verdicts that stayed the prefill's:\n{rendered}"
         );
     }
 

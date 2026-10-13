@@ -58,7 +58,10 @@ use smg::{
 use smg_grpc_client::{
     common_proto as grpc_common, tokenspeed_scheduler::tokenspeed_proto as ts, vllm_proto as proto,
 };
-use tokio::{net::TcpListener, sync::mpsc};
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc, oneshot},
+};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{transport::Server, Request, Response, Status};
 use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer};
@@ -344,14 +347,60 @@ fn produce_at_turn(
     });
 }
 
+/// Hold a parallel-dispatch generate stream open with nothing on it: a leg
+/// whose first response never comes.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test mock; the producer task ends with its stream"
+)]
+fn hold_open(tx: mpsc::Sender<Result<ts::GenerateResponse, Status>>) {
+    tokio::spawn(async move {
+        tokio::time::sleep(FOREVER).await;
+        drop(tx);
+    });
+}
+
+/// Feed a parallel-dispatch generate stream its tokens at once and then hold
+/// it open without a completion: a decode engine that stalled mid-stream.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test mock; the producer task ends with its stream"
+)]
+fn produce_then_stall(tx: mpsc::Sender<Result<ts::GenerateResponse, Status>>, request_id: String) {
+    tokio::spawn(async move {
+        for id in 1..=OUTPUT_TOKENS {
+            if tx.send(Ok(ts_chunk(&request_id, id))).await.is_err() {
+                return;
+            }
+        }
+        tokio::time::sleep(FOREVER).await;
+        drop(tx);
+    });
+}
+
+/// What a parallel-dispatch mock engine does with its generate calls.
+#[derive(Clone, Copy)]
+enum ParallelShape {
+    /// Every leg's first chunk waits for its turn at the engine's gate.
+    Queued,
+    /// The first call is answered at once; every later call's stream stays
+    /// empty for good (a prefill whose legs wait on a stalled decode side).
+    AnswerFirstThenHold,
+    /// Every call streams its tokens at once and then stalls without a
+    /// completion (a decode engine that stopped mid-stream).
+    StreamThenStall,
+}
+
 /// A parallel-dispatch mock engine (the TokenSpeed proto, as the mock-worker
 /// crate's worker speaks it): the generate call returns its stream at once,
-/// and the leg's first chunk waits for its turn at the engine's gate (one
-/// leg every `TURN`: the decode side admitting the pair's legs one by one),
-/// then the tokens and the completion follow. Counts its generate calls.
+/// and what follows on it is the engine's [`ParallelShape`]: queued, the
+/// leg's first chunk waits for its turn at the engine's gate (one leg every
+/// `TURN`: the decode side admitting the pair's legs one by one), then the
+/// tokens and the completion follow. Counts its generate calls.
 #[derive(Clone)]
 struct QueuedEngine {
     gate: Gate,
+    shape: ParallelShape,
     calls: Arc<AtomicUsize>,
 }
 
@@ -371,9 +420,17 @@ impl TokenSpeedScheduler for QueuedEngine {
         &self,
         request: Request<ts::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         let (tx, rx) = mpsc::channel(8);
-        produce_at_turn(tx, self.gate.clone(), request.into_inner().request_id);
+        let request_id = request.into_inner().request_id;
+        match self.shape {
+            ParallelShape::Queued => produce_at_turn(tx, self.gate.clone(), request_id),
+            ParallelShape::AnswerFirstThenHold if call == 1 => {
+                produce_at_turn(tx, self.gate.clone(), request_id);
+            }
+            ParallelShape::AnswerFirstThenHold => hold_open(tx),
+            ParallelShape::StreamThenStall => produce_then_stall(tx, request_id),
+        }
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
@@ -462,9 +519,10 @@ impl TokenSpeedScheduler for QueuedEngine {
     reason = "test helper - panicking on failure is intentional; the spawned \
               mock server task is fire-and-forget for the test process's lifetime"
 )]
-async fn start_queued_grpc_worker() -> (u16, QueuedEngine) {
+async fn start_queued_grpc_worker(shape: ParallelShape) -> (u16, QueuedEngine) {
     let engine = QueuedEngine {
         gate: Gate::default(),
+        shape,
         calls: Arc::new(AtomicUsize::new(0)),
     };
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -876,7 +934,7 @@ fn a_parallel_prefill_that_returns_no_stream_is_given_up_on_within_the_bound() {
 #[test]
 fn a_parallel_prefill_whose_legs_queue_behind_the_decode_side_is_not_given_up_on() {
     let rendered = render_after(|| async {
-        let (prefill_port, prefill) = start_queued_grpc_worker().await;
+        let (prefill_port, prefill) = start_queued_grpc_worker(ParallelShape::Queued).await;
         let decode_port = start_mock_grpc_worker(Duration::ZERO).await;
         let (router, workers) = build_pd_router_with(
             &[
@@ -903,6 +961,84 @@ fn a_parallel_prefill_whose_legs_queue_behind_the_decode_side_is_not_given_up_on
         worker_errors(&rendered, "prefill", "timeout"),
         0.0,
         "no leg was given up on:\n{rendered}"
+    );
+}
+
+/// Parallel dispatch, the decode worker stalls mid-stream: the first
+/// request's decode leg streams its tokens and then stops without a
+/// completion (its stream stays open); the second request's prefill leg,
+/// dispatched while the decode holds that stream, produces nothing (on this
+/// shape a prefill leg's first response waits for the decode side). At the
+/// prefill's bound the gateway reads the decode partner: a worker holding a
+/// stream it had been producing for and quiet for the bound takes the
+/// verdict. The second request is answered 504 `decode_worker_silent` at
+/// the bound, the decode worker is charged the `timeout` and a breaker
+/// failure (its breaker, set to one, opens), the prefill worker nothing (its
+/// breaker stays closed).
+#[test]
+fn a_parallel_prefill_waiting_on_a_decode_that_stalled_mid_stream_is_charged_to_the_decode() {
+    let rendered = render_after(|| async {
+        let (prefill_port, prefill) =
+            start_queued_grpc_worker(ParallelShape::AnswerFirstThenHold).await;
+        let (decode_port, _decode) = start_queued_grpc_worker(ParallelShape::StreamThenStall).await;
+        let (router, workers) = build_pd_router_with(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (decode_port, WorkerType::Decode),
+            ],
+            RuntimeType::TokenSpeed,
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        // The first request streams its tokens and then hangs on the stalled
+        // decode: it is let go of once the second request has its answer.
+        let first = async {
+            tokio::select! {
+                answer = one_streaming_chat(router.as_ref()) => {
+                    panic!("the stalled stream must not end on its own: {answer:?}")
+                }
+                _ = done_rx => {}
+            }
+        };
+        let second = async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let answer = one_streaming_chat(router.as_ref()).await;
+            let _ = done_tx.send(());
+            answer
+        };
+        let ((), (status, body, elapsed)) = tokio::join!(first, second);
+        assert_eq!(status, http::StatusCode::GATEWAY_TIMEOUT, "{body}");
+        assert!(body.contains("decode_worker_silent"), "{body}");
+        assert!(!body.contains("prefill_worker_silent"), "{body}");
+        assert!(
+            elapsed >= BOUND && elapsed < BOUND + SLACK,
+            "given up on at the bound ({BOUND:?}), not before and not much after: {elapsed:?}"
+        );
+        assert_eq!(prefill.calls(), 2, "both prefill legs were dispatched");
+        assert_eq!(
+            workers[0].circuit_breaker_state(),
+            CircuitState::Closed,
+            "the prefill worker was waiting on its partner, not failing"
+        );
+        assert_eq!(
+            workers[1].circuit_breaker_state(),
+            CircuitState::Open,
+            "the stalled decode worker is the one charged"
+        );
+    });
+    assert_eq!(
+        worker_errors(&rendered, "decode", "timeout"),
+        1.0,
+        "one timeout on the stalled decode worker:\n{rendered}"
+    );
+    assert_eq!(
+        worker_errors(&rendered, "prefill", "timeout"),
+        0.0,
+        "nothing on the prefill worker:\n{rendered}"
     );
 }
 

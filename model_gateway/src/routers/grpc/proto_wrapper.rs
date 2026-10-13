@@ -2828,6 +2828,9 @@ pub struct TrackedStream {
     /// The request's place in the worker's pile; a non-streaming generation
     /// holds none.
     progress: Option<ProgressTicket>,
+    /// Held from the stream's first response to its end: one of the streams
+    /// the worker is producing for (see [`Worker::output_silence`]).
+    output: Option<OutputTicket>,
     /// A response (or the stream's end) pulled ahead of the stream's reader
     /// by [`ProtoStream::first_response_within`], handed to the next `next`
     /// as it was: its bookkeeping ran when it was pulled.
@@ -2866,6 +2869,28 @@ struct ProgressTicket {
 impl Drop for ProgressTicket {
     fn drop(&mut self) {
         self.worker.note_tracked_ended();
+    }
+}
+
+/// A stream the worker has produced output for and that has not ended (see
+/// [`Worker::output_silence`]): opened at the first response, given back at
+/// the stream's end, or when its reader lets go of it.
+struct OutputTicket {
+    worker: Arc<dyn Worker>,
+}
+
+impl OutputTicket {
+    fn open(worker: &Arc<dyn Worker>) -> Self {
+        worker.note_output_started();
+        Self {
+            worker: Arc::clone(worker),
+        }
+    }
+}
+
+impl Drop for OutputTicket {
+    fn drop(&mut self) {
+        self.worker.note_output_ended();
     }
 }
 
@@ -3257,6 +3282,7 @@ impl ProtoStream {
             worker,
             prefill,
             progress,
+            output: None,
             replay: None,
         }))
     }
@@ -3289,6 +3315,7 @@ impl ProtoStream {
             worker,
             prefill,
             progress: None,
+            output: None,
             replay: None,
         }))
     }
@@ -3374,12 +3401,20 @@ impl ProtoStream {
         } else {
             tracked.inner.next_untracked().await
         };
-        if let Some(Ok(response)) = &item {
-            liveness::on_token_progress(&tracked.worker);
-            if let Some(ticket) = tracked.prefill.as_mut() {
-                ticket.first_response(u64::from(response.cached_tokens()));
+        match &item {
+            Some(Ok(response)) => {
+                liveness::on_token_progress(&tracked.worker);
+                if tracked.output.is_none() {
+                    tracked.output = Some(OutputTicket::open(&tracked.worker));
+                }
+                if let Some(ticket) = tracked.prefill.as_mut() {
+                    ticket.first_response(u64::from(response.cached_tokens()));
+                }
+                tracked.prefill = None;
             }
-            tracked.prefill = None;
+            // The stream ended, or failed: what the worker was producing for
+            // it is over, whenever its reader lets go of it.
+            Some(Err(_)) | None => tracked.output = None,
         }
         item
     }
@@ -3468,6 +3503,7 @@ impl ProtoStream {
                     worker,
                     prefill,
                     progress,
+                    output,
                     replay,
                 } = *stream;
                 Self::Tracked(Box::new(TrackedStream {
@@ -3475,6 +3511,7 @@ impl ProtoStream {
                     worker,
                     prefill,
                     progress,
+                    output,
                     replay,
                 }))
             }

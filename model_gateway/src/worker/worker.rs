@@ -669,6 +669,24 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     fn tracked_load(&self) -> usize {
         0
     }
+    /// Record the first token or completion of a stream from this worker:
+    /// from here until its end the stream is one the worker is producing for.
+    fn note_output_started(&self) {}
+    /// Record the end of a stream that had produced output.
+    fn note_output_ended(&self) {}
+    /// How long the worker has produced nothing while it still holds streams
+    /// it had been producing for: `Some(age)` when at least one stream past
+    /// its first token or completion is open and the last token or
+    /// completion from the worker was `age` ago; `None` when no such stream
+    /// is open (an idle worker, one whose streams all ended, one whose
+    /// in-flight work has shown nothing yet: nothing to judge it by), or for
+    /// a worker that does not track it. The signal a disaggregated request
+    /// reads on its decode partner when its prefill leg's silence bound
+    /// passes on the parallel dispatch shape, where the prefill's first
+    /// response waits for the decode side.
+    fn output_silence(&self) -> Option<Duration> {
+        None
+    }
 
     /// Store the engine's reported waiting-queue depth, returning the previous
     /// value.
@@ -1507,6 +1525,9 @@ pub struct WorkerRuntime {
     /// Requests in flight whose responses the gateway sees one by one (see
     /// [`Worker::tracked_load`]).
     tracked_in_flight: AtomicUsize,
+    /// Open streams that have produced a token or completion (see
+    /// [`Worker::output_silence`]).
+    producing_streams: AtomicUsize,
     /// The prefill book: pending prompt tokens, the busy interval and the
     /// rate window, moved together under one lock so a request's end and
     /// another's start cannot race the interval away (see [`PrefillBook`]).
@@ -1769,6 +1790,7 @@ impl WorkerRuntime {
             divert_until_ms: AtomicU64::new(0),
             busy_since_ms: AtomicU64::new(0),
             tracked_in_flight: AtomicUsize::new(0),
+            producing_streams: AtomicUsize::new(0),
             prefill: Mutex::new(PrefillBook::default()),
         }
     }
@@ -2046,6 +2068,24 @@ impl WorkerRuntime {
     }
     pub fn tracked_load(&self) -> usize {
         self.tracked_in_flight.load(Ordering::Relaxed)
+    }
+    /// A stream from this worker produced its first token or completion.
+    pub fn note_output_started(&self) {
+        self.producing_streams.fetch_add(1, Ordering::Relaxed);
+    }
+    /// A stream that had produced output ended.
+    pub fn note_output_ended(&self) {
+        let _ = self
+            .producing_streams
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
+    }
+    /// See [`Worker::output_silence`]: the age of the last token or
+    /// completion while a stream that produced output is still open.
+    pub fn output_silence(&self) -> Option<Duration> {
+        (self.producing_streams.load(Ordering::Relaxed) > 0)
+            .then(|| Self::age_of(self.last_token_ms.load(Ordering::Relaxed)))
     }
     /// The load counter left zero: the wedged rule's clock starts now.
     fn note_busy_started(&self) {
@@ -2801,6 +2841,18 @@ impl Worker for BasicWorker {
 
     fn tracked_load(&self) -> usize {
         self.runtime.load().tracked_load()
+    }
+
+    fn note_output_started(&self) {
+        self.runtime.load().note_output_started();
+    }
+
+    fn note_output_ended(&self) {
+        self.runtime.load().note_output_ended();
+    }
+
+    fn output_silence(&self) -> Option<Duration> {
+        self.runtime.load().output_silence()
     }
 
     fn is_available(&self) -> bool {
@@ -4845,6 +4897,28 @@ mod tests {
         );
         assert!(runtime.try_increment_load(4));
         assert!(runtime.progress_reference_ms() > registered);
+    }
+
+    #[test]
+    fn output_silence_is_read_only_while_a_stream_that_produced_output_is_open() {
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("grpc://decode:30000").build());
+        // Nothing in flight it has shown output on: nothing to judge.
+        assert!(worker.output_silence().is_none());
+        worker.note_output_started();
+        worker.note_token_progress();
+        thread::sleep(Duration::from_millis(20));
+        let silence = worker.output_silence().expect("a producing stream is open");
+        assert!(silence >= Duration::from_millis(20), "{silence:?}");
+        // A token: the silence restarts.
+        worker.note_token_progress();
+        assert!(worker.output_silence().expect("still open") < silence);
+        // The stream ended: nothing to judge again, however quiet the worker.
+        worker.note_output_ended();
+        assert!(worker.output_silence().is_none());
+        // The count never goes negative.
+        worker.note_output_ended();
+        assert!(worker.output_silence().is_none());
     }
 
     #[test]
