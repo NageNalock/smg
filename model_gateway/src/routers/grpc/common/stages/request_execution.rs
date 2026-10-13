@@ -1052,14 +1052,26 @@ async fn execute_parallel_pd(
             // Both legs are translated before either is propagated: a
             // decode-side failure is logged and counted even when the prefill
             // error is the one the client sees.
+            let prefill_silence = prefill_result
+                .as_ref()
+                .is_err_and(|e| is_prefill_silence(e) || is_decode_silence(e));
             let prefill = prefill_result
                 .map_err(|e| pd_leg_error(PdLeg::Prefill, prefill_label, &e, workers));
             let decode =
                 decode_result.map_err(|e| pd_leg_error(PdLeg::Decode, decode_label, &e, workers));
             let (prefill_stream, decode_stream) = match (prefill, decode) {
                 (Ok(prefill), Ok(decode)) => (prefill, decode),
-                // The surviving leg's stream drops here, which aborts its
-                // room on the worker.
+                // A prefill given up on for a silence verdict (its own, or
+                // its stalled decode partner's) may yet start the handoff
+                // into the decode's room: the decode's abort is deferred
+                // until its first item, as the other two paths of the
+                // verdict defer it (30 s at most), not fired by the drop.
+                (Err(response), Ok(decode)) if prefill_silence => {
+                    drop(decode.defer_abort_until_first_item());
+                    return Err(response);
+                }
+                // Any other failure: the surviving leg's stream drops here,
+                // which aborts its room on the worker.
                 (Err(response), _) | (Ok(_), Err(response)) => return Err(response),
             };
 
