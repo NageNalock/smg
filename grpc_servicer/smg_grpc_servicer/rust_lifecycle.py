@@ -1,10 +1,13 @@
 """The Python-owned lifecycle around a Rust servicer, shared by the engine
-launchers: a free port and socket directory for the handshake, the engine as
-a ``Popen``-shaped handle (one spawned headless engine, the engine cores a
-manager started from this process, or the scheduler processes this process
-started itself), its termination, and the supervision loop that drains on a
-signal and exits with the engine or the server. Nothing here knows which
-engine it supervises.
+launchers: the servicer switch (which implementation serves the process, from
+the launcher's flag or the engine's variable), the launcher's knobs, a free
+port and socket directory for the handshake, the engine as a ``Popen``-shaped
+handle (one spawned headless engine, the engine cores a manager started from
+this process, or the scheduler processes this process started itself), its
+termination, the supervision loop that drains on a signal and exits with the
+engine or the server, and :class:`RustLauncher`, the one sequence from the
+knobs to the supervision that every launcher runs with its engine's hooks
+filled in. Nothing here knows which engine it supervises.
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ import contextlib
 import dataclasses
 import faulthandler
 import glob
+import importlib
 import logging
 import math
 import multiprocessing
@@ -23,13 +27,18 @@ import socket
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, MutableMapping
 from typing import Any
+
+from smg_grpc_servicer.hostport import host_port
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DRAIN_SECS = 5.0
 ENGINE_TERMINATE_SECS = 30.0
+# How long the Rust server gets to stop: at the end of the supervision loop,
+# and when the engine launch behind an already-bound server failed.
+SERVER_STOP_SECS = 5.0
 # Bound on silence during the engine's ZMQ handshake. An engine's start
 # includes model load, kernel JIT and graph capture, and nothing crosses the
 # wire between its first handshake message and its last; a server that takes
@@ -251,6 +260,55 @@ def configuration_exit(error: ServicerConfigError, log: logging.Logger = logger)
     no traceback."""
     log.error("servicer configuration error: %s", error)
     return SystemExit(CONFIG_ERROR_EXIT_CODE)
+
+
+# ---------------------------------------------------------------------------
+# The servicer switch: which implementation serves this process
+# ---------------------------------------------------------------------------
+
+IMPLS = ("python", "rust")
+# Where the implementation choice came from, for the startup log line.
+SOURCE_FLAG = "flag"
+SOURCE_ENV = "env"
+SOURCE_DEFAULT = "default"
+
+
+def servicer_switch(
+    env_name: str,
+    args: Any = None,
+    environ: Mapping[str, str] | None = None,
+    *,
+    parsed_flag: str | None = None,
+) -> tuple[str, str]:
+    """Which implementation serves this process and where the choice came
+    from, as ``(impl, origin)``: the launcher's ``--servicer-impl``
+    (``args.servicer_impl``, else ``parsed_flag``, the value a launcher's
+    plugin kept when the engine's namespace carries only the engine's own
+    fields), else ``environ[env_name]``, else ``python``; the origin is
+    ``flag``, ``env`` or ``default``. A value outside :data:`IMPLS` is a
+    :class:`ServicerConfigError` naming the variable.
+
+    A decision made with the flag in hand is written back to the
+    environment, so the engine processes this process starts and anything
+    that reads only the variable (the Python servicer's guard against a
+    switch that never ran) agree with it when ``--servicer-impl python``
+    overrides an exported ``rust``. A value that came from the environment
+    or from the default is not written: what the engine inherits there is
+    what the operator exported, spelled as they exported it, and nothing
+    when they exported nothing."""
+    source = os.environ if environ is None else environ
+    value = getattr(args, "servicer_impl", None) if args is not None else None
+    value = value or parsed_flag
+    origin = SOURCE_FLAG
+    if not value:
+        value = source.get(env_name)
+        origin = SOURCE_ENV if value else SOURCE_DEFAULT
+    value = str(value or "python").strip().lower()
+    if value not in IMPLS:
+        raise ServicerConfigError(f"{env_name} must be one of {IMPLS}, got {value!r}")
+    if origin == SOURCE_FLAG and isinstance(source, MutableMapping):
+        source[env_name] = value
+    return value, origin
 
 
 # How long a servicer that decided to exit over its engine may spend in the
@@ -654,6 +712,46 @@ def _start_time(pid: int) -> str | None:
     return fields[19]
 
 
+def mark_not_serving(server: Any) -> None:
+    """Health flips to NOT_SERVING (the Router stops routing here); a failure
+    to flip it is logged, never raised: the caller's own outcome is the one
+    that propagates."""
+    try:
+        server.set_serving(False)
+    except Exception:
+        logger.exception("Failed to mark the servicer as not serving")
+
+
+async def stop_server(server: Any, timeout: float) -> None:
+    """Stop the Rust server off the event loop, within ``timeout``; a failure
+    to stop is logged, never raised, for the same reason."""
+    try:
+        await asyncio.to_thread(server.stop, timeout)
+    except Exception:
+        logger.exception("Failed to stop the Rust servicer cleanly")
+
+
+async def launch_or_stop(server: Any, launch: Callable[[], Any]) -> Any:
+    """Start the engine behind an already-bound server: ``launch()``'s handle,
+    or, when the launch raises, that error after the server was marked not
+    serving and stopped, each step best effort. The server owns the port and
+    a runtime thread; a launch that fails must not leave them to the process
+    exit, and the launch error is what the entry point reports. A
+    cancellation of this task while the stop runs waits for the stop too:
+    the port is released either way."""
+    try:
+        return launch()
+    except BaseException:
+        mark_not_serving(server)
+        stopping = asyncio.create_task(stop_server(server, SERVER_STOP_SECS))
+        try:
+            await asyncio.shield(stopping)
+        except asyncio.CancelledError:
+            await asyncio.shield(stopping)
+            raise
+        raise
+
+
 def terminate_engine(engine: Any, timeout: float = ENGINE_TERMINATE_SECS) -> None:
     """SIGTERM the headless engine (it tears down its own workers), then kill;
     workers that outlived it either way are killed too."""
@@ -677,7 +775,7 @@ async def supervise(
     engine: Any,
     *,
     drain_secs: float = DEFAULT_DRAIN_SECS,
-    stop_timeout: float = 5.0,
+    stop_timeout: float = SERVER_STOP_SECS,
     stop_event: asyncio.Event | None = None,
     poll_secs: float = _POLL_SECS,
 ) -> int:
@@ -723,16 +821,183 @@ async def supervise(
             except asyncio.TimeoutError:  # noqa: UP041 -- distinct from the builtin before 3.11
                 pass
     finally:
-        try:
-            server.set_serving(False)
-        except Exception:
-            logger.exception("Failed to mark the servicer as draining")
+        mark_not_serving(server)
         if stop_event.is_set() and drain_secs > 0 and engine.poll() is None:
             logger.info("Draining for %.1fs before stopping", drain_secs)
             await asyncio.sleep(drain_secs)
-        try:
-            await asyncio.to_thread(server.stop, stop_timeout)
-        except Exception:
-            logger.exception("Failed to stop the Rust servicer cleanly")
+        await stop_server(server, stop_timeout)
         terminate_engine(engine)
     return exit_code
+
+
+# ---------------------------------------------------------------------------
+# The launcher: one lifecycle for every engine's Rust servicer
+# ---------------------------------------------------------------------------
+
+
+class RustLauncher:
+    """The lifecycle of a Rust servicer as every engine's launcher runs it, in
+    :meth:`serve`: the launcher's knobs first, the Rust server bound, the
+    engine started from this process against the server's handshake, both
+    supervised until a signal or a failure. What differs per engine is named
+    here and filled by a subclass: the engine's words in the log lines, its
+    environment variables, the facts it advertises, where its tokenizer
+    lives, and how its processes start.
+
+    One instance serves one process. The hooks run in the order ``serve``
+    lists them, so a hook may keep on the instance what a later one needs
+    (the engine config the facts were read from).
+    """
+
+    # The engine's name in the log lines; the word for what the handshake
+    # waits for (its "engine" or its "scheduler"); and the word for what the
+    # engine count counts: the handshake identities (a data-parallel engine of
+    # vLLM, a DP rank of a scheduler whose TP ranks share one identity).
+    engine: str
+    started: str
+    counted: str
+    # The ``smg.servicer`` class that serves this engine's contract, by name:
+    # the binding is imported when ``serve`` runs, after the knobs are read.
+    server_class: str
+    # The IPC socket name prefix under the socket directory.
+    ipc_prefix: str
+    # This launcher's own environment variables (:func:`read_launcher_knobs`).
+    handshake_port_env: str
+    drain_secs_env: str
+    startup_timeout_secs_env: str
+    startup_ceiling_secs_env: str
+    kv_events_env: str
+    # What the servicer loses without a local tokenizer directory, for the warning.
+    without_tokenizer: str
+
+    def prepare(self, args: Any) -> None:
+        """Engine-specific set-up after the knobs are read and the binding is
+        imported, before the first log line (nothing by default)."""
+
+    def kv_events_default(self, args: Any) -> Any | None:
+        """Turn the engine's KV event publisher on when the launcher was given
+        no ``--kv-events-config``: the configuration applied, or ``None``."""
+        raise NotImplementedError
+
+    def facts(self, args: Any) -> dict[str, Any]:
+        """The Rust server's keyword arguments for ``GetModelInfo`` and
+        ``GetServerInfo``; ``serve`` reads ``data_parallel_size``,
+        ``kv_events_endpoint`` and ``model_path`` from them."""
+        raise NotImplementedError
+
+    def tokenizer_dir(self, args: Any) -> str | None:
+        """A local directory holding the served model's tokenizer, or ``None``."""
+        raise NotImplementedError
+
+    def bind_address(self, args: Any) -> str:
+        """Where the Rust server listens: the launcher's host and port (a
+        launcher that leaves host unset binds every interface, as upstream's
+        own server does then)."""
+        host = getattr(args, "host", None) or "0.0.0.0"
+        return host_port(host, int(getattr(args, "port", 0) or 0))
+
+    def server_extras(self, args: Any, tokenizer_dir: str | None) -> dict[str, Any]:
+        """Further keyword arguments of the Rust server (none by default)."""
+        return {}
+
+    def launch(self, args: Any, handshake_port: int, facts: Mapping[str, Any]) -> Any:
+        """Start the engine against the server's handshake port: the
+        ``Popen``-shaped handle :func:`supervise` polls."""
+        raise NotImplementedError
+
+    def launched(self, engine: Any) -> None:
+        """Once the engine started, before the supervision (nothing by default)."""
+
+    def announce_capabilities(self, facts: Mapping[str, Any], tokenizer_dir: str | None) -> None:
+        """What a cache-aware router and a tokenizer-backed feature get from
+        this servicer: whether SubscribeKvEvents relays a publisher, and what
+        is lost without a local tokenizer directory."""
+        if facts.get("kv_events_endpoint"):
+            logger.info(
+                "SubscribeKvEvents relays %s's KV events from %s",
+                self.engine,
+                facts["kv_events_endpoint"],
+            )
+        else:
+            logger.warning(
+                "SubscribeKvEvents is off (no ZMQ KV event publisher configured): a cache-aware "
+                "router sees nothing of this engine's cache"
+            )
+        if tokenizer_dir is None:
+            logger.warning(
+                "No local tokenizer directory for %s; %s",
+                facts.get("model_path", ""),
+                self.without_tokenizer,
+            )
+
+    def announce(
+        self, server: Any, knobs: LauncherKnobs, handshake_port: int, engine_count: int
+    ) -> None:
+        """The two lines an operator reads at the start: where the server
+        listens and what dials its handshake, and the startup bounds with the
+        variables that set them."""
+        logger.info(
+            "Rust %s servicer listening on %s (%s handshake tcp://127.0.0.1:%d, %d %s(s))",
+            self.engine,
+            server.address,
+            self.started,
+            handshake_port,
+            engine_count,
+            self.counted,
+        )
+        logger.info(
+            "%s startup bounds: %.0fs without a sign of life (%s), ceiling %s (%s); "
+            "the handshake waits while the %s process is alive",
+            self.started.capitalize(),
+            knobs.startup_timeout_secs,
+            self.startup_timeout_secs_env,
+            f"{knobs.startup_ceiling_secs:.0f}s" if knobs.startup_ceiling_secs else "none",
+            self.startup_ceiling_secs_env,
+            self.started,
+        )
+
+    async def serve(self, args: Any) -> int:
+        """Serve this process's gRPC contract from Rust. Returns the process
+        exit code."""
+        # The launcher's own knobs first, validated together: a bad value is a
+        # named error before any engine work and before the port is bound.
+        knobs = read_launcher_knobs(
+            handshake_port_env=self.handshake_port_env,
+            drain_secs_env=self.drain_secs_env,
+            startup_timeout_secs_env=self.startup_timeout_secs_env,
+            startup_ceiling_secs_env=self.startup_ceiling_secs_env,
+            socket_dir=default_socket_dir(),
+        )
+        servicer = importlib.import_module("smg.servicer")
+        self.prepare(args)
+        servicer.init_servicer_tracing()
+        if self.kv_events_default(args) is not None:
+            logger.info(
+                "KV event publishing enabled: no --kv-events-config was given, so %s's ZMQ "
+                "publisher is on with its default endpoint and SubscribeKvEvents relays it; pass "
+                "--kv-events-config to configure it, or set %s=0 to leave it off",
+                self.engine,
+                self.kv_events_env,
+            )
+        facts = self.facts(args)
+        engine_count = facts["data_parallel_size"]
+        tokenizer_dir = self.tokenizer_dir(args)
+        self.announce_capabilities(facts, tokenizer_dir)
+        handshake_port = knobs.handshake_port or free_port()
+        server = getattr(servicer, self.server_class)(
+            bind_address=self.bind_address(args),
+            # Per process, not per requested port: `--port 0` launchers would
+            # otherwise share one path and unlink each other's sockets.
+            ipc_base_url=f"ipc://{knobs.socket_dir}/{self.ipc_prefix}-{os.getpid()}",
+            handshake_address=f"tcp://127.0.0.1:{handshake_port}",
+            engine_count=engine_count,
+            tokenizer_dir=tokenizer_dir,
+            engine_startup_timeout_secs=knobs.startup_timeout_secs,
+            engine_startup_ceiling_secs=knobs.startup_ceiling_secs,
+            **self.server_extras(args, tokenizer_dir),
+            **facts,
+        )
+        self.announce(server, knobs, handshake_port, engine_count)
+        engine = await launch_or_stop(server, lambda: self.launch(args, handshake_port, facts))
+        self.launched(engine)
+        return await supervise(server, engine, drain_secs=knobs.drain_secs)

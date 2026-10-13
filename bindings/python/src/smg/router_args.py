@@ -1,3 +1,17 @@
+"""The Python launcher's side of the gateway's command line.
+
+``RouterArgs`` carries the router settings the launcher exposes (the Rust
+core's ``Router`` takes one more, the drain settle time, which the launcher
+leaves at its default), in a frozen positional order (new fields are appended
+at the end, never inserted: callers build it positionally). ``add_cli_args`` is the argparse
+mapping of those settings, one option per Rust CLI flag with the same name,
+default and second spelling, grouped as the CLI's help headings;
+``from_cli_args`` reads a parsed namespace back into ``RouterArgs`` (with the
+``--router-`` prefixed spellings taking precedence over the backend's when
+the launcher is embedded in a serving command); the ``_parse_*`` helpers
+mirror the Rust parsers of the flags whose values have a shape.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -93,7 +107,7 @@ class RouterArgs:
     multimodal_shm_min_bytes: int | None = None
     routing_key_override: bool = False
     dp_minimum_tokens_scheduler: bool = False
-    enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
+    enable_igw: bool = False  # Enable IGW (Inference Gateway) mode for multi-model support
     api_key: str | None = None
     log_dir: str | None = None
     log_level: str | None = None
@@ -117,7 +131,10 @@ class RouterArgs:
     prometheus_duration_buckets: list[float] | None = None
     # Request ID headers configuration
     request_id_headers: list[str] | None = None
-    # HTTP header to storage hook context mapping
+    # Storage-hook request context read from HTTP headers, oriented
+    # {header name: context key}, as `--storage-context-headers
+    # header=context_key` lists them and as the Rust CLI parses the same
+    # entries (the header name is the key, never the value)
     storage_context_headers: dict[str, str] = dataclasses.field(default_factory=dict)
     # Request timeout in seconds
     request_timeout_secs: int = 1800
@@ -1581,7 +1598,9 @@ class RouterArgs:
             action="extend",
             help=(
                 "Custom HTTP headers to check for request IDs (e.g., x-request-id x-trace-id)."
-                " If not specified, uses common defaults."
+                " If not specified, uses common defaults. The first header present is honoured"
+                " when its value is 1 to 128 visible-ASCII characters; otherwise a fresh id is"
+                " generated."
             ),
         )
         request_group.add_argument(
@@ -1661,7 +1680,11 @@ class RouterArgs:
             nargs="*",
             action="extend",
             default=[],
-            help="CORS allowed origins (e.g., http://localhost:3000 https://example.com)",
+            help=(
+                "Origins a browser may call the gateway from (e.g., http://localhost:3000"
+                " https://example.com), or '*' alone for any origin. Without this flag the"
+                " gateway makes no cross-origin allowance."
+            ),
         )
 
         # Rate limiting configuration
@@ -2414,12 +2437,9 @@ class RouterArgs:
             ):
                 args_dict[attr.name] = cli_args_dict[attr.name]
 
-            # Special handling for CLI args with dashes vs dataclass fields with underscores
-            # e.g. --tls-cert-path maps to tls_cert_path in args namespace,
-            # but we might want server_cert_path in dataclass
-            # Wait, dataclass fields are server_cert_path/server_key_path
-            # CLI args are tls_cert_path/tls_key_path
-            # We need to manually map them if names don't match
+        # The fields whose option is named differently, or whose value has a
+        # shape, are read below: --tls-cert-path/--tls-key-path onto
+        # server_cert_path/server_key_path, and the parsed lists and maps.
 
         # --disable-worker-overload-protection is the CLI spelling of
         # worker_overload_protection=False; the prefixed form wins, the
@@ -2530,6 +2550,12 @@ class RouterArgs:
 
     @staticmethod
     def _parse_selector(selector_list):
+        """``key=value`` entries as ``{key: value}``: the label selectors, and
+        ``--storage-context-headers``, whose key is the header name and whose
+        value is the context key (the same orientation as the Rust CLI's). A
+        token without ``=`` is skipped here where the Rust CLI refuses it, and
+        one argv item may carry several space-separated pairs: the launcher's
+        own allowances (smg-lab#431 tracks the first)."""
         if not selector_list:
             return {}
 

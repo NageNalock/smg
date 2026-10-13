@@ -23,14 +23,15 @@ use std::{future::Future, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 use tracing::warn;
 
 use crate::core::{
-    Conversation, ConversationId, ConversationItem, ConversationItemId, ConversationItemResult,
-    ConversationItemStorage, ConversationItemStorageError, ConversationMetadata,
-    ConversationResult, ConversationStorage, ConversationStorageError, ListParams, NewConversation,
-    NewConversationItem, ResponseId, ResponseResult, ResponseStorage, ResponseStorageError,
-    StoredResponse,
+    ConditionalStore, Conversation, ConversationId, ConversationItem, ConversationItemId,
+    ConversationItemResult, ConversationItemStorage, ConversationItemStorageError,
+    ConversationMetadata, ConversationResult, ConversationStorage, ConversationStorageError,
+    ListParams, NewConversation, NewConversationItem, ResponseId, ResponseResult, ResponseStorage,
+    ResponseStorageError, StoredResponse,
 };
 
 /// The bound of one store call, with the backend's name for the error message
@@ -164,6 +165,58 @@ impl ResponseStorage for BoundedResponseStorage {
             .run(
                 "delete_identifier_responses",
                 self.inner.delete_identifier_responses(identifier, tenant),
+                ResponseStorageError::Timeout,
+            )
+            .await
+    }
+
+    async fn expire_response(
+        &self,
+        response_id: &ResponseId,
+        after: Duration,
+    ) -> ResponseResult<()> {
+        self.bound
+            .run(
+                "expire_response",
+                self.inner.expire_response(response_id, after),
+                ResponseStorageError::Timeout,
+            )
+            .await
+    }
+
+    async fn store_response_if_open(
+        &self,
+        response: StoredResponse,
+    ) -> ResponseResult<ConditionalStore> {
+        self.bound
+            .run(
+                "store_response_if_open",
+                self.inner.store_response_if_open(response),
+                ResponseStorageError::Timeout,
+            )
+            .await
+    }
+
+    async fn update_response_object_if_open(
+        &self,
+        response_id: &ResponseId,
+        raw_response: Value,
+    ) -> ResponseResult<ConditionalStore> {
+        self.bound
+            .run(
+                "update_response_object_if_open",
+                self.inner
+                    .update_response_object_if_open(response_id, raw_response),
+                ResponseStorageError::Timeout,
+            )
+            .await
+    }
+
+    async fn delete_unstored_older_than(&self, cutoff: DateTime<Utc>) -> ResponseResult<usize> {
+        self.bound
+            .run(
+                "delete_unstored_older_than",
+                self.inner.delete_unstored_older_than(cutoff),
                 ResponseStorageError::Timeout,
             )
             .await
@@ -440,6 +493,84 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Storage timeout: the test get_response call exceeded its bound of 0.05 s"
+        );
+    }
+
+    /// The sweep of unstored records and the expiry of one reach the inner
+    /// store through the wrapper: left to the trait's defaults, a deployment
+    /// built through the factory swept nothing and expired nothing.
+    #[tokio::test]
+    async fn the_sweep_and_the_expiry_reach_the_inner_store() {
+        struct Sweeps {
+            expired_after: std::sync::Mutex<Option<Duration>>,
+        }
+        #[async_trait]
+        impl ResponseStorage for Sweeps {
+            async fn store_response(&self, response: StoredResponse) -> ResponseResult<ResponseId> {
+                Ok(response.id)
+            }
+            async fn get_response(
+                &self,
+                _response_id: &ResponseId,
+            ) -> ResponseResult<Option<StoredResponse>> {
+                Ok(None)
+            }
+            async fn delete_response(&self, _response_id: &ResponseId) -> ResponseResult<()> {
+                Ok(())
+            }
+            async fn list_identifier_responses(
+                &self,
+                _identifier: &str,
+                _tenant: Option<&str>,
+                _limit: Option<usize>,
+            ) -> ResponseResult<Vec<StoredResponse>> {
+                Ok(Vec::new())
+            }
+            async fn delete_identifier_responses(
+                &self,
+                _identifier: &str,
+                _tenant: Option<&str>,
+            ) -> ResponseResult<usize> {
+                Ok(0)
+            }
+            async fn expire_response(
+                &self,
+                _response_id: &ResponseId,
+                after: Duration,
+            ) -> ResponseResult<()> {
+                *self.expired_after.lock().unwrap() = Some(after);
+                Ok(())
+            }
+            async fn delete_unstored_older_than(
+                &self,
+                _cutoff: DateTime<Utc>,
+            ) -> ResponseResult<usize> {
+                Ok(7)
+            }
+        }
+        let inner = Arc::new(Sweeps {
+            expired_after: std::sync::Mutex::new(None),
+        });
+        let bounded = BoundedResponseStorage::new(
+            inner.clone(),
+            CallBound::new("test", Duration::from_millis(200)),
+        );
+        assert_eq!(
+            bounded
+                .delete_unstored_older_than(Utc::now())
+                .await
+                .unwrap(),
+            7,
+            "the sweep's count is the inner store's"
+        );
+        bounded
+            .expire_response(&ResponseId::from("resp_1"), Duration::from_secs(600))
+            .await
+            .unwrap();
+        assert_eq!(
+            *inner.expired_after.lock().unwrap(),
+            Some(Duration::from_secs(600)),
+            "the expiry reached the inner store with its deadline"
         );
     }
 

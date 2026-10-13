@@ -85,6 +85,57 @@ class TestDisaggregationMetrics:
         assert not load.HasField("disaggregation")
 
 
+class TestEffectiveRunningWindow:
+    """The window the schedulers enforce, off their published snapshots (the
+    figure `GetServerInfo` reports when `--max-running-requests` is unset)."""
+
+    def test_the_smallest_published_window_is_the_bound(self, loads_mod):
+        first, second = _snapshot(None), _snapshot(None)
+        first.max_running_requests, second.max_running_requests = 1574, 314
+        second.dp_rank = 1
+        assert loads_mod.effective_running_window([first, second]) == 314
+
+    def test_the_flags_units_are_the_share_times_the_attention_dp_width(self, loads_mod):
+        # The engine splits --max-running-requests across its attention-DP
+        # workers and each publishes its share: 16384 over 8 publishes 2048 each.
+        ranks = [_snapshot(None) for _ in range(8)]
+        for rank, snapshot in enumerate(ranks):
+            snapshot.dp_rank, snapshot.max_running_requests = rank, 2048
+        assert loads_mod.effective_running_window(ranks, attention_dp_size=8) == 16384
+        # Without attention DP every scheduler runs the whole flag.
+        assert loads_mod.effective_running_window(ranks, attention_dp_size=1) == 2048
+        assert loads_mod.effective_running_window([], attention_dp_size=8) == 0
+
+    def test_the_figure_is_clamped_to_what_the_gateway_label_can_carry(self, loads_mod):
+        # The gateway parses the label as a 16-bit count: 32 attention-DP
+        # workers publishing 2048 each (65536) would read as no window.
+        ranks = [_snapshot(None) for _ in range(32)]
+        for rank, snapshot in enumerate(ranks):
+            snapshot.dp_rank, snapshot.max_running_requests = rank, 2048
+        assert loads_mod.effective_running_window(ranks, attention_dp_size=32) == 65535
+        assert loads_mod.effective_running_window(ranks, attention_dp_size=31) == 63488
+        wide = _snapshot(None)
+        wide.max_running_requests = 70000
+        assert loads_mod.effective_running_window([wide]) == 65535
+        assert loads_mod.MAX_REPORTED_RUNNING_WINDOW == 65535
+
+    def test_the_ranks_that_published_a_window_are_counted(self, loads_mod):
+        published, unset = _snapshot(None), _snapshot(None)
+        unset.max_running_requests = 0
+        assert loads_mod.ranks_with_a_window([]) == 0
+        assert loads_mod.ranks_with_a_window([published, unset]) == 1
+        assert loads_mod.ranks_with_a_window([published, published]) == 2
+
+    def test_no_snapshot_or_no_figure_means_no_window(self, loads_mod):
+        unset = _snapshot(None)
+        unset.max_running_requests = 0
+        assert loads_mod.effective_running_window([]) == 0
+        assert loads_mod.effective_running_window([unset]) == 0
+        # A rank that has not computed one yet does not hide its peers' bound.
+        published = _snapshot(None)
+        assert loads_mod.effective_running_window([unset, published]) == 8
+
+
 class TestLoadRecord:
     """The record the KV-event stream carries: the published snapshot of the
     batch's rank, converted as GetLoads converts it."""

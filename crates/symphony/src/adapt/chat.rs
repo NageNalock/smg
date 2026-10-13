@@ -6,37 +6,14 @@
 //! driver wraps the choices in the response envelope (request id, model, timestamp, usage) and sets
 //! `matched_stop`, and `logprobs` where it has them, since the events carry neither.
 //!
-//! The shapes are the ones SMG's gateway sends today, the same fields in the same places:
-//!
-//! - content and reasoning deltas carry `role: "assistant"`; reasoning goes to `reasoning_content`;
-//! - a call begins with its `id`, `type: "function"` and `name` and no arguments; every later
-//!   fragment carries the call's `index` and `arguments` only;
-//! - the finishing choice has an empty delta without a role;
-//! - the whole message has `content` null when it is only whitespace, `reasoning_content` only when
-//!   there was reasoning, and `tool_calls` only when a call was made, each call with its id, name
-//!   and its argument fragments joined.
-//!
-//! One rule for `finish_reason`, in both shapes: the engine's reason, except that `stop` after at
-//! least one tool call becomes `tool_calls`. `length`, `abort` and engine-specific reasons stay what
-//! the engine said even when calls were made. The old streaming path rewrote `stop` only, as here;
-//! the old non-streaming path turned every reason but `length`, `failed` and `error` into
-//! `tool_calls`, so the two differ on `abort` and engine-specific reasons, where the rule keeps the
-//! information.
-//!
-//! Policy this adapter sets, where the events say more than Chat Completions can:
-//!
-//! - `ReasoningStart`, `ReasoningEnd`, `ToolCallEnd` and `Dropped` have no representation and
-//!   produce nothing; the markers a format consumes never reach the client.
-//! - `Malformed` text is content: the model wrote it, and the client sees it rather than losing
-//!   it. This is the opposite of the old driver, which logged a parser error and sent nothing for
-//!   that chunk.
-//! - An empty text or an empty argument fragment produces nothing; the gateway sends no empty deltas.
+//! Notes on what this module decides, and on what it leaves open: `docs/adapters.md`.
 
 use openai_protocol::{
     chat::{ChatChoice, ChatCompletionMessage, ChatMessageDelta, ChatStreamChoice},
     common::{FunctionCallDelta, FunctionCallResponse, ToolCall, ToolCallDelta},
 };
 
+use super::fold::fold;
 use crate::event::{Event, FinishReason};
 
 /// The stream choice one event produces for the choice at `choice`, if it produces one.
@@ -141,59 +118,33 @@ pub fn deltas<'a>(
 /// fragments for a call that never started cannot occur under the `Event` contract; should one
 /// arrive, its text joins the content so that no byte is lost.
 pub fn message<'a>(choice: u32, events: impl IntoIterator<Item = &'a Event>) -> ChatChoice {
-    let mut content = String::new();
-    let mut reasoning = String::new();
-    let mut calls: Vec<(u32, ToolCall)> = Vec::new();
-    let mut finish = None;
-    for event in events {
-        match event {
-            Event::Content(text) | Event::Malformed { text, .. } => content.push_str(&text.text),
-            Event::Reasoning(text) => reasoning.push_str(&text.text),
-            Event::ToolCallStart {
-                index, id, name, ..
-            } => calls.push((
-                *index,
-                ToolCall {
-                    id: id.clone(),
-                    tool_type: "function".to_string(),
-                    function: FunctionCallResponse {
-                        name: name.clone(),
-                        arguments: Some(String::new()),
-                    },
-                },
-            )),
-            Event::ToolCallArguments { index, json, .. } => {
-                match calls.iter_mut().find(|(started, _)| started == index) {
-                    Some((_, call)) => call
-                        .function
-                        .arguments
-                        .get_or_insert_with(String::new)
-                        .push_str(json),
-                    None => content.push_str(json),
-                }
-            }
-            Event::Finish {
-                reason, tool_calls, ..
-            } => finish = Some(finish_reason(reason, *tool_calls)),
-            Event::ReasoningStart
-            | Event::ReasoningEnd
-            | Event::ToolCallEnd { .. }
-            | Event::Dropped { .. } => {}
-        }
-    }
+    let folded = fold(events);
+    let calls: Vec<ToolCall> = folded
+        .calls
+        .into_iter()
+        .map(|call| ToolCall {
+            id: call.id,
+            tool_type: "function".to_string(),
+            function: FunctionCallResponse {
+                name: call.name,
+                arguments: Some(call.arguments),
+            },
+        })
+        .collect();
     ChatChoice {
         index: choice,
         message: ChatCompletionMessage {
             role: "assistant".to_string(),
-            content: (!content.trim().is_empty()).then_some(content),
+            content: (!folded.content.trim().is_empty()).then_some(folded.content),
             refusal: None,
             annotations: Vec::new(),
-            tool_calls: (!calls.is_empty())
-                .then(|| calls.into_iter().map(|(_, call)| call).collect()),
-            reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
+            tool_calls: (!calls.is_empty()).then_some(calls),
+            reasoning_content: (!folded.reasoning.is_empty()).then_some(folded.reasoning),
         },
         logprobs: None,
-        finish_reason: finish,
+        finish_reason: folded
+            .finish
+            .map(|finish| finish_reason(&finish.reason, finish.tool_calls)),
         matched_stop: None,
         hidden_states: None,
     }

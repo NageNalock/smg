@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import multiprocessing
 import os
@@ -612,3 +613,97 @@ def test_the_guard_ends_the_process_even_when_its_report_fails(monkeypatch):
     monkeypatch.setattr(rust_lifecycle.os, "_exit", ended.append)
     rust_lifecycle._end_process(1, 15.0)
     assert ended == [1]
+
+
+def test_launch_or_stop_stops_the_server_only_when_the_launch_raises():
+    events: list[str] = []
+
+    class Server:
+        def set_serving(self, serving: bool) -> None:
+            events.append(f"serving:{serving}")
+
+        def stop(self, timeout: float) -> None:
+            events.append(f"stop:{timeout}")
+
+    server = Server()
+    assert asyncio.run(rust_lifecycle.launch_or_stop(server, lambda: "engine")) == "engine"
+    assert events == []
+
+    def failing_launch():
+        raise RuntimeError("engine would not start")
+
+    with pytest.raises(RuntimeError, match="engine would not start"):
+        asyncio.run(rust_lifecycle.launch_or_stop(server, failing_launch))
+    assert events == ["serving:False", f"stop:{rust_lifecycle.SERVER_STOP_SECS}"]
+
+
+def test_launch_or_stop_reports_the_launch_error_when_the_stop_itself_fails(caplog):
+    """The stop after a failed launch is best effort, step by step: a server
+    that cannot flip its health is still stopped, a server that cannot stop
+    is logged, and the launch error is the one that propagates (the entry
+    point's exit code depends on its type)."""
+    events: list[str] = []
+
+    class Server:
+        def __init__(self, *, serving_fails: bool, stop_fails: bool):
+            self.serving_fails = serving_fails
+            self.stop_fails = stop_fails
+
+        def set_serving(self, serving: bool) -> None:
+            events.append(f"serving:{serving}")
+            if self.serving_fails:
+                raise RuntimeError("health flip failed")
+
+        def stop(self, timeout: float) -> None:
+            events.append(f"stop:{timeout}")
+            if self.stop_fails:
+                raise RuntimeError("stop failed")
+
+    def failing_launch():
+        raise ValueError("engine would not start")
+
+    caplog.set_level(logging.ERROR)
+    for server in (
+        Server(serving_fails=True, stop_fails=False),
+        Server(serving_fails=False, stop_fails=True),
+        Server(serving_fails=True, stop_fails=True),
+    ):
+        events.clear()
+        with pytest.raises(ValueError, match="engine would not start"):
+            asyncio.run(rust_lifecycle.launch_or_stop(server, failing_launch))
+        assert events == ["serving:False", f"stop:{rust_lifecycle.SERVER_STOP_SECS}"]
+    assert "Failed to mark the servicer as not serving" in caplog.text
+    assert "Failed to stop the Rust servicer cleanly" in caplog.text
+
+
+def test_a_cancelled_launch_task_still_stops_the_server():
+    """The stop after a failed launch finishes even when the launch's own task
+    is cancelled meanwhile (the entry point's loop shutting down): the port
+    is released before the cancellation propagates."""
+    stop_entered = threading.Event()
+    stop_may_finish = threading.Event()
+    events: list[str] = []
+
+    class Server:
+        def set_serving(self, serving: bool) -> None:
+            events.append(f"serving:{serving}")
+
+        def stop(self, timeout: float) -> None:
+            stop_entered.set()
+            stop_may_finish.wait(5)
+            events.append(f"stop:{timeout}")
+
+    def failing_launch():
+        raise RuntimeError("engine would not start")
+
+    async def run():
+        task = asyncio.create_task(rust_lifecycle.launch_or_stop(Server(), failing_launch))
+        await asyncio.to_thread(stop_entered.wait, 5)
+        task.cancel()
+        stop_may_finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        events.append("cancelled")
+
+    asyncio.run(run())
+    assert events == ["serving:False", f"stop:{rust_lifecycle.SERVER_STOP_SECS}", "cancelled"]

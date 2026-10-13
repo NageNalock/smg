@@ -70,6 +70,7 @@ env:
 
 jobs:
   fixture-tests:
+    name: fixture-tests (tokenizers-v1)
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     timeout-minutes: 140
     permissions:
@@ -149,7 +150,7 @@ jobs:
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
         with:
-          cache-key: bellwether-fixtures
+          cache-key: bellwether-fixtures-tokenizers-v1
 
       # The tests fetch each model's tokenizer files from Hugging Face once, at
       # the revision its manifest pins, into these directories. Which files
@@ -206,14 +207,17 @@ jobs:
           SOURCE_DATE_EPOCH: "1791374400"
         run: |
           source "$HOME/.cargo/env"
-          cargo test -p llm-tokenizer -p smg -p smg-symphony --test 'bellwether_*' --no-run
+          # Gateway forwards the feature to llm-tokenizer. Supported models
+          # exercise v1; unsupported configurations retain the existing encoder.
+          features=(--features smg/tokenizers-v1)
+          cargo test -p llm-tokenizer -p smg -p smg-symphony "${features[@]}" --test 'bellwether_*' --no-run
           targets=()
           for file in crates/symphony/tests/bellwether_*.rs model_gateway/tests/bellwether_*.rs crates/tokenizer/tests/bellwether_*.rs; do
             targets+=("$(basename "$file" .rs)")
           done
           declare -A pid
           for target in "${targets[@]}"; do
-            cargo test -p llm-tokenizer -p smg -p smg-symphony --test "$target" -- --nocapture \
+            cargo test -p llm-tokenizer -p smg -p smg-symphony "${features[@]}" --test "$target" -- --nocapture \
               > "$RUNNER_TEMP/$target.log" 2>&1 &
             pid[$target]=$!
           done
@@ -236,7 +240,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: bellwether-reports
+          name: bellwether-reports-tokenizers-v1
           path: ${{ runner.temp }}/bellwether-reports/
           if-no-files-found: ignore
           retention-days: 30

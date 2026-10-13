@@ -749,8 +749,8 @@ def test_serve_rust_starts_the_scheduler_ranks_from_this_process(
         rust, "server_facts", lambda args: {"server_args_json": "{}", "data_parallel_size": 1}
     )
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: str(tmp_path))
-    monkeypatch.setattr(rust, "free_port", lambda: 24321)
-    monkeypatch.setattr(rust, "default_socket_dir", lambda: str(tmp_path / "sockets"))
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
     monkeypatch.delenv("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", raising=False)
     supervised: dict = {}
 
@@ -758,7 +758,7 @@ def test_serve_rust_starts_the_scheduler_ranks_from_this_process(
         supervised["server"], supervised["engine"] = server, engine
         return 0
 
-    monkeypatch.setattr(rust, "supervise", fake_supervise)
+    monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
     args = FakeServerArgs(port=50123)
 
     assert asyncio.run(rust.serve_rust(args)) == 0
@@ -798,8 +798,8 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
         lambda args: {"server_args_json": "{}", "data_parallel_size": 2},
     )
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: str(tmp_path))
-    monkeypatch.setattr(rust, "free_port", lambda: 24321)
-    monkeypatch.setattr(rust, "default_socket_dir", lambda: str(tmp_path / "sockets"))
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
 
     def fake_launch(headless):
         recorded["headless"] = headless
@@ -810,7 +810,7 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
         return 0
 
     monkeypatch.setattr(rust, "launch_scheduler_ranks", fake_launch)
-    monkeypatch.setattr(rust, "supervise", fake_supervise)
+    monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
     monkeypatch.delenv("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", raising=False)
     monkeypatch.setenv("SMG_TOKENSPEED_SERVICER_DRAIN_SECS", "1.5")
     monkeypatch.setenv("SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS", "42")
@@ -863,14 +863,14 @@ def _run_serve_rust(monkeypatch, tmp_path) -> dict:
     )
     monkeypatch.setattr(rust, "_model_config", lambda args: model_config)
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: str(tmp_path))
-    monkeypatch.setattr(rust, "free_port", lambda: 24321)
-    monkeypatch.setattr(rust, "default_socket_dir", lambda: str(tmp_path / "sockets"))
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
     monkeypatch.setattr(rust, "launch_scheduler_ranks", lambda headless: "engine-handle")
 
     async def fake_supervise(server, engine, *, drain_secs, **_kwargs):
         return 0
 
-    monkeypatch.setattr(rust, "supervise", fake_supervise)
+    monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
     monkeypatch.delenv("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", raising=False)
     assert asyncio.run(rust.serve_rust(FakeServerArgs(port=50123))) == 0
     return created
@@ -1015,7 +1015,7 @@ def test_serve_rust_refuses_a_bad_knob_before_the_server_binds(
     monkeypatch.setattr(rust, "model_facts", no_engine_work)
     monkeypatch.setattr(rust, "server_facts", no_engine_work)
     monkeypatch.setattr(rust, "launch_scheduler_ranks", no_engine_work)
-    monkeypatch.setattr(rust, "default_socket_dir", lambda: str(tmp_path / "sockets"))
+    monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
     monkeypatch.setenv(name, value)
 
     with pytest.raises(rust_lifecycle.ServicerConfigError, match=f"{name}='{value}' {text}"):
@@ -1036,7 +1036,7 @@ def test_serve_rust_refuses_a_socket_dir_that_is_a_file_before_the_server_binds(
     _stub_servicer_module(monkeypatch)
     a_file = tmp_path / "a-file"
     a_file.write_text("not a directory")
-    monkeypatch.setattr(rust, "default_socket_dir", lambda: str(a_file))
+    monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(a_file))
 
     with pytest.raises(rust_lifecycle.ServicerConfigError, match="SMG_ZMQ_SOCKET_DIR=.*not a dir"):
         asyncio.run(rust.serve_rust(FakeServerArgs(port=50123)))
@@ -1064,3 +1064,42 @@ def test_the_launcher_answers_a_configuration_error_with_exit_code_2(launcher, m
         module.main(["--servicer-impl", "rust", "--model", "org/m"])
     assert raised.value.code == 2
     assert "SMG_TOKENSPEED_SERVICER_DRAIN_SECS='abc' is not a number" in caplog.text
+
+
+def test_a_launch_that_fails_stops_the_already_bound_server(monkeypatch, tmp_path):
+    """The server owns the port and a runtime thread: a scheduler launch that
+    raises must not leave them to the process exit (what the vLLM launcher
+    does), and nothing is supervised."""
+    events: list[str] = []
+
+    class FakeServer:
+        def __init__(self, **kwargs):
+            self.address = kwargs["bind_address"]
+
+        def set_serving(self, serving: bool) -> None:
+            events.append(f"serving:{serving}")
+
+        def stop(self, timeout: float) -> None:
+            events.append(f"stop:{timeout}")
+
+    _install_fake_servicer(monkeypatch, FakeServer)
+    monkeypatch.setattr(rust, "model_facts", lambda args: {"model_path": args.model})
+    monkeypatch.setattr(
+        rust, "server_facts", lambda args: {"server_args_json": "{}", "data_parallel_size": 1}
+    )
+    monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: str(tmp_path))
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
+    monkeypatch.delenv("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", raising=False)
+
+    def failing_launch(headless):
+        raise RuntimeError("scheduler would not start")
+
+    async def never_supervise(*_args, **_kwargs):
+        pytest.fail("a failed launch was supervised")
+
+    monkeypatch.setattr(rust, "launch_scheduler_ranks", failing_launch)
+    monkeypatch.setattr(rust_lifecycle, "supervise", never_supervise)
+    with pytest.raises(RuntimeError, match="scheduler would not start"):
+        asyncio.run(rust.serve_rust(FakeServerArgs(port=50123)))
+    assert events == ["serving:False", "stop:5.0"]

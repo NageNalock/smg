@@ -252,7 +252,9 @@ impl Gateway {
     /// An external worker sends the request to its provider's router. A
     /// disaggregated family is weighted only when both of its legs exist on
     /// the wire the family selects over, which is how a leg on a transport
-    /// the family cannot use (ZMQ prefill or decode) no longer counts.
+    /// the family cannot use (ZMQ prefill or decode) no longer counts; a
+    /// family with one leg missing takes the request only when no family
+    /// has weight (see [`Self::incomplete_disaggregated_router`]).
     fn select_router_for_model(&self, model_id: Option<&str>) -> Option<Arc<dyn RouterTrait>> {
         let snapshot = self
             .worker_registry
@@ -292,6 +294,55 @@ impl Gateway {
             0
         };
         self.pick_router_by_weights(grpc_epd, grpc_pd, http_pd, grpc_regular, http_regular)
+            .or_else(|| {
+                self.incomplete_disaggregated_router(
+                    grpc_encode,
+                    grpc_prefill + grpc_decode,
+                    http_prefill + http_decode,
+                )
+            })
+    }
+
+    /// The router for a model whose only workers are the legs of a
+    /// disaggregated family with a leg missing (one leg restarting or not yet
+    /// discovered, the other still registered). Such a family takes no weight
+    /// in [`Self::select_router_for_model`], so a fleet with another family
+    /// that can serve the request sends it there; when none can, the request
+    /// still belongs to this family, whose selection refuses it with the leg
+    /// that is missing: a retryable 503 with a `Retry-After`, counted under
+    /// the family's labels. Falling to the default router instead answered
+    /// that the model does not exist (404 `model_not_found`) and counted the
+    /// refusal under that router's labels, for a model that is served and
+    /// merely has no complete pair at the moment. An encode leg is the EPD
+    /// family's alone: registered beside a missing prefill or decode leg it
+    /// makes that family the first choice, and registered alone it takes the
+    /// EPD router when one is mounted (whose selection answers the incomplete
+    /// set itself) and the default router otherwise, never the PD router,
+    /// whose refusal would count and log it as prefill/decode traffic.
+    /// `None` when no leg of the model is registered on either wire, or no
+    /// family's router is mounted: the default router's answer stands.
+    fn incomplete_disaggregated_router(
+        &self,
+        grpc_encode: usize,
+        grpc_pair_legs: usize,
+        http_pair_legs: usize,
+    ) -> Option<Arc<dyn RouterTrait>> {
+        let routers = self.routers.load();
+        let family = |ids: &[&RouterId]| ids.iter().find_map(|id| routers.get(*id).cloned());
+        if grpc_pair_legs > 0 || grpc_encode > 0 {
+            let ids: &[&RouterId] = match (grpc_encode > 0, grpc_pair_legs > 0) {
+                (true, true) => &[&router_ids::GRPC_EPD, &router_ids::GRPC_PD],
+                (true, false) => &[&router_ids::GRPC_EPD],
+                _ => &[&router_ids::GRPC_PD, &router_ids::GRPC_EPD],
+            };
+            if let Some(router) = family(ids) {
+                return Some(router);
+            }
+        }
+        if http_pair_legs > 0 {
+            return family(&[&router_ids::HTTP_PD]);
+        }
+        None
     }
 
     /// The router for a Messages request with `max_tokens: 0`. Its answer,
@@ -1584,6 +1635,136 @@ mod tests {
         assert!(
             (pd_ratio - expected).abs() < tolerance,
             "PD ratio {pd_ratio:.3} was outside expected {expected} ± {tolerance}",
+        );
+    }
+
+    /// A disaggregated pair with one leg missing (the other restarting) is
+    /// still that family's: the request goes to its router (the one of its
+    /// wire), whose selection refuses it with the missing leg (a retryable
+    /// 503), not to the default router, which answers that the model does
+    /// not exist. With no leg of the model registered at all the default
+    /// router's answer stands, and with a regular worker beside the
+    /// incomplete pair the weights decide, as before.
+    #[test]
+    fn an_incomplete_disaggregated_pair_keeps_its_family_instead_of_the_default_router() {
+        fn gateway_with(
+            legs: &[(WorkerType, ConnectionMode)],
+            families: &[(&RouterId, &'static str)],
+        ) -> Arc<Gateway> {
+            let registry = Arc::new(WorkerRegistry::new());
+            for (idx, (worker_type, mode)) in legs.iter().enumerate() {
+                let mut labels = HashMap::new();
+                labels.insert("model_id".to_string(), "model-x".to_string());
+                let worker = BasicWorkerBuilder::new(format!("http://leg{idx}:8080"))
+                    .worker_type(*worker_type)
+                    .connection_mode(*mode)
+                    .labels(labels)
+                    .circuit_breaker_config(CircuitBreakerConfig::default())
+                    .build();
+                registry.register(Arc::new(worker)).unwrap();
+            }
+            let mut manager = Gateway::new(registry);
+            manager.enable_igw = true;
+            let manager = Arc::new(manager);
+            // The first router registered is the default one; the families
+            // answer with their own names.
+            manager.register_router(router_ids::HTTP_REGULAR, Arc::new(StubRouter));
+            for (id, name) in families {
+                manager.register_router((*id).clone(), Arc::new(NamedMessagesRouter(name)));
+            }
+            manager
+        }
+        let both_pd = [
+            (&router_ids::GRPC_PD, "grpc_pd"),
+            (&router_ids::HTTP_PD, "http_pd"),
+        ];
+        let picked = |legs: &[(WorkerType, ConnectionMode)],
+                      families: &[(&RouterId, &'static str)]| {
+            gateway_with(legs, families)
+                .select_router_for_request(Some("model-x"))
+                .expect("a router")
+                .router_type()
+        };
+
+        // Only the decode leg of a gRPC pair is registered (the prefill is
+        // restarting): the gRPC PD router, not the default one.
+        assert_eq!(
+            picked(&[(WorkerType::Decode, ConnectionMode::Grpc)], &both_pd),
+            "grpc_pd"
+        );
+        // Only the prefill leg: the same.
+        assert_eq!(
+            picked(&[(WorkerType::Prefill, ConnectionMode::Grpc)], &both_pd),
+            "grpc_pd"
+        );
+        // An HTTP pair missing its prefill leg: the HTTP PD router, the one
+        // that selects from the HTTP pools.
+        assert_eq!(
+            picked(&[(WorkerType::Decode, ConnectionMode::Http)], &both_pd),
+            "http_pd"
+        );
+        // gRPC legs with only the EPD router mounted: the family's second id.
+        assert_eq!(
+            picked(
+                &[(WorkerType::Decode, ConnectionMode::Grpc)],
+                &[(&router_ids::GRPC_EPD, "grpc_epd")]
+            ),
+            "grpc_epd"
+        );
+        // An encode leg alone is the EPD family's: with no EPD router mounted
+        // the default router answers (as for a model nobody serves, its
+        // refusal counted and logged as regular traffic), never the PD
+        // router; with one mounted (every router is, under IGW) the EPD
+        // router, whose selection answers the incomplete set itself.
+        assert_eq!(
+            picked(&[(WorkerType::Encode, ConnectionMode::Grpc)], &both_pd),
+            "stub"
+        );
+        let with_epd = [
+            (&router_ids::GRPC_PD, "grpc_pd"),
+            (&router_ids::HTTP_PD, "http_pd"),
+            (&router_ids::GRPC_EPD, "grpc_epd"),
+        ];
+        assert_eq!(
+            picked(&[(WorkerType::Encode, ConnectionMode::Grpc)], &with_epd),
+            "grpc_epd"
+        );
+        // An encode leg beside a decode leg (the prefill missing): the EPD
+        // family first when it is mounted, the PD family otherwise.
+        assert_eq!(
+            picked(
+                &[
+                    (WorkerType::Encode, ConnectionMode::Grpc),
+                    (WorkerType::Decode, ConnectionMode::Grpc),
+                ],
+                &with_epd
+            ),
+            "grpc_epd"
+        );
+        assert_eq!(
+            picked(
+                &[
+                    (WorkerType::Encode, ConnectionMode::Grpc),
+                    (WorkerType::Decode, ConnectionMode::Grpc),
+                ],
+                &both_pd
+            ),
+            "grpc_pd"
+        );
+        // No leg of the model at all: the default router answers for a model
+        // nobody serves.
+        assert_eq!(picked(&[], &both_pd), "stub");
+        // A regular worker beside the incomplete pair: the weights decide,
+        // and the incomplete family has none.
+        assert_eq!(
+            picked(
+                &[
+                    (WorkerType::Decode, ConnectionMode::Grpc),
+                    (WorkerType::Regular, ConnectionMode::Http),
+                ],
+                &both_pd
+            ),
+            "stub"
         );
     }
 

@@ -15,7 +15,7 @@ use llm_multimodal::{
     configure_parallelism, registry::modality_limit_override, vision::PreProcessorConfig,
     FrameSampling, MediaConnector, MediaConnectorConfig, MediaConnectorError, MediaContentPart,
     MediaFault, Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism,
-    VisionProcessorRegistry, POOL_THREADS_ENV,
+    TransparencyPolicy, VisionProcessorRegistry, POOL_THREADS_ENV,
 };
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
@@ -24,6 +24,7 @@ use tracing::{info, warn};
 
 use super::{
     assemble::{assemble_vllm_batches_with, VllmAssembly},
+    capability::runtime_reads_format,
     config::{MultimodalComponents, MultimodalConfigRegistry, MultimodalModelConfig},
     mm_settings,
     pixel_cache::pixel_cache_with_budget,
@@ -31,7 +32,10 @@ use super::{
     process::process_multimodal_plan,
     RegistryTokenizer,
 };
-use crate::{routers::grpc::proto_wrapper::vllm_mm_identity, worker::http_client::build_with};
+use crate::{
+    routers::grpc::proto_wrapper::vllm_mm_identity,
+    worker::{http_client::build_with, RuntimeType},
+};
 
 /// A worker serves one model: the config registry's one key.
 const CONFIG_KEY: &str = "worker";
@@ -391,6 +395,12 @@ impl WorkerMediaPipeline {
                     &model_registry.spec_names()
                 ))
             })?;
+            anyhow::ensure!(
+                runtime_reads_format(RuntimeType::Vllm, spec.encoder_input_format()),
+                "the {} spec preprocesses media into a format vLLM does not read; serve this \
+                 model's media with --mm-processor inprocess",
+                spec.name()
+            );
             let limits = spec.modality_limits(&metadata).map_err(|error| {
                 anyhow::anyhow!("reading the {} spec's media limits: {error}", spec.name())
             })?;
@@ -549,11 +559,16 @@ impl WorkerMediaPipeline {
             CONFIG_KEY,
             &self.model_dir,
             &HashMap::new(),
+            |format| runtime_reads_format(RuntimeType::Vllm, format),
         )
         .await
         .map_err(|error| WorkerMediaError::Invalid(format!("{error:#}")))?;
         validate_rendered_media_anchors(&plan, &placeholders, tokenizer, &prompt_token_ids)
             .map_err(|error| WorkerMediaError::Invalid(format!("{error:#}")))?;
+        // This pipeline runs inside the engine whose batches it assembles
+        // (`VllmAssembly`), so its frames decode under that engine's own
+        // transparency rule, the white composite of its image loader; a
+        // processor that keeps alpha overrides it inside the plan.
         let output = process_multimodal_plan(
             plan,
             &self.model_id,
@@ -562,6 +577,8 @@ impl WorkerMediaPipeline {
             &self.components,
             CONFIG_KEY,
             &self.model_dir,
+            self.assembly.image_wire_dtype(),
+            TransparencyPolicy::CompositeOverWhite,
         )
         .await
         .map_err(classify)?;
@@ -991,6 +1008,42 @@ mod unsupported_model_tests {
     use llm_tokenizer::MockTokenizer;
 
     use super::*;
+
+    /// A spec whose encoder inputs vLLM does not read never preprocesses for
+    /// this vLLM worker: the pipeline refuses to start.
+    #[tokio::test]
+    async fn a_spec_vllm_cannot_read_is_refused_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type": "NemotronH_Nano_Omni_Reasoning_V3"}"#,
+        )
+        .unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let settings = WorkerMediaSettings {
+            model_dir: path.clone(),
+            model_id: path,
+            served_model_name: None,
+            pixel_format: PixelFormat::Normalized,
+            encoder_dtype: "bfloat16".to_string(),
+            processor_kwargs: serde_json::Map::new(),
+            max_items: None,
+            engine_item_limits: HashMap::new(),
+            max_item_bytes: None,
+            allowed_domains: None,
+            fetch_timeout: Duration::from_secs(1),
+            video_fetch_timeout: Duration::from_secs(1),
+            video_frame_budget: None,
+            video_loader_rule: None,
+        };
+        let error = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::default()))
+            .await
+            .err()
+            .expect("a spec vLLM cannot read");
+        let message = format!("{error:#}");
+        assert!(message.contains("format vLLM does not read"), "{message}");
+        assert!(message.contains("--mm-processor inprocess"), "{message}");
+    }
 
     /// A family without a spec is refused in the terms an operator acts on:
     /// the model type and architectures, the served name, the families the

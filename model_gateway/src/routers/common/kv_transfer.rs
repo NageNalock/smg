@@ -14,6 +14,7 @@ use tracing::warn;
 use crate::{
     observability::metrics::metrics_labels,
     worker::{
+        pd_pairing::{connector_profile, KvTransferProfile},
         Worker, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, MORIIO_CONNECTOR, MORIIO_MODE_LABEL,
         NIXL_CONNECTOR,
     },
@@ -42,6 +43,13 @@ pub(crate) enum KvConnectorMode {
     /// or, dispatched concurrently, tag decode with the prefill peer (see
     /// [`moriio_decode_params`]).
     MoriIo,
+    /// A connector whose legs meet in a store the deployment shares (the
+    /// Mooncake store, the shared-storage, FlexKV and 3FS connectors; see
+    /// [`KvTransferProfile::Store`]): the decode engine reads the prefill's
+    /// blocks back by prefix hash, so the gateway mints nothing: neither leg
+    /// is tagged; params the engine does return are relayed, for a store
+    /// that runs a handoff of its own.
+    Store,
     /// Unknown/absent connector: relay returned params opportunistically.
     Passthrough,
 }
@@ -52,6 +60,7 @@ impl KvConnectorMode {
             Self::Mooncake { .. } => metrics_labels::KV_CONNECTOR_MOONCAKE,
             Self::Nixl => metrics_labels::KV_CONNECTOR_NIXL,
             Self::MoriIo => metrics_labels::KV_CONNECTOR_MORIIO,
+            Self::Store => metrics_labels::KV_CONNECTOR_STORE,
             Self::Passthrough => metrics_labels::KV_CONNECTOR_PASSTHROUGH,
         }
     }
@@ -72,6 +81,9 @@ pub(crate) fn kv_connector_mode(
         },
         Some(NIXL_CONNECTOR) => KvConnectorMode::Nixl,
         Some(MORIIO_CONNECTOR) => KvConnectorMode::MoriIo,
+        Some(connector) if connector_profile(connector) == KvTransferProfile::Store => {
+            KvConnectorMode::Store
+        }
         _ => KvConnectorMode::Passthrough,
     }
 }
@@ -1114,12 +1126,48 @@ mod tests {
         }
     }
 
+    /// A store connector takes the store mode whatever bootstrap metadata the
+    /// leg carries: nothing is minted from it.
+    #[test]
+    fn kv_connector_mode_store_connectors_take_the_store_mode() {
+        for connector in [
+            "MooncakeStoreConnector",
+            "SharedStorageConnector",
+            "FlexKVConnectorV1",
+            "HF3FSKVConnector",
+        ] {
+            assert_eq!(
+                kv_connector_mode(
+                    Some(connector),
+                    "prefill-host",
+                    Some(8998),
+                    Some("engine-1")
+                ),
+                KvConnectorMode::Store,
+                "{connector}"
+            );
+        }
+        assert_eq!(KvConnectorMode::Store.metrics_label(), "store");
+    }
+
+    /// Unknown connectors, and the connectors whose blocks stay in the engine
+    /// or whose disaggregated mode the request would have to address, keep
+    /// the passthrough handling.
     #[test]
     fn kv_connector_mode_unknown_or_missing_is_passthrough() {
-        assert_eq!(
-            kv_connector_mode(Some("LMCacheConnector"), "host", None, None),
-            KvConnectorMode::Passthrough
-        );
+        for connector in [
+            "P2pNcclConnector",
+            "OffloadingConnector",
+            "SimpleCPUOffloadConnector",
+            "LMCacheConnectorV1",
+            "LMCacheMPConnector",
+        ] {
+            assert_eq!(
+                kv_connector_mode(Some(connector), "host", None, None),
+                KvConnectorMode::Passthrough,
+                "{connector}"
+            );
+        }
         assert_eq!(
             kv_connector_mode(None, "host", None, None),
             KvConnectorMode::Passthrough

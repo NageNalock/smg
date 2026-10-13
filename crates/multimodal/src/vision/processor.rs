@@ -9,7 +9,7 @@ use image::DynamicImage;
 
 use super::{preprocessor_config::PreProcessorConfig, transforms::TransformError};
 pub use crate::encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs};
-use crate::types::RgbFrameRef;
+use crate::{encoder_inputs::EncoderDtype, types::RgbFrameRef};
 
 /// Helper to extract a dimension from encoder_input given an ndim-dependent axis index.
 /// Returns `Err` if the ndim is not 4 or 5.
@@ -86,6 +86,16 @@ pub trait VisionPreProcessor: Send + Sync {
         false
     }
 
+    /// Whether this processor takes an image that carries an alpha channel as
+    /// decoded and composites or drops the channel itself, because its
+    /// reference is handed the image as stored by the serving engines'
+    /// loaders. A frame for such a processor is decoded under
+    /// [`TransparencyPolicy::KeepAlpha`](crate::TransparencyPolicy::KeepAlpha)
+    /// whatever the destination engine's own rule.
+    fn keeps_alpha(&self) -> bool {
+        false
+    }
+
     /// Default normalization mean for this model family.
     fn default_mean(&self) -> [f64; 3];
 
@@ -105,6 +115,22 @@ pub trait VisionPreProcessor: Send + Sync {
         images: &[DynamicImage],
         config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError>;
+
+    /// Preprocess a batch of images straight into `dtype`, the wire's dtype,
+    /// when the processor can lay the patches out and normalize them in one
+    /// pass (an [`EncoderInput::Wire`](crate::encoder_inputs::EncoderInput::Wire)
+    /// result); `None` when it cannot, which leaves the caller
+    /// [`preprocess`](Self::preprocess) and the per-destination write. The
+    /// bytes a `Wire` carries are the bytes `preprocess` followed by a write
+    /// in `dtype` would produce.
+    fn preprocess_wire(
+        &self,
+        _images: &[DynamicImage],
+        _config: &PreProcessorConfig,
+        _dtype: EncoderDtype,
+    ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
+        None
+    }
 
     /// Preprocess one decoded video clip represented as sampled frames.
     ///
@@ -236,6 +262,14 @@ impl VisionProcessorRegistry {
             registry.register(
                 pattern,
                 Box::new(super::processors::DeepseekV41Processor::new()),
+            );
+        }
+
+        // Nemotron-H Omni (the HF model_type and the released ids' spelling).
+        for pattern in ["nemotronh_nano_omni", "nemotron-3-nano-omni"] {
+            registry.register(
+                pattern,
+                Box::new(super::processors::NemotronOmniProcessor::new()),
             );
         }
 

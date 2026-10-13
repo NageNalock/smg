@@ -46,25 +46,23 @@ import json
 import logging
 import multiprocessing
 import os
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Mapping
 from typing import Any
 
-from smg_grpc_servicer.hostport import host_port
-
-# The lifecycle's defaults, re-exported: this launcher's own documented defaults.
+# The lifecycle's defaults and the switch's choices, re-exported: this
+# launcher's own documented values.
 from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     DEFAULT_DRAIN_SECS,
     DEFAULT_STARTUP_CEILING_SECS,
     DEFAULT_STARTUP_TIMEOUT_SECS,
+    IMPLS,
     EngineProcess,
     EngineProcessGroup,
-    ServicerConfigError,
-    default_socket_dir,
-    free_port,
-    read_launcher_knobs,
+    RustLauncher,
     resolve_tokenizer_dir,
-    supervise,
+    servicer_switch,
 )
+from smg_grpc_servicer.vllm.config_view import EngineConfigView
 from smg_grpc_servicer.vllm.media_refs import FETCHABLE_MODALITIES
 from smg_grpc_servicer.vllm.model_info import (
     engine_reasoning_parser,
@@ -90,7 +88,6 @@ _OFF_VALUES = ("0", "false", "no", "off")
 # vLLM's own knob for how it starts its processes; the engine cores launched
 # from this process are spawned unless the deployment chose otherwise.
 MULTIPROC_METHOD_ENV = "VLLM_WORKER_MULTIPROC_METHOD"
-IMPLS = ("python", "rust")
 # What upstream's gRPC entrypoint references when it carries the switch.
 HOOK_SYMBOL = "resolve_servicer_impl"
 
@@ -104,6 +101,7 @@ def model_info_from_config(vllm_config: Any, *, log_stats: bool | None = None) -
     an engine's wire reports every scheduler step, which the servicer's
     pushed load records say from the first record; ``None`` leaves the
     servicer to classify the wire by what it shows."""
+    view = EngineConfigView(vllm_config)
     model_config = vllm_config.model_config
     facts = {**model_facts(model_config), **server_facts(vllm_config)}
     # `server_facts` carries the multimodal encoder dtype for the Python
@@ -112,20 +110,7 @@ def model_info_from_config(vllm_config: Any, *, log_stats: bool | None = None) -
     facts.pop("multimodal_encoder_dtype", None)
     # KV-event publishing, as the Python servicer resolves it: only vLLM's ZMQ
     # publisher can be relayed; anything else leaves SubscribeKvEvents off.
-    kv_events = getattr(vllm_config, "kv_events_config", None)
-    kv_events_enabled = (
-        kv_events is not None
-        and bool(getattr(kv_events, "enable_kv_cache_events", False))
-        and getattr(kv_events, "publisher", None) == "zmq"
-    )
-    structured = getattr(vllm_config, "structured_outputs_config", None)
-    structured_backend = getattr(structured, "backend", None) if structured is not None else None
-    # The pooler config vLLM's frontend merges into a pooling request's unset
-    # fields (`PoolingParams._merge_default_parameters`); absent on most
-    # generation models.
-    pooler = getattr(model_config, "pooler_config", None)
-    pooler_use_activation = getattr(pooler, "use_activation", None)
-    pooler_dimensions = getattr(pooler, "dimensions", None)
+    events = view.kv_events
     return {
         **facts,
         # The Rust servicer stops on the full set vLLM's frontend assembles
@@ -137,18 +122,15 @@ def model_info_from_config(vllm_config: Any, *, log_stats: bool | None = None) -
         "attention_backend": str(facts.get("attention_backend", "")),
         "model_dtype": str(facts.get("model_dtype", "")),
         "block_size": int(facts.get("block_size", 0) or 0),
-        "structured_outputs_backend": str(structured_backend or "auto"),
-        "kv_events_endpoint": str(getattr(kv_events, "endpoint", "") or "")
-        if kv_events_enabled
-        else "",
-        "kv_events_replay_endpoint": (
-            str(getattr(kv_events, "replay_endpoint", "") or "") if kv_events_enabled else ""
-        ),
-        "kv_events_topic": str(getattr(kv_events, "topic", "") or "") if kv_events_enabled else "",
-        "pooler_use_activation": (
-            bool(pooler_use_activation) if pooler_use_activation is not None else None
-        ),
-        "pooler_dimensions": int(pooler_dimensions) if pooler_dimensions is not None else None,
+        "structured_outputs_backend": str(view.structured_outputs.backend or "auto"),
+        "kv_events_endpoint": events.endpoint if events.relayed else "",
+        "kv_events_replay_endpoint": events.replay_endpoint if events.relayed else "",
+        "kv_events_topic": events.topic if events.relayed else "",
+        # The pooler config vLLM's frontend merges into a pooling request's
+        # unset fields (`PoolingParams._merge_default_parameters`); absent on
+        # most generation models.
+        "pooler_use_activation": view.pooler.use_activation,
+        "pooler_dimensions": view.pooler.dimensions,
         "mm_device_do_normalize": mm_device_do_normalize(vllm_config),
         "mm_item_limits": mm_item_limits(vllm_config),
         "engine_reasoning_parser": engine_reasoning_parser(vllm_config),
@@ -432,15 +414,14 @@ def launch_engine_cores(ns: argparse.Namespace) -> EngineProcessGroup | EnginePr
     vllm_config = engine_args.create_engine_config(
         usage_context=UsageContext.OPENAI_API_SERVER, headless=True
     )
-    parallel_config = vllm_config.parallel_config
-    node_rank = getattr(parallel_config, "node_rank_within_dp", 0)
-    backend = getattr(parallel_config, "data_parallel_backend", "mp")
-    if node_rank > 0 or backend == "ray":
+    view = EngineConfigView(vllm_config)
+    parallel = view.parallel
+    if parallel.node_rank_within_dp > 0 or parallel.data_parallel_backend == "ray":
         logger.info(
             "Engine launch left to vLLM's headless launcher in a spawned process "
             "(node rank %d within the data-parallel group, backend %s)",
-            node_rank,
-            backend,
+            parallel.node_rank_within_dp,
+            parallel.data_parallel_backend,
         )
         return launch_headless_engine(ns)
 
@@ -455,21 +436,20 @@ def launch_engine_cores(ns: argparse.Namespace) -> EngineProcessGroup | EnginePr
             MULTIPROC_METHOD_ENV,
             os.environ[MULTIPROC_METHOD_ENV],
         )
+    launch = view.launch
     manager = CoreEngineProcManager(
-        local_engine_count=parallel_config.data_parallel_size_local,
-        start_index=parallel_config.data_parallel_rank,
+        local_engine_count=launch.local_engine_count,
+        start_index=launch.start_index,
         local_start_index=0,
         vllm_config=vllm_config,
         local_client=False,
-        handshake_address=get_tcp_uri(
-            parallel_config.data_parallel_master_ip, parallel_config.data_parallel_rpc_port
-        ),
+        handshake_address=get_tcp_uri(launch.master_ip, launch.rpc_port),
         executor_class=Executor.get_class(vllm_config),
         log_stats=not engine_args.disable_log_stats,
     )
     # The engine's own request-drain budget bounds the shutdown when one is
     # configured; otherwise the manager's best-effort grace applies.
-    engines = EngineProcessGroup(manager, shutdown_timeout=vllm_config.shutdown_timeout or None)
+    engines = EngineProcessGroup(manager, shutdown_timeout=launch.shutdown_timeout or None)
     logger.info(
         "Started %d engine core process(es) from the servicer process: pids %s",
         len(engines.pids),
@@ -483,125 +463,103 @@ def launch_engine_cores(ns: argparse.Namespace) -> EngineProcessGroup | EnginePr
 # ---------------------------------------------------------------------------
 
 
+class VllmLauncher(RustLauncher):
+    """The vLLM launcher's lifecycle: the engine config, built once from the
+    launcher's parsed namespace, serves the facts, the tokenizer lookup and
+    the worker-side media options; the engine cores start from this
+    process."""
+
+    engine = "vLLM"
+    started = "engine"
+    counted = "engine"
+    server_class = "VllmGrpcServer"
+    ipc_prefix = "servicer"
+    handshake_port_env = HANDSHAKE_PORT_ENV
+    drain_secs_env = DRAIN_SECS_ENV
+    startup_timeout_secs_env = STARTUP_TIMEOUT_SECS_ENV
+    startup_ceiling_secs_env = STARTUP_CEILING_SECS_ENV
+    kv_events_env = KV_EVENTS_ENV
+    without_tokenizer = "string stops will be refused"
+
+    def __init__(self) -> None:
+        self.vllm_config: Any = None
+        self.media: Any = None
+
+    def prepare(self, args: argparse.Namespace) -> None:
+        configure_logging()
+
+    def kv_events_default(self, args: argparse.Namespace) -> Any | None:
+        return default_kv_events_config(args)
+
+    def facts(self, args: argparse.Namespace) -> dict[str, Any]:
+        from vllm.engine.arg_utils import AsyncEngineArgs
+        from vllm.usage.usage_lib import UsageContext
+
+        engine_args = AsyncEngineArgs.from_cli_args(args)
+        self.vllm_config = engine_args.create_engine_config(
+            usage_context=UsageContext.OPENAI_API_SERVER
+        )
+        # The engine cores are started with `log_stats=not disable_log_stats`
+        # (`launch_engine_cores`); the servicer is told the same.
+        disable_log_stats = getattr(engine_args, "disable_log_stats", None)
+        return model_info_from_config(
+            self.vllm_config,
+            log_stats=None if disable_log_stats is None else not disable_log_stats,
+        )
+
+    def tokenizer_dir(self, args: argparse.Namespace) -> str | None:
+        model = EngineConfigView(self.vllm_config).model
+        return resolve_tokenizer_dir(model.tokenizer, model.tokenizer_revision)
+
+    def server_extras(self, args: argparse.Namespace, tokenizer_dir: str | None) -> dict[str, Any]:
+        """Worker-side media processing, from the same ``--mm-*`` settings
+        (flags when the launcher has them, else the environment) as the
+        Python servicer: the Python processors behind a bridge, or smg's own
+        pipeline in Rust."""
+        from smg_grpc_servicer.vllm.mm_processor import MODE_SMG, MmSettings
+        from smg_grpc_servicer.vllm.rust_media import RustMediaBridge
+
+        settings = MmSettings.from_args(args).resolve()
+        smg_media = None
+        if settings.processor == MODE_SMG:
+            smg_media = smg_media_options(self.vllm_config, settings, tokenizer_dir)
+        else:
+            self.media = RustMediaBridge.build(
+                self.vllm_config, settings, asyncio.get_running_loop()
+            )
+        logger.info(
+            "Worker-side media processing: %s (source=%s)",
+            MODE_SMG
+            if smg_media is not None
+            else self.media.name
+            if self.media is not None
+            else "off",
+            settings.source if (smg_media is not None or self.media is not None) else "-",
+        )
+        return {"media_processor": self.media, "smg_media_processor": smg_media}
+
+    def launch(
+        self, args: argparse.Namespace, handshake_port: int, facts: Mapping[str, Any]
+    ) -> Any:
+        return launch_engine_cores(
+            headless_namespace(
+                args, handshake_port=handshake_port, data_parallel_size=facts["data_parallel_size"]
+            )
+        )
+
+    def launched(self, engine: Any) -> None:
+        logger.info("Launched the headless engine (pid %s)", engine.pid)
+        if self.media is not None:
+            self.media.start_warmup()
+
+
 async def serve_rust(args: argparse.Namespace) -> int:
     """Serve this process's gRPC contract from Rust: start the Rust server,
     launch the engine cores from the same parsed namespace, and supervise
-    both. ``args`` is the upstream launcher's namespace (``--host``/``--port``
-    plus ``AsyncEngineArgs``, and the frontend fields under ``vllm serve``).
-    Returns the process exit code."""
-    # The launcher's own knobs first, validated together: a bad value is a
-    # named error before any engine work and before the port is bound.
-    knobs = read_launcher_knobs(
-        handshake_port_env=HANDSHAKE_PORT_ENV,
-        drain_secs_env=DRAIN_SECS_ENV,
-        startup_timeout_secs_env=STARTUP_TIMEOUT_SECS_ENV,
-        startup_ceiling_secs_env=STARTUP_CEILING_SECS_ENV,
-        socket_dir=default_socket_dir(),
-    )
-    from smg.servicer import VllmGrpcServer, init_servicer_tracing
-    from vllm.engine.arg_utils import AsyncEngineArgs
-    from vllm.usage.usage_lib import UsageContext
-
-    configure_logging()
-    if default_kv_events_config(args) is not None:
-        logger.info(
-            "KV event publishing enabled: no --kv-events-config was given, so vLLM's ZMQ "
-            "publisher is on with its default endpoint and SubscribeKvEvents relays it; pass "
-            "--kv-events-config to configure it, or set %s=0 to leave it off",
-            KV_EVENTS_ENV,
-        )
-    engine_args = AsyncEngineArgs.from_cli_args(args)
-    vllm_config = engine_args.create_engine_config(usage_context=UsageContext.OPENAI_API_SERVER)
-    # The engine cores are started with `log_stats=not disable_log_stats`
-    # below (`launch_engine_cores`); the servicer is told the same.
-    disable_log_stats = getattr(engine_args, "disable_log_stats", None)
-    info = model_info_from_config(
-        vllm_config,
-        log_stats=None if disable_log_stats is None else not disable_log_stats,
-    )
-    if info["kv_events_endpoint"]:
-        logger.info("SubscribeKvEvents relays vLLM's KV events from %s", info["kv_events_endpoint"])
-    else:
-        logger.warning(
-            "SubscribeKvEvents is off (KV cache events disabled, or a publisher other than "
-            "zmq): a cache-aware router sees nothing of this engine's cache"
-        )
-    model_config = vllm_config.model_config
-    tokenizer_dir = resolve_tokenizer_dir(
-        str(getattr(model_config, "tokenizer", None) or model_config.model),
-        getattr(model_config, "tokenizer_revision", None)
-        or getattr(model_config, "revision", None),
-    )
-    data_parallel_size = info["data_parallel_size"]
-    handshake_port = knobs.handshake_port or free_port()
-    socket_dir = knobs.socket_dir
-    # Worker-side media processing, from the same `--mm-*` settings (flags
-    # when the launcher has them, else the environment) as the Python servicer:
-    # the Python processors behind a bridge, or smg's own pipeline in Rust.
-    from smg_grpc_servicer.vllm.mm_processor import MODE_SMG, MmSettings
-    from smg_grpc_servicer.vllm.rust_media import RustMediaBridge
-
-    mm_settings = MmSettings.from_args(args).resolve()
-    media = None
-    smg_media = None
-    if mm_settings.processor == MODE_SMG:
-        smg_media = smg_media_options(vllm_config, mm_settings, tokenizer_dir)
-    else:
-        media = RustMediaBridge.build(vllm_config, mm_settings, asyncio.get_running_loop())
-    logger.info(
-        "Worker-side media processing: %s (source=%s)",
-        MODE_SMG if smg_media is not None else media.name if media is not None else "off",
-        mm_settings.source if (smg_media is not None or media is not None) else "-",
-    )
-
-    init_servicer_tracing()
-    startup_timeout_secs = knobs.startup_timeout_secs
-    startup_ceiling_secs = knobs.startup_ceiling_secs
-    server = VllmGrpcServer(
-        # `vllm serve` leaves host unset and upstream binds all interfaces then.
-        bind_address=host_port(getattr(args, "host", None) or "0.0.0.0", args.port),
-        # Per process, not per requested port: `--port 0` launchers would
-        # otherwise share one path and unlink each other's sockets.
-        ipc_base_url=f"ipc://{socket_dir}/servicer-{os.getpid()}",
-        handshake_address=f"tcp://127.0.0.1:{handshake_port}",
-        engine_count=data_parallel_size,
-        tokenizer_dir=tokenizer_dir,
-        engine_startup_timeout_secs=startup_timeout_secs,
-        engine_startup_ceiling_secs=startup_ceiling_secs,
-        media_processor=media,
-        smg_media_processor=smg_media,
-        **info,
-    )
-    logger.info(
-        "Rust vLLM gRPC servicer listening on %s (engine handshake tcp://127.0.0.1:%d, %d engine(s))",
-        server.address,
-        handshake_port,
-        data_parallel_size,
-    )
-    logger.info(
-        "Engine startup bounds: %.0fs without a sign of life (%s), ceiling %s (%s); "
-        "the handshake waits while the engine process is alive",
-        startup_timeout_secs,
-        STARTUP_TIMEOUT_SECS_ENV,
-        f"{startup_ceiling_secs:.0f}s" if startup_ceiling_secs else "none",
-        STARTUP_CEILING_SECS_ENV,
-    )
-    try:
-        engine = launch_engine_cores(
-            headless_namespace(
-                args, handshake_port=handshake_port, data_parallel_size=data_parallel_size
-            )
-        )
-    except BaseException:
-        # The server owns the port and a runtime thread; a launch that fails
-        # must not leave them to the process exit.
-        server.set_serving(False)
-        await asyncio.to_thread(server.stop, 5.0)
-        raise
-    logger.info("Launched the headless engine (pid %s)", engine.pid)
-    if media is not None:
-        media.start_warmup()
-    return await supervise(server, engine, drain_secs=knobs.drain_secs)
+    both (:class:`VllmLauncher`). ``args`` is the upstream launcher's
+    namespace (``--host``/``--port`` plus ``AsyncEngineArgs``, and the
+    frontend fields under ``vllm serve``). Returns the process exit code."""
+    return await VllmLauncher().serve(args)
 
 
 # ---------------------------------------------------------------------------
@@ -613,21 +571,12 @@ def resolve_servicer_impl(
     args: argparse.Namespace | None = None, environ: Mapping[str, str] | None = None
 ) -> str:
     """Which implementation serves this process: ``args.servicer_impl`` when the
-    launcher exposes the flag, else ``$SMG_VLLM_SERVICER_IMPL``, else python.
-
-    A decision made with the launcher's flag in hand is written back to the
-    environment, so :func:`require_python_impl` (which has no flag) agrees with
-    it when ``--servicer-impl python`` overrides an exported ``rust``."""
-    source = os.environ if environ is None else environ
-    value = getattr(args, "servicer_impl", None) if args is not None else None
-    if not value:
-        value = source.get(SERVICER_IMPL_ENV) or "python"
-    value = str(value).strip().lower()
-    if value not in IMPLS:
-        raise ServicerConfigError(f"{SERVICER_IMPL_ENV} must be one of {IMPLS}, got {value!r}")
-    if args is not None and isinstance(source, MutableMapping):
-        source[SERVICER_IMPL_ENV] = value
-    return value
+    launcher exposes the flag, else ``$SMG_VLLM_SERVICER_IMPL``, else python
+    (the shared :func:`~smg_grpc_servicer.rust_lifecycle.servicer_switch`). A
+    decision made with the flag in hand is written back to the environment,
+    so :func:`require_python_impl` (which has no flag) agrees with it when
+    ``--servicer-impl python`` overrides an exported ``rust``."""
+    return servicer_switch(SERVICER_IMPL_ENV, args, environ)[0]
 
 
 def require_python_impl(environ: Mapping[str, str] | None = None) -> None:

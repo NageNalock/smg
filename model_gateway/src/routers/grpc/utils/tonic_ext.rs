@@ -2,7 +2,7 @@
 
 use axum::response::Response;
 use http::StatusCode;
-use smg_grpc_client::WorkerMediaFault;
+use smg_grpc_client::{is_transport_failure, WorkerMediaFault};
 use tonic::Code;
 
 use crate::routers::error;
@@ -12,7 +12,12 @@ pub(crate) trait TonicStatusExt {
     /// Map gRPC status code to the corresponding HTTP status code. A failure
     /// of the request's media (see [`TonicStatusExt::media_fault`]) is
     /// answered for the media: the request's own fault 400, the media host's
-    /// 502.
+    /// 502. A `CANCELLED` the worker answered is the worker's side ending the
+    /// call (its connection closed under it, its server reset the stream):
+    /// a bad gateway, never the request's fault. So is a status tonic made
+    /// of an HTTP/2 fault under the call (the connection went away, a stream
+    /// reset below gRPC, a protocol fault), whatever code tonic picked from
+    /// the frame's reason.
     fn http_status(&self) -> StatusCode;
 
     /// Convert this gRPC error into an HTTP error response with the appropriate status code.
@@ -46,12 +51,27 @@ impl TonicStatusExt for tonic::Status {
             Some(WorkerMediaFault::Transient) => return StatusCode::BAD_GATEWAY,
             None => {}
         }
+        // tonic makes a status of a failure in the HTTP/2 layer under the
+        // call (the connection went away: a GOAWAY of either side, the one
+        // the gateway's own client issues over too many locally-reset
+        // streams included; a stream reset below gRPC; a protocol fault) and
+        // picks its code from the frame's reason: ENHANCE_YOUR_CALM reads as
+        // RESOURCE_EXHAUSTED, which would answer the client a 429 rate limit
+        // it never hit, PROTOCOL_ERROR as INTERNAL, the code of a worker's
+        // own answer. The worker's connection failed under the call: a 502
+        // the breaker samples and the retry layer replays elsewhere.
+        if is_transport_failure(self) {
+            return StatusCode::BAD_GATEWAY;
+        }
         match self.code() {
             Code::Ok => StatusCode::OK,
-            Code::InvalidArgument
-            | Code::FailedPrecondition
-            | Code::OutOfRange
-            | Code::Cancelled => StatusCode::BAD_REQUEST,
+            Code::InvalidArgument | Code::FailedPrecondition | Code::OutOfRange => {
+                StatusCode::BAD_REQUEST
+            }
+            // The worker's side ended the call: what a connection that closed
+            // under it or a server that reset the stream produce, nothing the
+            // request did (the liveness monitor reads the code the same way).
+            Code::Cancelled => StatusCode::BAD_GATEWAY,
             Code::Unauthenticated => StatusCode::UNAUTHORIZED,
             Code::PermissionDenied => StatusCode::FORBIDDEN,
             Code::NotFound => StatusCode::NOT_FOUND,
@@ -108,6 +128,37 @@ mod tests {
         DEFAULT_CAPACITY_STATUS_CODES, DEFAULT_RETRYABLE_STATUS_CODES,
     };
 
+    /// A status tonic made of an HTTP/2 fault under the call (the h2 error in
+    /// its source chain) is the worker's connection failing, whatever code
+    /// tonic picked from the frame's reason: a 502 the breaker samples and
+    /// the retry layer replays elsewhere, never the 429 a GOAWAY
+    /// ENHANCE_YOUR_CALM reads as (a rate limit the client never hit) nor the
+    /// 500 of a worker's own answer. The worker's own RESOURCE_EXHAUSTED, in
+    /// its trailers, stays capacity pushback.
+    #[test]
+    fn an_http2_fault_under_the_call_is_a_retryable_502_whatever_its_code() {
+        use smg_grpc_client::h2::{Error, Reason};
+
+        for (reason, code) in [
+            (Reason::ENHANCE_YOUR_CALM, Code::ResourceExhausted),
+            (Reason::PROTOCOL_ERROR, Code::Internal),
+            (Reason::FLOW_CONTROL_ERROR, Code::Internal),
+            (Reason::REFUSED_STREAM, Code::Unavailable),
+            (Reason::CANCEL, Code::Cancelled),
+        ] {
+            let status = tonic::Status::from_error(Box::new(Error::from(reason)));
+            assert_eq!(status.code(), code, "tonic's own code for {reason:?}");
+            assert_eq!(status.http_status(), StatusCode::BAD_GATEWAY, "{reason:?}");
+            let result: Result<(), tonic::Status> = Err(status);
+            assert_eq!(result.breaker_status(), Some(502), "{reason:?}");
+        }
+        assert!(DEFAULT_RETRYABLE_STATUS_CODES.contains(&502));
+        assert_eq!(
+            tonic::Status::resource_exhausted("busy").http_status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
     #[test]
     fn invalid_argument_maps_to_400_and_is_not_a_circuit_breaker_failure() {
         for status in [
@@ -119,6 +170,18 @@ mod tests {
             let result: Result<(), tonic::Status> = Err(status);
             assert_eq!(result.breaker_status(), Some(400));
         }
+        assert!(!DEFAULT_RETRYABLE_STATUS_CODES.contains(&400));
+    }
+
+    /// A call the worker's side cancelled is the worker's failure: a 502 the
+    /// retry layer replays elsewhere and the breaker samples, never a 400.
+    #[test]
+    fn a_cancelled_call_maps_to_502_and_is_a_retryable_circuit_breaker_failure() {
+        let status = tonic::Status::cancelled("operation was canceled");
+        assert_eq!(status.http_status(), StatusCode::BAD_GATEWAY);
+        let result: Result<(), tonic::Status> = Err(status);
+        assert_eq!(result.breaker_status(), Some(502));
+        assert!(DEFAULT_RETRYABLE_STATUS_CODES.contains(&502));
         assert!(!DEFAULT_RETRYABLE_STATUS_CODES.contains(&400));
     }
 

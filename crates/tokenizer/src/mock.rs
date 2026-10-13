@@ -192,6 +192,15 @@ impl MockTokenizer {
         self.json_chat_template = true;
         self
     }
+
+    /// Add `(token, id)` pairs to the vocabulary.
+    pub fn with_tokens(mut self, tokens: &[(&str, u32)]) -> Self {
+        for &(token, id) in tokens {
+            self.vocab.insert(token.to_string(), id);
+            self.reverse_vocab.insert(id, token.to_string());
+        }
+        self
+    }
 }
 
 impl Encoder for MockTokenizer {

@@ -48,12 +48,21 @@ from smg_grpc_proto.generated import common_pb2
 
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.kv_events import subscribe_kv_events
-from smg_grpc_servicer.sglang.loads import convert_loads_to_protobuf, load_record
+from smg_grpc_servicer.sglang.loads import (
+    convert_loads_to_protobuf,
+    effective_running_window,
+    load_record,
+    ranks_with_a_window,
+)
 from smg_grpc_servicer.sglang.request_manager import (
     GrpcRequestManager,
     _validate_token_ids_logprobs,
 )
-from smg_grpc_servicer.sglang.utils import abort_code_from_output, to_token_id_array
+from smg_grpc_servicer.sglang.utils import (
+    abort_code_from_output,
+    scheduler_abort,
+    to_token_id_array,
+)
 from smg_grpc_servicer.tensor_wire import tensor_from_parts
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
 
@@ -122,6 +131,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     Standalone gRPC service implementation using GrpcRequestManager.
     Fully separated from HTTP server with its own process and no shared globals.
     """
+
+    # The running window the schedulers computed, once every rank's load
+    # snapshot has shown its bound (the bound does not change for the
+    # engine's lifetime); 0 until then. See `_running_window`.
+    _computed_running_window: int = 0
 
     def __init__(
         self,
@@ -214,6 +228,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                                 abort_code_from_output(batch_output),
                                 batch_output["error"],
                             )
+                        elif (aborted := scheduler_abort(batch_output)) is not None:
+                            # The scheduler's own abort, with its status: the
+                            # caller's error or the worker's, never a completion.
+                            await context.abort(
+                                abort_code_from_output(batch_output),
+                                aborted.get("message") or "aborted by the scheduler",
+                            )
                         else:
                             # All non-error batch outputs are final responses
                             yield self._create_completion_response(request.request_id, batch_output)
@@ -223,6 +244,16 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                         await context.abort(
                             abort_code_from_output(output),
                             output["error"],
+                        )
+                    elif (aborted := scheduler_abort(output)) is not None:
+                        # The scheduler's own abort, with its status (a 400 for
+                        # the caller's input, a 503 for a full queue): the stream
+                        # ends with that status and the scheduler's message, as
+                        # the TokenSpeed servicer ends it, not with a
+                        # `Complete(finish_reason = "abort")` that drops both.
+                        await context.abort(
+                            abort_code_from_output(output),
+                            aborted.get("message") or "aborted by the scheduler",
                         )
                     elif request.stream:
                         yield self._create_chunk_response(request.request_id, output)
@@ -517,6 +548,19 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 self.server_args, sglang_structured_outputs_start(self.server_args)
             )
         )
+        # The gateway reads this worker's running window (its PD admission
+        # bound, its share of the fleet's capacity) from `max_running_requests`
+        # here, which is None unless the operator set the flag: the scheduler
+        # then computes the bound itself and publishes it with its load
+        # snapshots. Report the bound the scheduler enforces under the
+        # argument's name and in the flag's units (the whole worker's, across
+        # its attention-DP workers), so a default start advertises the window
+        # a flag would; the operator's flag, when set, stays the figure
+        # reported.
+        if not serializable_args.get("max_running_requests"):
+            window = self._running_window()
+            if window > 0:
+                serializable_args["max_running_requests"] = window
         server_args_struct.update(serializable_args)
 
         # Convert scheduler_info to Struct
@@ -545,6 +589,54 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             start_time=start_timestamp,
             max_total_num_tokens=self.scheduler_info.get("max_total_num_tokens", 0),
         )
+
+    def _attention_dp_size(self) -> int:
+        """How many attention-DP workers the flag is split across: ``dp_size``
+        under ``--enable-dp-attention``, else 1 (plain data parallelism runs the
+        whole flag on every scheduler)."""
+        if not getattr(self.server_args, "enable_dp_attention", False):
+            return 1
+        return self._rank_count()
+
+    def _rank_count(self) -> int:
+        """How many schedulers publish a load snapshot: ``dp_size``, 1 when
+        the server arguments do not carry it."""
+        dp_size = getattr(self.server_args, "dp_size", 1)
+        if isinstance(dp_size, bool) or not isinstance(dp_size, int) or dp_size < 1:
+            return 1
+        return dp_size
+
+    def _running_window(self) -> int:
+        """The running window the schedulers enforce, in the flag's units: the
+        operator's `--max-running-requests` when set, else the figure the
+        schedulers publish in their load snapshots (one attention-DP worker's
+        share each, scaled back to the flag's units), else 0 (no snapshot
+        published yet, or a request manager without the reader). The figure is
+        cached once every rank has published its bound; a partial read (the
+        reader skips the ranks that have not published yet) is reported as it
+        stands and read again on the next call, so a rank with a smaller bound
+        still corrects it."""
+        configured = getattr(self.server_args, "max_running_requests", None)
+        if isinstance(configured, int) and not isinstance(configured, bool) and configured > 0:
+            return configured
+        if self._computed_running_window > 0:
+            return self._computed_running_window
+        reader = getattr(self.request_manager, "load_snapshot_reader", None)
+        if reader is None:
+            return 0
+        try:
+            snapshots = reader.read_all()
+        except Exception as e:  # noqa: BLE001 - the window is advisory; GetServerInfo must answer
+            logger.debug("load snapshots unreadable while resolving the running window: %s", e)
+            return 0
+        window = effective_running_window(snapshots, self._attention_dp_size())
+        if window > 0 and ranks_with_a_window(snapshots) >= self._rank_count():
+            self._computed_running_window = window
+            logger.info(
+                "max_running_requests is unset: reporting the scheduler's computed window %d",
+                window,
+            )
+        return window
 
     async def GetLoads(
         self,

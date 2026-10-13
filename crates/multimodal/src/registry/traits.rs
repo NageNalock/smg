@@ -13,6 +13,19 @@ use crate::{
     vision::PreProcessorConfig,
 };
 
+/// The format of the encoder inputs a spec's processors emit, which decides
+/// the engines whose models can read them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderInputFormat {
+    /// The model family's reference processor outputs, which every engine
+    /// serving the family reads.
+    Reference,
+    /// Images and video frames as patch rows with per-item grids, audio as mel
+    /// frames with per-clip lengths, for an engine whose model reads them
+    /// packed rather than the reference processor's tensors.
+    Packed,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ModelRegistryError {
     #[error("unsupported model: {0}")]
@@ -23,6 +36,8 @@ pub enum ModelRegistryError {
     MissingConfigField { field: String },
     #[error("invalid or missing preprocessed field '{field}'")]
     InvalidPreprocessedField { field: String },
+    #[error("config field '{field}' is present but unusable: {reason}")]
+    InvalidConfigField { field: String, reason: String },
     #[error("model spec {spec} could not encode '{text}' with the model tokenizer")]
     TextEncodingFailed { spec: &'static str, text: String },
     #[error("modality {modality} is not supported by model spec {spec}")]
@@ -111,7 +126,7 @@ fn check_media_counts(
 /// Ordering of media and text parts when rendering a multipart message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaPartOrder {
-    /// Emit media parts before text (vLLM `interleave_mm_strings=false`).
+    /// Emit media parts before text (the serving engine's `interleave_mm_strings=false` order).
     MediaFirst,
     /// Keep parts in request order; part order is protocol-visible.
     Authored,
@@ -152,6 +167,21 @@ impl<'a> ModelMetadata<'a> {
             })
     }
 
+    /// `text` encoded on its own by the model tokenizer, the way a spec
+    /// splices a frame stamp or a dimension line into a replacement. A
+    /// tokenizer that cannot encode it is the request's error, never an
+    /// empty splice: a replacement missing a stamp would reach the engine
+    /// with a layout its reference processor does not write.
+    pub fn encode_plain(&self, spec: &'static str, text: &str) -> RegistryResult<Vec<TokenId>> {
+        let ids = self.tokenizer.encode_text(text).ok_or_else(|| {
+            ModelRegistryError::TextEncodingFailed {
+                spec,
+                text: text.to_string(),
+            }
+        })?;
+        Ok(ids.into_iter().map(|id| id as TokenId).collect())
+    }
+
     pub fn config_u32(&self, path: &[&str]) -> Option<u32> {
         Self::find_value(self.config, path).and_then(|value| value.as_u64().map(|v| v as u32))
     }
@@ -181,16 +211,24 @@ pub trait ModelProcessorSpec: Send + Sync {
     fn matches(&self, metadata: &ModelMetadata) -> bool;
 
     /// Ordering of media/text parts this model's chat template expects. Most
-    /// models use vLLM-compatible media-first; families whose template renders
+    /// models use the serving engine's media-first order; families whose template renders
     /// parts positionally override to `Authored`.
     fn media_part_order(&self) -> MediaPartOrder {
         MediaPartOrder::MediaFirst
     }
 
     /// Whether the anchor rendered for `modality` is exactly the single token
-    /// vLLM's prompt updates target, so a worker can expand it itself.
+    /// the serving engine's prompt updates target, so a worker can expand it itself.
     fn worker_expandable(&self, _modality: Modality) -> bool {
         false
+    }
+
+    /// The format of the encoder inputs this spec's processors emit. The
+    /// gateway applies the spec only while every engine serving the model
+    /// reads that format; otherwise the model is handled as having no spec,
+    /// and its workers process media themselves.
+    fn encoder_input_format(&self) -> EncoderInputFormat {
+        EncoderInputFormat::Reference
     }
 
     fn placeholder_token(&self, metadata: &ModelMetadata) -> RegistryResult<String>;
@@ -221,6 +259,15 @@ pub trait ModelProcessorSpec: Send + Sync {
             }),
         }
     }
+    /// The text the model's chat template writes for one item of `modality`
+    /// when that is not the anchor token itself but several tokens (a
+    /// literal such as `<video>`). The gateway rewrites each occurrence in
+    /// the rendered prompt to the anchor before tokenizing; `None` when the
+    /// template writes the anchor.
+    fn rendered_marker_for(&self, _modality: Modality) -> Option<&'static str> {
+        None
+    }
+
     fn modality_limits(&self, metadata: &ModelMetadata)
         -> RegistryResult<HashMap<Modality, usize>>;
 
@@ -279,7 +326,7 @@ pub trait ModelProcessorSpec: Send + Sync {
     ///
     /// Receives the full preprocessed output so each model can extract whatever
     /// metadata it needs (e.g. aspect_ratios for tile-based models).  This
-    /// mirrors vLLM's `_get_prompt_updates(out_mm_kwargs)` pattern.
+    /// mirrors the reference implementation's `_get_prompt_updates(out_mm_kwargs)` pattern.
     fn prompt_replacements(
         &self,
         metadata: &ModelMetadata,
@@ -315,7 +362,7 @@ pub trait ModelProcessorSpec: Send + Sync {
     /// Declare how each tensor's first dimension maps to media items.
     ///
     /// Keys not listed are treated as shared (replicated across all media items).
-    /// The `"pixel_values"` key mirrors HF/vLLM vision kwargs and should be
+    /// The `"pixel_values"` key mirrors the reference processors' vision kwargs and should be
     /// included when the primary encoder input differs from batched layout.
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
         // Default: encoder_input is batched (most models).
@@ -324,7 +371,7 @@ pub trait ModelProcessorSpec: Send + Sync {
 
     /// Declare the neutral primary/side-tensor layout contract for one modality.
     ///
-    /// The default converts the legacy HF/vLLM-shaped field map so existing
+    /// The default converts the legacy reference-shaped field map so existing
     /// vision specs remain source-compatible. New multimodal specs should
     /// override this method and keep backend-specific field names at adapters.
     fn encoder_field_layouts_for(&self, _modality: Modality) -> EncoderFieldLayouts {
@@ -333,7 +380,7 @@ pub trait ModelProcessorSpec: Send + Sync {
 
     /// Tensor keys that should remain on CPU (not transferred to GPU).
     ///
-    /// In vLLM, certain model-specific tensors are marked `keep_on_cpu=True`
+    /// In the serving engine, certain model-specific tensors are marked `keep_on_cpu=True`
     /// in their `MultiModalFieldConfig`.  This method mirrors that per-model
     /// knowledge so the router can send the hint via gRPC, avoiding the need
     /// for the backend to instantiate a Python processor just to query it.
@@ -380,6 +427,46 @@ mod tests {
         registry::test_helpers::{test_preprocessed_with_tokens, TestTokenizer},
         types::ImageSize,
     };
+
+    #[test]
+    fn encode_plain_maps_the_ids_or_names_the_spec_and_the_text() {
+        let config = json!({});
+        let encoding = TestTokenizer::new(&[]).with_byte_encoder(1000);
+        let metadata = ModelMetadata {
+            model_id: "m",
+            tokenizer: &encoding,
+            config: &config,
+        };
+        assert_eq!(
+            metadata.encode_plain("test", "ab").unwrap(),
+            vec![1097 as TokenId, 1098]
+        );
+
+        struct NoText;
+        impl Tokenizer for NoText {
+            fn token_to_id(&self, _: &str) -> Option<u32> {
+                None
+            }
+            fn id_to_token(&self, _: u32) -> Option<String> {
+                None
+            }
+            fn encode_text(&self, _: &str) -> Option<Vec<u32>> {
+                None
+            }
+        }
+        let metadata = ModelMetadata {
+            model_id: "m",
+            tokenizer: &NoText,
+            config: &config,
+        };
+        assert_eq!(
+            metadata.encode_plain("test", "<0.2 seconds>").unwrap_err(),
+            ModelRegistryError::TextEncodingFailed {
+                spec: "test",
+                text: "<0.2 seconds>".to_string(),
+            }
+        );
+    }
 
     struct TestSpec;
 

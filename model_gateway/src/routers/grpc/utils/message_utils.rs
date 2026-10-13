@@ -28,7 +28,9 @@ use crate::routers::{
     error,
     grpc::{
         context::SharedComponents,
-        multimodal::{self, MediaPlan, MultimodalComponents, PlaceholderTokens},
+        multimodal::{
+            self, anchor_rendered_markers, MediaPlan, MultimodalComponents, PlaceholderTokens,
+        },
         ProcessedMessages,
     },
 };
@@ -168,9 +170,10 @@ pub(crate) fn process_messages_prompt(
         .stop_sequences
         .map(|seqs| StringOrArray::Array(seqs.to_vec()));
 
+    let text = anchor_rendered_markers(placeholder_tokens, &rendered.encoding, rendered.text);
     Ok((
         ProcessedMessages {
-            text: rendered.text,
+            text,
             stop_sequences,
             unbilled_prompt_tokens: rendered.unbilled_prompt_tokens,
         },
@@ -310,6 +313,7 @@ pub(crate) async fn resolve_messages_media(
         &entry.id,
         &entry.source,
         &engine_limits,
+        |format| multimodal::fleet_reads_format(&components.worker_registry, model_id, format),
     )
     .await
     .map_err(|e| {

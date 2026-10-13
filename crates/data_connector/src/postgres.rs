@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use deadpool_postgres::{ClientWrapper, Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use serde_json::Value;
-use tokio_postgres::{types::ToSql, IsolationLevel, NoTls, Row};
+use tokio_postgres::{error::SqlState, types::ToSql, IsolationLevel, NoTls, Row, Statement};
 
 use crate::{
     common::{
@@ -15,19 +15,20 @@ use crate::{
     config::PostgresConfig,
     context::current_extra_columns,
     core::{
-        make_item_id, Conversation, ConversationId, ConversationItem, ConversationItemId,
-        ConversationItemResult, ConversationItemStorage, ConversationItemStorageError,
-        ConversationMetadata, ConversationResult, ConversationStorage, ConversationStorageError,
-        ListParams, NewConversation, NewConversationItem, ResponseId, ResponseResult,
-        ResponseStorage, ResponseStorageError, SortOrder, StoredResponse,
+        make_item_id, sql_string_list, ConditionalStore, Conversation, ConversationId,
+        ConversationItem, ConversationItemId, ConversationItemResult, ConversationItemStorage,
+        ConversationItemStorageError, ConversationMetadata, ConversationResult,
+        ConversationStorage, ConversationStorageError, ListParams, NewConversation,
+        NewConversationItem, ResponseId, ResponseResult, ResponseStorage, ResponseStorageError,
+        SortOrder, StoredResponse, TERMINAL_RESPONSE_STATUSES,
     },
     factory::StoreContactError,
     postgres_migrations::POSTGRES_HISTORY_MIGRATIONS,
     schema::SchemaConfig,
     versioning::{
         postgres_create_versions_table, postgres_current_version, postgres_table_exists,
-        run_postgres_migrations, schema_ahead_check, stamp_postgres_versions,
-        POSTGRES_SCHEMA_LOCK_ID, VERSIONS_TABLE,
+        postgres_table_exists_sql, run_postgres_migrations, schema_ahead_check,
+        stamp_postgres_versions, POSTGRES_SCHEMA_LOCK_ID, VERSIONS_TABLE,
     },
 };
 
@@ -77,11 +78,14 @@ impl PostgresStore {
     /// answers, is a verdict before the gateway serves.
     pub(crate) async fn contact(&self, bound: Duration) -> Result<(), StoreContactError> {
         let round_trip = async {
-            let client = self.pool.get().await.map_err(|e| e.to_string())?;
+            // The cause chain stays in the text (`error connecting to server:
+            // Connection refused`, `db error: FATAL: password authentication
+            // failed ...`): the driver's kind alone says nothing of why.
+            let client = self.pool.get().await.map_err(|e| describe_error(&e))?;
             client
                 .simple_query("SELECT 1")
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| describe_error(&e))?;
             Ok::<(), String>(())
         };
         match tokio::time::timeout(bound, round_trip).await {
@@ -103,7 +107,9 @@ impl PostgresStore {
     /// (or refuses when `auto_migrate` is off), and creates the indexes
     /// last, once the columns they cover exist. Gateways starting together
     /// on an empty database all come up: the next one waits for the first's
-    /// commit and finds the schema in place.
+    /// commit and finds the schema in place. The index an earlier release
+    /// built for the sweep of unstored records goes after the commit,
+    /// concurrently (see [`Self::drop_legacy_unstored_index`]).
     pub(crate) async fn bootstrap(&self) -> Result<(), String> {
         let mut client = self.pool.get().await.map_err(|e| {
             format!(
@@ -228,37 +234,49 @@ impl PostgresStore {
         // own locks: the links index on columns the table always has, then
         // the safety-identifier index, whose column exists once the
         // migrations ran. A table the operator declared up to date without
-        // the column keeps starting without that index, as before.
-        tx.batch_execute(&PostgresConversationItemStorage::index_ddl(schema))
-            .await
-            .map_err(|e| {
-                format!(
-                    "failed to create the conversation item links index: {}",
-                    describe_error(&e)
-                )
-            })?;
-        if let Some(index_ddl) = PostgresResponseStorage::index_ddl(schema) {
-            let index = tx.savepoint("response_index").await.map_err(|e| {
-                format!("failed to open the index savepoint: {}", describe_error(&e))
-            })?;
-            match index.batch_execute(&index_ddl).await {
-                Ok(()) => index.commit().await.map_err(|e| {
+        // the column keeps starting without that index, as before. An index
+        // the catalog already has is not asked for again: the statement
+        // takes its share lock before it finds the index in place, and a
+        // share lock waiting behind an open write queues every later write
+        // on the table behind it (a start next to another's concurrent drop
+        // would wait that way too), so a start on a database that has its
+        // indexes takes no lock on the live tables.
+        let links_index = PostgresConversationItemStorage::links_index_name(schema);
+        if !postgres_index_exists(&tx, &links_index).await? {
+            tx.batch_execute(&PostgresConversationItemStorage::index_ddl(schema))
+                .await
+                .map_err(|e| {
                     format!(
-                        "failed to release the index savepoint: {}",
+                        "failed to create the conversation item links index: {}",
                         describe_error(&e)
                     )
-                })?,
-                Err(e) => {
-                    tracing::warn!(
-                        "response index not created (the safety_identifier column may be missing): {}",
-                        describe_error(&e)
-                    );
-                    index.rollback().await.map_err(|e| {
+                })?;
+        }
+        let safety_index = PostgresResponseStorage::safety_index_name(schema);
+        if let Some(index_ddl) = PostgresResponseStorage::index_ddl(schema) {
+            if !postgres_index_exists(&tx, &safety_index).await? {
+                let index = tx.savepoint("response_index").await.map_err(|e| {
+                    format!("failed to open the index savepoint: {}", describe_error(&e))
+                })?;
+                match index.batch_execute(&index_ddl).await {
+                    Ok(()) => index.commit().await.map_err(|e| {
                         format!(
-                            "failed to roll back the index savepoint: {}",
+                            "failed to release the index savepoint: {}",
                             describe_error(&e)
                         )
-                    })?;
+                    })?,
+                    Err(e) => {
+                        tracing::warn!(
+                            "response index not created (the safety_identifier column may be missing): {}",
+                            describe_error(&e)
+                        );
+                        index.rollback().await.map_err(|e| {
+                            format!(
+                                "failed to roll back the index savepoint: {}",
+                                describe_error(&e)
+                            )
+                        })?;
+                    }
                 }
             }
         }
@@ -268,8 +286,78 @@ impl PostgresStore {
                 "failed to commit the schema bootstrap: {}",
                 describe_error(&e)
             )
-        })
+        })?;
+
+        // The index an earlier release built over `::jsonb` (it refused every
+        // row whose object carries the escape `\u0000`) goes after the commit,
+        // outside any transaction and concurrently: a plain `DROP INDEX`
+        // takes an ACCESS EXCLUSIVE lock on the table, which on a database
+        // other replicas are serving queues behind every open transaction on
+        // the table and every later statement behind it, held to the commit.
+        // An existing table gets the replacement from its operator,
+        // concurrently too (see the release note).
+        self.drop_legacy_unstored_index(&client).await
     }
+
+    /// Drops the index an earlier release built under
+    /// [`LEGACY_UNSTORED_INDEX`] when the database still has it: `DROP INDEX
+    /// CONCURRENTLY`, which blocks no read or write on the table and waits
+    /// for the transactions using it to end instead (it cannot run inside a
+    /// transaction block, so this runs on `client` after the bootstrap's
+    /// commit). Nothing is sent once the index is gone.
+    async fn drop_legacy_unstored_index(
+        &self,
+        client: &tokio_postgres::Client,
+    ) -> Result<(), String> {
+        let index = PostgresResponseStorage::legacy_unstored_index_name(&self.schema);
+        let present: bool = client
+            .query_one(postgres_table_exists_sql(), &[&index])
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to check for the earlier unstored response index: {}",
+                    describe_error(&e)
+                )
+            })?
+            .get(0);
+        if !present {
+            return Ok(());
+        }
+        tracing::info!(
+            index = %index,
+            "dropping the earlier unstored response index concurrently (the drop waits for the transactions using the table to end, and blocks none)"
+        );
+        client
+            .batch_execute(&PostgresResponseStorage::legacy_unstored_index_drop_ddl(
+                &self.schema,
+            ))
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to drop the earlier unstored response index: {}",
+                    describe_error(&e)
+                )
+            })
+    }
+}
+
+/// Whether the catalog `tx` sees has the index `index` (owner-qualified when
+/// the schema has an owner): `to_regclass` resolves an index as it does a
+/// table.
+async fn postgres_index_exists(
+    tx: &tokio_postgres::Transaction<'_>,
+    index: &str,
+) -> Result<bool, String> {
+    let row = tx
+        .query_one(postgres_table_exists_sql(), &[&index])
+        .await
+        .map_err(|e| {
+            format!(
+                "failed to check for the {index} index: {}",
+                describe_error(&e)
+            )
+        })?;
+    Ok(row.get(0))
 }
 
 impl Clone for PostgresStore {
@@ -287,6 +375,46 @@ impl Clone for PostgresStore {
 // the execute. Prepared once and cached on the connection (the pool keeps the
 // cache with the connection), every later call is one round trip, which is
 // what a store a few milliseconds away multiplies by.
+//
+// A cached statement can go stale on its connection: the type of a column it
+// selects altered under it (a migration a newer build runs during a rolling
+// upgrade) makes the server answer every later call with SQLSTATE `0A000`
+// ("cached plan must not change result type"), and a statement the server
+// deallocated answers `26000`. The pool does not notice either (its recycling
+// only checks that the connection is open), so a helper drops such an entry
+// from the connection's cache and makes the call once more on a statement
+// prepared afresh; the connection is whole again for every later call.
+
+/// Whether `error` says the statement the server was handed is stale: its
+/// cached plan no longer fits the table (`0A000` raised by the server's
+/// cached-plan revalidation; the class holds unrelated answers too, which
+/// stay as they are) or it no longer exists on the server (`26000`).
+fn is_stale_statement(error: &tokio_postgres::Error) -> bool {
+    error
+        .as_db_error()
+        .is_some_and(|db| is_stale_statement_state(db.code(), db.routine()))
+}
+
+/// The server routine that raises `0A000` for a cached plan whose result no
+/// longer fits ("cached plan must not change result type"); the routine field
+/// is sent whatever the server's message locale, the message is not.
+const CACHED_PLAN_REVALIDATION: &str = "RevalidateCachedQuery";
+
+fn is_stale_statement_state(code: &SqlState, routine: Option<&str>) -> bool {
+    *code == SqlState::INVALID_SQL_STATEMENT_NAME
+        || (*code == SqlState::FEATURE_NOT_SUPPORTED && routine == Some(CACHED_PLAN_REVALIDATION))
+}
+
+/// The statement for `sql` prepared afresh after a stale answer: the entry
+/// goes from the connection's cache (the statement it held is closed on the
+/// server when its last handle goes) and the next prepare fills it again.
+async fn fresh_statement(
+    client: &ClientWrapper,
+    sql: &str,
+) -> Result<Statement, tokio_postgres::Error> {
+    drop(client.statement_cache.remove(sql, &[]));
+    client.prepare_cached(sql).await
+}
 
 /// Runs `sql` as a statement prepared once per connection.
 async fn query_cached(
@@ -295,7 +423,13 @@ async fn query_cached(
     params: &[&(dyn ToSql + Sync)],
 ) -> Result<Vec<Row>, tokio_postgres::Error> {
     let statement = client.prepare_cached(sql).await?;
-    client.query(&statement, params).await
+    match client.query(&statement, params).await {
+        Err(error) if is_stale_statement(&error) => {
+            let statement = fresh_statement(client, sql).await?;
+            client.query(&statement, params).await
+        }
+        result => result,
+    }
 }
 
 /// Runs `sql` as a statement prepared once per connection; one row.
@@ -305,7 +439,13 @@ async fn query_one_cached(
     params: &[&(dyn ToSql + Sync)],
 ) -> Result<Row, tokio_postgres::Error> {
     let statement = client.prepare_cached(sql).await?;
-    client.query_one(&statement, params).await
+    match client.query_one(&statement, params).await {
+        Err(error) if is_stale_statement(&error) => {
+            let statement = fresh_statement(client, sql).await?;
+            client.query_one(&statement, params).await
+        }
+        result => result,
+    }
 }
 
 /// Runs `sql` as a statement prepared once per connection; the rows affected.
@@ -315,7 +455,13 @@ async fn execute_cached(
     params: &[&(dyn ToSql + Sync)],
 ) -> Result<u64, tokio_postgres::Error> {
     let statement = client.prepare_cached(sql).await?;
-    client.execute(&statement, params).await
+    match client.execute(&statement, params).await {
+        Err(error) if is_stale_statement(&error) => {
+            let statement = fresh_statement(client, sql).await?;
+            client.execute(&statement, params).await
+        }
+        result => result,
+    }
 }
 
 /// Name of a JSON value's type, for error messages that must not echo
@@ -381,6 +527,54 @@ impl PostgresConversationStorage {
                 json_type_name(&other)
             ))),
         }
+    }
+
+    /// The columns a conversation is read with: the id, then its creation
+    /// time, metadata and tenant when the schema keeps them.
+    fn row_columns(s: &crate::schema::TableConfig) -> Vec<String> {
+        let mut columns = vec![s.col("id").to_string()];
+        for name in ["created_at", "metadata", "tenant"] {
+            if !s.is_skipped(name) {
+                columns.push(s.col(name).to_string());
+            }
+        }
+        columns
+    }
+
+    /// The conversation a row read with [`Self::row_columns`] holds.
+    fn conversation_from_row(
+        s: &crate::schema::TableConfig,
+        row: &Row,
+    ) -> Result<Conversation, ConversationStorageError> {
+        let id_str: String = row.get(s.col("id"));
+        let created_at: DateTime<Utc> = if s.is_skipped("created_at") {
+            Utc::now()
+        } else {
+            row.get(s.col("created_at"))
+        };
+        // Use `try_get` (not `get`) so schema drift or malformed data in the
+        // `JSON` column returns an error instead of panicking the request task.
+        let metadata_json: Option<Value> = if s.is_skipped("metadata") {
+            None
+        } else {
+            row.try_get(s.col("metadata")).map_err(|e| {
+                ConversationStorageError::StorageError(format!(
+                    "failed to decode metadata column: {e}"
+                ))
+            })?
+        };
+        let metadata = Self::parse_metadata(metadata_json)?;
+        let tenant: Option<String> = if s.is_skipped("tenant") {
+            None
+        } else {
+            row.get(s.col("tenant"))
+        };
+        Ok(Conversation::with_parts(
+            ConversationId(id_str),
+            created_at,
+            metadata,
+            tenant,
+        ))
     }
 }
 
@@ -453,21 +647,9 @@ impl ConversationStorage for PostgresConversationStorage {
         let s = &self.store.schema.conversations;
         let table = s.qualified_table(self.store.schema.owner.as_deref());
         let col_id = s.col("id");
-
-        let mut select_cols = vec![col_id.to_string()];
-        if !s.is_skipped("created_at") {
-            select_cols.push(s.col("created_at").to_string());
-        }
-        if !s.is_skipped("metadata") {
-            select_cols.push(s.col("metadata").to_string());
-        }
-        if !s.is_skipped("tenant") {
-            select_cols.push(s.col("tenant").to_string());
-        }
-
         let sql = format!(
             "SELECT {} FROM {table} WHERE {col_id} = $1",
-            select_cols.join(", ")
+            Self::row_columns(s).join(", ")
         );
 
         let client = self
@@ -479,39 +661,10 @@ impl ConversationStorage for PostgresConversationStorage {
         let rows = query_cached(&client, &sql, &[&id.0.as_str()])
             .await
             .map_err(ConversationStorageError::from_pg)?;
-        if rows.is_empty() {
-            return Ok(None);
+        match rows.first() {
+            Some(row) => Self::conversation_from_row(s, row).map(Some),
+            None => Ok(None),
         }
-        let row = &rows[0];
-        let id_str: String = row.get(s.col("id"));
-        let created_at: DateTime<Utc> = if s.is_skipped("created_at") {
-            Utc::now()
-        } else {
-            row.get(s.col("created_at"))
-        };
-        // Use `try_get` (not `get`) so schema drift or malformed data in the
-        // `JSON` column returns an error instead of panicking the request task.
-        let metadata_json: Option<Value> = if s.is_skipped("metadata") {
-            None
-        } else {
-            row.try_get(s.col("metadata")).map_err(|e| {
-                ConversationStorageError::StorageError(format!(
-                    "failed to decode metadata column: {e}"
-                ))
-            })?
-        };
-        let metadata = Self::parse_metadata(metadata_json)?;
-        let tenant: Option<String> = if s.is_skipped("tenant") {
-            None
-        } else {
-            row.get(s.col("tenant"))
-        };
-        Ok(Some(Conversation::with_parts(
-            ConversationId(id_str),
-            created_at,
-            metadata,
-            tenant,
-        )))
     }
 
     async fn update_conversation(
@@ -519,42 +672,45 @@ impl ConversationStorage for PostgresConversationStorage {
         id: &ConversationId,
         metadata: Option<ConversationMetadata>,
     ) -> Result<Option<Conversation>, ConversationStorageError> {
-        // The row as stored (its creation time and its tenant come back as
-        // they are), then the one column the update moves.
-        let Some(current) = self.get_conversation(id).await? else {
-            return Ok(None);
-        };
         let s = &self.store.schema.conversations;
         if s.is_skipped("metadata") {
-            return Ok(Some(Conversation {
-                metadata,
-                ..current
-            }));
+            // Nothing to move in the table: the row as stored, with the
+            // metadata the caller holds.
+            return Ok(self
+                .get_conversation(id)
+                .await?
+                .map(|current| Conversation {
+                    metadata,
+                    ..current
+                }));
         }
         let table = s.qualified_table(self.store.schema.owner.as_deref());
         let col_id = s.col("id");
         let col_meta = s.col("metadata");
+        // One statement: the update, returning the row's other columns (its
+        // creation time, its tenant) for the answer; no row returned = no
+        // row matched.
+        let sql = format!(
+            "UPDATE {table} SET {col_meta} = $1 WHERE {col_id} = $2 RETURNING {}",
+            Self::row_columns(s).join(", ")
+        );
 
         // Bind the JSON column as `Value`, not a serialized `String` (see
         // `create_conversation` for why `tokio-postgres` requires this).
-        let metadata_value: Option<Value> = metadata.clone().map(Value::Object);
+        let metadata_value: Option<Value> = metadata.map(Value::Object);
         let client = self
             .store
             .pool
             .get()
             .await
             .map_err(|e| ConversationStorageError::pool_unavailable(&e))?;
-        let sql = format!("UPDATE {table} SET {col_meta} = $1 WHERE {col_id} = $2");
-        let rows_affected = execute_cached(&client, &sql, &[&metadata_value, &id.0.as_str()])
+        let rows = query_cached(&client, &sql, &[&metadata_value, &id.0.as_str()])
             .await
             .map_err(ConversationStorageError::from_pg)?;
-        if rows_affected == 0 {
-            return Ok(None);
+        match rows.first() {
+            Some(row) => Self::conversation_from_row(s, row).map(Some),
+            None => Ok(None),
         }
-        Ok(Some(Conversation {
-            metadata,
-            ..current
-        }))
     }
 
     async fn delete_conversation(&self, id: &ConversationId) -> ConversationResult<bool> {
@@ -645,10 +801,15 @@ impl PostgresConversationItemStorage {
         let sl = &schema.conversation_item_links;
         let links_table = sl.qualified_table(schema.owner.as_deref());
         format!(
-            "CREATE INDEX IF NOT EXISTS conv_item_links_conv_idx ON {links_table} ({}, {});",
+            "CREATE INDEX IF NOT EXISTS {LINKS_INDEX} ON {links_table} ({}, {});",
             sl.col("conversation_id"),
             sl.col("added_at")
         )
+    }
+
+    /// The name of the links index, under the schema's owner when it has one.
+    pub(crate) fn links_index_name(schema: &SchemaConfig) -> String {
+        qualified_index(schema, LINKS_INDEX)
     }
 }
 
@@ -1132,14 +1293,23 @@ impl PostgresResponseStorage {
         }
         let table = s.qualified_table(schema.owner.as_deref());
         Some(format!(
-            "CREATE INDEX IF NOT EXISTS responses_safety_idx ON {table} ({});",
+            "CREATE INDEX IF NOT EXISTS {SAFETY_INDEX} ON {table} ({});",
             s.col("safety_identifier")
         ))
     }
 
+    /// The name of the safety-identifier index, under the schema's owner
+    /// when it has one.
+    pub(crate) fn safety_index_name(schema: &SchemaConfig) -> String {
+        qualified_index(schema, SAFETY_INDEX)
+    }
+
     /// The index behind [`ResponseStorage::delete_unstored_older_than`]: the
     /// object's status, over the unstored records only, so a sweep reads
-    /// those rows and no other. Its expressions are the sweep's predicate.
+    /// those rows and no other. Its expressions are the sweep's predicate,
+    /// read through [`nul_safe_json_text`]: an index over `::jsonb` refused
+    /// every row whose object carries the escape `\u0000` (a model's or a
+    /// client's text can), so that form is not used.
     pub(crate) fn unstored_index_ddl(schema: &SchemaConfig) -> Option<String> {
         let s = &schema.responses;
         if s.is_skipped("raw_response") {
@@ -1147,10 +1317,61 @@ impl PostgresResponseStorage {
         }
         let table = s.qualified_table(schema.owner.as_deref());
         let col_raw = s.col("raw_response");
+        let status = nul_safe_json_text(col_raw, "status");
+        let store = nul_safe_json_text(col_raw, "store");
         Some(format!(
-            "CREATE INDEX IF NOT EXISTS responses_unstored_idx ON {table} (({col_raw}::jsonb->>'status')) \
-             WHERE ({col_raw}::jsonb->>'store') = 'false';"
+            "CREATE INDEX IF NOT EXISTS {UNSTORED_INDEX} ON {table} (({status})) WHERE {store} = 'false';"
         ))
+    }
+
+    /// The statement behind [`ResponseStorage::delete_unstored_older_than`]
+    /// (the cutoff bound as `$1`, epoch seconds): the unstored records in a
+    /// terminal status whose `completed_at` (or, without one, `created_at`)
+    /// lies before it. Its `store` and `status` reads are the index's own
+    /// expressions (see [`Self::unstored_index_ddl`]; a unit test holds them
+    /// together), so the planner matches the index. `None` when the schema
+    /// skips the object column (nothing to read).
+    pub(crate) fn unstored_sweep_sql(schema: &SchemaConfig) -> Option<String> {
+        let s = &schema.responses;
+        if s.is_skipped("raw_response") {
+            return None;
+        }
+        let table = s.qualified_table(schema.owner.as_deref());
+        let col_raw = s.col("raw_response");
+        let store = nul_safe_json_text(col_raw, "store");
+        let status = nul_safe_json_text(col_raw, "status");
+        let completed_at = nul_safe_json_text(col_raw, "completed_at");
+        let ended = if s.is_skipped("created_at") {
+            format!("({completed_at})::bigint")
+        } else {
+            format!(
+                "COALESCE(({completed_at})::bigint, EXTRACT(EPOCH FROM {})::bigint)",
+                s.col("created_at")
+            )
+        };
+        Some(format!(
+            "DELETE FROM {table} WHERE {store} = 'false' \
+             AND {status} IN ('completed', 'incomplete', 'failed', 'cancelled') \
+             AND {ended} < $1"
+        ))
+    }
+
+    /// The name of the index an earlier release built over `::jsonb`,
+    /// [`LEGACY_UNSTORED_INDEX`], under the schema's owner when it has one.
+    pub(crate) fn legacy_unstored_index_name(schema: &SchemaConfig) -> String {
+        qualified_index(schema, LEGACY_UNSTORED_INDEX)
+    }
+
+    /// The statement that drops the index an earlier release built over
+    /// `::jsonb` under [`LEGACY_UNSTORED_INDEX`], valid or not: with it on
+    /// the table no row whose object carries `\u0000` can be written.
+    /// Concurrently, so no read or write on the table waits on the drop;
+    /// the statement cannot run inside a transaction block.
+    pub(crate) fn legacy_unstored_index_drop_ddl(schema: &SchemaConfig) -> String {
+        format!(
+            "DROP INDEX CONCURRENTLY IF EXISTS {};",
+            Self::legacy_unstored_index_name(schema)
+        )
     }
 
     pub fn build_response_from_row(
@@ -1245,22 +1466,25 @@ fn tenant_scope_sql(s: &crate::schema::TableConfig, param: usize) -> Option<Stri
 }
 
 /// The query behind [`ResponseStorage::find_response_by_output_item`]:
-/// `raw_response` is a native `JSON` column, so each row is cast to `jsonb`
-/// and asked whether its `output` array contains an item with the id bound as
-/// `$1`. `None` when the schema skips the column (nothing to search).
+/// `raw_response` is a native `JSON` column, so each row's document is read
+/// through [`nul_safe_json_document`] (the cast fails on a row whose object
+/// carries `\u0000`, and the predicate runs on every row the scan visits),
+/// cast to `jsonb` and asked whether its `output` array contains an item with
+/// the id bound as `$1`. `None` when the schema skips the column (nothing to
+/// search).
 fn find_by_output_item_sql(schema: &SchemaConfig, select_base: &str) -> Option<String> {
     let s = &schema.responses;
     if s.is_skipped("raw_response") {
         return None;
     }
-    let col_raw = s.col("raw_response");
+    let document = nul_safe_json_document(s.col("raw_response"));
     let order = if s.is_skipped("created_at") {
         String::new()
     } else {
         format!(" ORDER BY {} DESC", s.col("created_at"))
     };
     Some(format!(
-        "{select_base} WHERE {col_raw}::jsonb @> jsonb_build_object('output', \
+        "{select_base} WHERE {document}::jsonb @> jsonb_build_object('output', \
          jsonb_build_array(jsonb_build_object('id', $1::text))){order} LIMIT 1"
     ))
 }
@@ -1377,6 +1601,47 @@ fn link_sql(table: &str, col_names: &[&str]) -> String {
     )
 }
 
+/// The name of the conversation item links index.
+const LINKS_INDEX: &str = "conv_item_links_conv_idx";
+/// The name of the safety-identifier index on the responses table.
+const SAFETY_INDEX: &str = "responses_safety_idx";
+/// The name of the index the unstored-record sweep reads.
+const UNSTORED_INDEX: &str = "responses_unstored_text_idx";
+/// The name an earlier release gave that index, built over `::jsonb`.
+const LEGACY_UNSTORED_INDEX: &str = "responses_unstored_idx";
+
+/// `index` under the schema's owner when it has one: the name the catalog
+/// resolves, as `to_regclass` and `DROP INDEX` take it.
+fn qualified_index(schema: &SchemaConfig, index: &str) -> String {
+    match schema.owner.as_deref() {
+        Some(owner) => format!("{owner}.{index}"),
+        None => index.to_string(),
+    }
+}
+
+/// The JSON document in `col_raw` as text every stored object survives: the
+/// column's text with the escape `\u0000` replaced by `\u0020` (a space), to
+/// be parsed as `json` or `jsonb` after. A `::jsonb` cast, and `->>` on a
+/// `json` value, both fail on an object that carries that escape anywhere,
+/// and an index expression is evaluated for every row written and a lookup's
+/// predicate for every row scanned; the replacement keeps the text the same
+/// length and a literal backslash sequence in it valid, which replacing with
+/// nothing would not. The two literals are dollar-quoted: an ordinary literal
+/// with a backslash in it reads differently under
+/// `standard_conforming_strings = off` (an installation setting the server
+/// still accepts: the pattern is refused at parse time, the replacement
+/// becomes a space), and the index on a database, the sweep and the lookup
+/// must mean the same on every installation.
+fn nul_safe_json_document(col_raw: &str) -> String {
+    format!("replace({col_raw}::text, $$\\u0000$$, $$\\u0020$$)")
+}
+
+/// `field` of the JSON object in `col_raw` as text, read through
+/// [`nul_safe_json_document`].
+fn nul_safe_json_text(col_raw: &str, field: &str) -> String {
+    format!("{}::json->>'{field}'", nul_safe_json_document(col_raw))
+}
+
 /// The statement of the upsert path: the row is inserted, or every other
 /// column of the row under the id (the first column) is replaced;
 /// `DO NOTHING` when the id is the only column.
@@ -1422,6 +1687,91 @@ fn locked_merge_sql(table: &str, col_names: &[&str]) -> String {
     )
 }
 
+/// The columns a response is written to and their values, in the order of
+/// the statement's parameters (the id first), skipping the configured
+/// `skip_columns` and appending the extra columns of hooks or defaults.
+#[expect(
+    clippy::ref_option,
+    reason = "the previous id is pushed as a `&dyn ToSql` that lives as long as the caller's `Option<String>`"
+)]
+fn write_columns<'a>(
+    s: &'a crate::schema::TableConfig,
+    response: &'a StoredResponse,
+    previous_id: &'a Option<String>,
+    extra_cols: &'a [(&'a str, Option<String>)],
+) -> (Vec<&'a str>, Vec<&'a (dyn ToSql + Sync)>) {
+    let mut col_names: Vec<&str> = vec![s.col("id")];
+    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&response.id.0];
+    if !s.is_skipped("conversation_id") {
+        col_names.push(s.col("conversation_id"));
+        params.push(&response.conversation_id);
+    }
+    if !s.is_skipped("previous_response_id") {
+        col_names.push(s.col("previous_response_id"));
+        params.push(previous_id);
+    }
+    if !s.is_skipped("input") {
+        col_names.push(s.col("input"));
+        params.push(&response.input);
+    }
+    if !s.is_skipped("created_at") {
+        col_names.push(s.col("created_at"));
+        params.push(&response.created_at);
+    }
+    if !s.is_skipped("safety_identifier") {
+        col_names.push(s.col("safety_identifier"));
+        params.push(&response.safety_identifier);
+    }
+    if !s.is_skipped("model") {
+        col_names.push(s.col("model"));
+        params.push(&response.model);
+    }
+    if !s.is_skipped("raw_response") {
+        col_names.push(s.col("raw_response"));
+        params.push(&response.raw_response);
+    }
+    if !s.is_skipped("tenant") {
+        col_names.push(s.col("tenant"));
+        params.push(&response.tenant);
+    }
+    for (name, val) in extra_cols {
+        col_names.push(*name);
+        params.push(val);
+    }
+    (col_names, params)
+}
+
+/// The condition under which [`ResponseStorage::store_response_if_open`]
+/// writes: the stored object's status is not terminal
+/// ([`TERMINAL_RESPONSE_STATUSES`]; a record without a status counts as
+/// open), read as [`nul_safe_json_text`] reads it.
+fn open_predicate(col_raw: &str) -> String {
+    format!(
+        "COALESCE({}, '') NOT IN ({})",
+        nul_safe_json_text(col_raw, "status"),
+        sql_string_list(&TERMINAL_RESPONSE_STATUSES)
+    )
+}
+
+/// The statement of [`ResponseStorage::store_response_if_open`]: an UPDATE of
+/// every column of the row under the id, applied only while `open` holds
+/// (none: the schema skips the status' column, so the update is plain). The
+/// condition is evaluated on the row's current version under its lock, so a
+/// close that lands first makes this statement update nothing.
+fn update_if_open_sql(table: &str, col_names: &[&str], open: Option<&str>) -> String {
+    let id_col = col_names.first().copied().unwrap_or("id");
+    let assignments: Vec<String> = col_names
+        .iter()
+        .enumerate()
+        .map(|(i, col)| format!("{col} = ${}", i + 1))
+        .collect();
+    let condition = open.map(|open| format!(" AND {open}")).unwrap_or_default();
+    format!(
+        "UPDATE {table} SET {} WHERE {id_col} = $1{condition}",
+        assignments.join(", ")
+    )
+}
+
 /// The lock statement of the locked path, sent through the simple query
 /// protocol (one round trip, nothing to prepare): the key is a locally
 /// computed integer.
@@ -1448,66 +1798,13 @@ impl ResponseStorage for PostgresResponseStorage {
         &self,
         response: StoredResponse,
     ) -> Result<ResponseId, ResponseStorageError> {
-        let StoredResponse {
-            id: response_id,
-            previous_response_id,
-            input,
-            created_at,
-            safety_identifier,
-            model,
-            conversation_id,
-            raw_response,
-            tenant,
-        } = response;
-        let previous_id = previous_response_id.map(|r| r.0);
-
         let s = &self.store.schema.responses;
         let table = s.qualified_table(self.store.schema.owner.as_deref());
-
-        // Build dynamic column/param lists, skipping configured skip_columns
-        let mut col_names: Vec<&str> = vec![s.col("id")];
-        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&response_id.0];
-
-        if !s.is_skipped("conversation_id") {
-            col_names.push(s.col("conversation_id"));
-            params.push(&conversation_id);
-        }
-        if !s.is_skipped("previous_response_id") {
-            col_names.push(s.col("previous_response_id"));
-            params.push(&previous_id);
-        }
-        if !s.is_skipped("input") {
-            col_names.push(s.col("input"));
-            params.push(&input);
-        }
-        if !s.is_skipped("created_at") {
-            col_names.push(s.col("created_at"));
-            params.push(&created_at);
-        }
-        if !s.is_skipped("safety_identifier") {
-            col_names.push(s.col("safety_identifier"));
-            params.push(&safety_identifier);
-        }
-        if !s.is_skipped("model") {
-            col_names.push(s.col("model"));
-            params.push(&model);
-        }
-        if !s.is_skipped("raw_response") {
-            col_names.push(s.col("raw_response"));
-            params.push(&raw_response);
-        }
-        if !s.is_skipped("tenant") {
-            col_names.push(s.col("tenant"));
-            params.push(&tenant);
-        }
-
-        // Append extra columns from hooks or defaults
+        let previous_id = response.previous_response_id.as_ref().map(|r| r.0.clone());
         let hook_extra = current_extra_columns().unwrap_or_default();
         let extra_cols: Vec<(&str, Option<String>)> = resolve_extra_column_values(s, &hook_extra);
-        for (name, val) in &extra_cols {
-            col_names.push(*name);
-            params.push(val);
-        }
+        let (col_names, params) = write_columns(s, &response, &previous_id, &extra_cols);
+        let response_id = response.id.clone();
 
         let mut client = self
             .store
@@ -1519,13 +1816,9 @@ impl ResponseStorage for PostgresResponseStorage {
         // The statement is prepared once per pooled connection (the cache
         // keeps it), so a store on the upsert path is one round trip.
         let rows = match self.store_path {
-            StorePath::Upsert => {
-                let stmt = client
-                    .prepare_cached(&upsert_sql(&table, &col_names))
-                    .await
-                    .map_err(store_err)?;
-                client.execute(&stmt, &params).await.map_err(store_err)?
-            }
+            StorePath::Upsert => execute_cached(&client, &upsert_sql(&table, &col_names), &params)
+                .await
+                .map_err(store_err)?,
             StorePath::LockedMerge => {
                 // One READ COMMITTED transaction: the statement takes its
                 // snapshot once the lock is held, so it sees the row of every
@@ -1540,11 +1833,20 @@ impl ResponseStorage for PostgresResponseStorage {
                 tx.batch_execute(&lock_sql(store_lock_key(&response_id.0)))
                     .await
                     .map_err(store_err)?;
-                let stmt = tx
-                    .prepare_cached(&locked_merge_sql(&table, &col_names))
+                let sql = locked_merge_sql(&table, &col_names);
+                let stmt = tx.prepare_cached(&sql).await.map_err(store_err)?;
+                // A stale statement fails the transaction (no second try
+                // inside it); its entry goes, so the next store on this
+                // connection prepares the statement afresh.
+                let inserted = tx
+                    .execute(&stmt, &params)
                     .await
+                    .inspect_err(|error| {
+                        if is_stale_statement(error) {
+                            drop(tx.statement_cache.remove(&sql, &[]));
+                        }
+                    })
                     .map_err(store_err)?;
-                let inserted = tx.execute(&stmt, &params).await.map_err(store_err)?;
                 tx.commit().await.map_err(store_err)?;
                 inserted
             }
@@ -1555,6 +1857,75 @@ impl ResponseStorage for PostgresResponseStorage {
             "Response stored in Postgres"
         );
         Ok(response_id)
+    }
+
+    async fn store_response_if_open(
+        &self,
+        response: StoredResponse,
+    ) -> ResponseResult<ConditionalStore> {
+        let s = &self.store.schema.responses;
+        let table = s.qualified_table(self.store.schema.owner.as_deref());
+        let previous_id = response.previous_response_id.as_ref().map(|r| r.0.clone());
+        let hook_extra = current_extra_columns().unwrap_or_default();
+        let extra_cols: Vec<(&str, Option<String>)> = resolve_extra_column_values(s, &hook_extra);
+        let (col_names, params) = write_columns(s, &response, &previous_id, &extra_cols);
+        let open = (!s.is_skipped("raw_response")).then(|| open_predicate(s.col("raw_response")));
+        let sql = update_if_open_sql(&table, &col_names, open.as_deref());
+
+        let client = self
+            .store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let rows = execute_cached(&client, &sql, &params)
+            .await
+            .map_err(ResponseStorageError::from_pg)?;
+        if rows > 0 {
+            return Ok(ConditionalStore::Stored);
+        }
+        // Nothing moved: the record is closed, or gone.
+        drop(client);
+        Ok(match self.get_response(&response.id).await? {
+            Some(current) => ConditionalStore::Closed(Box::new(current)),
+            None => ConditionalStore::Missing,
+        })
+    }
+
+    async fn update_response_object_if_open(
+        &self,
+        id: &ResponseId,
+        raw_response: Value,
+    ) -> ResponseResult<ConditionalStore> {
+        let s = &self.store.schema.responses;
+        if s.is_skipped("raw_response") {
+            // No object column: nothing a transition could move.
+            return Ok(ConditionalStore::Stored);
+        }
+        let table = s.qualified_table(self.store.schema.owner.as_deref());
+        let col_raw = s.col("raw_response");
+        let sql = update_if_open_sql(
+            &table,
+            &[s.col("id"), col_raw],
+            Some(&open_predicate(col_raw)),
+        );
+        let client = self
+            .store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let rows = execute_cached(&client, &sql, &[&id.0, &raw_response])
+            .await
+            .map_err(ResponseStorageError::from_pg)?;
+        if rows > 0 {
+            return Ok(ConditionalStore::Stored);
+        }
+        drop(client);
+        Ok(match self.get_response(id).await? {
+            Some(current) => ConditionalStore::Closed(Box::new(current)),
+            None => ConditionalStore::Missing,
+        })
     }
 
     async fn get_response(
@@ -1673,41 +2044,27 @@ impl ResponseStorage for PostgresResponseStorage {
     }
 
     async fn delete_unstored_older_than(&self, cutoff: DateTime<Utc>) -> ResponseResult<usize> {
-        let s = &self.store.schema.responses;
-
         // The object (its `store`, `status` and `completed_at`) is what the
         // query reads; without the column there is nothing to read.
-        if s.is_skipped("raw_response") {
+        let Some(sql) = Self::unstored_sweep_sql(&self.store.schema) else {
             return Ok(0);
-        }
-
-        let table = s.qualified_table(self.store.schema.owner.as_deref());
-        let col_raw = s.col("raw_response");
-        let ended = if s.is_skipped("created_at") {
-            format!("({col_raw}::jsonb->>'completed_at')::bigint")
-        } else {
-            format!(
-                "COALESCE(({col_raw}::jsonb->>'completed_at')::bigint, EXTRACT(EPOCH FROM {})::bigint)",
-                s.col("created_at")
-            )
         };
-        let sql = format!(
-            "DELETE FROM {table} WHERE {col_raw}::jsonb->>'store' = 'false' \
-             AND {col_raw}::jsonb->>'status' IN ('completed', 'incomplete', 'failed', 'cancelled') \
-             AND {ended} < $1"
-        );
 
+        // The failures as every other call maps them: no connection from
+        // the pool is the store being unavailable; a statement the server
+        // refuses keeps the server's message (`e.to_string()` alone is the
+        // kind, `db error`, without it).
         let client = self
             .store
             .pool
             .get()
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
         let cutoff_secs: i64 = cutoff.timestamp();
         let rows_deleted = client
             .execute(&sql, &[&cutoff_secs])
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(ResponseStorageError::from_pg)?;
         Ok(rows_deleted as usize)
     }
 
@@ -1752,6 +2109,81 @@ mod tests {
 
     use super::*;
 
+    /// The replacement's literals are dollar-quoted, so the index expression,
+    /// the sweep and the lookup read the same under
+    /// `standard_conforming_strings = off` as under `on`: an ordinary literal
+    /// with a backslash in it is re-read under `off` (the pattern refused, the
+    /// replacement a space).
+    #[test]
+    fn the_nul_replacement_s_literals_read_the_same_under_either_string_setting() {
+        let document = nul_safe_json_document("raw_response");
+        assert_eq!(
+            document,
+            "replace(raw_response::text, $$\\u0000$$, $$\\u0020$$)"
+        );
+        assert!(!document.contains("'\\"), "{document}");
+    }
+
+    /// The sweep's statement reads `store` and `status` through the very
+    /// expressions its index is built on (a drift between the two would leave
+    /// the planner without the index, and the sweep scanning the table), and
+    /// the lookup by output item reads the document through the same NUL-safe
+    /// form.
+    #[test]
+    fn the_sweep_s_predicate_is_the_index_s_expressions() {
+        let schema = SchemaConfig::default();
+        let ddl = PostgresResponseStorage::unstored_index_ddl(&schema)
+            .expect("the default schema keeps the object column");
+        let sweep = PostgresResponseStorage::unstored_sweep_sql(&schema)
+            .expect("the default schema keeps the object column");
+        let col_raw = schema.responses.col("raw_response");
+        let status = nul_safe_json_text(col_raw, "status");
+        let store = nul_safe_json_text(col_raw, "store");
+        assert!(ddl.contains(&format!("(({status}))")), "{ddl}");
+        assert!(ddl.contains(&format!("WHERE {store} = 'false'")), "{ddl}");
+        assert!(
+            sweep.contains(&format!("WHERE {store} = 'false'")),
+            "{sweep}"
+        );
+        assert!(sweep.contains(&format!("AND {status} IN (")), "{sweep}");
+        assert!(!sweep.contains("::jsonb"), "{sweep}");
+        let lookup = find_by_output_item_sql(&schema, "SELECT id FROM responses")
+            .expect("the default schema keeps the object column");
+        assert!(
+            lookup.contains(&format!("{}::jsonb @>", nul_safe_json_document(col_raw))),
+            "{lookup}"
+        );
+    }
+
+    /// The earlier index is dropped concurrently (a plain drop holds an
+    /// ACCESS EXCLUSIVE lock on the live table to the end of its
+    /// transaction), under the schema's owner when it has one, as are the
+    /// indexes a start looks up before asking for them.
+    #[test]
+    fn the_earlier_index_is_dropped_concurrently() {
+        let schema = SchemaConfig::default();
+        assert_eq!(
+            PostgresResponseStorage::legacy_unstored_index_drop_ddl(&schema),
+            "DROP INDEX CONCURRENTLY IF EXISTS responses_unstored_idx;"
+        );
+        let owned = SchemaConfig {
+            owner: Some("history".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            PostgresResponseStorage::legacy_unstored_index_drop_ddl(&owned),
+            "DROP INDEX CONCURRENTLY IF EXISTS history.responses_unstored_idx;"
+        );
+        assert_eq!(
+            PostgresConversationItemStorage::links_index_name(&owned),
+            "history.conv_item_links_conv_idx"
+        );
+        assert_eq!(
+            PostgresResponseStorage::safety_index_name(&schema),
+            "responses_safety_idx"
+        );
+    }
+
     #[test]
     fn parse_metadata_none_returns_ok_none() {
         assert!(PostgresConversationStorage::parse_metadata(None)
@@ -1780,6 +2212,39 @@ mod tests {
     fn parse_metadata_non_object_is_error() {
         assert!(PostgresConversationStorage::parse_metadata(Some(json!("not an object"))).is_err());
     }
+
+    /// The start-up contact's failure carries its cause chain: the driver's
+    /// kind alone (`error connecting to server`) says nothing of why.
+    #[tokio::test]
+    async fn the_start_up_contact_keeps_the_cause_of_a_refused_connection() {
+        // A port nothing listens on: bound and released here, so the OS
+        // picked it and no service of the host is assumed absent.
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind a local port")
+            .local_addr()
+            .expect("local address")
+            .port();
+        let store = PostgresStore::new(PostgresConfig {
+            db_url: format!("postgres://u:p@127.0.0.1:{closed_port}/db"),
+            pool_max: 1,
+            op_timeout_secs: 2,
+            schema: None,
+        })
+        .expect("a store");
+        let err = store
+            .contact(Duration::from_secs(5))
+            .await
+            .expect_err("nothing listens on the closed port");
+        match err {
+            StoreContactError::Failed(cause) => {
+                assert!(cause.contains("refused"), "{cause}");
+            }
+            StoreContactError::NoAnswer => {
+                panic!("a refused connection is a failure with its cause, not silence")
+            }
+        }
+    }
+
     /// The bootstrap creates every table `IF NOT EXISTS`, in the schema's
     /// names, and the index on its own so a legacy table can gain the column
     /// first.
@@ -1835,6 +2300,26 @@ mod tests {
             link_sql("l", &["conversation_id", "item_id"]),
             "INSERT INTO l (conversation_id, item_id) VALUES ($1, $2) \
              ON CONFLICT (conversation_id, item_id) DO NOTHING"
+        );
+    }
+
+    #[test]
+    fn update_if_open_sql_updates_the_row_under_its_id_only_while_its_status_is_open() {
+        let open = open_predicate("raw_response");
+        assert_eq!(
+            open,
+            "COALESCE(replace(raw_response::text, $$\\u0000$$, $$\\u0020$$)::json->>'status', '') \
+             NOT IN ('completed', 'incomplete', 'failed', 'cancelled')"
+        );
+        assert_eq!(
+            update_if_open_sql("responses", &["id", "input", "raw_response"], Some(&open)),
+            "UPDATE responses SET id = $1, input = $2, raw_response = $3 WHERE id = $1 AND \
+             COALESCE(replace(raw_response::text, $$\\u0000$$, $$\\u0020$$)::json->>'status', '') \
+             NOT IN ('completed', 'incomplete', 'failed', 'cancelled')"
+        );
+        assert_eq!(
+            update_if_open_sql("r", &["response_key", "input"], None),
+            "UPDATE r SET response_key = $1, input = $2 WHERE response_key = $1"
         );
     }
 
@@ -1896,5 +2381,42 @@ mod tests {
         // database, so the key of an id must never change.
         assert_eq!(store_lock_key(""), 0xcbf2_9ce4_8422_2325_u64 as i64);
         assert_eq!(store_lock_key("a"), 0xaf63_dc4c_8601_ec8c_u64 as i64);
+    }
+
+    /// The two answers that mean the statement the server was handed is
+    /// stale (its cached plan no longer fits, raised by the server's
+    /// cached-plan revalidation; it no longer exists, whatever raised it),
+    /// and no other, make a helper prepare the statement afresh and call
+    /// again: `0A000` from any other routine is the broad class it is (a
+    /// feature the server does not support) and is answered as it came.
+    #[test]
+    fn a_stale_plan_and_a_missing_statement_are_the_stale_states() {
+        assert!(is_stale_statement_state(
+            &SqlState::FEATURE_NOT_SUPPORTED,
+            Some("RevalidateCachedQuery")
+        ));
+        assert!(is_stale_statement_state(
+            &SqlState::INVALID_SQL_STATEMENT_NAME,
+            None
+        ));
+        assert!(is_stale_statement_state(
+            &SqlState::INVALID_SQL_STATEMENT_NAME,
+            Some("FetchPreparedStatement")
+        ));
+        assert!(!is_stale_statement_state(
+            &SqlState::FEATURE_NOT_SUPPORTED,
+            None
+        ));
+        assert!(!is_stale_statement_state(
+            &SqlState::FEATURE_NOT_SUPPORTED,
+            Some("infer_arbiter_indexes")
+        ));
+        assert!(!is_stale_statement_state(&SqlState::UNIQUE_VIOLATION, None));
+        assert!(!is_stale_statement_state(
+            &SqlState::IN_FAILED_SQL_TRANSACTION,
+            None
+        ));
+        assert!(!is_stale_statement_state(&SqlState::UNDEFINED_COLUMN, None));
+        assert!(!is_stale_statement_state(&SqlState::QUERY_CANCELED, None));
     }
 }

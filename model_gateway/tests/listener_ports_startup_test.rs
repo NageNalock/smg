@@ -171,9 +171,11 @@ fn a_held_listener_port_starts_no_mesh_member() {
         let [free_port, mesh_port, _] = free_ports();
         let (name, port, metrics_port, watch) = if hold_http_port {
             // The metrics and probe listeners are up when the HTTP bind
-            // fails (they bind earlier, by design): the mesh port alone is
-            // watched here.
-            ("port-held", held_port, free_port, vec![mesh_port])
+            // fails (they bind earlier, by design), and so is the mesh
+            // listener's socket, bound just before it and dropped with the
+            // failed start: no port is watched here; the log shows below
+            // that the mesh server never served from that socket.
+            ("port-held", held_port, free_port, vec![])
         } else {
             (
                 "metrics-port-held",
@@ -192,6 +194,41 @@ fn a_held_listener_port_starts_no_mesh_member() {
             &dir.path().join(format!("{name}.log")),
         );
         assert_refused(name, &launch, &["Address already in use"]);
+        assert!(
+            !launch.log.contains("Mesh server listening on"),
+            "{name}: the mesh server started although a listener port was held\n{}",
+            launch.log
+        );
         drop(held);
     }
+}
+
+/// The mesh port another process holds is refused like the other listeners'
+/// ports, with nothing served: the mesh listener binds with them, before the
+/// HTTP listener, where its failed bind used to be one error line from the
+/// mesh server's task while the gateway served outside the mesh.
+#[test]
+fn a_held_mesh_port_refuses_to_start() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let held = TcpListener::bind((IP, 0)).expect("a port to hold");
+    let held_port = held.local_addr().expect("the held address").port();
+    let [port, metrics_port, _] = free_ports();
+    let mut args = base_args(port, metrics_port);
+    args.extend(mesh_args(held_port));
+    // The metrics and probe listeners are up when the mesh bind fails (they
+    // bind earlier, by design): the HTTP port is watched, the one a gateway
+    // outside the mesh used to serve on.
+    let launch = launch_with(
+        &args,
+        &[port],
+        Until::Bound,
+        &dir.path().join("mesh-port-held.log"),
+    );
+    assert_refused(
+        "mesh-port-held",
+        &launch,
+        &["--mesh-port", "Address already in use"],
+    );
+    drop(held);
 }

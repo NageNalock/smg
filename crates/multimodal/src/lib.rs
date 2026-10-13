@@ -7,6 +7,7 @@ pub mod hasher;
 pub mod hub;
 pub mod jpeg_turbo;
 pub mod media;
+mod mp4_metadata;
 #[cfg(feature = "opencv-video")]
 mod opencv_buffer;
 mod pixel_convert;
@@ -14,6 +15,7 @@ pub mod registry;
 pub mod tracker;
 pub mod types;
 pub mod vision;
+pub mod webp_native;
 
 pub use audio::AudioPreProcessor;
 pub use encoder_inputs::{
@@ -28,15 +30,15 @@ pub use media::{
     MediaConnectorConfig, MediaSource, VideoFetchConfig,
 };
 pub use registry::{
-    MediaItemInfo, MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistry, Tokenizer,
-    DEEPSEEK_V41_IMAGE_PLACEHOLDER,
+    EncoderInputFormat, MediaItemInfo, MediaPartOrder, ModelMetadata, ModelProcessorSpec,
+    ModelRegistry, Tokenizer, DEEPSEEK_V41_IMAGE_PLACEHOLDER,
 };
 pub use tracker::{AsyncMultiModalTracker, TrackerOutput};
 pub use types::{
     AudioClip, AudioSource, EncoderFieldLayouts, FieldLayout, ImageDetail, ImageFrame, ImageSize,
     ImageSource, MediaContentPart, Modality, MultiModalData, MultiModalUUIDs, PlaceholderRange,
-    PromptReplacement, RgbFrameRef, TokenId, TrackedMedia, VideoClip, VideoSamplingInfo,
-    VideoSource,
+    PromptReplacement, RgbFrameRef, TokenId, TrackedMedia, TransparencyPolicy, VideoClip,
+    VideoSamplingInfo, VideoSource,
 };
 // Re-export vision processing components
 pub use vision::execution::{configure_parallelism, parallelism, Parallelism, POOL_THREADS_ENV};

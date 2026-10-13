@@ -58,7 +58,10 @@ use smg::{
 use smg_grpc_client::{
     common_proto as grpc_common, tokenspeed_scheduler::tokenspeed_proto as ts, vllm_proto as proto,
 };
-use tokio::{net::TcpListener, sync::mpsc};
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc, oneshot},
+};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{transport::Server, Request, Response, Status};
 use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer};
@@ -344,14 +347,64 @@ fn produce_at_turn(
     });
 }
 
+/// Hold a parallel-dispatch generate stream open with nothing on it: a leg
+/// whose first response never comes.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test mock; the producer task ends with its stream"
+)]
+fn hold_open(tx: mpsc::Sender<Result<ts::GenerateResponse, Status>>) {
+    tokio::spawn(async move {
+        tokio::time::sleep(FOREVER).await;
+        drop(tx);
+    });
+}
+
+/// Feed a parallel-dispatch generate stream its tokens at once and then hold
+/// it open without a completion: a decode engine that stalled mid-stream.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test mock; the producer task ends with its stream"
+)]
+fn produce_then_stall(tx: mpsc::Sender<Result<ts::GenerateResponse, Status>>, request_id: String) {
+    tokio::spawn(async move {
+        for id in 1..=OUTPUT_TOKENS {
+            if tx.send(Ok(ts_chunk(&request_id, id))).await.is_err() {
+                return;
+            }
+        }
+        tokio::time::sleep(FOREVER).await;
+        drop(tx);
+    });
+}
+
+/// What a parallel-dispatch mock engine does with its generate calls.
+#[derive(Clone, Copy)]
+enum ParallelShape {
+    /// Every leg's first chunk waits for its turn at the engine's gate.
+    Queued,
+    /// The first call is answered at once; every later call's stream stays
+    /// empty for good (a prefill whose legs wait on a stalled decode side).
+    AnswerFirstThenHold,
+    /// The first call is answered at once; every later call never returns
+    /// its stream (a servicer that sends its headers with the first message,
+    /// in front of a prefill whose legs wait on a stalled decode side).
+    AnswerFirstThenHoldHeaders,
+    /// Every call streams its tokens at once and then stalls without a
+    /// completion (a decode engine that stopped mid-stream).
+    StreamThenStall,
+}
+
 /// A parallel-dispatch mock engine (the TokenSpeed proto, as the mock-worker
 /// crate's worker speaks it): the generate call returns its stream at once,
-/// and the leg's first chunk waits for its turn at the engine's gate (one
-/// leg every `TURN`: the decode side admitting the pair's legs one by one),
-/// then the tokens and the completion follow. Counts its generate calls.
+/// and what follows on it is the engine's [`ParallelShape`]: queued, the
+/// leg's first chunk waits for its turn at the engine's gate (one leg every
+/// `TURN`: the decode side admitting the pair's legs one by one), then the
+/// tokens and the completion follow. Counts its generate calls.
 #[derive(Clone)]
 struct QueuedEngine {
     gate: Gate,
+    shape: ParallelShape,
     calls: Arc<AtomicUsize>,
 }
 
@@ -371,9 +424,24 @@ impl TokenSpeedScheduler for QueuedEngine {
         &self,
         request: Request<ts::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         let (tx, rx) = mpsc::channel(8);
-        produce_at_turn(tx, self.gate.clone(), request.into_inner().request_id);
+        let request_id = request.into_inner().request_id;
+        match self.shape {
+            ParallelShape::Queued => produce_at_turn(tx, self.gate.clone(), request_id),
+            ParallelShape::AnswerFirstThenHold if call == 1 => {
+                produce_at_turn(tx, self.gate.clone(), request_id);
+            }
+            ParallelShape::AnswerFirstThenHold => hold_open(tx),
+            ParallelShape::AnswerFirstThenHoldHeaders if call == 1 => {
+                produce_at_turn(tx, self.gate.clone(), request_id);
+            }
+            ParallelShape::AnswerFirstThenHoldHeaders => {
+                tokio::time::sleep(FOREVER).await;
+                drop(tx);
+            }
+            ParallelShape::StreamThenStall => produce_then_stall(tx, request_id),
+        }
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
@@ -462,9 +530,10 @@ impl TokenSpeedScheduler for QueuedEngine {
     reason = "test helper - panicking on failure is intentional; the spawned \
               mock server task is fire-and-forget for the test process's lifetime"
 )]
-async fn start_queued_grpc_worker() -> (u16, QueuedEngine) {
+async fn start_queued_grpc_worker(shape: ParallelShape) -> (u16, QueuedEngine) {
     let engine = QueuedEngine {
         gate: Gate::default(),
+        shape,
         calls: Arc::new(AtomicUsize::new(0)),
     };
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -539,6 +608,136 @@ async fn start_mock_grpc_worker(delay: Duration) -> u16 {
         ..mock_worker::config::Config::default()
     });
     tokio::spawn(mock_worker::grpc::serve_with_listener(cfg, listener));
+    port
+}
+
+/// A parallel-dispatch mock engine (the TokenSpeed proto) that accepts every
+/// generate call, returns its stream at once and fails it with the first item
+/// (`UNAVAILABLE`): a decode engine that admits a request and then drops it
+/// before any token.
+#[derive(Clone, Default)]
+struct CutEngine;
+
+#[tonic::async_trait]
+impl TokenSpeedScheduler for CutEngine {
+    type GenerateStream = ReceiverStream<Result<ts::GenerateResponse, Status>>;
+    type GetTokenizerStream = ReceiverStream<Result<grpc_common::GetTokenizerChunk, Status>>;
+    type SubscribeKvEventsStream = ReceiverStream<Result<grpc_common::KvEventBatch, Status>>;
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test mock; the producer task ends with its one item"
+    )]
+    async fn generate(
+        &self,
+        _request: Request<ts::GenerateRequest>,
+    ) -> Result<Response<Self::GenerateStream>, Status> {
+        let (tx, rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Err(Status::unavailable("the engine dropped the request")))
+                .await;
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn health_check(
+        &self,
+        _request: Request<ts::HealthCheckRequest>,
+    ) -> Result<Response<ts::HealthCheckResponse>, Status> {
+        Ok(Response::new(ts::HealthCheckResponse {
+            healthy: true,
+            message: "ok".to_string(),
+        }))
+    }
+
+    async fn abort(
+        &self,
+        _request: Request<ts::AbortRequest>,
+    ) -> Result<Response<ts::AbortResponse>, Status> {
+        Ok(Response::new(ts::AbortResponse {
+            success: true,
+            message: String::new(),
+        }))
+    }
+
+    async fn get_model_info(
+        &self,
+        _request: Request<ts::GetModelInfoRequest>,
+    ) -> Result<Response<ts::GetModelInfoResponse>, Status> {
+        Ok(Response::new(ts::GetModelInfoResponse::default()))
+    }
+
+    async fn get_server_info(
+        &self,
+        _request: Request<ts::GetServerInfoRequest>,
+    ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
+        Ok(Response::new(ts::GetServerInfoResponse::default()))
+    }
+
+    async fn get_loads(
+        &self,
+        _request: Request<ts::GetLoadsRequest>,
+    ) -> Result<Response<ts::GetLoadsResponse>, Status> {
+        Ok(Response::new(ts::GetLoadsResponse::default()))
+    }
+
+    async fn flush_cache(
+        &self,
+        _request: Request<grpc_common::FlushCacheRequest>,
+    ) -> Result<Response<grpc_common::FlushCacheResponse>, Status> {
+        Err(Status::unimplemented("unused in this test"))
+    }
+
+    async fn start_profile(
+        &self,
+        _request: Request<grpc_common::StartProfileRequest>,
+    ) -> Result<Response<grpc_common::ProfileResponse>, Status> {
+        Err(Status::unimplemented("unused in this test"))
+    }
+
+    async fn stop_profile(
+        &self,
+        _request: Request<grpc_common::StopProfileRequest>,
+    ) -> Result<Response<grpc_common::ProfileResponse>, Status> {
+        Err(Status::unimplemented("unused in this test"))
+    }
+
+    async fn get_tokenizer(
+        &self,
+        _request: Request<grpc_common::GetTokenizerRequest>,
+    ) -> Result<Response<Self::GetTokenizerStream>, Status> {
+        Err(Status::unimplemented("unused in this test"))
+    }
+
+    async fn subscribe_kv_events(
+        &self,
+        _request: Request<grpc_common::SubscribeKvEventsRequest>,
+    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
+        Err(Status::unimplemented("unused in this test"))
+    }
+}
+
+/// Serve a [`CutEngine`] in-process; returns its port.
+#[expect(
+    clippy::expect_used,
+    clippy::disallowed_methods,
+    reason = "test helper - panicking on failure is intentional; the spawned \
+              mock server task is fire-and-forget for the test process's lifetime"
+)]
+async fn start_cut_grpc_worker() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind cut mock engine");
+    let port = listener
+        .local_addr()
+        .expect("cut mock engine address")
+        .port();
+    tokio::spawn(
+        Server::builder()
+            .add_service(TokenSpeedSchedulerServer::new(CutEngine))
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
     port
 }
 
@@ -876,7 +1075,7 @@ fn a_parallel_prefill_that_returns_no_stream_is_given_up_on_within_the_bound() {
 #[test]
 fn a_parallel_prefill_whose_legs_queue_behind_the_decode_side_is_not_given_up_on() {
     let rendered = render_after(|| async {
-        let (prefill_port, prefill) = start_queued_grpc_worker().await;
+        let (prefill_port, prefill) = start_queued_grpc_worker(ParallelShape::Queued).await;
         let decode_port = start_mock_grpc_worker(Duration::ZERO).await;
         let (router, workers) = build_pd_router_with(
             &[
@@ -903,6 +1102,155 @@ fn a_parallel_prefill_whose_legs_queue_behind_the_decode_side_is_not_given_up_on
         worker_errors(&rendered, "prefill", "timeout"),
         0.0,
         "no leg was given up on:\n{rendered}"
+    );
+}
+
+/// Parallel dispatch, the decode worker stalls mid-stream: the first
+/// request's decode leg streams its tokens and then stops without a
+/// completion (its stream stays open); the second request's prefill leg,
+/// dispatched while the decode holds that stream, produces nothing (on this
+/// shape a prefill leg's first response waits for the decode side). At the
+/// prefill's bound the gateway reads the decode partner: a worker holding a
+/// stream it had been producing for and quiet for the bound takes the
+/// verdict. The second request is answered 504 `decode_worker_silent` at
+/// the bound, the decode worker is charged the `timeout` and a breaker
+/// failure (its breaker, set to one, opens), the prefill worker nothing (its
+/// breaker stays closed).
+#[test]
+fn a_parallel_prefill_waiting_on_a_decode_that_stalled_mid_stream_is_charged_to_the_decode() {
+    let rendered = render_after(|| async {
+        let (prefill_port, prefill) =
+            start_queued_grpc_worker(ParallelShape::AnswerFirstThenHold).await;
+        let (decode_port, _decode) = start_queued_grpc_worker(ParallelShape::StreamThenStall).await;
+        let (router, workers) = build_pd_router_with(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (decode_port, WorkerType::Decode),
+            ],
+            RuntimeType::TokenSpeed,
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        // The first request streams its tokens and then hangs on the stalled
+        // decode: it is let go of once the second request has its answer.
+        let first = async {
+            tokio::select! {
+                answer = one_streaming_chat(router.as_ref()) => {
+                    panic!("the stalled stream must not end on its own: {answer:?}")
+                }
+                _ = done_rx => {}
+            }
+        };
+        let second = async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let answer = one_streaming_chat(router.as_ref()).await;
+            let _ = done_tx.send(());
+            answer
+        };
+        let ((), (status, body, elapsed)) = tokio::join!(first, second);
+        assert_eq!(status, http::StatusCode::GATEWAY_TIMEOUT, "{body}");
+        assert!(body.contains("decode_worker_silent"), "{body}");
+        assert!(!body.contains("prefill_worker_silent"), "{body}");
+        assert!(
+            elapsed >= BOUND && elapsed < BOUND + SLACK,
+            "given up on at the bound ({BOUND:?}), not before and not much after: {elapsed:?}"
+        );
+        assert_eq!(prefill.calls(), 2, "both prefill legs were dispatched");
+        assert_eq!(
+            workers[0].circuit_breaker_state(),
+            CircuitState::Closed,
+            "the prefill worker was waiting on its partner, not failing"
+        );
+        assert_eq!(
+            workers[1].circuit_breaker_state(),
+            CircuitState::Open,
+            "the stalled decode worker is the one charged"
+        );
+    });
+    assert_eq!(
+        worker_errors(&rendered, "decode", "timeout"),
+        1.0,
+        "one timeout on the stalled decode worker:\n{rendered}"
+    );
+    assert_eq!(
+        worker_errors(&rendered, "prefill", "timeout"),
+        0.0,
+        "nothing on the prefill worker:\n{rendered}"
+    );
+}
+
+/// The same stall, met in the prefill's dispatch phase: the prefill's second
+/// call never returns its stream (its servicer sends the headers with the
+/// first message), while the decode's call had returned at once, so both
+/// legs' outcomes are judged together once the prefill's bound passes. The
+/// verdict is still the decode's: 504 `decode_worker_silent`, the decode's
+/// breaker (set to one) open, the prefill's closed, the timeout on the
+/// decode.
+#[test]
+fn a_parallel_prefill_held_in_its_dispatch_by_a_stalled_decode_is_charged_to_the_decode() {
+    let rendered = render_after(|| async {
+        let (prefill_port, prefill) =
+            start_queued_grpc_worker(ParallelShape::AnswerFirstThenHoldHeaders).await;
+        let (decode_port, _decode) = start_queued_grpc_worker(ParallelShape::StreamThenStall).await;
+        let (router, workers) = build_pd_router_with(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (decode_port, WorkerType::Decode),
+            ],
+            RuntimeType::TokenSpeed,
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let first = async {
+            tokio::select! {
+                answer = one_streaming_chat(router.as_ref()) => {
+                    panic!("the stalled stream must not end on its own: {answer:?}")
+                }
+                _ = done_rx => {}
+            }
+        };
+        let second = async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let answer = one_streaming_chat(router.as_ref()).await;
+            let _ = done_tx.send(());
+            answer
+        };
+        let ((), (status, body, elapsed)) = tokio::join!(first, second);
+        assert_eq!(status, http::StatusCode::GATEWAY_TIMEOUT, "{body}");
+        assert!(body.contains("decode_worker_silent"), "{body}");
+        assert!(
+            elapsed >= BOUND && elapsed < BOUND + SLACK,
+            "given up on at the bound: {elapsed:?}"
+        );
+        assert_eq!(prefill.calls(), 2, "both prefill legs were dispatched");
+        assert_eq!(
+            workers[1].circuit_breaker_state(),
+            CircuitState::Open,
+            "the stalled decode worker is the one charged, in the dispatch phase too"
+        );
+        assert_eq!(
+            workers[0].circuit_breaker_state(),
+            CircuitState::Closed,
+            "the prefill worker was waiting on its partner"
+        );
+    });
+    assert_eq!(
+        worker_errors(&rendered, "decode", "timeout"),
+        1.0,
+        "one timeout on the stalled decode worker:\n{rendered}"
+    );
+    assert_eq!(
+        worker_errors(&rendered, "prefill", "timeout"),
+        0.0,
+        "nothing on the prefill worker:\n{rendered}"
     );
 }
 
@@ -1084,4 +1432,86 @@ fn the_request_is_retried_on_another_prefill_worker_and_never_on_the_silent_one_
         1.0,
         "one timeout on the silent prefill worker:\n{rendered}"
     );
+}
+
+/// Parallel dispatch, a decode worker that accepts every leg and fails its
+/// stream before any token: each request is one failure of that worker, so
+/// two failed requests open its breaker (set to two), as they do on any
+/// other worker. The leg's dispatch used to be sampled as a success the
+/// moment its stream was returned, a success the leg had not earned, and the
+/// failure that followed never built a streak: a decode worker that failed
+/// every request kept its breaker closed. The prefill worker, which answered
+/// every leg, keeps its breaker closed.
+#[test]
+fn a_decode_worker_that_fails_every_stream_it_accepted_opens_its_breaker() {
+    let rendered = render_after(|| async {
+        let prefill_port = start_mock_grpc_worker(Duration::ZERO).await;
+        let decode_port = start_cut_grpc_worker().await;
+        let (router, workers) = build_pd_router_with(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (decode_port, WorkerType::Decode),
+            ],
+            RuntimeType::TokenSpeed,
+            CircuitBreakerConfig {
+                failure_threshold: 2,
+                ..Default::default()
+            },
+        )
+        .await;
+        for _ in 0..2 {
+            let (status, body, _) = one_streaming_chat(router.as_ref()).await;
+            assert!(
+                status.is_server_error() || body.contains("error"),
+                "the request fails on its decode leg: {status} {body}"
+            );
+        }
+        assert_eq!(
+            workers[1].circuit_breaker_state(),
+            CircuitState::Open,
+            "two failed requests are two consecutive failures of the decode worker"
+        );
+        assert_eq!(
+            workers[0].circuit_breaker_state(),
+            CircuitState::Closed,
+            "the prefill worker answered every leg"
+        );
+    });
+    assert!(
+        worker_errors(&rendered, "decode", "backend_error") >= 2.0,
+        "each failed request counts on the decode worker:\n{rendered}"
+    );
+}
+
+/// The success a decode leg does earn is still sampled, at its first
+/// response: a failure before it is forgiven by a request the decode served,
+/// so the next failure leaves a breaker set to two closed.
+#[test]
+fn a_decode_leg_that_answers_earns_its_workers_breaker_success_at_its_first_response() {
+    render_after(|| async {
+        let prefill_port = start_mock_grpc_worker(Duration::ZERO).await;
+        let decode_port = start_mock_grpc_worker(Duration::ZERO).await;
+        let (router, workers) = build_pd_router_with(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (decode_port, WorkerType::Decode),
+            ],
+            RuntimeType::TokenSpeed,
+            CircuitBreakerConfig {
+                failure_threshold: 2,
+                ..Default::default()
+            },
+        )
+        .await;
+        workers[1].record_outcome(504);
+        let (status, body, _) = one_streaming_chat(router.as_ref()).await;
+        assert_eq!(status, http::StatusCode::OK, "{body}");
+        assert!(body.contains("data: [DONE]"), "{body}");
+        workers[1].record_outcome(504);
+        assert_eq!(
+            workers[1].circuit_breaker_state(),
+            CircuitState::Closed,
+            "the served request's first response reset the streak"
+        );
+    });
 }

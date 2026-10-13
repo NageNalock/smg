@@ -50,11 +50,6 @@ pub enum CallSyntax {
     /// and later and Qwen3-Coder (on a line of its own), Seed-OSS and MiMo (between the tags
     /// directly).
     Tagged(tagged::Spelling, tagged::Placement),
-    /// DeepSeek's DSML: the arguments state is one `<｜DSML｜ invoke name="…">` block, whose
-    /// parameter tags carry a `string` attribute that types each value. The terminal that enters
-    /// the state is the invoke tag's opening, and the one that leaves it is the invoke's closing
-    /// tag, which the call's end carries.
-    Dsml,
     /// The call's name as text, then `<arg_key>` and `<arg_value>` pairs, in the family's spelling
     /// of the four tags, typed by the request's tools: GLM, Hy4, Ling, IQuest. The terminals that
     /// enter and leave the state are the call's own markers, and the call's end carries the
@@ -77,16 +72,12 @@ pub enum CallSyntax {
     /// opening, and the one that leaves it is `</invoke>`, which the call's end carries.
     Xml,
     /// Parameters named by an attribute: the arguments state is one `<invoke name="…">` block
-    /// whose `<parameter name="…">` tags carry the key in the attribute and are typed by the
-    /// request's tools, in the family's spelling of the parameter tags: MiniMax M2. The terminal
-    /// that enters the state is the invoke tag's opening, and the one that leaves it is
-    /// `</invoke>`, which the call's end carries.
+    /// whose `<parameter name="…">` tags carry the key in the attribute, typed by the request's
+    /// tools or by an attribute of the tag, in the family's spelling of the tags: MiniMax M2,
+    /// dots3, MiniCPM5, DeepSeek's DSML, Kimi K3's XTML. The terminal that enters the state is the
+    /// invoke tag's opening, and the one that leaves it is the invoke's closing tag, which the
+    /// call's end carries.
     Attributed(tagged::attributed::Tags),
-    /// Kimi K3's XTML: the arguments state is one `<|open|>call tool="…" index="N"<|sep|>` block,
-    /// whose argument tags carry a `type` attribute that types each value (`string`, `number`,
-    /// `boolean`, `null`, `array`, `object`). The terminal that enters the state is the call tag's
-    /// opening, and the one that leaves it is `<|close|>call<|sep|>`, which the call's end carries.
-    Xtml,
     /// The tool's name as text, then this marker, then one JSON object `{"name": …, "args": …}`:
     /// Inkling, whose every message starts the arguments state and says what it is only after
     /// its opener (`<|content_thinking|>`, `<|content_text|>`, or the name and the marker). The

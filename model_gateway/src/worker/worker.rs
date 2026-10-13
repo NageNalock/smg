@@ -669,6 +669,30 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     fn tracked_load(&self) -> usize {
         0
     }
+    /// Record the first token or completion of a stream from this worker:
+    /// from here until its end the stream is one the worker is producing for.
+    fn note_output_started(&self) {}
+    /// Record the end of a stream that had produced output.
+    fn note_output_ended(&self) {}
+    /// How long the worker has produced nothing while it still holds streams
+    /// it had been producing for: `Some(age)` when at least one stream past
+    /// its first token or completion is open and the last token or
+    /// completion from the worker was `age` ago; `None` when no such stream
+    /// is open (an idle worker, one whose streams all ended, one whose
+    /// in-flight work has shown nothing yet: nothing to judge it by), or for
+    /// a worker that does not track it. The signal a disaggregated request
+    /// reads on its decode partner when its prefill leg's silence bound
+    /// passes on the parallel dispatch shape, where the prefill's first
+    /// response waits for the decode side. The age is that of the last
+    /// response the gateway read, not of the engine's last production: a
+    /// stream whose reader stops polling (a client that stays connected and
+    /// stops reading its bounded channel) keeps its open count and ages, so
+    /// a decode whose only open producing streams belong to such readers
+    /// can read as silent while a frozen prefill is the cause; the two
+    /// conditions together are the limit of this signal.
+    fn output_silence(&self) -> Option<Duration> {
+        None
+    }
 
     /// Store the engine's reported waiting-queue depth, returning the previous
     /// value.
@@ -1507,6 +1531,9 @@ pub struct WorkerRuntime {
     /// Requests in flight whose responses the gateway sees one by one (see
     /// [`Worker::tracked_load`]).
     tracked_in_flight: AtomicUsize,
+    /// Open streams that have produced a token or completion (see
+    /// [`Worker::output_silence`]).
+    producing_streams: AtomicUsize,
     /// The prefill book: pending prompt tokens, the busy interval and the
     /// rate window, moved together under one lock so a request's end and
     /// another's start cannot race the interval away (see [`PrefillBook`]).
@@ -1769,6 +1796,7 @@ impl WorkerRuntime {
             divert_until_ms: AtomicU64::new(0),
             busy_since_ms: AtomicU64::new(0),
             tracked_in_flight: AtomicUsize::new(0),
+            producing_streams: AtomicUsize::new(0),
             prefill: Mutex::new(PrefillBook::default()),
         }
     }
@@ -2046,6 +2074,24 @@ impl WorkerRuntime {
     }
     pub fn tracked_load(&self) -> usize {
         self.tracked_in_flight.load(Ordering::Relaxed)
+    }
+    /// A stream from this worker produced its first token or completion.
+    pub fn note_output_started(&self) {
+        self.producing_streams.fetch_add(1, Ordering::Relaxed);
+    }
+    /// A stream that had produced output ended.
+    pub fn note_output_ended(&self) {
+        let _ = self
+            .producing_streams
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
+    }
+    /// See [`Worker::output_silence`]: the age of the last token or
+    /// completion while a stream that produced output is still open.
+    pub fn output_silence(&self) -> Option<Duration> {
+        (self.producing_streams.load(Ordering::Relaxed) > 0)
+            .then(|| Self::age_of(self.last_token_ms.load(Ordering::Relaxed)))
     }
     /// The load counter left zero: the wedged rule's clock starts now.
     fn note_busy_started(&self) {
@@ -2801,6 +2847,18 @@ impl Worker for BasicWorker {
 
     fn tracked_load(&self) -> usize {
         self.runtime.load().tracked_load()
+    }
+
+    fn note_output_started(&self) {
+        self.runtime.load().note_output_started();
+    }
+
+    fn note_output_ended(&self) {
+        self.runtime.load().note_output_ended();
+    }
+
+    fn output_silence(&self) -> Option<Duration> {
+        self.runtime.load().output_silence()
     }
 
     fn is_available(&self) -> bool {
@@ -3941,6 +3999,11 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// The load counter's increment, a million times: the count is exact,
+    /// and the rate is printed. The rate is machine-bound (a loaded or slow
+    /// machine reaches a fraction of a quiet one's), so the unit suite
+    /// asserts no absolute floor; `SMG_TEST_LOAD_COUNTER_FLOOR=<ops/s>` turns
+    /// the printed measurement into an assertion for a run on a known machine.
     #[test]
     #[expect(clippy::print_stderr)]
     fn test_load_counter_performance() {
@@ -3958,16 +4021,28 @@ mod tests {
             worker.increment_load();
         }
         let duration = start.elapsed();
+        assert_eq!(worker.load(), iterations);
 
         let ops_per_sec = iterations as f64 / duration.as_secs_f64();
         eprintln!("Load counter operations per second: {ops_per_sec:.0}");
 
-        // Lower bound is intentionally generous so this microbench does
-        // not flake on CI runners under contention. A relaxed Acquire/
-        // Release atomic increment should comfortably exceed this on any
-        // reasonable hardware — observed CI floor is around 1M ops/sec,
-        // so 500k gives a 2x safety margin.
-        assert!(ops_per_sec > 500_000.0);
+        // An asked-for floor is an assertion; an unreadable or malformed one
+        // is an error, not a silently skipped check: only an absent variable
+        // means no floor was asked for.
+        match std::env::var("SMG_TEST_LOAD_COUNTER_FLOOR") {
+            Err(std::env::VarError::NotPresent) => {}
+            Err(error) => panic!("SMG_TEST_LOAD_COUNTER_FLOOR is unreadable: {error}"),
+            Ok(floor) => {
+                let floor: f64 = match floor.parse::<f64>() {
+                    Ok(floor) if floor.is_finite() => floor,
+                    _ => panic!("SMG_TEST_LOAD_COUNTER_FLOOR {floor:?} is not a finite number"),
+                };
+                assert!(
+                    ops_per_sec > floor,
+                    "load counter: {ops_per_sec:.0} ops/s, under the asked-for floor of {floor:.0}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4845,6 +4920,28 @@ mod tests {
         );
         assert!(runtime.try_increment_load(4));
         assert!(runtime.progress_reference_ms() > registered);
+    }
+
+    #[test]
+    fn output_silence_is_read_only_while_a_stream_that_produced_output_is_open() {
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("grpc://decode:30000").build());
+        // Nothing in flight it has shown output on: nothing to judge.
+        assert!(worker.output_silence().is_none());
+        worker.note_output_started();
+        worker.note_token_progress();
+        thread::sleep(Duration::from_millis(20));
+        let silence = worker.output_silence().expect("a producing stream is open");
+        assert!(silence >= Duration::from_millis(20), "{silence:?}");
+        // A token: the silence restarts.
+        worker.note_token_progress();
+        assert!(worker.output_silence().expect("still open") < silence);
+        // The stream ended: nothing to judge again, however quiet the worker.
+        worker.note_output_ended();
+        assert!(worker.output_silence().is_none());
+        // The count never goes negative.
+        worker.note_output_ended();
+        assert!(worker.output_silence().is_none());
     }
 
     #[test]

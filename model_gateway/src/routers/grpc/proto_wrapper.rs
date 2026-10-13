@@ -3003,6 +3003,13 @@ pub struct TrackedStream {
     /// The request's place in the worker's pile; a non-streaming generation
     /// holds none.
     progress: Option<ProgressTicket>,
+    /// Held from the stream's first response to its end: one of the streams
+    /// the worker is producing for (see [`Worker::output_silence`]).
+    output: Option<OutputTicket>,
+    /// Whether the worker's circuit-breaker success for this dispatch is
+    /// still to be sampled, at the stream's first response (a disaggregated
+    /// decode leg: see [`ProtoStream::tracked_decode_leg`]).
+    samples_success: bool,
     /// A response (or the stream's end) pulled ahead of the stream's reader
     /// by [`ProtoStream::first_response_within`], handed to the next `next`
     /// as it was: its bookkeeping ran when it was pulled.
@@ -3074,6 +3081,28 @@ impl Drop for ProgressTicket {
     }
 }
 
+/// A stream the worker has produced output for and that has not ended (see
+/// [`Worker::output_silence`]): opened at the first response, given back at
+/// the stream's end, or when its reader lets go of it.
+struct OutputTicket {
+    worker: Arc<dyn Worker>,
+}
+
+impl OutputTicket {
+    fn open(worker: &Arc<dyn Worker>) -> Self {
+        worker.note_output_started();
+        Self {
+            worker: Arc::clone(worker),
+        }
+    }
+}
+
+impl Drop for OutputTicket {
+    fn drop(&mut self) {
+        self.worker.note_output_ended();
+    }
+}
+
 /// The prompt tokens a dispatched request adds to its worker's prefill
 /// backlog (see [`Worker::prefill_backlog`]), released by the first response
 /// (with the prefix-cache hit it reports, so the worker's rate learns the
@@ -3100,12 +3129,24 @@ impl PrefillTicket {
     /// stream by [`ProtoStream::tracked_prefill_leg_booked`]; dropped before
     /// that (the call failed or was retired), it releases the prompt untimed.
     pub(crate) fn book(worker: &Arc<dyn Worker>, prompt_tokens: u64) -> Option<Self> {
+        Self::book_as(worker, prompt_tokens, true)
+    }
+
+    /// [`Self::book`] with the prompt's prefill `timed` or not: a regular
+    /// dispatch times it when the engine streams the generation (the first
+    /// response is the first token) and books it untimed otherwise (the one
+    /// response of a non-streaming generation is its whole answer).
+    pub(crate) fn book_as(
+        worker: &Arc<dyn Worker>,
+        prompt_tokens: u64,
+        timed: bool,
+    ) -> Option<Self> {
         (prompt_tokens > 0).then(|| {
-            worker.note_prefill_started(prompt_tokens, true);
+            worker.note_prefill_started(prompt_tokens, timed);
             Self {
                 worker: Arc::clone(worker),
                 tokens: prompt_tokens,
-                timed: true,
+                timed,
                 released: false,
             }
         })
@@ -3131,12 +3172,39 @@ impl Drop for PrefillTicket {
     }
 }
 
+/// What a regular dispatch books on its worker before its call is polled
+/// (see [`PrefillTicket::book`]): the prompt as pending prefill, timed when
+/// the engine streams the generation, and, for a streaming generation, the
+/// request's place in the worker's pile. [`ProtoStream::tracked_booked`]
+/// hands both to the call's stream; dropped before that (the call failed),
+/// the booking gives both back.
+pub(crate) struct DispatchBooking {
+    prefill: Option<PrefillTicket>,
+    progress: Option<ProgressTicket>,
+}
+
+impl DispatchBooking {
+    pub(crate) fn book(worker: &Arc<dyn Worker>, prompt_tokens: u64, streaming: bool) -> Self {
+        let progress = streaming.then(|| {
+            worker.note_tracked_started();
+            ProgressTicket {
+                worker: Arc::clone(worker),
+            }
+        });
+        Self {
+            prefill: PrefillTicket::book_as(worker, prompt_tokens, streaming),
+            progress,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tracked_tests {
     use std::sync::Arc;
 
     use super::{
-        sglang, vllm, FanoutStream, FirstItem, PrefillTicket, ProtoGenerateResponse, ProtoStream,
+        sglang, vllm, DispatchBooking, FanoutStream, FirstItem, PrefillTicket,
+        ProtoGenerateResponse, ProtoStream,
     };
     use crate::worker::{BasicWorkerBuilder, Worker};
 
@@ -3238,6 +3306,43 @@ mod tracked_tests {
         assert_eq!(worker.tracked_load(), 0);
     }
 
+    /// A disaggregated decode leg earns its worker's breaker success at its
+    /// first response, never at its dispatch: a leg whose stream ends with
+    /// nothing on it leaves a failure before it standing, so the next one
+    /// opens a breaker set to two.
+    #[tokio::test]
+    async fn a_decode_leg_that_ends_with_nothing_on_it_earns_no_breaker_success() {
+        use crate::worker::circuit_breaker::{CircuitBreakerConfig, CircuitState};
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:30000")
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 2,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        worker.record_outcome(504);
+        let mut leg = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
+            .tracked_decode_leg(Arc::clone(&worker));
+        match &leg {
+            ProtoStream::Tracked(tracked) => {
+                assert!(tracked.samples_success, "the success waits for a response");
+                assert!(tracked.progress.is_none(), "no pile slot");
+                assert!(tracked.prefill.is_none(), "no prompt booked");
+            }
+            _ => panic!("a tracked stream"),
+        }
+        assert!(leg.next().await.is_none(), "an empty fanout ends at once");
+        drop(leg);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+        worker.record_outcome(504);
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::Open,
+            "two failures with no success earned between them"
+        );
+    }
+
     #[test]
     fn a_prefill_leg_booked_at_dispatch_is_pending_before_its_stream_exists() {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
@@ -3336,6 +3441,40 @@ mod tracked_tests {
         assert!(stream.next().await.is_none(), "the held end is replayed");
         assert!(stream.next().await.is_none(), "and the stream stays ended");
     }
+
+    #[test]
+    fn a_dispatch_booking_holds_the_prompt_and_the_pile_until_its_stream_takes_over() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w1:8000").build());
+        let books = |worker: &Arc<dyn Worker>| (worker.prefill_backlog(), worker.tracked_load());
+        // 4,096 prompt tokens at the cold prior read as 409 ms of backlog.
+        let pending = std::time::Duration::from_millis(409);
+        let none = (std::time::Duration::ZERO, 0);
+        // A streaming generation: its prompt timed, its place in the pile.
+        let booking = DispatchBooking::book(&worker, 4_096, true);
+        assert_eq!(
+            books(&worker),
+            (pending, 1),
+            "booked at the dispatch, before the call has answered"
+        );
+        assert!(booking.prefill.as_ref().is_some_and(|ticket| ticket.timed));
+        let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
+            .tracked_booked(Arc::clone(&worker), booking);
+        assert_eq!(
+            books(&worker),
+            (pending, 1),
+            "handed to the stream: booked once, not again"
+        );
+        drop(stream);
+        assert_eq!(books(&worker), none, "released with the stream");
+        // A non-streaming generation: its prompt pending untimed, no pile slot.
+        let booking = DispatchBooking::book(&worker, 4_096, false);
+        assert_eq!(books(&worker), (pending, 0));
+        assert!(booking.prefill.as_ref().is_some_and(|ticket| !ticket.timed));
+        assert!(booking.progress.is_none());
+        // Dropped before a stream took it over (the call failed): given back.
+        drop(booking);
+        assert_eq!(books(&worker), none);
+    }
 }
 
 /// The message of the `Internal` status a stream ends with when the engine
@@ -3373,26 +3512,24 @@ impl ProtoStream {
     /// from first tokens only.
     #[must_use]
     pub fn tracked(self, worker: Arc<dyn Worker>, prompt_tokens: u64, streaming: bool) -> Self {
-        let progress = streaming.then(|| {
-            worker.note_tracked_started();
-            ProgressTicket {
-                worker: Arc::clone(&worker),
-            }
-        });
-        let prefill = (prompt_tokens > 0).then(|| {
-            worker.note_prefill_started(prompt_tokens, streaming);
-            PrefillTicket {
-                worker: Arc::clone(&worker),
-                tokens: prompt_tokens,
-                timed: streaming,
-                released: false,
-            }
-        });
+        let booking = DispatchBooking::book(&worker, prompt_tokens, streaming);
+        self.tracked_booked(worker, booking)
+    }
+
+    /// [`Self::tracked`] for a request booked at its dispatch (see
+    /// [`DispatchBooking::book`]): the stream takes the booking over, so the
+    /// prompt's span runs from before the call was polled to the first
+    /// response, and the request has been in the pile since the dispatch.
+    #[must_use]
+    pub(crate) fn tracked_booked(self, worker: Arc<dyn Worker>, booking: DispatchBooking) -> Self {
+        let DispatchBooking { prefill, progress } = booking;
         Self::Tracked(Box::new(TrackedStream {
             inner: self,
             worker,
             prefill,
             progress,
+            output: None,
+            samples_success: false,
             replay: None,
         }))
     }
@@ -3425,8 +3562,30 @@ impl ProtoStream {
             worker,
             prefill,
             progress: None,
+            output: None,
+            samples_success: false,
             replay: None,
         }))
+    }
+
+    /// Track this stream as the decode leg of a disaggregated dispatch to
+    /// `worker`: every response is the worker's token progress, the leg
+    /// joins no pile and books no prefill (as [`Self::tracked`] with no
+    /// prompt and no pile does), and the worker's circuit-breaker success
+    /// for the dispatch is sampled at the leg's first response rather than
+    /// when the call returned its stream. A decode leg's first response
+    /// waits for the handoff, so a leg accepted into silence, or one whose
+    /// stream fails at once, is one failure of its worker and not a success
+    /// and then a failure, which reset the breaker's streak on every
+    /// request; a stream that ends with nothing on it earns no success
+    /// either, as a prefill leg's does not.
+    #[must_use]
+    pub(crate) fn tracked_decode_leg(self, worker: Arc<dyn Worker>) -> Self {
+        let mut stream = self.tracked(worker, 0, false);
+        if let Self::Tracked(tracked) = &mut stream {
+            tracked.samples_success = true;
+        }
+        stream
     }
 
     /// Wait for the stream's first item, a response or its end, until
@@ -3515,12 +3674,23 @@ impl ProtoStream {
         } else {
             tracked.inner.next_untracked().await
         };
-        if let Some(Ok(response)) = &item {
-            liveness::on_token_progress(&tracked.worker);
-            if let Some(ticket) = tracked.prefill.as_mut() {
-                ticket.first_response(u64::from(response.cached_tokens()));
+        match &item {
+            Some(Ok(response)) => {
+                liveness::on_token_progress(&tracked.worker);
+                if std::mem::take(&mut tracked.samples_success) {
+                    tracked.worker.record_outcome(200);
+                }
+                if tracked.output.is_none() {
+                    tracked.output = Some(OutputTicket::open(&tracked.worker));
+                }
+                if let Some(ticket) = tracked.prefill.as_mut() {
+                    ticket.first_response(u64::from(response.cached_tokens()));
+                }
+                tracked.prefill = None;
             }
-            tracked.prefill = None;
+            // The stream ended, or failed: what the worker was producing for
+            // it is over, whenever its reader lets go of it.
+            Some(Err(_)) | None => tracked.output = None,
         }
         item
     }
@@ -3631,6 +3801,8 @@ impl ProtoStream {
                     worker,
                     prefill,
                     progress,
+                    output,
+                    samples_success,
                     replay,
                 } = *stream;
                 Self::Tracked(Box::new(TrackedStream {
@@ -3638,6 +3810,8 @@ impl ProtoStream {
                     worker,
                     prefill,
                     progress,
+                    output,
+                    samples_success,
                     replay,
                 }))
             }

@@ -11,7 +11,10 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use bytes::{Bytes, BytesMut};
-use image::{codecs::jpeg::JpegDecoder, ImageDecoder as _};
+use image::{
+    codecs::{jpeg::JpegDecoder, webp::WebPDecoder},
+    ImageDecoder as _,
+};
 #[cfg(feature = "opencv-video")]
 use opencv::{
     core::{Mat, Vector},
@@ -26,7 +29,8 @@ use url::Url;
 use crate::{
     audio::decode_audio_mono_f32,
     fetch_policy::{MediaHostPolicy, MediaHostResolver},
-    vision::transforms::resize_catmull_rom_rgb,
+    types::TransparencyPolicy,
+    vision::{orientation::oriented, transforms::resize_catmull_rom_rgb},
 };
 
 const DEFAULT_VIDEO_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -113,6 +117,9 @@ pub struct ImageFetchConfig {
     pub detail: ImageDetail,
     /// MiniMax-M3 extension: cap the decoded image's long side.
     pub max_long_side_pixel: Option<u32>,
+    /// The policy the frame decodes an alpha channel under; part of the
+    /// frame's hash like the cap, since it changes the decoded pixels.
+    pub transparency: TransparencyPolicy,
 }
 
 impl Default for ImageFetchConfig {
@@ -120,6 +127,7 @@ impl Default for ImageFetchConfig {
         Self {
             detail: ImageDetail::Auto,
             max_long_side_pixel: None,
+            transparency: TransparencyPolicy::KeepAlpha,
         }
     }
 }
@@ -311,6 +319,7 @@ impl MediaConnector {
                 bytes.clone(),
                 cfg.detail,
                 cfg.max_long_side_pixel,
+                cfg.transparency,
                 ImageSource::InlineBytes,
             ),
             FetchSource::File(path) => self.fetch_file(path, cfg).await,
@@ -383,6 +392,7 @@ impl MediaConnector {
             bytes,
             cfg.detail,
             cfg.max_long_side_pixel,
+            cfg.transparency,
             ImageSource::Url {
                 url: parsed.to_string(),
             },
@@ -409,6 +419,7 @@ impl MediaConnector {
             decoded.into(),
             cfg.detail,
             cfg.max_long_side_pixel,
+            cfg.transparency,
             ImageSource::DataUrl,
         )
     }
@@ -478,6 +489,7 @@ impl MediaConnector {
             bytes,
             cfg.detail,
             cfg.max_long_side_pixel,
+            cfg.transparency,
             ImageSource::File { path: canonical },
         )
     }
@@ -671,26 +683,25 @@ impl MediaConnector {
         bytes: Bytes,
         detail: ImageDetail,
         max_long_side_pixel: Option<u32>,
+        transparency: TransparencyPolicy,
         source: ImageSource,
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
         validate_max_long_side_pixel(max_long_side_pixel)?;
         ensure_input_byte_limit(bytes.len(), image_max_input_bytes(), "image")?;
-        // The cap changes the decoded pixels, so it has to be part of the
-        // identity the pixel cache and the backend's mm cache key off.
-        let hash = crate::hasher::hash_image_with_resolution_cap(&bytes, max_long_side_pixel);
+        // The cap and the transparency policy change the decoded pixels, so
+        // both are part of the identity the pixel cache and the backend's mm
+        // cache key off.
+        let hash =
+            crate::hasher::hash_image_with_transparency(&bytes, max_long_side_pixel, transparency);
         // The header is enough to plan the request by; the pixels are decoded
         // when preprocessing first asks for them, which a pixel-cache hit
         // never does.
         let size = encoded_image_size(&bytes, max_long_side_pixel)?;
 
-        Ok(Arc::new(ImageFrame::encoded(
-            bytes,
-            detail,
-            source,
-            hash,
-            size,
-            max_long_side_pixel,
-        )))
+        Ok(Arc::new(
+            ImageFrame::encoded(bytes, detail, source, hash, size, max_long_side_pixel)
+                .with_transparency(transparency),
+        ))
     }
 
     async fn decode_audio(
@@ -1909,10 +1920,54 @@ async fn decode_video_with_ffmpeg_runners(
     selection: Option<&FrameSelection>,
 ) -> Result<DecodedVideoFrames, MediaConnectorError> {
     let sampling = selection.map(FrameSelection::sampling_info);
-    if let Some(metadata) = metadata {
+    if let Some(mut metadata) = metadata {
         let sample_fps = effective_sample_fps(metadata.duration_seconds, cfg);
-        let started = Instant::now();
-        match decode_video_with_ffmpeg_ppm(input_path, cfg, metadata, selection).await {
+        let mut started = Instant::now();
+        let mut headed = decode_video_with_ffmpeg_ppm(input_path, cfg, metadata, selection).await;
+        if metadata.from_container && headed.as_ref().is_err_and(is_frame_size_mismatch) {
+            // The container's size is the muxer's; the probe's is the
+            // decoder's. A headed decode whose frames were neither the
+            // container's size nor its transpose is retried once on the
+            // probe's metadata before anything frames raw output by a size
+            // the decoder may not produce; a probe that cannot run leaves the
+            // mismatch standing, which the headed PNG runner takes straight
+            // away. The first decode's entry is logged before the probe runs,
+            // so it carries the decode's own duration; the retry is timed apart.
+            log_video_decode_backend_timing(
+                "ffmpeg_ppm_file",
+                started,
+                input_bytes,
+                cfg,
+                headed.as_ref().err(),
+            );
+            match probe_video_info(input_path)
+                .await
+                .and_then(|info| video_metadata_from(info, false))
+            {
+                Ok(probed) => {
+                    metadata = probed;
+                    started = Instant::now();
+                    headed =
+                        decode_video_with_ffmpeg_ppm(input_path, cfg, metadata, selection).await;
+                }
+                Err(error) => {
+                    info!(
+                        error = %error,
+                        "video probe after a frame size mismatch failed; the container's metadata stands"
+                    );
+                    return decode_video_png_frames(
+                        input_path,
+                        input_bytes,
+                        cfg,
+                        Some(metadata),
+                        selection,
+                        sampling,
+                    )
+                    .await;
+                }
+            }
+        }
+        match headed {
             Ok(video) => {
                 log_video_decode_backend_timing("ffmpeg_ppm_file", started, input_bytes, cfg, None);
                 return Ok(DecodedVideoFrames::Rgb {
@@ -1920,6 +1975,26 @@ async fn decode_video_with_ffmpeg_runners(
                     sample_fps,
                     sampling,
                 });
+            }
+            Err(error) if is_frame_size_mismatch(&error) => {
+                // The frames are not the metadata's size: the raw runner would
+                // frame them wrongly; the headed PNG runner carries its own.
+                log_video_decode_backend_timing(
+                    "ffmpeg_ppm_file",
+                    started,
+                    input_bytes,
+                    cfg,
+                    Some(&error),
+                );
+                return decode_video_png_frames(
+                    input_path,
+                    input_bytes,
+                    cfg,
+                    Some(metadata),
+                    selection,
+                    sampling,
+                )
+                .await;
             }
             Err(error) => {
                 log_video_decode_backend_timing(
@@ -1954,6 +2029,18 @@ async fn decode_video_with_ffmpeg_runners(
         }
     }
 
+    decode_video_png_frames(input_path, input_bytes, cfg, metadata, selection, sampling).await
+}
+
+/// The headed PNG runner, the last of the chain: every frame carries its own size.
+async fn decode_video_png_frames(
+    input_path: &Path,
+    input_bytes: usize,
+    cfg: VideoFetchConfig,
+    metadata: Option<VideoMetadata>,
+    selection: Option<&FrameSelection>,
+    sampling: Option<VideoSamplingInfo>,
+) -> Result<DecodedVideoFrames, MediaConnectorError> {
     let started = Instant::now();
     match decode_video_with_ffmpeg_png(input_path, cfg, metadata, selection).await {
         Ok((frames, sample_fps)) => {
@@ -2152,6 +2239,18 @@ async fn decode_video_with_ffmpeg_ppm(
     }
 
     let mut video = parse_ppm_rgb_video(Bytes::from(output.stdout))?;
+    if let Some(frame) = video.frames.first() {
+        // The frames carry their own size; the metadata states the coded one.
+        // This decode autorotates, so a clip stored with a 90 or 270 degree
+        // display rotation comes out transposed: both are the decoder's size.
+        let size = (frame.width, frame.height);
+        if size != (metadata.width, metadata.height) && size != (metadata.height, metadata.width) {
+            return Err(MediaConnectorError::VideoDecode(format!(
+                "{FRAME_SIZE_MISMATCH} {}x{} differs from the stated {}x{} and its transpose",
+                frame.width, frame.height, metadata.width, metadata.height
+            )));
+        }
+    }
     if let Some(selection) = selection {
         video.frames = selection.expand(video.frames)?;
     }
@@ -2172,8 +2271,13 @@ async fn decode_video_with_ffmpeg_raw(
     );
     let decoded_bytes = checked_decoded_rgb_bytes(target_frames, frame_size)?;
     let output_limit = decoded_bytes.to_string();
-    // Rawvideo has no per-frame header, so we interpret stdout using ffprobe's
-    // coded stream dimensions. Disable FFmpeg autorotation here; otherwise a
+    // Rawvideo has no per-frame header, so stdout is framed by the metadata's
+    // size. That size is the probe's, or the container's sample entry size
+    // when the tables were read directly; the headed runner before this one
+    // has checked the decoded frames against it (and container metadata the
+    // decoder disagreed with was re-read from the probe), so the check below
+    // only guards a stream that is not a whole number of frames. Disable
+    // FFmpeg autorotation here; otherwise a
     // display-matrix rotation can swap output width/height and corrupt framing.
     let active_decode = ActiveVideoDecode::enter_async().await;
     let mut command = ffmpeg_decode_command(decoder_threads(active_decode.count()), false);
@@ -2307,9 +2411,14 @@ struct VideoMetadata {
     /// else the container's duration (the format's before the stream's) at the
     /// frame rate; `None` when the container states neither.
     container_frames: Option<usize>,
+    /// The values were read from the container's own tables, not from the
+    /// probe tool: the size is then the muxer's stated size, which the probe
+    /// replaces with the decoder's; a headed decode that disagrees with it
+    /// sends the file back to the probe before any raw framing.
+    from_container: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct ProbedVideoInfo {
     width: Option<u32>,
     height: Option<u32>,
@@ -2320,7 +2429,23 @@ struct ProbedVideoInfo {
 }
 
 async fn probe_video_metadata(input_path: &Path) -> Result<VideoMetadata, MediaConnectorError> {
-    let info = probe_video_info(input_path).await?;
+    // The container's own tables first (an MP4 / MOV of the common shape, no
+    // process); the probe tool for every other file.
+    let path = input_path.to_path_buf();
+    let from_container = task::spawn_blocking(move || crate::mp4_metadata::read(&path))
+        .await
+        .map_err(MediaConnectorError::Blocking)?;
+    let (info, from_container) = match from_container {
+        Ok(Some(container)) => (probed_from_container(&container), true),
+        _ => (probe_video_info(input_path).await?, false),
+    };
+    video_metadata_from(info, from_container)
+}
+
+fn video_metadata_from(
+    info: ProbedVideoInfo,
+    from_container: bool,
+) -> Result<VideoMetadata, MediaConnectorError> {
     let width = info.width.ok_or_else(|| {
         MediaConnectorError::VideoDecode("ffprobe did not return video width".to_string())
     })?;
@@ -2334,10 +2459,55 @@ async fn probe_video_metadata(input_path: &Path) -> Result<VideoMetadata, MediaC
         source_fps: info.source_fps,
         total_frames: info.total_frames,
         container_frames: info.container_frames,
+        from_container,
     })
 }
 
+/// The start of the error a headed decode returns when its frames are not
+/// the metadata's size: the raw runner, which frames its output by that size,
+/// must not run on such metadata.
+const FRAME_SIZE_MISMATCH: &str = "decoded frame size";
+
+fn is_frame_size_mismatch(error: &MediaConnectorError) -> bool {
+    matches!(error, MediaConnectorError::VideoDecode(message) if message.starts_with(FRAME_SIZE_MISMATCH))
+}
+
+/// The probe's fields from the container's tables: the stream duration (the
+/// probe's first choice), the average frame rate, the sample count as the
+/// frame count the stream and the container both state.
+fn probed_from_container(container: &crate::mp4_metadata::ContainerVideoInfo) -> ProbedVideoInfo {
+    let frames = Some(container.frame_count as usize).filter(|frames| *frames > 0);
+    ProbedVideoInfo {
+        width: Some(container.width),
+        height: Some(container.height),
+        duration_seconds: container
+            .stream_duration_seconds()
+            .or_else(|| container.movie_duration_seconds()),
+        source_fps: container.frames_per_second(),
+        total_frames: frames,
+        container_frames: frames,
+    }
+}
+
+/// A test switch: on this thread the probe tool is treated as unable to run.
+#[cfg(test)]
+mod probe_switch {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static UNAVAILABLE: Cell<bool> = const { Cell::new(false) };
+    }
+}
+
 async fn probe_video_info(input_path: &Path) -> Result<ProbedVideoInfo, MediaConnectorError> {
+    #[cfg(test)]
+    {
+        if probe_switch::UNAVAILABLE.with(|off| off.get()) {
+            return Err(MediaConnectorError::VideoDecode(
+                "the probe tool is switched off for this test".to_string(),
+            ));
+        }
+    }
     let mut command = Command::new("ffprobe");
     command
         .args([
@@ -2529,8 +2699,16 @@ fn effective_sample_fps(duration_seconds: Option<f64>, cfg: VideoFetchConfig) ->
         .unwrap_or(cfg.sample_fps)
 }
 
-/// Terms ffmpeg will accept in one expression before it refuses to parse any of it.
+/// Past this many distinct frames the selection is described by a fixed-size
+/// spread expression (plus at most [`FFMPEG_SPREAD_EXTRA_TERMS`] explicit
+/// frames) when one reproduces it, instead of a list that grows with the clip:
+/// ffmpeg 5.1 refuses a list of hundreds of terms (a 451-term list fails to
+/// parse on 5.1.9; 8.0 takes it). A selection no spread describes stays a
+/// list past the cutoff and depends on the ffmpeg build.
 const FFMPEG_MAX_SELECT_TERMS: usize = 100;
+/// Explicit frames a described selection may add to its spread formula (a
+/// rate-based selection ends on the clip's last frame, one past its spread).
+const FFMPEG_SPREAD_EXTRA_TERMS: usize = 8;
 
 /// Exact source frames for an ffmpeg decode, sampled the way the OpenCV path samples.
 #[derive(Debug, Clone, PartialEq)]
@@ -2608,8 +2786,9 @@ impl FrameSelection {
 
     /// `select` over the distinct indices; `\,` keeps the filtergraph parser from splitting.
     ///
-    /// Anything over a minute or two has more frames than ffmpeg will take as a
-    /// list, so those are described instead of enumerated.
+    /// Anything over a minute or two would be a list of hundreds of terms, so
+    /// those are described instead of enumerated where a spread formula
+    /// reproduces them exactly.
     fn select_filter(&self) -> String {
         if self.unique_frames.len() > FFMPEG_MAX_SELECT_TERMS {
             if let Some(filter) = self.spread_select_filter() {
@@ -2640,6 +2819,9 @@ impl FrameSelection {
     /// computes it): `(step * last) / denom` lands on the other side of a tie
     /// for some steps, and ffmpeg evaluates in the same doubles.
     fn spread_select_filter(&self) -> Option<String> {
+        let unique: Vec<usize> = self.unique_frames.iter().map(|(index, _)| *index).collect();
+        // The picker's own spread (its steps over the whole stream), exact or
+        // with a few explicit frames beyond it.
         let last = self.total_frames.checked_sub(1).filter(|last| *last > 0)?;
         let denom = self
             .frame_indices
@@ -2649,38 +2831,49 @@ impl FrameSelection {
         let floored = |step: f64| (step * last as f64 / denom as f64).floor() as usize;
         let stride = last as f64 / denom as f64;
         let nearest_to_even = |step: f64| (step * stride).round_ties_even() as usize;
-        if self.is_described_by(last, denom, floored) {
-            return Some(format!(
-                "select='eq(n\\,floor(round(n*{denom}/{last})*{last}/{denom}))'"
-            ));
+        let floored_expr = format!("eq(n\\,floor(round(n*{denom}/{last})*{last}/{denom}))");
+        let x = format!("round(n*{denom}/{last})*({last}/{denom})");
+        let nearest_expr = format!(
+            "eq(n\\,floor({x})+gt({x}-floor({x})\\,0.5)+eq({x}-floor({x})\\,0.5)*mod(floor({x})\\,2))"
+        );
+        let floored_extra = spread_misses(&unique, last, denom, floored);
+        let nearest_extra = spread_misses(&unique, last, denom, nearest_to_even);
+        let described = match (floored_extra, nearest_extra) {
+            (Some(extra), _) if extra.is_empty() => Some((floored_expr, extra)),
+            (_, Some(extra)) if extra.is_empty() => Some((nearest_expr, extra)),
+            (Some(extra), _) => Some((floored_expr, extra)),
+            (_, Some(extra)) => Some((nearest_expr, extra)),
+            (None, None) => None,
+        };
+        // Else a selection that is an even spread of its own distinct frames
+        // plus a few trailing frames: a rate-based selection ends on the
+        // clip's last frame, one stride short of its spread. The spread is
+        // bounded to its own last frame, so no frame between it and the
+        // trailing ones is picked up.
+        let described = described.or_else(|| {
+            (1..=FFMPEG_SPREAD_EXTRA_TERMS).find_map(|drop| {
+                let kept = unique.len().checked_sub(drop).filter(|kept| *kept > 2)?;
+                let (own_last, own_denom) = (unique[kept - 1], kept - 1);
+                let own_floored =
+                    |step: f64| (step * own_last as f64 / own_denom as f64).floor() as usize;
+                let extra = spread_misses(&unique[..kept], own_last, own_denom, own_floored)?;
+                extra.is_empty().then(|| {
+                    (
+                        format!(
+                            "eq(n\\,floor(round(n*{own_denom}/{own_last})*{own_last}/{own_denom}))*lte(n\\,{own_last})"
+                        ),
+                        unique[kept..].to_vec(),
+                    )
+                })
+            })
+        });
+        let (expr, extra) = described?;
+        let mut filter = format!("select='{expr}");
+        for index in extra {
+            filter.push_str(&format!("+eq(n\\,{index})"));
         }
-        if self.is_described_by(last, denom, nearest_to_even) {
-            let x = format!("round(n*{denom}/{last})*({last}/{denom})");
-            return Some(format!(
-                "select='eq(n\\,floor({x})+gt({x}-floor({x})\\,0.5)+eq({x}-floor({x})\\,0.5)*mod(floor({x})\\,2))'"
-            ));
-        }
-        None
-    }
-
-    /// Whether `eq(n, frame_at(round(n * denom / last)))` over the stream picks
-    /// out exactly this selection's distinct frames.
-    fn is_described_by(&self, last: usize, denom: usize, frame_at: impl Fn(f64) -> usize) -> bool {
-        let step_of = |index: usize| (index as f64 * denom as f64 / last as f64).round();
-        // A fixed point is by definition something the formula produces, and the
-        // formula produces one frame per step, so the candidates are counted by
-        // the frames asked for rather than by the frames the file claims to hold.
-        // Ascending, so the last one kept is enough to skip a repeat.
-        let mut described: Vec<usize> = Vec::with_capacity(self.unique_frames.len());
-        for step in 0..=denom {
-            let index = frame_at(step as f64);
-            if described.last() != Some(&index) && frame_at(step_of(index)) == index {
-                described.push(index);
-            }
-        }
-        described
-            .iter()
-            .eq(self.unique_frames.iter().map(|(index, _)| index))
+        filter.push('\'');
+        Some(filter)
     }
 
     /// Repeat each distinct decoded frame so the result lines up with `frame_indices`.
@@ -2705,6 +2898,47 @@ impl FrameSelection {
             frame_indices: self.frame_indices.clone(),
         }
     }
+}
+
+/// The frames of `selected` (ascending) that the spread
+/// `eq(n, frame_at(round(n * denom / last)))` over the stream misses, when it
+/// misses at most [`FFMPEG_SPREAD_EXTRA_TERMS`] of them and picks no frame
+/// outside `selected`; `None` otherwise. Empty when the spread is the selection.
+fn spread_misses(
+    selected: &[usize],
+    last: usize,
+    denom: usize,
+    frame_at: impl Fn(f64) -> usize,
+) -> Option<Vec<usize>> {
+    let step_of = |index: usize| (index as f64 * denom as f64 / last as f64).round();
+    // A fixed point is by definition something the formula produces, and the
+    // formula produces one frame per step, so the candidates are counted by
+    // the frames asked for rather than by the frames the file claims to hold.
+    // Ascending, so the last one kept is enough to skip a repeat.
+    let mut described: Vec<usize> = Vec::with_capacity(selected.len());
+    for step in 0..=denom {
+        let index = frame_at(step as f64);
+        if described.last() != Some(&index) && frame_at(step_of(index)) == index {
+            described.push(index);
+        }
+    }
+    // Every described frame must be selected; the selected frames the spread
+    // misses (both lists ascending) become the explicit terms.
+    let mut extra = Vec::new();
+    let mut described = described.iter().peekable();
+    for index in selected {
+        match described.peek() {
+            Some(next) if *next == index => {
+                described.next();
+            }
+            Some(next) if *next < index => return None,
+            _ => extra.push(*index),
+        }
+    }
+    if described.next().is_some() || extra.len() > FFMPEG_SPREAD_EXTRA_TERMS {
+        return None;
+    }
+    Some(extra)
 }
 
 /// How the decoded frames become RGB, appended to every frame filter.
@@ -3096,6 +3330,87 @@ fn skip_ppm_whitespace_and_comments(bytes: &[u8], pos: &mut usize) {
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
+    /// Where the tools are installed: clips written by the encoder at several
+    /// frame rates and lengths, read through the container tables, equal the
+    /// probe tool's own report field by field (the numbers the frame
+    /// selection and the clip's sample rate are built from).
+    #[test]
+    fn container_tables_agree_with_the_probe_tool() {
+        use std::process::Command;
+        let have = |tool: &str| {
+            Command::new(tool)
+                .arg("-version")
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false)
+        };
+        if !have("ffmpeg") || !have("ffprobe") {
+            // Without the tools there is nothing to agree with; the unit tests
+            // on synthetic containers still run.
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cases = [
+            ("24", "1", "mp4"),
+            ("30000/1001", "2", "mp4"),
+            ("25", "3", "mov"),
+            ("60", "1", "mp4"),
+            ("24000/1001", "2", "mp4"),
+        ];
+        for (rate, seconds, container) in cases {
+            let path = dir.path().join(format!(
+                "clip_{}_{seconds}.{container}",
+                rate.replace('/', "_")
+            ));
+            // A codec every ffmpeg build carries; the tables under test are
+            // the container's, whichever codec fills them.
+            let encoded = Command::new("ffmpeg")
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-nostdin",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                ])
+                .arg(format!("testsrc=size=64x48:rate={rate}:duration={seconds}"))
+                .args(["-pix_fmt", "yuv420p", "-c:v", "mpeg4"])
+                .arg(&path)
+                .output()
+                .expect("ffmpeg runs");
+            assert!(
+                encoded.status.success(),
+                "ffmpeg wrote {path:?}: {}",
+                String::from_utf8_lossy(&encoded.stderr)
+            );
+            let container_info = crate::mp4_metadata::read(&path)
+                .expect("readable")
+                .unwrap_or_else(|| panic!("{path:?} not accepted by the container reader"));
+            let output = Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=width,height,duration,duration_ts,time_base,r_frame_rate,avg_frame_rate,nb_frames:format=duration",
+                    "-of",
+                    "json",
+                ])
+                .arg(&path)
+                .output()
+                .expect("ffprobe runs");
+            assert!(output.status.success());
+            let probed = parse_ffprobe_video_info(&output.stdout).expect("probe parses");
+            assert_eq!(
+                super::probed_from_container(&container_info),
+                probed,
+                "{rate} fps, {seconds} s, {container}"
+            );
+        }
+    }
 
     /// The engine's frame budget replaces only the loader-style budget: the
     /// rate-based samplers keep their rule, `0` means every frame, `None`
@@ -3205,6 +3520,7 @@ mod tests {
             source_fps: info.source_fps,
             total_frames: info.total_frames,
             container_frames: info.container_frames,
+            from_container: false,
         };
         assert_eq!(expected_sampled_frame_count(metadata, cfg), 4);
         assert_eq!(fps_filter_for_metadata(metadata, cfg), "fps=4.000000");
@@ -3766,6 +4082,7 @@ mod video_sampling_tests {
             source_fps,
             total_frames,
             container_frames: total_frames,
+            from_container: false,
         }
     }
 
@@ -3993,9 +4310,407 @@ mod video_sampling_tests {
             assert_eq!(filter, expected, "{sampling:?}");
             assert!(
                 filter.matches('+').count() < FFMPEG_MAX_SELECT_TERMS,
-                "ffmpeg refuses an expression this long as a list"
+                "a selection past the cutoff is described, not listed"
             );
         }
+    }
+
+    /// The selection run through ffmpeg itself, where it is installed: a
+    /// synthetic clip longer than the list cutoff, the filter as the crate
+    /// builds it in both of its shapes (the described spread and the explicit
+    /// list), the frames ffmpeg hands back read as the source indices they
+    /// carry, so the frames picked are the Rust selection's.
+    #[tokio::test]
+    async fn the_selection_picks_the_same_frames_through_ffmpeg() {
+        use std::process::{Command as Sync, Stdio};
+        let have = |tool: &str| {
+            Sync::new(tool)
+                .arg("-version")
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false)
+        };
+        if !have("ffmpeg") {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let total = 900usize;
+        let fps = 30.0;
+        let path = dir.path().join("clip.mkv");
+        // Frame i carries i in its pixels: sixteen 4x4 blocks, white where
+        // the bit is set, black elsewhere, kept exact by a lossless codec
+        // every ffmpeg build carries, so a decoded frame names its own index.
+        let side = 16usize;
+        let mut raw = Vec::with_capacity(total * side * side * 3);
+        for index in 0..total {
+            for y in 0..side {
+                for x in 0..side {
+                    let bit = (y / 4) * 4 + x / 4;
+                    let value = if (index >> bit) & 1 == 1 { 255u8 } else { 0u8 };
+                    raw.extend_from_slice(&[value, value, value]);
+                }
+            }
+        }
+        let mut encode = Sync::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-s",
+                "16x16",
+                "-r",
+                "30",
+                "-i",
+                "pipe:0",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "ffv1",
+            ])
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("ffmpeg runs");
+        {
+            use std::io::Write;
+            let mut stdin = encode.stdin.take().expect("ffmpeg stdin");
+            stdin.write_all(&raw).expect("frames written");
+        }
+        let encoded = encode.wait_with_output().expect("ffmpeg finishes");
+        assert!(
+            encoded.status.success(),
+            "ffmpeg encode: {}",
+            String::from_utf8_lossy(&encoded.stderr)
+        );
+        // every frame, decoded the way the selected frames are decoded
+        let mut all = ffmpeg_decode_command(2, true);
+        all.arg(&path);
+        all.args([
+            "-vf",
+            RGB_CONVERSION,
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "ppm",
+            "-pix_fmt",
+            "rgb24",
+            "pipe:1",
+        ]);
+        let all = run_video_command_output(all, "ffmpeg")
+            .await
+            .expect("full decode");
+        assert!(all.status.success());
+        let every_frame = parse_ppm_stream(&all.stdout).expect("ppm frames");
+        assert_eq!(every_frame.len(), total, "the clip holds every frame");
+        let index_of = |frame: &image::DynamicImage| -> usize {
+            let rgb = frame.to_rgb8();
+            assert_eq!((rgb.width(), rgb.height()), (16, 16));
+            (0..16u32).fold(0usize, |index, bit| {
+                let (x, y) = (bit % 4 * 4 + 2, bit / 4 * 4 + 2);
+                let bright = rgb.get_pixel(x, y)[0] > 127;
+                index | (usize::from(bright) << bit)
+            })
+        };
+        assert_eq!(
+            every_frame.iter().map(index_of).collect::<Vec<_>>(),
+            (0..total).collect::<Vec<_>>(),
+            "the clip's frames decode to their own indices, in order"
+        );
+        // The loader's spread, an exact rate spread, and a rate whose picks
+        // end on the clip's last frame (the spread plus one explicit term):
+        // all three are the described form, and all three go through ffmpeg.
+        for (label, config, extra_terms) in [
+            ("loader spread", up_to_cfg(300), 0),
+            (
+                "rate spread ending on the last frame",
+                interval_cfg(15.0, 768),
+                1,
+            ),
+            (
+                "exact rate spread",
+                VideoFetchConfig {
+                    sample_fps: 12.0,
+                    max_frames: 768,
+                    ..cfg()
+                },
+                0,
+            ),
+        ] {
+            let selection = FrameSelection::from_metadata(metadata(Some(fps), Some(total)), config)
+                .expect("frame rate and count are known");
+            assert!(
+                selection.unique_count() > FFMPEG_MAX_SELECT_TERMS,
+                "{label}: {} distinct frames are past the list limit",
+                selection.unique_count()
+            );
+            let filter = selection.select_filter();
+            assert!(
+                filter.starts_with("select='eq(n\\,floor("),
+                "{label}: described, not listed: {filter}"
+            );
+            assert_eq!(
+                filter.matches('+').count(),
+                extra_terms,
+                "{label}: explicit terms beyond the spread: {filter}"
+            );
+            let mut command = ffmpeg_decode_command(2, true);
+            command.arg(&path);
+            FfmpegFrameArgs::selected(&selection)
+                .await
+                .apply(&mut command);
+            command.args([
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "ppm",
+                "-pix_fmt",
+                "rgb24",
+                "pipe:1",
+            ]);
+            let output = run_video_command_output(command, "ffmpeg")
+                .await
+                .expect("selected decode");
+            assert!(
+                output.status.success(),
+                "{label}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let picked = parse_ppm_stream(&output.stdout).expect("ppm frames");
+            let indices: Vec<usize> = picked.iter().map(index_of).collect();
+            let expected: Vec<usize> = selection
+                .unique_frames
+                .iter()
+                .map(|(index, _)| *index)
+                .collect();
+            assert_eq!(
+                indices, expected,
+                "{label}: ffmpeg picked other frames than the selection"
+            );
+        }
+    }
+
+    /// `(offset, header length, size)` of the first `kind` box in
+    /// `bytes[start..end]`.
+    fn mp4_child(bytes: &[u8], start: usize, end: usize, kind: [u8; 4]) -> (usize, usize, usize) {
+        let mut offset = start;
+        while offset + 8 <= end {
+            let stated = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            let (size, header) = match stated {
+                1 => (
+                    u64::from_be_bytes(bytes[offset + 8..offset + 16].try_into().unwrap()) as usize,
+                    16,
+                ),
+                0 => (end - offset, 8),
+                stated => (stated as usize, 8),
+            };
+            if bytes[offset + 4..offset + 8] == kind {
+                return (offset, header, size);
+            }
+            offset += size;
+        }
+        panic!("no {} box", String::from_utf8_lossy(&kind));
+    }
+
+    /// The payload bounds of the box at the end of `kinds`, each kind
+    /// the first of its name inside the previous one.
+    fn mp4_payload(bytes: &[u8], kinds: &[[u8; 4]]) -> (usize, usize) {
+        let (mut start, mut end) = (0, bytes.len());
+        for kind in kinds {
+            let (offset, header, size) = mp4_child(bytes, start, end, *kind);
+            start = offset + header;
+            end = offset + size;
+        }
+        (start, end)
+    }
+
+    /// Writes `width` into the first track's first sample entry, the muxer's
+    /// stated size the container reader reports: a clip whose stated size is
+    /// not the decoder's.
+    fn narrow_first_sample_entry(path: &Path, width: u16) {
+        use std::fs as std_fs;
+        let mut bytes = std_fs::read(path).expect("clip bytes");
+        let (stsd, _) = mp4_payload(
+            &bytes,
+            &[*b"moov", *b"trak", *b"mdia", *b"minf", *b"stbl", *b"stsd"],
+        );
+        // After the sample description's version, flags and entry count, the
+        // first entry: its width sits 32 bytes in (the sample entry header,
+        // then the visual entry's reserved fields).
+        let entry = stsd + 8;
+        bytes[entry + 32..entry + 34].copy_from_slice(&width.to_be_bytes());
+        std_fs::write(path, bytes).expect("clip rewritten");
+    }
+
+    /// Writes a 90-degree display rotation into the first track's header
+    /// matrix, the way a phone stores a portrait recording: the rotation lives
+    /// in the container, the coded size stays what it was. Written by hand
+    /// because not every ffmpeg build turns a `rotate` tag into the matrix.
+    fn rotate_first_track(path: &Path) {
+        use std::fs as std_fs;
+        let mut bytes = std_fs::read(path).expect("clip bytes");
+        let (tkhd, _) = mp4_payload(&bytes, &[*b"moov", *b"trak", *b"tkhd"]);
+        let payload = tkhd;
+        let matrix = payload + if bytes[payload] == 1 { 52 } else { 40 };
+        let rotated: [i32; 9] = [0, 65536, 0, -65536, 0, 0, 0, 0, 1 << 30];
+        let (slots, _) = bytes[matrix..matrix + 36].as_chunks_mut::<4>();
+        for (slot, value) in slots.iter_mut().zip(rotated) {
+            *slot = value.to_be_bytes();
+        }
+        std_fs::write(path, bytes).expect("clip rewritten");
+    }
+
+    /// A one-second 64x48 clip at 24 fps written by ffmpeg into `dir`, or
+    /// `None` where the tools are not installed.
+    fn small_clip(dir: &Path, name: &str) -> Option<PathBuf> {
+        use std::process::Command as Sync;
+        let have = |tool: &str| {
+            Sync::new(tool)
+                .arg("-version")
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false)
+        };
+        if !have("ffmpeg") || !have("ffprobe") {
+            return None;
+        }
+        let path = dir.join(name);
+        let encoded = Sync::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x48:rate=24:duration=1",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "mpeg4",
+            ])
+            .arg(&path)
+            .output()
+            .expect("ffmpeg runs");
+        assert!(
+            encoded.status.success(),
+            "ffmpeg wrote the clip: {}",
+            String::from_utf8_lossy(&encoded.stderr)
+        );
+        Some(path)
+    }
+
+    /// A clip stored with a 90-degree display rotation (the portrait phone
+    /// shape) through both runners, where the tools are installed: the headed
+    /// decode autorotates and hands back the transposed size, which the size
+    /// check accepts on the first decode; the raw runner, without
+    /// autorotation, frames the coded size.
+    #[tokio::test]
+    async fn a_rotated_clip_decodes_through_both_runners() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let Some(path) = small_clip(dir.path(), "rotated.mp4") else {
+            return;
+        };
+        rotate_first_track(&path);
+        let metadata = probe_video_metadata(&path).await.expect("metadata");
+        assert_eq!(
+            (metadata.width, metadata.height),
+            (64, 48),
+            "the coded size"
+        );
+        let config = up_to_cfg(4);
+        let selection = FrameSelection::from_metadata(metadata, config)
+            .expect("frame rate and count are known");
+        let headed = decode_video_with_ffmpeg_ppm(&path, config, metadata, Some(&selection))
+            .await
+            .expect("the headed decode accepts the transposed frames");
+        assert_eq!(headed.frames.len(), selection.frame_indices.len());
+        assert_eq!((headed.frames[0].width, headed.frames[0].height), (48, 64));
+        let raw = decode_video_with_ffmpeg_raw(&path, config, metadata, Some(&selection))
+            .await
+            .expect("the raw decode frames the coded size");
+        assert_eq!(raw.frames.len(), selection.frame_indices.len());
+        assert_eq!((raw.frames[0].width, raw.frames[0].height), (64, 48));
+    }
+
+    /// A clip whose sample entry states half its width: the container path
+    /// reports that size, the headed decode fails on the frames' real size,
+    /// the probe is read, and the second headed decode returns the frames at
+    /// the probe's size.
+    #[tokio::test]
+    async fn a_container_size_the_decoder_disagrees_with_is_re_read_from_the_probe() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let Some(path) = small_clip(dir.path(), "narrow.mp4") else {
+            return;
+        };
+        narrow_first_sample_entry(&path, 32);
+        let metadata = probe_video_metadata(&path).await.expect("metadata");
+        assert!(metadata.from_container, "read from the container's tables");
+        assert_eq!(
+            (metadata.width, metadata.height),
+            (32, 48),
+            "the stated size"
+        );
+        let config = up_to_cfg(4);
+        let selection = FrameSelection::from_metadata(metadata, config)
+            .expect("frame rate and count are known");
+        let input_bytes = std::fs::metadata(&path).expect("clip size").len() as usize;
+        let decoded = decode_video_with_ffmpeg_runners(
+            &path,
+            input_bytes,
+            config,
+            Some(metadata),
+            Some(&selection),
+        )
+        .await
+        .expect("the retry on the probe's size succeeds");
+        let DecodedVideoFrames::Rgb { video, .. } = decoded else {
+            panic!("the second headed decode returns raw RGB frames");
+        };
+        assert_eq!(video.frames.len(), selection.frame_indices.len());
+        assert_eq!((video.frames[0].width, video.frames[0].height), (64, 48));
+    }
+
+    /// The same clip with the probe unable to run: the mismatch stands and
+    /// the request ends in the headed PNG runner, whose frames carry their
+    /// own size, never framed raw by the container's.
+    #[tokio::test]
+    async fn a_container_size_mismatch_with_no_probe_ends_in_the_headed_png_runner() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let Some(path) = small_clip(dir.path(), "narrow-no-probe.mp4") else {
+            return;
+        };
+        narrow_first_sample_entry(&path, 32);
+        let metadata = probe_video_metadata(&path).await.expect("metadata");
+        assert!(metadata.from_container);
+        let config = up_to_cfg(4);
+        let selection = FrameSelection::from_metadata(metadata, config)
+            .expect("frame rate and count are known");
+        let input_bytes = std::fs::metadata(&path).expect("clip size").len() as usize;
+        probe_switch::UNAVAILABLE.with(|off| off.set(true));
+        let decoded = decode_video_with_ffmpeg_runners(
+            &path,
+            input_bytes,
+            config,
+            Some(metadata),
+            Some(&selection),
+        )
+        .await;
+        probe_switch::UNAVAILABLE.with(|off| off.set(false));
+        let DecodedVideoFrames::Images { frames, .. } = decoded.expect("the headed PNG runner")
+        else {
+            panic!("a size mismatch without a probe ends in the headed PNG runner");
+        };
+        assert_eq!(frames.len(), selection.frame_indices.len());
+        assert_eq!((frames[0].width(), frames[0].height()), (64, 48));
     }
 
     #[test]
@@ -4120,16 +4835,29 @@ mod video_sampling_tests {
         assert!(checked > 8_000, "{checked} selections checked");
     }
 
+    /// A selection with no even spread in it (gaps alternating 4 and 2) keeps
+    /// the explicit list; one that is its own even spread plus a trailing
+    /// frame, which the picker's whole-stream spread misses, is described by
+    /// that spread, bounded to its last frame, plus the frame.
     #[test]
     fn a_selection_the_formula_misses_keeps_the_explicit_list() {
         let mut selection =
             FrameSelection::from_metadata(metadata(Some(30.0), Some(18_000)), cfg())
                 .expect("frame rate and count are known");
         selection.unique_frames = (0..FFMPEG_MAX_SELECT_TERMS + 1)
-            .map(|index| (index * 3, 1))
+            .map(|index| (index * 3 + index % 2, 1))
             .collect();
         assert!(selection.spread_select_filter().is_none());
         assert!(selection.select_filter().starts_with(r"select='eq(n\,0)+"));
+
+        selection.unique_frames = (0..FFMPEG_MAX_SELECT_TERMS + 1)
+            .map(|index| (index * 3, 1))
+            .collect();
+        let filter = selection.select_filter();
+        assert_eq!(
+            filter,
+            r"select='eq(n\,floor(round(n*99/297)*297/99))*lte(n\,297)+eq(n\,300)'"
+        );
     }
 
     #[test]
@@ -4714,42 +5442,283 @@ fn validate_max_long_side_pixel(value: Option<u32>) -> Result<(), MediaConnector
 /// also treats the ink values as Adobe-inverted and multiplies them the same
 /// way for plain CMYK, but its DCT and upsampling are its own and YCCK goes
 /// through its own YCbCr step, so those pixels are close to PIL's, not equal.
+/// A still WebP decodes through libwebp when it is present
+/// (`webp_native::decode_webp`, the library the reference loaders use, in
+/// the JPEG class of cost); without it, or for an animation, the `image`
+/// crate's decoder takes it, with the same pixels on the files checked.
 pub(crate) fn decode_image_bytes(
     bytes: &[u8],
     max_long_side_pixel: Option<u32>,
+    transparency: TransparencyPolicy,
 ) -> Result<image::DynamicImage, MediaConnectorError> {
     // The orientation tag is applied the way the engine's own loader applies
     // it, so a photo stored sideways reaches the model upright on both paths.
     let mut image = match crate::jpeg_turbo::decode_jpeg_rgb(bytes) {
-        Some(mut image) => {
+        Some(image) => {
             // libjpeg-turbo yields pixels only; the tag comes from the header.
-            image.apply_orientation(jpeg_orientation(bytes));
-            image
+            oriented(image, jpeg_orientation(bytes))
         }
-        None => {
-            let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
-                .with_guessed_format()
-                .map_err(MediaConnectorError::Io)?
-                .into_decoder()?;
-            // `ImageReader::decode` reserves the decoded buffer against the
-            // crate's allocation limit (512 MiB by default) before it decodes;
-            // `into_decoder` does not, so the reservation is made here. A file
-            // whose header declares more than the limit (a decompression bomb,
-            // or a JPEG the turbojpeg path handed over for its size) is refused
-            // without the allocation.
-            let mut limits = image::Limits::default();
-            limits.reserve(decoder.total_bytes())?;
-            decoder.set_limits(limits)?;
-            let orientation = decoder
-                .orientation()
-                .unwrap_or(image::metadata::Orientation::NoTransforms);
-            let mut image = image::DynamicImage::from_decoder(decoder)?;
-            image.apply_orientation(orientation);
-            image
-        }
+        None => match crate::webp_native::decode_webp(bytes) {
+            Some(image) => {
+                // libwebp yields pixels only; the tag comes from the file's
+                // metadata chunk, read as the fallback decoder reads it.
+                oriented(image, webp_orientation(bytes))
+            }
+            None => {
+                let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
+                    .with_guessed_format()
+                    .map_err(MediaConnectorError::Io)?
+                    .into_decoder()?;
+                // `ImageReader::decode` reserves the decoded buffer against the
+                // crate's allocation limit (512 MiB by default) before it
+                // decodes; `into_decoder` does not, so the reservation is made
+                // here. A file whose header declares more than the limit (a
+                // decompression bomb, or a JPEG the turbojpeg path handed over
+                // for its size) is refused without the allocation.
+                let mut limits = image::Limits::default();
+                limits.reserve(decoder.total_bytes())?;
+                decoder.set_limits(limits)?;
+                let orientation = decoder
+                    .orientation()
+                    .unwrap_or(image::metadata::Orientation::NoTransforms);
+                let image = image::DynamicImage::from_decoder(decoder)?;
+                oriented(image, orientation)
+            }
+        },
     };
+    image = narrow_sixteen_bit_colour(image);
+    // The transparency policy applies before the cap: the compositing loader
+    // flattens to RGB first and resizes after, and a resample of straight
+    // alpha would mix the stored colour of transparent pixels into their
+    // neighbours.
+    image = apply_transparency(image, bytes, transparency);
     image = apply_max_long_side_pixel(image, max_long_side_pixel);
     Ok(image)
+}
+
+/// Bring 16-bit truecolour samples down to 8 bits by their high byte, as the
+/// serving engine's own loader unpacks them (its 16-bit RGB, RGBA and LA
+/// readers keep the most significant byte of each sample). Rounding the
+/// sample instead (`v * 255 / 65535`, what the `image` crate's conversion
+/// does) lands one level higher wherever the low byte is 128 or more, and
+/// every downstream tensor differs there. 16-bit greyscale keeps its own
+/// conversion.
+fn narrow_sixteen_bit_colour(image: image::DynamicImage) -> image::DynamicImage {
+    use image::DynamicImage::{
+        ImageLumaA16, ImageLumaA8, ImageRgb16, ImageRgb8, ImageRgba16, ImageRgba8,
+    };
+    match image {
+        ImageRgb16(wide) => ImageRgb8(high_bytes(wide)),
+        ImageRgba16(wide) => ImageRgba8(high_bytes(wide)),
+        ImageLumaA16(wide) => ImageLumaA8(high_bytes(wide)),
+        other => other,
+    }
+}
+
+/// The high byte of every sample; the pixel layout is unchanged, so the
+/// narrow pixel type must have the wide one's channel count.
+fn high_bytes<Wide, Narrow>(
+    image: image::ImageBuffer<Wide, Vec<u16>>,
+) -> image::ImageBuffer<Narrow, Vec<u8>>
+where
+    Wide: image::Pixel<Subpixel = u16>,
+    Narrow: image::Pixel<Subpixel = u8>,
+{
+    let (width, height) = image.dimensions();
+    let bytes: Vec<u8> = image
+        .into_raw()
+        .into_iter()
+        .map(|sample| (sample >> 8) as u8)
+        .collect();
+    #[expect(
+        clippy::expect_used,
+        reason = "the same pixel and channel count as the 16-bit buffer"
+    )]
+    image::ImageBuffer::from_raw(width, height, bytes).expect("buffer matches image dimensions")
+}
+
+#[cfg(test)]
+mod sixteen_bit_colour_tests {
+    use super::*;
+
+    #[test]
+    fn truecolour_samples_keep_their_high_byte() {
+        // Low bytes of 128 and more are where rounding would land one higher.
+        let wide = image::ImageBuffer::<image::Rgb<u16>, Vec<u16>>::from_raw(
+            2,
+            1,
+            vec![0x0080, 0x00FF, 0x8080, 0xFF7F, 0x0100, 0xFFFF],
+        )
+        .expect("2x1 RGB16");
+        match narrow_sixteen_bit_colour(image::DynamicImage::ImageRgb16(wide)) {
+            image::DynamicImage::ImageRgb8(narrow) => {
+                assert_eq!(narrow.as_raw(), &[0, 0, 0x80, 0xFF, 1, 0xFF]);
+            }
+            other => panic!("expected RGB8, got {:?}", other.color()),
+        }
+    }
+
+    #[test]
+    fn alpha_samples_are_narrowed_the_same_way() {
+        let wide =
+            image::ImageBuffer::<image::LumaA<u16>, Vec<u16>>::from_raw(1, 1, vec![0x1234, 0xFF80])
+                .expect("1x1 LA16");
+        match narrow_sixteen_bit_colour(image::DynamicImage::ImageLumaA16(wide)) {
+            image::DynamicImage::ImageLumaA8(narrow) => assert_eq!(narrow.as_raw(), &[0x12, 0xFF]),
+            other => panic!("expected LA8, got {:?}", other.color()),
+        }
+    }
+
+    #[test]
+    fn other_depths_pass_through_untouched() {
+        let grey = image::DynamicImage::new_luma16(2, 2);
+        assert!(matches!(
+            narrow_sixteen_bit_colour(grey),
+            image::DynamicImage::ImageLuma16(_)
+        ));
+        let rgb = image::DynamicImage::new_rgb8(2, 2);
+        assert!(matches!(
+            narrow_sixteen_bit_colour(rgb),
+            image::DynamicImage::ImageRgb8(_)
+        ));
+    }
+}
+
+/// The decoded image under `policy` (see [`TransparencyPolicy`]): as it is
+/// without an alpha channel; with one, composited over opaque white, reduced
+/// to its stored colour, or kept. The composite is the compositing loader's:
+/// per channel `out = (src * a + 255 * (255 - a) + 127) / 255`, the integer
+/// paste-through-mask blend (exact rounding of the real blend, checked
+/// against the reference for every value and alpha), and a truecolour PNG
+/// whose `tRNS` chunk names a colour key keeps its stored RGB, as that loader
+/// returns such an image (its mode is already RGB, the key never becomes
+/// alpha) while the decoder here expands the key into an alpha channel.
+/// `bytes` is the encoded image the pixels came from.
+pub(crate) fn apply_transparency(
+    image: image::DynamicImage,
+    bytes: &[u8],
+    policy: TransparencyPolicy,
+) -> image::DynamicImage {
+    if !image.color().has_alpha() {
+        return image;
+    }
+    match policy {
+        TransparencyPolicy::KeepAlpha => image,
+        TransparencyPolicy::DropAlpha => image::DynamicImage::ImageRgb8(image.to_rgb8()),
+        TransparencyPolicy::CompositeOverWhite => {
+            if png_colour_type(bytes) == Some(PNG_COLOUR_TYPE_TRUECOLOUR) {
+                return image::DynamicImage::ImageRgb8(image.to_rgb8());
+            }
+            let composited = match image {
+                image::DynamicImage::ImageRgba8(rgba) => composite_over_white(&rgba),
+                other => composite_over_white(&other.to_rgba8()),
+            };
+            image::DynamicImage::ImageRgb8(composited)
+        }
+    }
+}
+
+/// The eight-byte PNG signature.
+const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+/// PNG colour type 2: truecolour without an alpha channel.
+const PNG_COLOUR_TYPE_TRUECOLOUR: u8 = 2;
+
+/// The colour type from a PNG's IHDR chunk; `None` for any other container.
+fn png_colour_type(bytes: &[u8]) -> Option<u8> {
+    let is_png = bytes.starts_with(&PNG_SIGNATURE) && bytes.get(12..16) == Some(&b"IHDR"[..]);
+    if is_png {
+        bytes.get(25).copied()
+    } else {
+        None
+    }
+}
+
+/// Composite straight-alpha RGBA over opaque white with the reference's
+/// integer blend, `(src * a + 255 * (255 - a) + 127) / 255` per channel.
+fn composite_over_white(rgba: &image::RgbaImage) -> image::RgbImage {
+    let (width, height) = rgba.dimensions();
+    let mut out = Vec::with_capacity(width as usize * height as usize * 3);
+    for px in rgba.as_raw().as_chunks::<4>().0 {
+        let alpha = u32::from(px[3]);
+        let white = 255 * (255 - alpha) + 127;
+        out.extend_from_slice(&[
+            ((u32::from(px[0]) * alpha + white) / 255) as u8,
+            ((u32::from(px[1]) * alpha + white) / 255) as u8,
+            ((u32::from(px[2]) * alpha + white) / 255) as u8,
+        ]);
+    }
+    #[expect(
+        clippy::expect_used,
+        reason = "out holds exactly width * height * 3 bytes by construction"
+    )]
+    image::RgbImage::from_raw(width, height, out).expect("buffer matches image dimensions")
+}
+
+#[cfg(test)]
+mod transparency_tests {
+    use super::*;
+
+    #[test]
+    fn png_colour_type_comes_from_the_header_alone() {
+        let mut png = PNG_SIGNATURE.to_vec();
+        png.extend_from_slice(&[0, 0, 0, 13]);
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0]);
+        assert_eq!(png_colour_type(&png), Some(PNG_COLOUR_TYPE_TRUECOLOUR));
+        assert_eq!(png_colour_type(&png[..20]), None);
+        assert_eq!(png_colour_type(b"RIFF\0\0\0\0WEBPVP8 "), None);
+    }
+
+    #[test]
+    fn the_blend_is_the_reference_loader_s() {
+        // Pillow's paste through the alpha mask over (255, 255, 255).
+        let rgba = image::RgbaImage::from_raw(
+            4,
+            1,
+            vec![
+                10, 20, 30, 255, 10, 20, 30, 0, 10, 20, 30, 128, 200, 100, 0, 1,
+            ],
+        )
+        .expect("4x1 RGBA");
+        let rgb = composite_over_white(&rgba);
+        assert_eq!(
+            rgb.as_raw(),
+            &[10, 20, 30, 255, 255, 255, 132, 137, 142, 255, 254, 254]
+        );
+    }
+
+    #[test]
+    fn opaque_images_pass_through_untouched() {
+        for policy in [
+            TransparencyPolicy::KeepAlpha,
+            TransparencyPolicy::CompositeOverWhite,
+            TransparencyPolicy::DropAlpha,
+        ] {
+            let grey = image::DynamicImage::new_luma8(2, 2);
+            assert!(matches!(
+                apply_transparency(grey, &[], policy),
+                image::DynamicImage::ImageLuma8(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn each_policy_treats_a_transparent_pixel_its_own_way() {
+        let rgba = || {
+            image::DynamicImage::ImageRgba8(
+                image::RgbaImage::from_raw(2, 1, vec![0, 0, 0, 0, 10, 20, 30, 255])
+                    .expect("2x1 RGBA"),
+            )
+        };
+        let white = apply_transparency(rgba(), &[], TransparencyPolicy::CompositeOverWhite);
+        assert_eq!(white.to_rgb8().as_raw(), &[255, 255, 255, 10, 20, 30]);
+        assert!(!white.color().has_alpha());
+        let dropped = apply_transparency(rgba(), &[], TransparencyPolicy::DropAlpha);
+        assert_eq!(dropped.to_rgb8().as_raw(), &[0, 0, 0, 10, 20, 30]);
+        assert!(!dropped.color().has_alpha());
+        let kept = apply_transparency(rgba(), &[], TransparencyPolicy::KeepAlpha);
+        assert!(kept.color().has_alpha());
+    }
 }
 
 /// The dimensions the decode will produce, from the header alone (after the
@@ -4781,6 +5750,15 @@ pub(crate) fn encoded_image_size(
 /// unreadable metadata means no transform.
 fn jpeg_orientation(bytes: &[u8]) -> image::metadata::Orientation {
     JpegDecoder::new(std::io::Cursor::new(bytes))
+        .and_then(|mut decoder| decoder.orientation())
+        .unwrap_or(image::metadata::Orientation::NoTransforms)
+}
+
+/// The orientation tag of a WebP file, from its metadata chunk, as the
+/// `image` crate's decoder reads it (`NoTransforms` when there is none or
+/// the header does not parse).
+fn webp_orientation(bytes: &[u8]) -> image::metadata::Orientation {
+    WebPDecoder::new(std::io::Cursor::new(bytes))
         .and_then(|mut decoder| decoder.orientation())
         .unwrap_or(image::metadata::Orientation::NoTransforms)
 }
@@ -4861,7 +5839,7 @@ mod exif_orientation_tests {
         let bytes = jpeg_with_orientation(6);
         let size = encoded_image_size(&bytes, None).expect("size");
         assert_eq!((size.width, size.height), (2, 4));
-        let img = decode_image_bytes(&bytes, None).expect("decode");
+        let img = decode_image_bytes(&bytes, None, TransparencyPolicy::KeepAlpha).expect("decode");
         assert_eq!(img.dimensions(), (2, 4));
         assert!(is_red(img.get_pixel(0, 0)) && is_red(img.get_pixel(1, 0)));
         assert!(is_blue(img.get_pixel(0, 3)) && is_blue(img.get_pixel(1, 3)));
@@ -4873,14 +5851,14 @@ mod exif_orientation_tests {
         let bytes = jpeg_with_orientation(2);
         let size = encoded_image_size(&bytes, None).expect("size");
         assert_eq!((size.width, size.height), (4, 2));
-        let img = decode_image_bytes(&bytes, None).expect("decode");
+        let img = decode_image_bytes(&bytes, None, TransparencyPolicy::KeepAlpha).expect("decode");
         assert!(is_blue(img.get_pixel(0, 0)) && is_red(img.get_pixel(3, 0)));
     }
 
     #[test]
     fn an_upright_jpeg_and_a_png_are_left_alone() {
         let bytes = jpeg_with_orientation(1);
-        let img = decode_image_bytes(&bytes, None).expect("decode");
+        let img = decode_image_bytes(&bytes, None, TransparencyPolicy::KeepAlpha).expect("decode");
         assert_eq!(img.dimensions(), (4, 2));
         assert!(is_red(img.get_pixel(0, 0)) && is_blue(img.get_pixel(3, 0)));
 
@@ -4889,7 +5867,9 @@ mod exif_orientation_tests {
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .expect("png");
         assert_eq!(
-            decode_image_bytes(&png, None).expect("decode").dimensions(),
+            decode_image_bytes(&png, None, TransparencyPolicy::KeepAlpha)
+                .expect("decode")
+                .dimensions(),
             (4, 2)
         );
         let size = encoded_image_size(&png, None).expect("size");
@@ -4951,6 +5931,45 @@ mod max_long_side_pixel_tests {
         // The cap only ever removes resolution; it must not upscale.
         let original = apply_max_long_side_pixel(image(200, 100), Some(1008));
         assert_eq!((original.width(), original.height()), (200, 100));
+    }
+
+    #[test]
+    fn a_fetched_frame_carries_its_policy_in_its_hash() {
+        let rgba =
+            image::RgbaImage::from_raw(2, 1, vec![0, 0, 0, 0, 10, 20, 30, 255]).expect("2x1");
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("png");
+        let frame = |policy| {
+            MediaConnector::decode_image(
+                Bytes::from(png.clone()),
+                ImageDetail::Auto,
+                None,
+                policy,
+                ImageSource::InlineBytes,
+            )
+            .expect("decodes")
+        };
+        let keep = frame(TransparencyPolicy::KeepAlpha);
+        let white = frame(TransparencyPolicy::CompositeOverWhite);
+        assert_eq!(keep.transparency(), TransparencyPolicy::KeepAlpha);
+        assert_eq!(white.transparency(), TransparencyPolicy::CompositeOverWhite);
+        assert_eq!(keep.hash, crate::hasher::hash_image(&png));
+        assert_eq!(
+            white.hash,
+            crate::hasher::hash_image_with_transparency(
+                &png,
+                None,
+                TransparencyPolicy::CompositeOverWhite
+            )
+        );
+        assert_ne!(keep.hash, white.hash);
+        assert!(keep.image().expect("decode").color().has_alpha());
+        assert_eq!(
+            white.image().expect("decode").to_rgb8().as_raw(),
+            &[255, 255, 255, 10, 20, 30]
+        );
     }
 
     #[test]
@@ -5367,7 +6386,7 @@ mod decode_limit_tests {
     fn a_decoded_size_over_the_allocation_limit_is_refused_before_the_allocation() {
         // 30000 x 30000 x 3 = 2.7 GB declared by a 70-byte file.
         let bomb = png_declaring(30_000);
-        match decode_image_bytes(&bomb, None) {
+        match decode_image_bytes(&bomb, None, TransparencyPolicy::KeepAlpha) {
             Err(MediaConnectorError::Image(image::ImageError::Limits(_))) => {}
             other => panic!("expected the crate's limit error, got {other:?}"),
         }
@@ -5383,7 +6402,7 @@ mod decode_limit_tests {
         image::RgbImage::from_pixel(3, 2, image::Rgb([10, 20, 30]))
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .expect("encode");
-        let image = decode_image_bytes(&png, None).expect("decode");
+        let image = decode_image_bytes(&png, None, TransparencyPolicy::KeepAlpha).expect("decode");
         assert_eq!((image.width(), image.height()), (3, 2));
     }
 }

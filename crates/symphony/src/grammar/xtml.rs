@@ -19,7 +19,8 @@
 //! boolean is JSON `true` or `false`; `null` is the word. A property the schema leaves untyped, or
 //! one whose `$ref` points at nothing, keeps its key but takes any type and any value; a schema
 //! without properties takes any number of such arguments. The engine then accepts exactly what
-//! the XTML assembler reads ([`tagged::xtml`](crate::tagged::xtml)).
+//! the attributed assembler reads with Kimi's tags
+//! ([`tagged::attributed`](crate::tagged::attributed)).
 
 use openai_protocol::common::Tool;
 use serde_json::Value;

@@ -8,51 +8,8 @@
 //! compose; `const_string`, `any_text`, `regex` and `json_schema` as leaves. [`Grammar::to_json`]
 //! writes it as the engine reads it, and [`Grammar::payload`] wraps it as the request carries it.
 //!
-//! [`Format::grammar`] derives the tree from the table. A region of the table (a call, a block of
-//! calls, the thought, the answer) is opened by the terminal of a row into its state and closed
-//! by the terminal of a row back to a state it is entered from; the terminal every state has a
-//! row for is the end of the turn, which ends whatever is open and closes no region of its own.
-//! So the call markers are the rows into and out of the arguments state, the block markers the
-//! rows into and out of the wrapper state the calls sit in, and the thought's close the row from
-//! the reasoning state back to where the thought opened; the request's tools give each call its
-//! name and schema. What the syntax inside the markers constrains comes from the call syntax: a
-//! JSON object around each tool's schema for the JSON family; the engines' `glm_xml` style of a
-//! schema for keyed arguments in the compact spelling, and the table's own tags written one pair
-//! per property for Ling's newlines and Hy4's suffixed tags (the `keyed` module); `<function=`
-//! and `<parameter=` tags, one per property, for Qwen 3.5's and Seed-OSS's tagged syntax (the
-//! `tagged` module); a tag grammar per parameter for DSML; for Kimi K3's XTML, one argument tag
-//! per property of the schema (the `xtml` module); `<invoke name="…">` blocks of `<parameter
-//! name="…">` tags for MiniMax M2 (the `attributed` module); Python calls, one per line or as a
-//! list, each value in the template's spelling, for Olmo 3 and LFM2.5 (the `pythonic` module);
-//! xLAM's bare list of JSON objects, written from the tools alone since its table has no markers;
-//! for MiniMax M3, the XML tree of elements with the table's separator before every tag (the
-//! `xml` module); Gemma 4's `call:NAME{key:value}` spelling, the keys sorted and each string
-//! between `<|"|>` tokens (the `gemma` module); for Inkling, the call marker and a JSON object
-//! whose `args` the schema accepts, wherever the marker stands in a message. The gateway's old
-//! parsers wrote these tags by hand, one function per parser;
-//! where one exists for a format Symphony has, the derived tag is pinned to it in the tests, so
-//! the switch changes nothing an engine sees.
-//!
-//! With the prompt's reasoning still open, the tag is wrapped in a prefix: free text that can
-//! write none of the table's markers but the thought's own, nor the call syntax's inner tags,
-//! with nothing owed at its end, so the forced call follows the reasoning instead of replacing
-//! it, as the gateway's `wrap_in_reasoning_prefix` does. The text is the thought and its close
-//! where the engine applies the grammar from the first token, and a newline or nothing where
-//! the engine runs a reasoning parser and applies the grammar only after the model's own close;
-//! a prefix the thought's close ended would be owed a second time there, and the model would
-//! fill the gap with a fabricated observation and answer. A table without a thought has nothing
-//! to wrap, and the tag comes back as it is; a thought that does not close back to where it
-//! opened has no prefix yet, and the table gives `None` rather than a tag the model could write
-//! inside its thought. Kimi
-//! K3's tag takes no prefix: the block of calls can be entered from the turn itself, from the
-//! thought or from the answer, and the tag has one way in per state: from a region with a close
-//! of its own, that close and then the row into the block from where the close returns; from any
-//! other state, its own row into the block. So the model closes whatever the prompt left open on
-//! its way to the calls, whichever that was.
-//!
-//! Inkling's named JSON takes the tag the gateway's old Inkling parser writes, the call marker its
-//! trigger inside whatever message the model is writing. A table without calls gives `None`, and
-//! the gateway takes the JSON-schema path for it.
+//! [`Format::grammar`] derives the tree from the table's rows and the request's tools, one spelling
+//! per call syntax. Notes on how, and on what it leaves open: `docs/grammar.md`.
 
 use openai_protocol::common::Tool;
 use serde_json::{json, Value};
@@ -60,7 +17,7 @@ use serde_json::{json, Value};
 use crate::{
     format::{CallSyntax, Emits, Format},
     gemma::STRING as GEMMA_STRING,
-    tagged::{assembler::TAGS as TAGGED_TAGS, dsml, keyed::Tags as KeyedTags},
+    tagged::{assembler::TAGS as TAGGED_TAGS, attributed::Typing, keyed::Tags as KeyedTags},
 };
 
 mod attributed;
@@ -332,17 +289,19 @@ impl Format {
             CallSyntax::Keyed(tags) if *tags == KeyedTags::PLAIN => {
                 Self::keyed_calls(markers?, &named, at_least_one)
             }
-            CallSyntax::Dsml => Self::dsml_calls(markers?, &named, at_least_one)?,
-            CallSyntax::Attributed(tags) => attributed::calls(markers?, tags, &named, at_least_one),
+            // XTML's grammar is its own: the block's ways in come from the table.
+            CallSyntax::Attributed(tags) if tags.typing == Typing::TypeAttribute => {
+                let markers = markers?;
+                let ways_in = self.ways_into(markers.block.as_ref()?.state);
+                return xtml::calls(markers, &ways_in, &named, at_least_one);
+            }
+            CallSyntax::Attributed(tags) => {
+                attributed::calls(markers?, tags, &named, at_least_one)?
+            }
             CallSyntax::Keyed(tags) => {
                 let markers = markers?;
                 let ways_in = self.ways_into_block(markers);
                 keyed::calls(markers, &ways_in, tags, &named, at_least_one)
-            }
-            CallSyntax::Xtml => {
-                let markers = markers?;
-                let ways_in = self.ways_into(markers.block.as_ref()?.state);
-                return xtml::calls(markers, &ways_in, &named, at_least_one);
             }
             CallSyntax::Tagged(spelling, _) => {
                 let markers = markers?;
@@ -368,7 +327,8 @@ impl Format {
         };
         // The thought's own markers stay writable: the model closes its thought inside the
         // prefix where the engine applies the grammar from the first token, and an engine that
-        // runs a reasoning parser has consumed them before the grammar starts.
+        // runs a reasoning parser has consumed them before the grammar starts. XTML's tag never
+        // comes this far: it closes the thought on its own way into the block.
         let thought = self.region(reasoning, |state| self.is_call_state(state))?;
         let mut excludes: Vec<String> = self
             .terminal_texts()
@@ -382,7 +342,6 @@ impl Format {
                 tags.value_open,
                 tags.value_close,
             ],
-            Some(CallSyntax::Dsml) => &[dsml::PARAMETER_OPEN, dsml::PARAMETER_CLOSE],
             Some(CallSyntax::Attributed(tags)) => &[tags.parameter_open, tags.parameter_close],
             Some(CallSyntax::Tagged(..)) => &TAGGED_TAGS,
             Some(CallSyntax::Gemma) => &[GEMMA_STRING],
@@ -538,66 +497,6 @@ impl Format {
             tags,
             at_least_one,
         }
-    }
-
-    /// DSML: the calls block, inside it one invoke per call, inside an invoke any number of
-    /// parameter tags whose `string` attribute types the value (`true`: any text up to a closing
-    /// tag; `false`: any JSON value), with the template's newlines; the shape the gateway writes
-    /// for DeepSeek V4.1 today. The block follows the template's two newlines.
-    fn dsml_calls(
-        markers: &CallMarkers<'_>,
-        tools: &[&Tool],
-        at_least_one: bool,
-    ) -> Option<Grammar> {
-        let block = markers.block.as_ref()?;
-        let (block_open, block_close) = (block.open, block.close);
-        let parameter_close = dsml::PARAMETER_CLOSE;
-        let parameter = Grammar::Tag(Tag::new(
-            dsml::PARAMETER_OPEN,
-            Grammar::Sequence(vec![
-                Grammar::Regex("[^\"]+".to_string()),
-                Grammar::ConstString("\" string=\"".to_string()),
-                Grammar::Or(vec![
-                    Grammar::Sequence(vec![
-                        Grammar::ConstString("true\">".to_string()),
-                        Grammar::AnyText {
-                            excludes: vec![
-                                parameter_close.to_string(),
-                                markers.call_close.to_string(),
-                                block_close.to_string(),
-                            ],
-                        },
-                    ]),
-                    Grammar::Sequence(vec![
-                        Grammar::ConstString("false\">".to_string()),
-                        Grammar::JsonSchema {
-                            schema: Value::Bool(true),
-                            style: None,
-                        },
-                    ]),
-                ]),
-            ]),
-            format!("{parameter_close}\n"),
-        ));
-        let invokes = tools
-            .iter()
-            .map(|tool| {
-                Tag::new(
-                    format!("{}{}\">\n", markers.call_open, tool.function.name),
-                    Grammar::Star(Box::new(parameter.clone())),
-                    format!("{}\n", markers.call_close),
-                )
-            })
-            .collect();
-        Some(Grammar::Sequence(vec![
-            Grammar::ConstString(format!("\n\n{block_open}\n")),
-            Grammar::TagsWithSeparator {
-                tags: invokes,
-                separator: String::new(),
-                at_least_one,
-            },
-            Grammar::ConstString(block_close.to_string()),
-        ]))
     }
 
     /// The text the table drops wherever it stands, which the template writes before every tag
@@ -758,7 +657,7 @@ mod tests {
     use serde_json::json as value;
 
     use super::*;
-    use crate::formats;
+    use crate::{formats, tagged::attributed::Tags as AttributedTags};
 
     fn tool(name: &str, strict: Option<bool>, parameters: Value) -> Tool {
         Tool {
@@ -955,7 +854,7 @@ mod tests {
         assert!(into_the_block(CallSyntax::Json)
             .grammar(&tools, true, true)
             .is_none());
-        let as_xtml = into_the_block(CallSyntax::Xtml)
+        let as_xtml = into_the_block(CallSyntax::Attributed(AttributedTags::XTML))
             .grammar(&tools, true, true)
             .expect("a grammar")
             .payload();
@@ -989,7 +888,7 @@ mod tests {
             .transition("calls", "call_open", "call")
             .transition("call", "call_close", "calls")
             .transition("calls", "calls_close", "reasoning")
-            .calls(CallSyntax::Xtml);
+            .calls(CallSyntax::Attributed(AttributedTags::XTML));
         let payload = mid_thought
             .grammar(&weather_tools(), true, true)
             .expect("a grammar")
@@ -1008,7 +907,7 @@ mod tests {
         // row they share makes one way in.
         let tools = weather_tools();
         let as_xtml = formats::minimax_m3()
-            .calls(CallSyntax::Xtml)
+            .calls(CallSyntax::Attributed(AttributedTags::XTML))
             .grammar(&tools, true, true)
             .expect("a grammar")
             .payload();
@@ -1057,12 +956,12 @@ mod tests {
                 .calls(syntax)
         };
         let tools = weather_tools();
-        let as_dsml = two_doors(CallSyntax::Dsml)
+        let as_dsml = two_doors(CallSyntax::Attributed(AttributedTags::DSML))
             .grammar(&tools, true, false)
             .expect("a grammar")
             .payload();
         assert_eq!(as_dsml["format"]["elements"][0]["value"], "\n\n<calls>\n");
-        let as_xtml = two_doors(CallSyntax::Xtml)
+        let as_xtml = two_doors(CallSyntax::Attributed(AttributedTags::XTML))
             .grammar(&tools, true, false)
             .expect("a grammar")
             .payload();
@@ -1116,7 +1015,7 @@ mod tests {
         for (from, on, to) in rows.iter().rev() {
             reversed = reversed.transition(from, on, to);
         }
-        let reversed = reversed.calls(CallSyntax::Xtml);
+        let reversed = reversed.calls(CallSyntax::Attributed(AttributedTags::XTML));
         let tools = weather_tools();
         assert_eq!(
             reversed.grammar(&tools, true, true),
@@ -1135,7 +1034,7 @@ mod tests {
             .terminal("calls_open", "<｜DSML｜ calls>")
             .terminal("calls_close", "</｜DSML｜ calls>")
             .terminal("invoke_open", "<｜DSML｜ invoke name=\"")
-            .terminal("invoke_close", dsml::INVOKE_CLOSE)
+            .terminal("invoke_close", AttributedTags::DSML.invoke_close)
             .state("content", Emits::Content)
             .state("reasoning", Emits::Reasoning)
             .state("calls", Emits::Wrapper)
@@ -1149,7 +1048,7 @@ mod tests {
             .transition("invoke", "invoke_close", "calls")
             .transition("invoke", "invoke_open", "invoke")
             .transition("calls", "calls_close", "content")
-            .calls(CallSyntax::Dsml);
+            .calls(CallSyntax::Attributed(AttributedTags::DSML));
         let tools = weather_tools();
         assert_eq!(
             swapped.grammar(&tools, true, true),

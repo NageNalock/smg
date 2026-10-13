@@ -50,47 +50,86 @@ use smg::{
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
 use smg_mesh::{MTLSConfig, MeshServerConfig};
 
-/// Parse repeated `<flag> <url> [bootstrap_port|none]` occurrences into
-/// (url, optional bootstrap port) pairs. The trailing port is optional, so
-/// these flags are hand-parsed (clap cannot express the optional positional)
-/// and stripped from argv before `Cli::parse_from`.
-fn parse_url_port_args(flag: &str) -> Vec<(String, Option<u16>)> {
-    let args: Vec<String> = std::env::args().collect();
+/// The command line as the gateway reads it, before clap sees it: the
+/// `--prefill <url> [bootstrap_port|none]` and `--encode <url>
+/// [bootstrap_port|none]` occurrences are hand-parsed (clap cannot express
+/// the optional trailing port) and stripped from the arguments clap parses.
+struct CommandLine {
+    /// argv without the `--prefill` / `--encode` occurrences and their values.
+    clap_args: Vec<String>,
+    prefill_urls: Vec<(String, Option<u16>)>,
+    encode_urls: Vec<(String, Option<u16>)>,
+}
+
+impl CommandLine {
+    /// Split `args` (argv, the program name first). Each url list is what
+    /// [`parse_url_port_args`] reads for its flag over the whole of `args`,
+    /// independently of the other flag; `clap_args` is `args` with every
+    /// `<flag> <url> [port|none]` run removed by the same token rule, so a
+    /// flag given without a url (last on the line) reaches clap, which
+    /// refuses it as unexpected.
+    fn split(args: &[String]) -> Self {
+        Self {
+            clap_args: strip_url_port_args(args),
+            prefill_urls: parse_url_port_args(args, "--prefill"),
+            encode_urls: parse_url_port_args(args, "--encode"),
+        }
+    }
+}
+
+/// Whether the token after a `--prefill` / `--encode` url is its optional
+/// bootstrap port: a port number or `none` (any case). Another flag, or a
+/// url, is not consumed.
+fn is_bootstrap_port_token(token: &str) -> bool {
+    !token.starts_with("--") && (token.parse::<u16>().is_ok() || token.to_lowercase() == "none")
+}
+
+/// Parse the repeated `<flag> <url> [bootstrap_port|none]` occurrences of
+/// `args` into (url, optional bootstrap port) pairs; `none` and an absent
+/// port both read as `None`.
+fn parse_url_port_args(args: &[String], flag: &str) -> Vec<(String, Option<u16>)> {
     let mut entries = Vec::new();
     let mut i = 0;
-
     while i < args.len() {
         if args[i] == flag && i + 1 < args.len() {
             let url = args[i + 1].clone();
-            let bootstrap_port = if i + 2 < args.len() && !args[i + 2].starts_with("--") {
-                if let Ok(port) = args[i + 2].parse::<u16>() {
-                    i += 1;
-                    Some(port)
-                } else if args[i + 2].to_lowercase() == "none" {
-                    i += 1;
-                    None
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+            let mut bootstrap_port = None;
+            if args
+                .get(i + 2)
+                .is_some_and(|token| is_bootstrap_port_token(token))
+            {
+                bootstrap_port = args[i + 2].parse::<u16>().ok();
+                i += 1;
+            }
             entries.push((url, bootstrap_port));
             i += 2;
         } else {
             i += 1;
         }
     }
-
     entries
 }
 
-fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
-    parse_url_port_args("--prefill")
-}
-
-fn parse_encode_args() -> Vec<(String, Option<u16>)> {
-    parse_url_port_args("--encode")
+/// `args` without the `--prefill` / `--encode` occurrences and their url and
+/// optional port, by the token rule of [`parse_url_port_args`].
+fn strip_url_port_args(args: &[String]) -> Vec<String> {
+    let mut kept = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if (args[i] == "--prefill" || args[i] == "--encode") && i + 1 < args.len() {
+            i += 2;
+            if args
+                .get(i)
+                .is_some_and(|token| is_bootstrap_port_token(token))
+            {
+                i += 1;
+            }
+        } else {
+            kept.push(args[i].clone());
+            i += 1;
+        }
+    }
+    kept
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -257,6 +296,16 @@ fn parse_job_queue_concurrency(value: &str) -> Result<usize, String> {
     parse_usize_in_range(value, 100_000)
 }
 
+// clap renders `--help` by `help_heading`: the headings in first-use order,
+// the fields of a heading in declaration order, so a heading's fields need
+// not be contiguous below; a field's doc comment is its help text. The second
+// spellings, each a `visible_alias` of its field and mirrored by the Python
+// launcher's `RouterArgs`: --cache-match-threshold (--cache-threshold),
+// --spill-abs-threshold (--balance-abs-threshold), --spill-rel-threshold
+// (--balance-rel-threshold), --sticky-key-idle-secs (--max-idle-secs),
+// --sticky-sessions (--routing-key-override) and --worker-auto-recovery
+// (--remove-unhealthy-workers); the hidden ones: --model (--model-path),
+// --runtime (--backend), and `start` for the `launch` subcommand.
 #[derive(Parser, Debug)]
 struct CliArgs {
     // ==================== Worker Configuration ====================
@@ -991,7 +1040,9 @@ struct CliArgs {
     token_dump_max_mb: u64,
 
     // ==================== Request Handling ====================
-    /// Custom HTTP headers to check for request IDs
+    /// Custom HTTP headers to check for request IDs. The first one present
+    /// is honoured when its value is 1 to 128 visible-ASCII characters;
+    /// otherwise a fresh id is generated
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
     request_id_headers: Vec<String>,
 
@@ -1082,7 +1133,9 @@ struct CliArgs {
     #[arg(long, default_value_t = 90, help_heading = "Request Handling")]
     idle_connection_timeout_secs: u64,
 
-    /// CORS allowed origins
+    /// Origins a browser may call the gateway from (exact origins,
+    /// space-separated), or `*` alone for any origin. Without this flag the
+    /// gateway makes no cross-origin allowance
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
     cors_allowed_origins: Vec<String>,
 
@@ -2139,12 +2192,13 @@ impl CliArgs {
         let pool_max = self.redis_pool_max_size.unwrap_or(16);
 
         let retention_days = match self.redis_retention_days {
-            Some(d) if d < 0 => None, // Persistent
-            // A retention of 0 days would expire every record as it is written.
-            Some(0) => {
+            Some(-1) => None, // Persistent
+            // A retention of 0 days would expire every record as it is
+            // written; -1 is the one spelling of persistent records.
+            Some(d) if d <= 0 => {
                 return Err(ConfigError::InvalidValue {
                     field: "redis_retention_days".to_string(),
-                    value: "0".to_string(),
+                    value: d.to_string(),
                     reason: "Must be at least 1 (-1 keeps records persistent)".to_string(),
                 });
             }
@@ -2167,50 +2221,23 @@ impl CliArgs {
         Ok(rcf)
     }
 
-    /// The flags whose value has a required shape, refused by name when the
-    /// shape is wrong: a wrong shape used to be dropped or passed on in
-    /// silence, which narrowed a security policy or broke a health policy
-    /// without a word.
+    /// The flags whose value has a required shape and whose raw form never
+    /// reaches `RouterConfig`, refused by name when the shape is wrong: a
+    /// wrong shape used to be dropped or passed on in silence. The shapes of
+    /// the fields `RouterConfig` carries (the CORS origins, the health-check
+    /// endpoint, the request-id header names, the storage-context header
+    /// names, an empty API key) are checked by `ConfigValidator`, on every
+    /// construction path.
     fn validate_flag_formats(&self) -> ConfigResult<()> {
         let invalid = |field: &str, value: &str, reason: &str| ConfigError::InvalidValue {
             field: field.to_string(),
             value: value.to_string(),
             reason: reason.to_string(),
         };
-        for origin in &self.cors_allowed_origins {
-            // Exactly what a browser sends as `Origin`: the scheme and the host
-            // in lower case, no userinfo, no default port, nothing after the
-            // authority (not even `/`); anything else never matches the exact
-            // comparison of the CORS layer.
-            let default_port = |scheme: &str| match scheme {
-                "http" | "ws" => Some(80),
-                "https" | "wss" => Some(443),
-                _ => None,
-            };
-            let parsed = http::Uri::try_from(origin.as_str()).ok().filter(|uri| {
-                matches!((uri.scheme_str(), uri.authority()), (Some(scheme), Some(authority))
-                    if origin.as_str() == format!("{scheme}://{authority}")
-                        && authority.as_str() == authority.as_str().to_ascii_lowercase()
-                        && !authority.as_str().contains('@')
-                        && authority
-                            .port_u16()
-                            .is_none_or(|port| Some(port) != default_port(scheme)))
-            });
-            if parsed.is_none() || http::HeaderValue::from_str(origin).is_err() {
-                return Err(invalid(
-                    "cors_allowed_origins",
-                    origin,
-                    "not exactly an origin (lower-case scheme://host[:port], no userinfo, no default port, nothing after it); the policy would silently narrow to the origins that match",
-                ));
-            }
-        }
-        if !self.health_check_endpoint.starts_with('/') {
-            return Err(invalid(
-                "health_check_endpoint",
-                &self.health_check_endpoint,
-                "must start with '/': it is appended to every HTTP worker's URL",
-            ));
-        }
+        // `cors_allowed_origins`, the health-check endpoint, the request-id
+        // header names and an empty API key are checked by the shared
+        // `ConfigValidator`, which every construction path runs (this CLI
+        // through `builder.build()`).
         let buckets = &self.prometheus_duration_buckets;
         if let Some(bad) = buckets.iter().find(|b| !b.is_finite() || **b <= 0.0) {
             return Err(invalid(
@@ -2235,24 +2262,6 @@ impl CliArgs {
                 ));
             }
         }
-        for name in &self.request_id_headers {
-            if http::header::HeaderName::try_from(name.as_str()).is_err() {
-                return Err(invalid(
-                    "request_id_headers",
-                    name,
-                    "not a valid HTTP header name: it could never match a request",
-                ));
-            }
-        }
-        if let Some(key) = &self.api_key {
-            if key.trim().is_empty() {
-                return Err(invalid(
-                    "api_key",
-                    "",
-                    "an empty credential would switch authentication on with a key nothing can present",
-                ));
-            }
-        }
         for mapping in &self.jwt_role_mapping {
             match mapping.split_once('=') {
                 Some((idp_role, gateway_role))
@@ -2274,80 +2283,93 @@ impl CliArgs {
     }
 
     /// The flags that only act with a companion, named when the companion is
-    /// absent: each used to be ignored in silence.
+    /// absent: each used to be ignored in silence. One row per warning, in
+    /// the order they are printed: when it applies, and its text.
     fn ignored_companions(
         &self,
         prefill_urls: &[(String, Option<u16>)],
         encode_urls: &[(String, Option<u16>)],
     ) -> Vec<String> {
-        let mut ignored = Vec::new();
-        if !(self.pd_disaggregation || self.epd_disaggregation) {
-            for (flag, given) in [
-                ("--prefill", !prefill_urls.is_empty()),
-                ("--decode", !self.decode.is_empty()),
-                ("--prefill-policy", self.prefill_policy.is_some()),
-                ("--decode-policy", self.decode_policy.is_some()),
-            ] {
-                if given {
-                    ignored.push(format!(
-                        "{flag} is ignored without --pd-disaggregation (or --epd-disaggregation)"
-                    ));
-                }
-            }
-        }
-        if !self.epd_disaggregation {
-            for (flag, given) in [
-                ("--encode", !encode_urls.is_empty()),
-                ("--encode-policy", self.encode_policy.is_some()),
-            ] {
-                if given {
-                    ignored.push(format!("{flag} is ignored without --epd-disaggregation"));
-                }
-            }
-        }
+        const PD: &str = "without --pd-disaggregation (or --epd-disaggregation)";
+        const EPD: &str = "without --epd-disaggregation";
+        let pd = self.pd_disaggregation || self.epd_disaggregation;
+        let epd = self.epd_disaggregation;
         // The selectors select Kubernetes pods: another provider ignores them
         // as the absence of any does.
         let provider = self.selected_discovery_provider();
-        if provider != Some(DiscoveryProvider::Kubernetes) {
-            let without = match provider {
-                None => "without --service-discovery".to_string(),
-                Some(provider) => format!(
-                    "under --discovery-provider {}: it selects Kubernetes pods",
-                    provider.flag_value()
-                ),
-            };
-            for (flag, given) in [
-                ("--selector", !self.selector.is_empty()),
-                ("--prefill-selector", !self.prefill_selector.is_empty()),
-                ("--decode-selector", !self.decode_selector.is_empty()),
-                ("--encode-selector", !self.encode_selector.is_empty()),
-                ("--router-selector", !self.router_selector.is_empty()),
-            ] {
-                if given {
-                    ignored.push(format!("{flag} is ignored {without}"));
-                }
-            }
-        }
-        if let Some(provider) = provider {
-            if !self.worker_urls.is_empty() {
-                let source = if self.service_discovery {
-                    "--service-discovery".to_string()
-                } else {
-                    format!("--discovery-provider {}", provider.flag_value())
-                };
-                ignored.push(format!(
+        let kubernetes = provider == Some(DiscoveryProvider::Kubernetes);
+        let selectors = match provider {
+            None => "without --service-discovery".to_string(),
+            Some(provider) => format!(
+                "under --discovery-provider {}: it selects Kubernetes pods",
+                provider.flag_value()
+            ),
+        };
+        // Two worker sources are both honoured, which is worth a line of its
+        // own, naming the source as it was given.
+        let source = if self.service_discovery {
+            "--service-discovery".to_string()
+        } else {
+            provider.map_or_else(String::new, |provider| {
+                format!("--discovery-provider {}", provider.flag_value())
+            })
+        };
+        let ignored = |flag: &str, needs: &str| format!("{flag} is ignored {needs}");
+        let warnings = [
+            (!prefill_urls.is_empty() && !pd, ignored("--prefill", PD)),
+            (!self.decode.is_empty() && !pd, ignored("--decode", PD)),
+            (
+                self.prefill_policy.is_some() && !pd,
+                ignored("--prefill-policy", PD),
+            ),
+            (
+                self.decode_policy.is_some() && !pd,
+                ignored("--decode-policy", PD),
+            ),
+            (!encode_urls.is_empty() && !epd, ignored("--encode", EPD)),
+            (
+                self.encode_policy.is_some() && !epd,
+                ignored("--encode-policy", EPD),
+            ),
+            (
+                !self.selector.is_empty() && !kubernetes,
+                ignored("--selector", selectors.as_str()),
+            ),
+            (
+                !self.prefill_selector.is_empty() && !kubernetes,
+                ignored("--prefill-selector", selectors.as_str()),
+            ),
+            (
+                !self.decode_selector.is_empty() && !kubernetes,
+                ignored("--decode-selector", selectors.as_str()),
+            ),
+            (
+                !self.encode_selector.is_empty() && !kubernetes,
+                ignored("--encode-selector", selectors.as_str()),
+            ),
+            (
+                !self.router_selector.is_empty() && !kubernetes,
+                ignored("--router-selector", selectors.as_str()),
+            ),
+            (
+                provider.is_some() && !self.worker_urls.is_empty(),
+                format!(
                     "--worker-urls and {source} are both given: both are worker sources, \
                      the listed workers register first and the discovered ones join them"
-                ));
-            }
-        }
-        if self.priority_scheduler_config.is_some() && !self.priority_scheduler_enabled {
-            ignored.push(
-                "--priority-scheduler-config is ignored without --priority-scheduler-enabled"
-                    .to_string(),
-            );
-        }
-        ignored
+                ),
+            ),
+            (
+                self.priority_scheduler_config.is_some() && !self.priority_scheduler_enabled,
+                ignored(
+                    "--priority-scheduler-config",
+                    "without --priority-scheduler-enabled",
+                ),
+            ),
+        ];
+        warnings
+            .into_iter()
+            .filter_map(|(applies, warning)| applies.then_some(warning))
+            .collect()
     }
 
     /// The companion warnings of [`ignored_companions`](Self::ignored_companions), one
@@ -2363,55 +2385,57 @@ impl CliArgs {
         }
     }
 
-    fn to_router_config(
+    /// The routing mode the flags select. A vendor backend (`--backend
+    /// openai|anthropic|gemini`) routes to that vendor whatever else is set;
+    /// otherwise `--epd-disaggregation` wins over `--pd-disaggregation`, and
+    /// neither is the regular mode over `--worker-urls`. IGW mode does not
+    /// change the routing mode: it only affects router initialization.
+    fn routing_mode(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
         encode_urls: Vec<(String, Option<u16>)>,
-    ) -> ConfigResult<RouterConfig> {
-        self.validate_flag_formats()?;
-        self.warn_ignored_companions(&prefill_urls, &encode_urls);
-
-        // Determine routing mode based on backend type and PD disaggregation flag
-        // IGW mode doesn't change routing mode, only affects router initialization
-        let mode = if matches!(self.backend, Some(Backend::Openai)) {
-            RoutingMode::OpenAI {
+    ) -> RoutingMode {
+        let policy = |name: Option<&String>| name.map(|p| self.parse_policy(p));
+        match (
+            self.backend,
+            self.epd_disaggregation,
+            self.pd_disaggregation,
+        ) {
+            (Some(Backend::Openai), _, _) => RoutingMode::OpenAI {
                 worker_urls: self.worker_urls.clone(),
-            }
-        } else if matches!(self.backend, Some(Backend::Anthropic)) {
-            RoutingMode::Anthropic {
+            },
+            (Some(Backend::Anthropic), _, _) => RoutingMode::Anthropic {
                 worker_urls: self.worker_urls.clone(),
-            }
-        } else if matches!(self.backend, Some(Backend::Gemini)) {
-            RoutingMode::Gemini {
+            },
+            (Some(Backend::Gemini), _, _) => RoutingMode::Gemini {
                 worker_urls: self.worker_urls.clone(),
-            }
-        } else if self.epd_disaggregation {
-            RoutingMode::EncodePrefillDecode {
+            },
+            (_, true, _) => RoutingMode::EncodePrefillDecode {
                 encode_urls,
                 prefill_urls,
                 decode_urls: self.decode.clone(),
-                encode_policy: self.encode_policy.as_ref().map(|p| self.parse_policy(p)),
-                prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
-                decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
-            }
-        } else if self.pd_disaggregation {
-            RoutingMode::PrefillDecode {
+                encode_policy: policy(self.encode_policy.as_ref()),
+                prefill_policy: policy(self.prefill_policy.as_ref()),
+                decode_policy: policy(self.decode_policy.as_ref()),
+            },
+            (_, false, true) => RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls: self.decode.clone(),
-                prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
-                decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
-            }
-        } else {
-            RoutingMode::Regular {
+                prefill_policy: policy(self.prefill_policy.as_ref()),
+                decode_policy: policy(self.decode_policy.as_ref()),
+            },
+            (_, false, false) => RoutingMode::Regular {
                 worker_urls: self.worker_urls.clone(),
-            }
-        };
+            },
+        }
+    }
 
-        let policy = self.parse_policy(&self.policy);
-
-        // A provider's own flags are ignored under another provider, as the
-        // Kubernetes flags always were without discovery. The file flags have
-        // no other use, so giving them without the file provider is an error.
+    /// The discovery configuration of the selected provider, or none. A
+    /// provider's own flags are ignored under another provider, as the
+    /// Kubernetes flags always were without discovery; the file flags have
+    /// no other use, so giving them without the file provider is an error,
+    /// as is the file provider without its manifest.
+    fn discovery_config(&self) -> ConfigResult<Option<DiscoveryConfig>> {
         let provider = self.selected_discovery_provider();
         if provider != Some(DiscoveryProvider::File)
             && (self.discovery_file.is_some() || self.discovery_check_interval_secs.is_some())
@@ -2422,7 +2446,7 @@ impl CliArgs {
                     .to_string(),
             });
         }
-        let discovery = match provider {
+        Ok(match provider {
             None => None,
             Some(DiscoveryProvider::Kubernetes) => {
                 Some(DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
@@ -2453,99 +2477,64 @@ impl CliArgs {
                     .discovery_check_interval_secs
                     .unwrap_or(DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS),
             })),
-        };
+        })
+    }
 
-        let metrics = Some(MetricsConfig {
-            port: self.prometheus_port,
-            host: self.metrics_host(),
-        });
-
-        let trace_config = Some(TraceConfig {
-            enable_trace: self.enable_trace,
-            otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
-        });
-
-        let mut all_urls = Vec::new();
-        match &mode {
-            RoutingMode::Regular { worker_urls } => {
-                all_urls.extend(worker_urls.clone());
-            }
+    /// Every worker url the mode starts with, in the order the flags list
+    /// them (encode, prefill, decode for the disaggregated modes): the first
+    /// url that declares a wire protocol decides the connection mode.
+    fn startup_worker_urls(mode: &RoutingMode) -> Vec<String> {
+        match mode {
+            RoutingMode::Regular { worker_urls }
+            | RoutingMode::OpenAI { worker_urls }
+            | RoutingMode::Anthropic { worker_urls }
+            | RoutingMode::Gemini { worker_urls } => worker_urls.clone(),
             RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls,
                 ..
-            } => {
-                for (url, _) in prefill_urls {
-                    all_urls.push(url.clone());
-                }
-                all_urls.extend(decode_urls.clone());
-            }
+            } => prefill_urls
+                .iter()
+                .map(|(url, _)| url.clone())
+                .chain(decode_urls.iter().cloned())
+                .collect(),
             RoutingMode::EncodePrefillDecode {
                 encode_urls,
                 prefill_urls,
                 decode_urls,
                 ..
-            } => {
-                for (url, _) in encode_urls.iter().chain(prefill_urls.iter()) {
-                    all_urls.push(url.clone());
-                }
-                all_urls.extend(decode_urls.clone());
-            }
-            RoutingMode::OpenAI { worker_urls } => {
-                all_urls.extend(worker_urls.clone());
-            }
-            RoutingMode::Anthropic { worker_urls } => {
-                all_urls.extend(worker_urls.clone());
-            }
-            RoutingMode::Gemini { worker_urls } => {
-                all_urls.extend(worker_urls.clone());
-            }
+            } => encode_urls
+                .iter()
+                .chain(prefill_urls.iter())
+                .map(|(url, _)| url.clone())
+                .chain(decode_urls.iter().cloned())
+                .collect(),
         }
-        let connection_mode = Self::determine_connection_mode(&all_urls);
+    }
 
-        // `--backend` normally only steers the routing mode. Over ZMQ it
-        // additionally pins the startup workers' runtime: the shared EngineCore
-        // handshake carries no engine identity, so the wire protocol cannot be
-        // probed and must be declared. HTTP/gRPC keep auto-detection (None).
-        let startup_worker_runtime_type = if connection_mode == ConnectionMode::Zmq {
-            match self.backend {
-                Some(Backend::Vllm) => Some(RuntimeType::Vllm),
-                Some(Backend::Tokenspeed) => Some(RuntimeType::TokenSpeed),
-                Some(Backend::Sglang) => Some(RuntimeType::Sglang),
-                _ => None,
-            }
-        } else {
-            None
-        };
+    /// `--backend` normally only steers the routing mode. Over ZMQ it
+    /// additionally pins the startup workers' runtime: the shared EngineCore
+    /// handshake carries no engine identity, so the wire protocol cannot be
+    /// probed and must be declared. HTTP/gRPC keep auto-detection (None).
+    fn startup_worker_runtime_type(&self, connection_mode: ConnectionMode) -> Option<RuntimeType> {
+        if connection_mode != ConnectionMode::Zmq {
+            return None;
+        }
+        match self.backend {
+            Some(Backend::Vllm) => Some(RuntimeType::Vllm),
+            Some(Backend::Tokenspeed) => Some(RuntimeType::TokenSpeed),
+            Some(Backend::Sglang) => Some(RuntimeType::Sglang),
+            _ => None,
+        }
+    }
 
-        let history_backend = match self.history_backend.as_str() {
-            "none" => HistoryBackend::None,
-            "oracle" => HistoryBackend::Oracle,
-            "postgres" => HistoryBackend::Postgres,
-            "redis" => HistoryBackend::Redis,
-            _ => HistoryBackend::Memory,
-        };
-
-        let schema = self.load_schema_config()?;
-
-        let tenant_api_keys = self
-            .tenant_api_keys
-            .iter()
-            .map(|k| parse_tenant_api_key(k))
-            .collect::<ConfigResult<Vec<_>>>()?;
-
-        let (oracle, postgres, redis) = match history_backend {
-            HistoryBackend::Oracle => (Some(self.build_oracle_config(schema)?), None, None),
-            HistoryBackend::Postgres => (None, Some(self.build_postgres_config(schema)?), None),
-            HistoryBackend::Redis => (None, None, Some(self.build_redis_config(schema)?)),
-            _ => (None, None, None),
-        };
-
-        // clap validated each entry's shape; here we only reject the same
-        // alias naming two different canonical models, which would make the
-        // routing outcome depend on argument order.
+    /// The `--model-alias` entries as a map. clap validated each entry's
+    /// shape; here only the same alias naming two different canonical models
+    /// is refused, which would make the routing outcome depend on argument
+    /// order.
+    fn model_aliases(entries: &[String]) -> ConfigResult<HashMap<String, String>> {
         let mut model_aliases: HashMap<String, String> = HashMap::new();
-        for entry in &self.model_alias {
+        for entry in entries {
             let Some((alias, canonical)) = entry.split_once('=') else {
                 return Err(ConfigError::InvalidValue {
                     field: "model_alias".to_string(),
@@ -2563,6 +2552,55 @@ impl CliArgs {
                 }
             }
         }
+        Ok(model_aliases)
+    }
+
+    /// The router configuration of the flags. A refusal is raised in this
+    /// order: the flag shapes, the discovery flags, the schema file, the
+    /// tenant keys, the history store, the model aliases, and last the
+    /// shared validator over the built configuration, which the builder
+    /// runs.
+    fn to_router_config(
+        &self,
+        prefill_urls: Vec<(String, Option<u16>)>,
+        encode_urls: Vec<(String, Option<u16>)>,
+    ) -> ConfigResult<RouterConfig> {
+        self.validate_flag_formats()?;
+        self.warn_ignored_companions(&prefill_urls, &encode_urls);
+
+        let mode = self.routing_mode(prefill_urls, encode_urls);
+        let policy = self.parse_policy(&self.policy);
+        let discovery = self.discovery_config()?;
+        let metrics = Some(MetricsConfig {
+            port: self.prometheus_port,
+            host: self.metrics_host(),
+        });
+        let trace_config = Some(TraceConfig {
+            enable_trace: self.enable_trace,
+            otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
+        });
+        let connection_mode = Self::determine_connection_mode(&Self::startup_worker_urls(&mode));
+        let startup_worker_runtime_type = self.startup_worker_runtime_type(connection_mode);
+        let history_backend = match self.history_backend.as_str() {
+            "none" => HistoryBackend::None,
+            "oracle" => HistoryBackend::Oracle,
+            "postgres" => HistoryBackend::Postgres,
+            "redis" => HistoryBackend::Redis,
+            _ => HistoryBackend::Memory,
+        };
+        let schema = self.load_schema_config()?;
+        let tenant_api_keys = self
+            .tenant_api_keys
+            .iter()
+            .map(|k| parse_tenant_api_key(k))
+            .collect::<ConfigResult<Vec<_>>>()?;
+        let (oracle, postgres, redis) = match history_backend {
+            HistoryBackend::Oracle => (Some(self.build_oracle_config(schema)?), None, None),
+            HistoryBackend::Postgres => (None, Some(self.build_postgres_config(schema)?), None),
+            HistoryBackend::Redis => (None, None, Some(self.build_redis_config(schema)?)),
+            _ => (None, None, None),
+        };
+        let model_aliases = Self::model_aliases(&self.model_alias)?;
 
         let builder = RouterConfig::builder()
             .mode(mode)
@@ -2798,105 +2836,110 @@ impl CliArgs {
             webrtc_stun_server: self.webrtc_stun_server.clone(),
         })
     }
+
+    /// The mode label of the start-up banner. It follows the flags, not the
+    /// built [`RoutingMode`]: IGW first, then the OpenAI and Anthropic
+    /// backends, then the disaggregated modes, then the backend's name
+    /// (`--backend gemini` is labelled `Regular (gemini)`, as it always was).
+    fn banner_mode(&self) -> String {
+        if self.enable_igw {
+            "IGW (Inference Gateway)".to_string()
+        } else if matches!(self.backend, Some(Backend::Openai)) {
+            "OpenAI Backend".to_string()
+        } else if matches!(self.backend, Some(Backend::Anthropic)) {
+            "Anthropic Backend".to_string()
+        } else if self.epd_disaggregation {
+            "EPD Disaggregated".to_string()
+        } else if self.pd_disaggregation {
+            "PD Disaggregated".to_string()
+        } else if let Some(backend) = &self.backend {
+            format!("Regular ({backend})")
+        } else {
+            "Regular".to_string()
+        }
+    }
+
+    /// Phase 2, announce: the banner and the lines under it, printed before
+    /// the configuration is built so an operator sees what was asked for
+    /// even when it is refused; nothing is changed. The logger is not up
+    /// yet: this is plain stdout.
+    #[expect(
+        clippy::print_stdout,
+        reason = "pre-logger startup output: the banner and the flags' summary"
+    )]
+    fn announce(
+        &self,
+        igw_enabled_for_discovery: bool,
+        prefill_urls: &[(String, Option<u16>)],
+        encode_urls: &[(String, Option<u16>)],
+    ) {
+        if igw_enabled_for_discovery {
+            println!("INFO: IGW mode automatically enabled because service discovery is turned on");
+        }
+        version::print_banner(&self.host, self.port, &self.banner_mode());
+        if self.enable_igw {
+            return;
+        }
+        println!("Policy: {}", self.policy);
+        if self.pd_disaggregation && !prefill_urls.is_empty() {
+            println!("Prefill nodes: {prefill_urls:?}");
+            println!("Decode nodes: {:?}", self.decode);
+        }
+        if self.epd_disaggregation {
+            println!("Encode nodes: {encode_urls:?}");
+            println!("Prefill nodes: {prefill_urls:?}");
+            println!("Decode nodes: {:?}", self.decode);
+        }
+    }
+
+    /// Phase 3, configure: the router configuration, validated, wrapped in
+    /// the server configuration. Every refusal is a [`ConfigError`] naming
+    /// the flag; nothing has been bound or spawned when one is raised.
+    fn configure(
+        &self,
+        prefill_urls: Vec<(String, Option<u16>)>,
+        encode_urls: Vec<(String, Option<u16>)>,
+    ) -> ConfigResult<ServerConfig> {
+        let router_config = self.to_router_config(prefill_urls, encode_urls)?;
+        router_config.validate()?;
+        self.to_server_config(router_config)
+    }
 }
 
-#[expect(
-    clippy::print_stdout,
-    reason = "pre-logger startup output and version display"
-)]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    register_jemalloc_as_global_allocator();
+/// The text a version flag prints, read before anything else is parsed so a
+/// command line with an error elsewhere still answers `--version`.
+fn version_flag(args: &[String]) -> Option<String> {
+    args.iter().find_map(|arg| match arg.as_str() {
+        "--version" | "-V" => Some(version::get_version_string()),
+        "--version-verbose" => Some(version::get_verbose_version_string()),
+        _ => None,
+    })
+}
 
-    // Check for version flags before parsing other args to avoid errors
-    let args: Vec<String> = std::env::args().collect();
-    for arg in &args {
-        if arg == "--version" || arg == "-V" {
-            println!("{}", version::get_version_string());
-            return Ok(());
-        }
-        if arg == "--version-verbose" {
-            println!("{}", version::get_verbose_version_string());
-            return Ok(());
-        }
-    }
-
-    let prefill_urls = parse_prefill_args();
-    let encode_urls = parse_encode_args();
-
-    let mut filtered_args: Vec<String> = Vec::new();
-    let raw_args: Vec<String> = std::env::args().collect();
-    let mut i = 0;
-
-    while i < raw_args.len() {
-        if (raw_args[i] == "--prefill" || raw_args[i] == "--encode") && i + 1 < raw_args.len() {
-            i += 2;
-            if i < raw_args.len()
-                && !raw_args[i].starts_with("--")
-                && (raw_args[i].parse::<u16>().is_ok() || raw_args[i].to_lowercase() == "none")
-            {
-                i += 1;
-            }
-        } else {
-            filtered_args.push(raw_args[i].clone());
-            i += 1;
-        }
-    }
-
-    let cli = Cli::parse_from(filtered_args);
-
-    // Handle subcommands or use direct args
+/// Phase 1, parse: clap over the command line with the `--prefill` /
+/// `--encode` occurrences already taken out, `smg launch ...` and the bare
+/// form alike. A usage error or `--help` ends the process here, before the
+/// banner. Selecting a discovery provider turns IGW mode on here as well, so
+/// the flags are final when this returns and the phases after it only read
+/// them; the second value says whether this call turned IGW on, for the
+/// announcement.
+fn parse_cli_args(clap_args: Vec<String>) -> (CliArgs, bool) {
+    let cli = Cli::parse_from(clap_args);
     let mut cli_args = match cli.command {
         Some(Commands::Launch { args }) => args,
         None => cli.router_args,
     };
+    let igw_enabled_for_discovery = cli_args.enable_igw_for_discovery();
+    (cli_args, igw_enabled_for_discovery)
+}
 
-    if cli_args.enable_igw_for_discovery() {
-        println!("INFO: IGW mode automatically enabled because service discovery is turned on");
-    }
-
-    let mode_str = if cli_args.enable_igw {
-        "IGW (Inference Gateway)".to_string()
-    } else if matches!(cli_args.backend, Some(Backend::Openai)) {
-        "OpenAI Backend".to_string()
-    } else if matches!(cli_args.backend, Some(Backend::Anthropic)) {
-        "Anthropic Backend".to_string()
-    } else if cli_args.epd_disaggregation {
-        "EPD Disaggregated".to_string()
-    } else if cli_args.pd_disaggregation {
-        "PD Disaggregated".to_string()
-    } else if let Some(backend) = &cli_args.backend {
-        format!("Regular ({backend})")
-    } else {
-        "Regular".to_string()
-    };
-
-    version::print_banner(&cli_args.host, cli_args.port, &mode_str);
-
-    if !cli_args.enable_igw {
-        println!("Policy: {}", cli_args.policy);
-
-        if cli_args.pd_disaggregation && !prefill_urls.is_empty() {
-            println!("Prefill nodes: {prefill_urls:?}");
-            println!("Decode nodes: {:?}", cli_args.decode);
-        }
-
-        if cli_args.epd_disaggregation {
-            println!("Encode nodes: {encode_urls:?}");
-            println!("Prefill nodes: {prefill_urls:?}");
-            println!("Decode nodes: {:?}", cli_args.decode);
-        }
-    }
-
-    let router_config = cli_args.to_router_config(prefill_urls, encode_urls)?;
-    router_config.validate()?;
-
-    let server_config = cli_args.to_server_config(router_config)?;
-    // tokio's default worker-thread count is `available_parallelism()`, which on
-    // Rust 1.95+ already honors the cgroup CPU quota, so the default is
-    // container-aware. Only build the runtime explicitly when an operator pins a
-    // worker-thread count.
-    // The runtime's size is logged by `startup`, once the log subscriber is
-    // up: a line emitted here would reach no subscriber.
+/// Phase 4, serve: the async runtime (tokio's container-aware default size
+/// unless `--runtime-worker-threads` pins one; the size is logged by
+/// `startup` once the log subscriber is up), the server until it stops,
+/// then the log writers flushed; the tracer is shut down after a clean stop
+/// (a failed start-up returns before it, as it always did). The runtime is
+/// built only now: a refusal before this point costs no threads.
+fn serve(server_config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = match server_config.runtime_worker_threads {
         Some(n) => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(n)
@@ -2915,6 +2958,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The start-up sequence: parse, announce, configure, serve. The version
+/// flags are answered first, before clap sees the line.
+#[expect(clippy::print_stdout, reason = "the version flags' answer")]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    register_jemalloc_as_global_allocator();
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(version) = version_flag(&args) {
+        println!("{version}");
+        return Ok(());
+    }
+    let command_line = CommandLine::split(&args);
+    let (cli_args, igw_enabled_for_discovery) = parse_cli_args(command_line.clap_args);
+    cli_args.announce(
+        igw_enabled_for_discovery,
+        &command_line.prefill_urls,
+        &command_line.encode_urls,
+    );
+    let server_config = cli_args.configure(command_line.prefill_urls, command_line.encode_urls)?;
+    serve(server_config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2925,6 +2989,62 @@ mod tests {
             .chain(args.iter().map(|s| (*s).to_string()))
             .collect();
         Cli::parse_from(argv).router_args
+    }
+
+    /// `--prefill` / `--encode` take an optional trailing bootstrap port (a
+    /// number or `none`, any case); one token rule parses the pairs and
+    /// strips them from the line clap parses, so a following flag or url is
+    /// kept, and a flag without a url is left for clap to refuse.
+    #[test]
+    fn url_port_flags_are_split_from_argv_by_one_token_rule() {
+        let args: Vec<String> = [
+            "smg",
+            "--pd-disaggregation",
+            "--prefill",
+            "http://p1:1",
+            "9001",
+            "--prefill",
+            "http://p2:2",
+            "NONE",
+            "--encode",
+            "http://e1:3",
+            "--prefill",
+            "http://p3:4",
+            "--decode",
+            "http://d1:5",
+            "--encode",
+            "http://e2:6",
+            "--prefill",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let line = CommandLine::split(&args);
+        assert_eq!(
+            line.prefill_urls,
+            vec![
+                ("http://p1:1".to_string(), Some(9001)),
+                ("http://p2:2".to_string(), None),
+                ("http://p3:4".to_string(), None),
+            ]
+        );
+        assert_eq!(
+            line.encode_urls,
+            vec![
+                ("http://e1:3".to_string(), None),
+                ("http://e2:6".to_string(), None),
+            ]
+        );
+        assert_eq!(
+            line.clap_args,
+            [
+                "smg",
+                "--pd-disaggregation",
+                "--decode",
+                "http://d1:5",
+                "--prefill"
+            ]
+        );
     }
 
     /// A flag whose value has a required shape is refused by name when the
@@ -2959,7 +3079,7 @@ mod tests {
             ),
             (
                 vec!["--health-check-endpoint", "health"],
-                "health_check_endpoint",
+                "health_check.endpoint",
             ),
             (
                 vec!["--prometheus-duration-buckets", "2", "1"],
@@ -2980,6 +3100,10 @@ mod tests {
             (
                 vec!["--request-id-headers", "bad header"],
                 "request_id_headers",
+            ),
+            (
+                vec!["--cors-allowed-origins", "*", "https://example.com"],
+                "cors_allowed_origins",
             ),
             (vec!["--api-key", ""], "api_key"),
             (vec!["--jwt-role-mapping", "noeq"], "jwt_role_mapping"),
@@ -3014,6 +3138,9 @@ mod tests {
         ])
         .to_router_config(vec![], vec![])
         .expect("well-formed values pass");
+        cli_args_from(&["--cors-allowed-origins", "*"])
+            .to_router_config(vec![], vec![])
+            .expect("a lone '*' is the open policy");
     }
 
     /// A flag that only acts with a companion is named when the companion is
@@ -3213,6 +3340,34 @@ mod tests {
         assert!(err.contains("op_timeout_secs"), "{err}");
         let err = args.build_redis_config(None).unwrap_err().to_string();
         assert!(err.contains("op_timeout_secs"), "{err}");
+    }
+
+    /// `-1` is the one spelling of persistent Redis records on the command
+    /// line; 0 and any other negative value are refused by name.
+    #[test]
+    fn a_redis_retention_other_than_minus_one_below_one_is_refused() {
+        let persistent =
+            cli_args_from(&["--redis-url", "redis://h:6379", "--redis-retention-days=-1"]);
+        assert_eq!(
+            persistent.build_redis_config(None).unwrap().retention_days,
+            None
+        );
+        for value in ["-2", "0"] {
+            let flag = format!("--redis-retention-days={value}");
+            let args = cli_args_from(&["--redis-url", "redis://h:6379", flag.as_str()]);
+            match args.build_redis_config(None) {
+                Err(ConfigError::InvalidValue {
+                    field,
+                    value: shown,
+                    reason,
+                }) => {
+                    assert_eq!(field, "redis_retention_days");
+                    assert_eq!(shown, value);
+                    assert!(reason.contains("-1 keeps records persistent"), "{reason}");
+                }
+                other => panic!("expected {value} refused by name, got {other:?}"),
+            }
+        }
     }
 
     /// Mesh bind and advertise hosts go through the shared bind-host rule, so

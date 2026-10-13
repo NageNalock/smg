@@ -573,6 +573,12 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             supported.append(image_modality)
             if hf_config is not None and config_value(hf_config, "video_token_id") is not None:
                 supported.append(video_modality)
+        if (
+            bool(getattr(model_config, "is_audio_model", False))
+            and hf_config is not None
+            and config_value(hf_config, "audio_token_id") is not None
+        ):
+            supported.append(audio_modality)
         return supported
 
     # ------------------------------------------------------------------

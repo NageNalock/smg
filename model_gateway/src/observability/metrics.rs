@@ -268,7 +268,10 @@ pub(crate) fn init_metrics() {
          response has gone out in full (its last frame, or the length it declared); a \
          request whose client closed the connection first counts as status_code 499 \
          with error_code client_closed_request, as does the rare request the server \
-         dropped unanswered (a handler panic, a forced shutdown)"
+         dropped unanswered (a handler panic, a forced shutdown); a response whose body \
+         failed after its head (an upstream stream that broke mid-body) keeps its head's \
+         status_code with error_code stream_error, unless the head carried a gateway \
+         error code"
     );
     describe_gauge!(
         "smg_http_connections_active",
@@ -377,7 +380,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_pd_kv_connector_mode_total",
-        "KV connector mode decisions by mode (mooncake/nixl/moriio/passthrough)"
+        "KV connector mode decisions by mode (mooncake/nixl/moriio/store/passthrough)"
     );
     describe_counter!(
         "smg_pd_bootstrap_failures_total",
@@ -825,6 +828,10 @@ pub(crate) fn init_metrics() {
     describe_gauge!(
         "smg_mm_turbojpeg_available",
         "1 when JPEGs decode through libjpeg-turbo (PIL's pixels), 0 through the pure-Rust fallback"
+    );
+    describe_gauge!(
+        "smg_mm_webp_available",
+        "1 when WebP files decode through libwebp, 0 through the pure-Rust fallback"
     );
     // The router-side pixel cache (--mm-pixel-cache-mb): one per process,
     // shared by every model, keyed by image and model configuration.
@@ -1385,6 +1392,10 @@ impl Metrics {
         gauge!("smg_mm_turbojpeg_available").set(if available { 1.0 } else { 0.0 });
     }
 
+    pub fn set_mm_webp_available(available: bool) {
+        gauge!("smg_mm_webp_available").set(if available { 1.0 } else { 0.0 });
+    }
+
     /// The pixel cache's occupancy and eviction series, at zero: called when
     /// the cache is built, so they are on the first scrape.
     pub fn init_mm_pixel_cache_series() {
@@ -1749,7 +1760,7 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
-    /// Record a KV connector mode decision (mooncake/nixl/moriio/passthrough).
+    /// Record a KV connector mode decision (mooncake/nixl/moriio/store/passthrough).
     pub fn record_pd_kv_connector_mode(mode: &'static str) {
         counter!(
             "smg_pd_kv_connector_mode_total",

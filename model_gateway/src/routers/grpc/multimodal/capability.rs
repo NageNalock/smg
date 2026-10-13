@@ -11,7 +11,7 @@
 
 use anyhow::Result;
 use axum::response::Response;
-use llm_multimodal::Modality;
+use llm_multimodal::{EncoderInputFormat, Modality};
 
 use super::{plan::MediaPlan, MultimodalIntermediate};
 use crate::{
@@ -137,6 +137,31 @@ pub(crate) fn runtime_supports_modality(runtime: RuntimeType, modality: Modality
     }
 }
 
+/// Whether `runtime`'s models read encoder inputs in `format` (see
+/// `ModelProcessorSpec::encoder_input_format`).
+pub(crate) fn runtime_reads_format(runtime: RuntimeType, format: EncoderInputFormat) -> bool {
+    match format {
+        EncoderInputFormat::Reference => true,
+        EncoderInputFormat::Packed => matches!(runtime, RuntimeType::TokenSpeed),
+    }
+}
+
+/// Whether every gRPC-pipeline worker registered for `model_id` reads
+/// `format`. HTTP workers of the model sit in another router's pool and never
+/// receive the gateway's tensors. With none registered yet the format is
+/// readable, so the request fails at worker selection as for any model.
+pub(crate) fn fleet_reads_format(
+    registry: &WorkerRegistry,
+    model_id: &str,
+    format: EncoderInputFormat,
+) -> bool {
+    registry
+        .get_by_model(model_id)
+        .iter()
+        .filter(|worker| worker.connection_mode().uses_grpc_pipeline())
+        .all(|worker| runtime_reads_format(worker.metadata().spec.runtime_type, format))
+}
+
 /// Reject early if the selected backend does not support every modality present
 /// in the request. Runs at worker selection, once the runtime is known but
 /// before request building assembles the payload, so an unsupported combination
@@ -145,6 +170,11 @@ pub(crate) fn ensure_backend_supports_modalities(
     runtime: RuntimeType,
     intermediate: &MultimodalIntermediate,
 ) -> Result<()> {
+    // A worker of another engine may have registered since the spec was applied.
+    anyhow::ensure!(
+        runtime_reads_format(runtime, intermediate.encoder_input_format()),
+        "this model's media was preprocessed into a format backend {runtime} does not read"
+    );
     for batch in intermediate.batches() {
         let modality = batch.media.modality();
         anyhow::ensure!(
@@ -333,6 +363,17 @@ mod tests {
         assert_eq!(err.to_string(), "backend mlx does not support image inputs");
     }
 
+    /// Packed inputs reach only an engine that reads them, even from a worker
+    /// of another engine that registered after the spec was applied.
+    #[test]
+    fn packed_inputs_reach_only_an_engine_that_reads_them() {
+        let intermediate =
+            single_image_intermediate().with_encoder_input_format(EncoderInputFormat::Packed);
+        assert!(ensure_backend_supports_modalities(RuntimeType::TokenSpeed, &intermediate).is_ok());
+        let err = ensure_backend_supports_modalities(RuntimeType::Vllm, &intermediate).unwrap_err();
+        assert!(err.to_string().contains("does not read"), "{err}");
+    }
+
     mod pool {
         use std::sync::Arc;
 
@@ -415,6 +456,53 @@ mod tests {
                 &all_lmo,
                 "another-model"
             ));
+        }
+
+        /// Packed inputs suit a fleet unless one of its gRPC workers runs an
+        /// engine that does not read them; with none registered, worker
+        /// selection answers.
+        #[test]
+        fn a_fleet_reads_packed_inputs_unless_another_engine_is_registered() {
+            let packed = |registry: &WorkerRegistry| {
+                fleet_reads_format(registry, MODEL, EncoderInputFormat::Packed)
+            };
+            let tokenspeed = |url| -> Arc<dyn Worker> {
+                Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new(MODEL))
+                        .worker_type(WorkerType::Regular)
+                        .runtime_type(RuntimeType::TokenSpeed)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .build(),
+                )
+            };
+            assert!(packed(&registry_with(vec![])));
+            assert!(packed(&registry_with(vec![tokenspeed(
+                "grpc://10.0.0.1:1"
+            )])));
+            let mixed = registry_with(vec![
+                tokenspeed("grpc://10.0.0.1:1"),
+                worker("grpc://10.0.0.2:1", &[]),
+            ]);
+            assert!(!packed(&mixed));
+            assert!(fleet_reads_format(
+                &mixed,
+                MODEL,
+                EncoderInputFormat::Reference
+            ));
+            // An HTTP worker of the model is outside the gRPC pool.
+            let http: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new("http://10.0.0.3:1")
+                    .model(ModelCard::new(MODEL))
+                    .worker_type(WorkerType::Regular)
+                    .runtime_type(RuntimeType::Vllm)
+                    .connection_mode(ConnectionMode::Http)
+                    .build(),
+            );
+            assert!(packed(&registry_with(vec![
+                tokenspeed("grpc://10.0.0.1:1"),
+                http
+            ])));
         }
 
         /// Media to a language-model-only pool is a 400 naming the modality
