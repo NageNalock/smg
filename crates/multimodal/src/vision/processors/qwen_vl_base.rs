@@ -326,6 +326,7 @@ fn resize_dynamic_frame_to_raw(
 pub struct QwenVLProcessorBase {
     config: QwenVLConfig,
     allow_video_dimensions_below_factor: bool,
+    raise_rounded_sides_to_factor: bool,
 }
 
 impl QwenVLProcessorBase {
@@ -334,6 +335,7 @@ impl QwenVLProcessorBase {
         Self {
             config,
             allow_video_dimensions_below_factor: false,
+            raise_rounded_sides_to_factor: false,
         }
     }
 
@@ -344,6 +346,20 @@ impl QwenVLProcessorBase {
     /// default and lets wrappers select the model-specific behavior.
     pub fn allow_video_dimensions_below_factor(mut self) -> Self {
         self.allow_video_dimensions_below_factor = true;
+        self
+    }
+
+    /// Raise a side that rounds to zero to one factor before the pixel-budget
+    /// test of [`smart_resize`](Self::smart_resize).
+    ///
+    /// The Qwen-VL reference processor does not: a side under half the factor
+    /// rounds to 0, the product falls under `min_pixels`, and both sides scale
+    /// up from the original dimensions (a 1x100 image becomes 28x560). The
+    /// MiniMax-M3 reference takes `max(factor, round(...))` on each side first,
+    /// so such an image keeps its rounded long side (28x112) and skips the
+    /// scale-up. This opt-in selects the latter; the default is the Qwen rule.
+    pub fn raise_rounded_sides_to_factor(mut self) -> Self {
+        self.raise_rounded_sides_to_factor = true;
         self
     }
 
@@ -547,9 +563,14 @@ impl QwenVLProcessorBase {
         let mut h_bar = round_half_to_even(height as f64 / factor as f64) as usize * factor;
         let mut w_bar = round_half_to_even(width as f64 / factor as f64) as usize * factor;
 
-        // Ensure minimum size
-        h_bar = h_bar.max(factor);
-        w_bar = w_bar.max(factor);
+        // The reference rounds without a floor: a side under half the factor
+        // rounds to 0, so the product falls under `min_pixels` and the branch
+        // below scales both sides up from the original dimensions. Only the
+        // MiniMax-M3 reference raises the rounded sides to the factor first.
+        if self.raise_rounded_sides_to_factor {
+            h_bar = h_bar.max(factor);
+            w_bar = w_bar.max(factor);
+        }
 
         // Scale down if exceeding max_pixels
         if h_bar * w_bar > self.config.max_pixels {
@@ -1543,6 +1564,47 @@ mod tests {
             mean: [0.5, 0.5, 0.5],
             std: [0.5, 0.5, 0.5],
             model_name: "test-qwen-vl",
+        }
+    }
+
+    /// The MiniMax-M3 section of `tests/fixtures/golden/qwen_smart_resize.json`
+    /// (its pinned image processor floors each rounded side to one factor
+    /// before the pixel-budget test) against the base with that opt-in.
+    #[test]
+    fn smart_resize_with_the_floor_matches_the_minimax_m3_reference() {
+        let golden: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/golden/qwen_smart_resize.json"
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let family = &golden["families"]["minimax_m3"];
+        let as_usize = |v: &serde_json::Value| v.as_u64().unwrap() as usize;
+        let processor = QwenVLProcessorBase::new(QwenVLConfig {
+            patch_size: as_usize(&family["patch_size"]),
+            merge_size: as_usize(&family["merge_size"]),
+            min_pixels: as_usize(&family["min_pixels"]),
+            max_pixels: as_usize(&family["max_pixels"]),
+            video_min_pixels: as_usize(&family["min_pixels"]),
+            video_max_pixels: as_usize(&family["max_pixels"]),
+            video_resize_mode: QwenVideoResizeMode::PerFrame,
+            temporal_patch_size: 2,
+            mean: [0.5; 3],
+            std: [0.5; 3],
+            model_name: "minimax_m3",
+        })
+        .raise_rounded_sides_to_factor();
+        let cases = family["cases"].as_array().unwrap();
+        assert!(!cases.is_empty());
+        for case in cases {
+            let (height, width) = (as_usize(&case["height"]), as_usize(&case["width"]));
+            let got = processor.smart_resize(height, width).ok();
+            let want = case["resized"]
+                .as_array()
+                .map(|r| (as_usize(&r[0]), as_usize(&r[1])));
+            assert_eq!(got, want, "{height}x{width}");
         }
     }
 
