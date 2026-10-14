@@ -7,11 +7,10 @@ use openai_protocol::worker::WorkerStatus;
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use super::create_worker::merge_labels;
 use crate::{
     worker::{
-        overload::OverloadThresholds, service::MAX_WORKER_LABELS, BasicWorker, BasicWorkerBuilder,
-        Worker,
+        overload::OverloadThresholds, service::MAX_WORKER_LABELS, worker::merge_labels,
+        BasicWorker, BasicWorkerBuilder, Worker,
     },
     workflow::data::WorkerUpdateWorkflowData,
 };
