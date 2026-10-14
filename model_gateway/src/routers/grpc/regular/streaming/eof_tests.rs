@@ -156,6 +156,27 @@ pub(crate) async fn scripted_stream(
     (stream, server)
 }
 
+/// [`scripted_stream`] whose frames leave `gap` apart, as an engine's steps
+/// do, so a test can read when each event reached the client.
+pub(crate) async fn scripted_stream_paced(
+    responses: Vec<proto::GenerateResponse>,
+    grpc_status: &'static str,
+    gap: Duration,
+) -> (ProtoStream, JoinHandle<()>) {
+    let frames: Vec<Result<Frame<Bytes>, tonic::Status>> = responses
+        .iter()
+        .map(|response| Ok(data_frame(response)))
+        .chain(std::iter::once(Ok(trailers_frame(grpc_status))))
+        .collect();
+    let (client, server) = mock_client().await;
+    let frames = stream::iter(frames).then(move |frame| async move {
+        tokio::time::sleep(gap).await;
+        frame
+    });
+    let stream = response_stream(frames, client);
+    (stream, server)
+}
+
 /// [`scripted_stream`] with the frames after `first` held back until `gate`
 /// fires: the processor sees the first engine output on its own.
 pub(super) async fn gated_stream(

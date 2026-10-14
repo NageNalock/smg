@@ -17,7 +17,9 @@
 //! choices, events carrying `logprobs` or fields this module does not know.
 //!
 //! The HTTP relay drives [`SseRechunker`] inline; the gRPC pipeline wraps
-//! its own channel in [`rechunk_stream`].
+//! its own channel in [`rechunk_stream`]. Both only when the gateway runs
+//! with `--stream-delta-slicing`: a slice is held until it is full, so by
+//! default every engine chunk leaves as its own delta.
 
 use std::{borrow::Cow, collections::BTreeMap, fmt, pin::Pin, time::Duration};
 

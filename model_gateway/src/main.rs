@@ -1070,6 +1070,13 @@ struct CliArgs {
     #[arg(long, default_value_t = 15, help_heading = "Request Handling")]
     sse_keepalive_secs: u64,
 
+    /// Re-slice the deltas of a streamed chat completion into the sizes the
+    /// provider's own API emits (MiniMax: 80 to 160 characters per event,
+    /// flushed after 250 ms of silence). Off: one delta per engine chunk, as
+    /// the engine streams it.
+    #[arg(long, default_value_t = false, help_heading = "Request Handling")]
+    stream_delta_slicing: bool,
+
     /// Idle timeout in seconds for pooled upstream connections. Must stay
     /// below the backend HTTP server's keep-alive timeout (vLLM and SGLang
     /// default to 5), or reused connections the server already closed fail
@@ -2630,6 +2637,7 @@ impl CliArgs {
             .idle_connection_timeout_secs(self.idle_connection_timeout_secs)
             .request_timeout_secs(self.request_timeout_secs)
             .sse_keepalive_secs(self.sse_keepalive_secs)
+            .stream_delta_slicing(self.stream_delta_slicing)
             .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_delay_secs(self.worker_startup_delay)
@@ -3825,6 +3833,21 @@ mod tests {
 
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.sse_keepalive_secs, 15);
+    }
+
+    /// The delta-slicing flag is off unless given, and flows into `RouterConfig`.
+    #[test]
+    fn stream_delta_slicing_flag_flows_into_router_config() {
+        let cli = cli_args_from(&["--stream-delta-slicing"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(router_config.stream_delta_slicing);
+        assert!(
+            !cli_args_from(&[])
+                .to_router_config(vec![], vec![])
+                .unwrap()
+                .stream_delta_slicing,
+            "off by default"
+        );
     }
 
     #[test]

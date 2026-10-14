@@ -129,6 +129,9 @@ pub struct Router {
     /// requests stream and forfeit router retries. `0` never buffers for
     /// retries.
     max_buffered_request_bytes: u64,
+    /// `--stream-delta-slicing`: re-slice a MiniMax chat stream's deltas to
+    /// the provider's event sizes; off, the upstream's events are relayed.
+    stream_delta_slicing: bool,
     realtime_registry: Arc<RealtimeRegistry>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
@@ -196,6 +199,7 @@ impl Router {
                 secs => Some(Duration::from_secs(secs)),
             },
             max_buffered_request_bytes: ctx.router_config.max_buffered_request_bytes,
+            stream_delta_slicing: ctx.router_config.stream_delta_slicing,
             realtime_registry: ctx.realtime_registry.clone(),
             webrtc_bind_addr: ctx.webrtc_bind_addr,
             webrtc_stun_server: ctx.webrtc_stun_server.clone(),
@@ -667,8 +671,10 @@ impl Router {
         let headers = Some(&headers_with_trace);
 
         // The profile comes from the model the client asked for, as request
-        // validation selects it, not from the alias-resolved id.
-        let rechunk = is_stream
+        // validation selects it, not from the alias-resolved id. The
+        // re-slicing is opt-in (`--stream-delta-slicing`).
+        let rechunk = self.stream_delta_slicing
+            && is_stream
             && route == "/v1/chat/completions"
             && lease.with_view(|view| {
                 view.request.get_model().is_some_and(|model| {
@@ -2633,6 +2639,7 @@ mod tests {
             max_payload_size: 536_870_912,
             stream_stall_timeout: Some(Duration::from_secs(60)),
             max_buffered_request_bytes: 0,
+            stream_delta_slicing: false,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
@@ -2939,6 +2946,7 @@ mod tests {
             max_payload_size: 536_870_912,
             stream_stall_timeout: Some(Duration::from_secs(60)),
             max_buffered_request_bytes: 0,
+            stream_delta_slicing: false,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
@@ -3244,6 +3252,7 @@ mod tests {
             // Streaming tests exercise the streamed path; 0 never buffers
             // for retries.
             max_buffered_request_bytes: 0,
+            stream_delta_slicing: false,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,

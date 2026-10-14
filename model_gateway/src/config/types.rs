@@ -140,6 +140,13 @@ pub struct RouterConfig {
     /// on a long prefill. Nothing is sent while frames flow. `0` sends none.
     #[serde(default = "default_sse_keepalive_secs")]
     pub sse_keepalive_secs: u64,
+    /// Re-slice the deltas of a streamed chat completion into the sizes the
+    /// provider's own API emits (MiniMax: 80 to 160 characters per event,
+    /// flushed after 250 ms of silence) instead of one delta per engine chunk.
+    /// Off by default: clients read every token as the engine produces it;
+    /// a provider verifier run turns it on.
+    #[serde(default)]
+    pub stream_delta_slicing: bool,
     /// Idle timeout for pooled upstream connections. Must stay below the
     /// backend HTTP server's keep-alive timeout (the engines default to
     /// 5s), or the pool hands out connections the server has already closed
@@ -1679,6 +1686,7 @@ impl Default for RouterConfig {
             idle_connection_timeout_secs: default_idle_connection_timeout_secs(),
             request_timeout_secs: 1800, // 30 minutes
             sse_keepalive_secs: default_sse_keepalive_secs(),
+            stream_delta_slicing: false,
             upstream_pool_idle_timeout_secs: default_upstream_pool_idle_timeout_secs(),
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
             worker_startup_delay_secs: 0,

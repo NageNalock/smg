@@ -178,6 +178,9 @@ pub(crate) struct StreamingProcessor {
     /// Per-request parser-name resolution (model-card override → configured).
     parser_resolver: utils::ParserResolver,
     backend_type: &'static str,
+    /// Re-slice a MiniMax chat stream's deltas to the provider's event sizes
+    /// (`--stream-delta-slicing`); off, every engine chunk is its own delta.
+    stream_delta_slicing: bool,
 }
 
 /// Context for generate endpoint streaming - groups config params to reduce function arguments
@@ -205,7 +208,16 @@ impl StreamingProcessor {
             reasoning_parser_factory,
             parser_resolver,
             backend_type,
+            stream_delta_slicing: false,
         }
+    }
+
+    /// Re-slice MiniMax chat deltas to the provider's event sizes (the
+    /// configured `stream_delta_slicing`).
+    #[must_use]
+    pub fn with_stream_delta_slicing(mut self, on: bool) -> Self {
+        self.stream_delta_slicing = on;
+        self
     }
 
     /// Process streaming chat response and return SSE response
@@ -239,10 +251,13 @@ impl StreamingProcessor {
             chat_request.ignore_eos,
         );
 
-        // MiniMax's stream-QoS contract bounds per-event delta sizes. The HTTP
-        // relay re-slices the upstream body; here the gateway encodes the
-        // frames itself, so the channel is re-chunked on its way out.
-        let rechunk = chat_request.provider == ProviderProfile::Minimax;
+        // MiniMax's stream-QoS contract bounds per-event delta sizes; the
+        // re-slicing is opt-in (`--stream-delta-slicing`), because a slice is
+        // held until it is full. The HTTP relay re-slices the upstream body;
+        // here the gateway encodes the frames itself, so the channel is
+        // re-chunked on its way out.
+        let rechunk =
+            self.stream_delta_slicing && chat_request.provider == ProviderProfile::Minimax;
 
         // Create SSE channel
         let (tx, rx) = sse_channel();
@@ -4281,6 +4296,8 @@ mod pd_usage_tests;
 #[cfg(test)]
 mod symphony_tests;
 
+#[cfg(test)]
+mod delta_slicing_tests;
 #[cfg(test)]
 mod sse_bytes_tests;
 #[cfg(test)]

@@ -252,6 +252,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn stream_delta_slicing(mut self, on: bool) -> Self {
+        self.config.stream_delta_slicing = on;
+        self
+    }
+
     pub fn worker_startup_timeout_secs(mut self, timeout: u64) -> Self {
         self.config.worker_startup_timeout_secs = timeout;
         self

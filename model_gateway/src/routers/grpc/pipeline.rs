@@ -123,6 +123,9 @@ pub(crate) struct PipelineDeps {
     /// `--queue-timeout-secs`: a request still ahead of worker selection this
     /// long after the gateway accepted it is refused instead of dispatched.
     queue_timeout: Duration,
+    /// `--stream-delta-slicing`: re-slice MiniMax chat deltas to the
+    /// provider's event sizes instead of one delta per engine chunk.
+    stream_delta_slicing: bool,
 }
 
 impl PipelineDeps {
@@ -142,6 +145,7 @@ impl PipelineDeps {
         configured_reasoning_parser: Option<String>,
         rate_limit_manager: Option<Arc<RateLimitManager>>,
         queue_timeout: Duration,
+        stream_delta_slicing: bool,
     ) -> Self {
         Self {
             worker_registry,
@@ -153,6 +157,7 @@ impl PipelineDeps {
             configured_reasoning_parser,
             rate_limit_manager,
             queue_timeout,
+            stream_delta_slicing,
         }
     }
 
@@ -164,6 +169,7 @@ impl PipelineDeps {
         prefill_admission: Option<Arc<PrefillAdmission>>,
         rate_limit_manager: Option<Arc<RateLimitManager>>,
         queue_timeout: Duration,
+        stream_delta_slicing: bool,
     ) -> Self {
         Self {
             worker_registry,
@@ -175,6 +181,7 @@ impl PipelineDeps {
             configured_reasoning_parser: None,
             rate_limit_manager,
             queue_timeout,
+            stream_delta_slicing,
         }
     }
 
@@ -197,12 +204,15 @@ impl PipelineDeps {
             self.reasoning_parser_factory.clone(),
             parser_resolver.clone(),
         );
-        let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
-            self.tool_parser_factory.clone(),
-            self.reasoning_parser_factory.clone(),
-            parser_resolver,
-            backend,
-        ));
+        let streaming_processor = Arc::new(
+            streaming::StreamingProcessor::new(
+                self.tool_parser_factory.clone(),
+                self.reasoning_parser_factory.clone(),
+                parser_resolver,
+                backend,
+            )
+            .with_stream_delta_slicing(self.stream_delta_slicing),
+        );
         (processor, streaming_processor)
     }
 
@@ -210,6 +220,7 @@ impl PipelineDeps {
     /// factories (completion does not use configured parsers), labeled `backend`.
     fn default_processors(
         backend: &'static str,
+        stream_delta_slicing: bool,
     ) -> (
         processor::ResponseProcessor,
         Arc<streaming::StreamingProcessor>,
@@ -219,12 +230,15 @@ impl PipelineDeps {
             ReasoningParserFactory::default(),
             utils::ParserResolver::disabled(),
         );
-        let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
-            ToolParserFactory::default(),
-            ReasoningParserFactory::default(),
-            utils::ParserResolver::disabled(),
-            backend,
-        ));
+        let streaming_processor = Arc::new(
+            streaming::StreamingProcessor::new(
+                ToolParserFactory::default(),
+                ReasoningParserFactory::default(),
+                utils::ParserResolver::disabled(),
+                backend,
+            )
+            .with_stream_delta_slicing(stream_delta_slicing),
+        );
         (processor, streaming_processor)
     }
 
@@ -241,6 +255,7 @@ impl PipelineDeps {
             configured_reasoning_parser: None,
             rate_limit_manager: None,
             queue_timeout: Duration::from_secs(60),
+            stream_delta_slicing: false,
         }
     }
 }
@@ -363,7 +378,8 @@ impl RequestPipeline {
             }
             Endpoint::Completion => {
                 // Completion uses default parser factories, not the configured ones.
-                let (processor, streaming_processor) = PipelineDeps::default_processors(backend);
+                let (processor, streaming_processor) =
+                    PipelineDeps::default_processors(backend, deps.stream_delta_slicing);
                 PipelineStages {
                     preparation: Box::new(CompletionPreparationStage),
                     rate_limit: Some(rate_limit()),
@@ -432,7 +448,8 @@ impl RequestPipeline {
                     return None;
                 }
                 // Plain text decode: no configured parsers needed.
-                let (processor, _streaming) = PipelineDeps::default_processors(backend);
+                let (processor, _streaming) =
+                    PipelineDeps::default_processors(backend, deps.stream_delta_slicing);
                 PipelineStages {
                     preparation: Box::new(TranscriptionPreparationStage),
                     // Whole-file transcription was never tenant rate-limited on
@@ -1670,6 +1687,7 @@ mod alias_pipeline_tests {
             None,
             None,
             Duration::from_secs(60),
+            false,
         );
         let pipeline = RequestPipeline::build(Endpoint::Chat, Mode::PrefillDecode, &deps).unwrap();
         let components = Arc::new(SharedComponents {
@@ -2238,6 +2256,7 @@ mod request_release_tests {
             None,
             None,
             Duration::from_secs(60),
+            false,
         );
         let pipeline =
             RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
@@ -2340,6 +2359,7 @@ mod request_release_tests {
             None,
             None,
             Duration::from_secs(60),
+            false,
         );
         let pipeline =
             RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
@@ -2412,6 +2432,7 @@ mod request_release_tests {
             None,
             None,
             Duration::from_secs(60),
+            false,
         );
         let pipeline =
             RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
@@ -2501,6 +2522,7 @@ mod request_release_tests {
             prefill_admission,
             None,
             Duration::from_secs(60),
+            false,
         );
         RequestPipeline::build(Endpoint::Completion, mode, &deps).expect("completion pipeline")
     }
@@ -2515,6 +2537,7 @@ mod request_release_tests {
             None,
             None,
             Duration::from_secs(60),
+            false,
         );
         RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
             .expect("completion pipeline")
@@ -3796,6 +3819,7 @@ mod request_release_tests {
             None,
             None,
             Duration::from_secs(60),
+            false,
         );
         let pipeline =
             RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
@@ -4499,6 +4523,7 @@ mod model_label_tests {
             None,
             None,
             Duration::from_secs(60),
+            false,
         );
         let pipeline =
             RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
