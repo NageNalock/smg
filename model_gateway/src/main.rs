@@ -1613,11 +1613,12 @@ struct CliArgs {
     webrtc_stun_server: Option<String>,
 
     // ==================== Runtime ====================
-    /// Async runtime worker-thread count, at least 1. Unset: the available
-    /// parallelism (the container's CPU quota) capped at 8, the gateway's own
-    /// budget: idle workers park and unpark on every streamed chunk, so a
-    /// runtime the size of a large quota costs CPU for no work. Set it to
-    /// size the runtime for a heavier deployment.
+    /// Async runtime worker-thread count, at least 1. Unset:
+    /// `TOKIO_WORKER_THREADS` when it is set (a positive integer, as tokio
+    /// reads it), else the available parallelism (the container's CPU quota)
+    /// capped at 8, the gateway's own budget: idle workers park and unpark on
+    /// every streamed chunk, so a runtime the size of a large quota costs CPU
+    /// for no work. Set it to size the runtime for a heavier deployment.
     #[arg(long, help_heading = "Runtime")]
     runtime_worker_threads: Option<usize>,
 }
@@ -2927,7 +2928,7 @@ fn serve(server_config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(server::runtime_worker_threads(
             server_config.runtime_worker_threads,
-        ))
+        )?)
         .enable_all()
         .build()?;
     let served = runtime.block_on(Box::pin(server::startup(server_config)));
@@ -2965,6 +2966,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The flag's help names the default cap, which is one constant in the
+    /// server module: the two cannot drift apart.
+    #[test]
+    fn the_runtime_flag_help_names_the_default_cap() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        let named = format!("capped at {}", server::DEFAULT_RUNTIME_WORKER_THREADS_CAP);
+        assert!(help.contains(&named), "{named}: not in the rendered help");
+    }
 
     /// Parse top-level CLI args into the flattened `CliArgs` the binary uses.
     fn cli_args_from(args: &[&str]) -> CliArgs {

@@ -1859,10 +1859,13 @@ impl Router {
             duration_buckets: self.prometheus_duration_buckets.clone(),
         });
 
-        // Sized as the CLI sizes its runtime: the gateway's budget, not the
-        // container's quota (the launcher exposes no flag for it).
+        // Sized as the CLI sizes its runtime: `TOKIO_WORKER_THREADS` when set,
+        // else the gateway's budget rather than the container's quota (the
+        // launcher exposes no flag for it).
+        let worker_threads = server::runtime_worker_threads(None)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(server::runtime_worker_threads(None))
+            .worker_threads(worker_threads)
             .enable_all()
             .build()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
