@@ -30,10 +30,11 @@ use smg::{
         bind_socket_addr, resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, FileDiscoveryConfig,
         HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind,
-        ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig, PdPairingMode,
-        PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric, RedisConfig, RetryConfig, RouterConfig,
-        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
-        TokenizerCacheConfig, TraceConfig, DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
+        ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig, ParserChoice,
+        PdPairingMode, PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric, RedisConfig,
+        RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig,
+        TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+        DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
     },
     mesh_discovery::MeshDiscoveryConfig,
     observability::{
@@ -1358,13 +1359,29 @@ struct CliArgs {
     tokenizer_cache_l1_max_memory: usize,
 
     // ==================== Parsers ====================
-    /// Parser for reasoning models (e.g., deepseek-r1, qwen3)
+    /// Parser for reasoning models (e.g., deepseek-r1, qwen3). Under --parser
+    /// symphony, a Symphony table's name here (and in --tool-call-parser, or
+    /// there alone) reads every model with that table; a legacy parser's name
+    /// keeps the legacy parsers. A worker's labels set the names per model.
     #[arg(long, help_heading = "Parsers")]
     reasoning_parser: Option<String>,
 
-    /// Parser for tool-call interactions
+    /// Parser for tool-call interactions (e.g., json, qwen). Under --parser
+    /// symphony, a Symphony table's name here (and in --reasoning-parser, or
+    /// here alone) reads every model with that table; a legacy parser's name
+    /// keeps the legacy parsers. A worker's labels set the names per model.
     #[arg(long, help_heading = "Parsers")]
     tool_call_parser: Option<String>,
+
+    /// Which parser reads a chat completion's reasoning and tool calls: the
+    /// per-model parsers (legacy) or Symphony. With Symphony, the parser names
+    /// set for a model decide (its worker labels, else --tool-call-parser and
+    /// --reasoning-parser): a Symphony table's name reads with that table, a
+    /// legacy parser's keeps the legacy parsers, and no name takes Symphony's
+    /// registry for the models it knows. A request's X-SMG-Parser header
+    /// overrides the flag for that request.
+    #[arg(long, default_value = "legacy", value_parser = ["legacy", "symphony"], help_heading = "Parsers")]
+    parser: String,
 
     /// Path to MCP server configuration file
     #[arg(long, help_heading = "Parsers")]
@@ -2716,6 +2733,7 @@ impl CliArgs {
                 l1_max_memory: self.tokenizer_cache_l1_max_memory,
             })
             .disable_tokenizer_autoload(self.disable_tokenizer_autoload)
+            .parser(ParserChoice::parse(&self.parser).unwrap_or_default())
             .history_backend(history_backend)
             .memory_config(MemoryConfig {
                 max_responses: self.history_memory_max_responses,

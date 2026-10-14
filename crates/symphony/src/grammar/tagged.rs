@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use super::{
     block_of,
     schema::{self, shape, Definitions},
-    CallMarkers, Grammar, Tag, WayIn,
+    CallMarkers, Count, Grammar, Tag, WayIn,
 };
 use crate::tagged::{assembler::TAGS, Spelling};
 
@@ -43,7 +43,7 @@ pub(super) fn calls(
     ways_in: &[WayIn<'_>],
     spelling: Spelling,
     tools: &[&Tool],
-    at_least_one: bool,
+    count: Count<'_>,
 ) -> Grammar {
     let values = Values {
         spelling,
@@ -70,20 +70,14 @@ pub(super) fn calls(
                     })
                     .collect(),
             );
-            block_of(
-                ways_in,
-                Grammar::Plus(Box::new(one_call)),
-                block.close,
-                at_least_one,
-            )
+            block_of(ways_in, count.calls(one_call), block.close, count)
         }
-        None => Grammar::TriggeredTags {
-            triggers: vec![markers.call_open.to_string()],
-            tags: calls
+        None => count.triggered(
+            vec![markers.call_open.to_string()],
+            calls
                 .map(|(begin, content, end)| Tag::new(begin, content, end))
                 .collect(),
-            at_least_one,
-        },
+        ),
     }
 }
 

@@ -1130,6 +1130,12 @@ impl Decoder for HuggingFaceTokenizer {
         if let Some(table) = &self.byte_level {
             return Ok(table.decode(token_ids, skip_special_tokens));
         }
+        // A sentencepiece-style vocabulary with byte fallback decodes through
+        // its piece table, as its streaming windows do: one pass over the ids
+        // in place of the `tokenizers` decoder chain over every piece.
+        if let Some(table) = &self.pieces {
+            return Ok(table.render(token_ids, skip_special_tokens));
+        }
         self.tokenizer
             .decode(token_ids, skip_special_tokens)
             .map_err(|e| Error::msg(format!("Decoding failed: {e}")))
@@ -1289,6 +1295,24 @@ impl TokenizerTrait for HuggingFaceTokenizer {
 
     fn eos_token_ids(&self) -> &[TokenIdType] {
         &self.eos_token_ids
+    }
+
+    fn added_token_strings(&self) -> Vec<String> {
+        self.tokenizer
+            .get_added_tokens_decoder()
+            .values()
+            .filter(|token| !token.special && !token.normalized)
+            .map(|token| token.content.clone())
+            .collect()
+    }
+
+    fn added_tokens_after_normalization(&self) -> Vec<String> {
+        self.tokenizer
+            .get_added_tokens_decoder()
+            .values()
+            .filter(|token| token.normalized)
+            .map(|token| token.content.clone())
+            .collect()
     }
 
     fn apply_chat_template(
@@ -1812,6 +1836,92 @@ mod tests {
 
     use super::derive_thinking_mode;
     use crate::{chat_template::ChatTemplateParams, encoders::deepseek_v32::ThinkingMode};
+
+    /// The added tokens a prefix cache may match are those of the raw pass
+    /// (`normalized: false`); the tokens matched after normalization, special
+    /// or not, are reported apart, so the cache does not split at any of them.
+    #[test]
+    fn the_cache_sees_the_raw_pass_added_tokens_and_the_normalized_ones_apart() {
+        use tokenizers::{
+            models::bpe::{Merges, Vocab, BPE},
+            AddedToken,
+        };
+
+        use super::HuggingFaceTokenizer;
+        use crate::traits::Tokenizer as TokenizerTrait;
+        let mut vocab = Vocab::default();
+        for (id, piece) in ["<unk>", "a", "b", "<", ">"].iter().enumerate() {
+            vocab.insert((*piece).to_string(), id as u32);
+        }
+        let model = BPE::builder()
+            .vocab_and_merges(vocab, Merges::new())
+            .unk_token("<unk>".into())
+            .build()
+            .expect("model");
+        let mut tokenizer = tokenizers::Tokenizer::new(model);
+        tokenizer
+            .add_special_tokens([
+                AddedToken::from("<|s|>", true),
+                AddedToken::from("<|n|>", true).normalized(true),
+            ])
+            .expect("special tokens added");
+        tokenizer
+            .add_tokens([
+                AddedToken::from("</think>", false).normalized(false),
+                AddedToken::from("a<", false),
+            ])
+            .expect("added tokens added");
+        let wrapped = HuggingFaceTokenizer::from_tokenizer(tokenizer);
+        assert_eq!(wrapped.added_token_strings(), vec!["</think>".to_owned()]);
+        let mut after_normalization = wrapped.added_tokens_after_normalization();
+        after_normalization.sort();
+        assert_eq!(
+            after_normalization,
+            vec!["<|n|>".to_owned(), "a<".to_owned()]
+        );
+    }
+
+    /// The one-shot decode through the piece table is byte for byte the
+    /// `tokenizers` decode: random id sequences of word pieces, byte runs
+    /// (valid, incomplete, lost), specials, a lone marker and a piece ending
+    /// in U+FFFD, with and without the trailing strip, under both
+    /// special-token settings, long and short.
+    #[test]
+    fn the_piece_table_decodes_what_the_tokenizers_decode_decodes() {
+        use super::HuggingFaceTokenizer;
+        use crate::{
+            byte_fallback::tests::{random_ids, synthetic as synthetic_for_decode},
+            traits::Decoder as _,
+        };
+        for strip in [false, true] {
+            for skip in [false, true] {
+                let with = HuggingFaceTokenizer::from_tokenizer(synthetic_for_decode(strip));
+                assert!(with.pieces.is_some(), "the synthetic chain has a table");
+                let mut without = HuggingFaceTokenizer::from_tokenizer(synthetic_for_decode(strip));
+                without.pieces = None;
+                let mut state =
+                    0x2545_F491_4F6C_DD1Du64 ^ u64::from(strip) ^ (u64::from(skip) << 1);
+                for round in 0..2_000usize {
+                    let ids = random_ids(&mut state, 1 + round % 40);
+                    assert_eq!(
+                        with.decode(&ids, skip).unwrap(),
+                        without.decode(&ids, skip).unwrap(),
+                        "ids {ids:?} strip {strip} skip {skip}"
+                    );
+                }
+                // A long sequence, as a one-shot decode of a whole output is.
+                let long: Vec<u32> = (0..400)
+                    .flat_map(|r| random_ids(&mut state, 1 + r % 40))
+                    .collect();
+                assert_eq!(
+                    with.decode(&long, skip).unwrap(),
+                    without.decode(&long, skip).unwrap(),
+                    "{} ids, strip {strip} skip {skip}",
+                    long.len()
+                );
+            }
+        }
+    }
 
     /// With the piece table the step algorithm streams byte for byte what it
     /// streams through the `tokenizers` window decode. Random streams of word

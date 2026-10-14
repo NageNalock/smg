@@ -35,6 +35,7 @@ pub mod json;
 pub mod markers;
 pub mod parser;
 pub mod pythonic;
+pub mod shape;
 pub mod tagged;
 pub mod tokens;
 
@@ -42,12 +43,13 @@ pub use engine::Engine;
 pub use event::{DropReason, Event, Events, FinishReason, MalformedReason, Text};
 pub use format::{CallSyntax, Emits, Format};
 pub use formats::{
-    deepseek_v4_1, glm, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, plain, qwen2_5,
-    qwen3, seed_oss, xlam,
+    deepseek_v4_1, forced, function_gemma, glm, hy4, iquest, kimi_k3, lfm2_5, ling, llama_nemotron,
+    minimax_m3, mistral_v13, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
 };
 pub use grammar::{Grammar, Tag};
 pub use input::{EngineFinish, Input, TokenSpan};
 pub use markers::{Piece, Scanner};
 pub use parser::{ParseError, Parser};
+pub use shape::{Inferred, ValueRead};
 pub use tagged::Declared;
 pub use tokens::Ledger;

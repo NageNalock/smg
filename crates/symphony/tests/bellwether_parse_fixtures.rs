@@ -80,9 +80,9 @@ use serde::Deserialize;
 use symphony::{
     adapt,
     formats::{
-        deepseek_v4_1, dots3, for_model, gemma4, glm, glm4, hy4, inkling, iquest, k2_horizon,
-        kimi_k3, lfm2_5, ling, minicpm5, minimax_m2, minimax_m3, olmo3, plain, qwen2_5, qwen3,
-        seed_oss, xlam,
+        deepseek_v4_1, dots3, for_model, function_gemma, gemma4, glm, glm4, groups, hy4, inkling,
+        iquest, json, k2_horizon, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2,
+        minimax_m3, mistral_v13, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
     },
     tagged::{Placement, Spelling},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
@@ -115,7 +115,15 @@ const SLUG: &str = "qwen3-8b";
 /// reference on whole sets, which no per-case list could carry. The slug stays
 /// in the table so its family and prompt tail are kept; the issue brings it
 /// back.
-const SKIPPED: &[(&str, &str)] = &[];
+const SKIPPED: &[(&str, &str)] = &[
+    // bellwether #149 recorded its sets again without the common set (the 16 cases are gone from
+    // main 25b7767791), so the probes its family lists have no fixture to meet; replayed again
+    // once bellwether records them.
+    (
+        "step-3.5-flash",
+        "bellwether #149 dropped its common set, so the listed probes have no fixture to meet",
+    ),
+];
 /// bellwether's slugs for the checkpoints the tables read, in its manifests' spelling, each with
 /// the table that reads it and how its template ends the generation prompt. The fixtures carry
 /// the request and the output, not the rendered prompt, so the prompt's tail is stated here until
@@ -488,12 +496,13 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Plain,
         GenerationPrompt::Plain,
     ),
-    // Python calls: Olmo 3 has no thought; LFM2.5 writes its own `<think>`.
+    // Python calls: Olmo 3 has no thought; LFM2.5's template adds nothing to the turn opener in
+    // either thinking setting (its render set), and the model writes `<think>` itself or not.
     ("olmo-3-7b-instruct", Family::Olmo3, GenerationPrompt::Plain),
     (
         "lfm2.5-1.2b-instruct",
         Family::Lfm2_5,
-        GenerationPrompt::ModelWritesTheThought,
+        GenerationPrompt::ModelDecides,
     ),
     // A bare JSON list of calls, or content; no thought.
     (
@@ -549,6 +558,361 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Gemma4,
         GenerationPrompt::ModelDecides,
     ),
+    // Qwen3's JSON calls under other templates (bellwether main 5bcd7b0b0): each as its own
+    // template writes the thought.
+    (
+        "agentcpm-explore",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "ai21-jamba-reasoning-3b",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "astabrief-8b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "baichuan-m3-235b",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    ("caprl-qwen3vl-4b", Family::Qwen3, GenerationPrompt::Plain),
+    ("caprl-video-4b", Family::Qwen3, GenerationPrompt::Plain),
+    (
+        "contextpilot-14b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "falcon-h1r-7b",
+        Family::Qwen3,
+        GenerationPrompt::ModelDecides,
+    ),
+    (
+        "nemotron-cascade-14b-thinking",
+        Family::Qwen3,
+        GenerationPrompt::ModelDecides,
+    ),
+    (
+        "nemotron-orchestrator-8b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    // Qwen2.5's JSON calls, no thought.
+    (
+        "falcon-h1-tiny-90m-instruct",
+        Family::Qwen2_5,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "nemotron-research-goosereason-4b-instruct",
+        Family::Qwen2_5,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "opencodereasoning-nemotron-7b",
+        Family::Qwen2_5,
+        GenerationPrompt::Plain,
+    ),
+    // Qwen 3.5's tagged calls, the thought opened in the prompt and closed there when the
+    // request turns thinking off.
+    (
+        "arex-2",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "arex-base",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "arex-turbo",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "cosmos3-edge",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "cosmos3-edge-policy-droid",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "nemotron-cascade-2-30b-a3b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "nvidia-nemotron-3-nano-4b-bf16",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "nvidia-nemotron-3-super-120b-a12b-bf16",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "nvidia-nemotron-3-ultra-550b-a55b-bf16",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "nvidia-nemotron-3.5-lightning-30b-a3b-bf16",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "nvidia-nemotron-labs-3-elastic-30b-a3b-bf16",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "nvidia-nemotron-labs-3-puzzle-75b-a9b-bf16",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    // GLM 4.5's keyed spelling (a newline after the name, each key and each value); the model
+    // writes its own `<think>`, closed in the prompt when thinking is off.
+    (
+        "glm-4.5v",
+        Family::Glm4,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "glm-4.6v",
+        Family::Glm4,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "glm-4.6v-flash",
+        Family::Glm4,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    // GLM's compact keyed spelling; the prompt opens the thought, or closes it when the request
+    // turns thinking off; GLM-5.3 opens it whatever the request says.
+    (
+        "atria-dawn-preview",
+        Family::Glm,
+        GenerationPrompt::OpensTheThought,
+    ),
+    ("glm-4.7", Family::Glm, GenerationPrompt::OpensTheThought),
+    (
+        "glm-4.7-flash",
+        Family::Glm,
+        GenerationPrompt::OpensTheThought,
+    ),
+    ("glm-5", Family::Glm, GenerationPrompt::OpensTheThought),
+    ("glm-5.1", Family::Glm, GenerationPrompt::OpensTheThought),
+    ("glm-5.2", Family::Glm, GenerationPrompt::OpensTheThought),
+    (
+        "glm-5.3",
+        Family::Glm,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    // MiniMax M2's blocks of invokes; the prompt opens the thought whatever the request says.
+    (
+        "minimax-m2.5",
+        Family::MinimaxM2,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    // LFM2.5's Python calls under d1's template, which adds nothing to the turn opener in either
+    // thinking setting; the model writes `<think>` itself or not.
+    ("d1-3b", Family::Lfm2_5, GenerationPrompt::ModelDecides),
+    // Mistral: `[THINK]` and `[/THINK]` the model's own, `[TOOL_CALLS]name[ARGS]{…}` per call; the
+    // prompt ends at `[/INST]` whatever the request says. The instruct templates have no thought.
+    (
+        "devstral-2-123b-instruct-2512",
+        Family::MistralV13,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "ministral-3-14b-instruct-2512-bf16",
+        Family::MistralV13,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "ministral-3-14b-reasoning-2512",
+        Family::MistralV13,
+        GenerationPrompt::ModelDecides,
+    ),
+    (
+        "ministral-3-3b-instruct-2512",
+        Family::MistralV13,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "ministral-3-3b-instruct-2512-bf16",
+        Family::MistralV13,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "ministral-3-8b-instruct-2512-bf16",
+        Family::MistralV13,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "mistral-medium-3.5-128b",
+        Family::MistralV13,
+        GenerationPrompt::ModelDecides,
+    ),
+    (
+        "mistral-small-4-119b-2603",
+        Family::MistralV13,
+        GenerationPrompt::ModelDecides,
+    ),
+    // Llama Nemotron: one JSON list of calls between `<TOOLCALL>` and `</TOOLCALL>`. The Super
+    // template has a thought the model writes itself (`/no_think` in the system prompt closes it
+    // in the prompt; the request's switch changes nothing); the Nano and DLER templates have none.
+    (
+        "dler-llama-nemotron-8b-merge-research",
+        Family::LlamaNemotron,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "llama-3-3-nemotron-super-49b-v1-5",
+        Family::LlamaNemotron,
+        GenerationPrompt::ModelDecides,
+    ),
+    (
+        "llama-3.1-nemotron-nano-8b-v1",
+        Family::LlamaNemotron,
+        GenerationPrompt::Plain,
+    ),
+    // Qwen3's JSON calls under other templates (bellwether main 8029536af5): EXAONE 4.5 opens the
+    // thought in the prompt under its own opener; AReaL-SEA and the tau2 SFT open it whatever the
+    // request says; the boba-2 line and the tau2 user SFT leave it to the model.
+    (
+        "areal-boba-2-14b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "areal-boba-2-32b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "areal-boba-2-8b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "areal-sea-235b-a22b",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "areal-tau2-telecom-sft-30b",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "areal-tau2-telecom-user-sft-30b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "exaone-4.5-33b",
+        Family::Qwen3,
+        GenerationPrompt::OpensTheThought,
+    ),
+    // Qwen2.5's JSON calls, no thought: A.X under its own opener (`<|im_start|><|assistant|>`,
+    // the object without newlines), the Seed-OSS alternate tokenizer under Llama 3's header, the
+    // rest under Qwen2.5's own template.
+    ("a.x-3.1-light", Family::Qwen2_5, GenerationPrompt::Plain),
+    ("a.x-4.0", Family::Qwen2_5, GenerationPrompt::Plain),
+    ("a.x-4.0-light", Family::Qwen2_5, GenerationPrompt::Plain),
+    (
+        "baichuanmed-ocr-7b",
+        Family::Qwen2_5,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "bytedance-seed-oss-36b-alternate-tokenizer",
+        Family::Qwen2_5,
+        GenerationPrompt::Plain,
+    ),
+    ("caller", Family::Qwen2_5, GenerationPrompt::Plain),
+    ("caprl-3b", Family::Qwen2_5, GenerationPrompt::Plain),
+    ("caprl-eval-3b", Family::Qwen2_5, GenerationPrompt::Plain),
+    (
+        "cogalign-internvl2-5-mpo-4b",
+        Family::Qwen2_5,
+        GenerationPrompt::Plain,
+    ),
+    ("crispers-7b-v1", Family::Qwen2_5, GenerationPrompt::Plain),
+    ("ernie-image-aes", Family::Qwen2_5, GenerationPrompt::Plain),
+    // Qwen 3.5's tagged calls, the thought opened in the prompt and closed there when the
+    // request turns thinking off.
+    (
+        "fara1.5-27b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "fara1.5-9b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "h2o-lightning-4b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "huatuogpt-3-27b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    // Llama 3.1's own template under the Nemotron Ultra, UltraLong, Safety Guard and Reward
+    // checkpoints: one call object alone in the turn, `parameters` naming the arguments, no
+    // thought; the template refuses parallel calls and content beside a call.
+    (
+        "llama-3-1-nemotron-ultra-253b-cpt-v1",
+        Family::Json,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "llama-3.1-nemotron-8b-ultralong-1m-instruct",
+        Family::Json,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "llama-3.1-nemotron-8b-ultralong-2m-instruct",
+        Family::Json,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "llama-3.1-nemotron-8b-ultralong-4m-instruct",
+        Family::Json,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "llama-3.1-nemotron-safety-guard-8b-v3",
+        Family::Json,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "llama-3.3-nemotron-70b-reward-principle",
+        Family::Json,
+        GenerationPrompt::Plain,
+    ),
+    // FunctionGemma: Gemma's calls between `<start_function_call>` and `<end_function_call>`,
+    // `<escape>` around a string and `None` for a null; the template has no thought.
+    (
+        "functiongemma-270m-it",
+        Family::FunctionGemma,
+        GenerationPrompt::Plain,
+    ),
 ];
 
 /// The turn opener a model's own chat template writes, for a model that reads another family's
@@ -565,6 +929,38 @@ const OPENERS: &[(&str, &str)] = &[
         "<|start_of_role|>assistant<|end_of_role|>",
     ),
     ("laguna-xs.2", "<assistant>"),
+    ("a.x-3.1-light", "<|im_start|><|assistant|>"),
+    ("a.x-4.0", "<|im_start|><|assistant|>"),
+    ("a.x-4.0-light", "<|im_start|><|assistant|>"),
+    (
+        "bytedance-seed-oss-36b-alternate-tokenizer",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    ("exaone-4.5-33b", "<|assistant|>"),
+    (
+        "llama-3-1-nemotron-ultra-253b-cpt-v1",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "llama-3.1-nemotron-8b-ultralong-1m-instruct",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "llama-3.1-nemotron-8b-ultralong-2m-instruct",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "llama-3.1-nemotron-8b-ultralong-4m-instruct",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "llama-3.1-nemotron-safety-guard-8b-v3",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "llama-3.3-nemotron-70b-reward-principle",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
 ];
 
 /// The table that reads a checkpoint's output.
@@ -595,6 +991,12 @@ enum Family {
     Lfm2_5,
     /// [`xlam`]: a bare JSON list of calls.
     Xlam,
+    /// [`json`]: one call object, or a list of them, alone in the turn.
+    Json,
+    /// [`mistral_v13`]: the tool's name, `[ARGS]` and the arguments object after `[TOOL_CALLS]`.
+    MistralV13,
+    /// [`llama_nemotron`]: one JSON list of calls between `<TOOLCALL>` and `</TOOLCALL>`.
+    LlamaNemotron,
     /// [`minimax_m2`]: parameters named by an attribute, typed by the request tools.
     MinimaxM2,
     /// [`minimax_m3`]: an XML tree of arguments, typed by the request tools at every depth.
@@ -609,6 +1011,8 @@ enum Family {
     Dots3,
     /// [`gemma4`]: `call:NAME{…}` calls in Gemma's spelling, the thought a channel.
     Gemma4,
+    /// [`function_gemma`]: Gemma's calls in FunctionGemma's tokens, no thought.
+    FunctionGemma,
     /// [`plain`]: content and nothing else.
     Plain,
 }
@@ -625,6 +1029,7 @@ impl Family {
             Self::Inkling => ("<|content_thinking|>", "<|end_message|>"),
             Self::Gemma4 => ("<|channel>thought\n", "<channel|>"),
             Self::K2Horizon => ("<ifm|think>", "</ifm|think>"),
+            Self::MistralV13 => ("[THINK]", "[/THINK]"),
             _ => ("<think>", "</think>"),
         }
     }
@@ -634,7 +1039,7 @@ impl Family {
     /// separators=(",", ":"))` does: a case whose arguments differ from the reference's only so,
     /// equal as values, is counted as respelled, not as a difference.
     fn respells_arguments(self) -> bool {
-        matches!(self, Self::Inkling | Self::Gemma4)
+        matches!(self, Self::Inkling | Self::Gemma4 | Self::FunctionGemma)
     }
 
     /// The table for one of the model's cases: the family's, with the model's own turn opener
@@ -669,6 +1074,9 @@ impl Family {
             Self::Olmo3 => olmo3(),
             Self::Lfm2_5 => lfm2_5(),
             Self::Xlam => xlam(),
+            Self::Json => json(),
+            Self::MistralV13 => mistral_v13(),
+            Self::LlamaNemotron => llama_nemotron(),
             Self::MinimaxM2 => minimax_m2(),
             Self::MinimaxM3 => minimax_m3(),
             Self::KimiK3 => kimi_k3(),
@@ -676,6 +1084,7 @@ impl Family {
             Self::MiniCpm5 => minicpm5(),
             Self::Dots3 => dots3(),
             Self::Gemma4 => gemma4(),
+            Self::FunctionGemma => function_gemma(),
             Self::Plain => plain(),
         }
     }
@@ -687,28 +1096,33 @@ impl Family {
         let list = match self {
             Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
             Self::Qwen3Tagged | Self::MiMo => KNOWN_TAGGED_DIFFERENCES,
-            // Seed-OSS, Hy4, Olmo 3, xLAM, Kimi K3, K2-Horizon, Inkling, Gemma 4 and the plain
-            // table read neither of the probes' Qwen markers: `</think>` stays reasoning text and
-            // the fenced `<tool_call>` block stays content, as the reference says.
+            // Seed-OSS, Hy4, Olmo 3, xLAM, the json table, Kimi K3, K2-Horizon, Inkling, Gemma 4
+            // and the plain table read neither of the probes' Qwen markers: `</think>` stays
+            // reasoning text and the fenced `<tool_call>` block stays content, as the reference
+            // says.
             Self::SeedOss
             | Self::Hy4
             | Self::Olmo3
             | Self::Xlam
+            | Self::Json
             | Self::KimiK3
             | Self::K2Horizon
             | Self::Inkling
             | Self::Gemma4
+            | Self::FunctionGemma
+            | Self::MistralV13
             | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
             // tagged ones' (no call comes of the fence); IQuest, DSML, LFM2.5, MiniMax M2,
-            // MiniCPM5 and dots3 read `</think>` but not `<tool_call>`.
+            // MiniCPM5, dots3 and Llama Nemotron read `</think>` but not `<tool_call>`.
             Self::Ling | Self::Glm | Self::Glm4 => KNOWN_TAGGED_DIFFERENCES,
             Self::IQuest
             | Self::DeepSeekV4_1
             | Self::Lfm2_5
             | Self::MinimaxM2
             | Self::MiniCpm5
-            | Self::Dots3 => KNOWN_REASONING_PROBE,
+            | Self::Dots3
+            | Self::LlamaNemotron => KNOWN_REASONING_PROBE,
             Self::MinimaxM3 => KNOWN_M3_DIFFERENCES,
         };
         // A template that writes no thought for the probe's request leaves the reasoning out, so
@@ -836,9 +1250,27 @@ impl GenerationPrompt {
 #[test]
 fn every_recorded_model_reads_with_the_registrys_table() {
     for (slug, family, _) in MODELS {
-        let registered = for_model(slug).unwrap_or_else(|| panic!("{slug}: not in the registry"));
+        let model = model_of(slug);
+        let registered = for_model(&model).unwrap_or_else(|| panic!("{slug}: not in the registry"));
         assert_eq!(registered, family.table(slug), "{slug}");
     }
+}
+
+/// The id the registry knows `slug` by. Bellwether's slug is the repository name in lower case
+/// with `_` written `-`, which the registry's case-insensitive match reads as it is, except for a
+/// name with an underscore (AstaBrief_8B): that one is found through the registry's own groups.
+fn model_of(slug: &str) -> String {
+    let slug_of = |id: &str| {
+        id.rsplit('/')
+            .next()
+            .unwrap_or(id)
+            .to_ascii_lowercase()
+            .replace('_', "-")
+    };
+    groups()
+        .flat_map(|(model, also, _)| std::iter::once(model).chain(also.iter().copied()))
+        .find(|id| slug_of(id) == slug)
+        .map_or_else(|| slug.to_string(), str::to_string)
 }
 
 /// The variable a preview run sets to allow the corpus classes below; CI, on sets bellwether
@@ -936,6 +1368,26 @@ const REFUSED_PROBES: &[(&str, &str)] = &[
     // bellwether's reference refuses the reasoning probe for its template: twelve of the sixteen
     // common cases are recorded, and that one is not among them.
     ("glm-4.6", "parse/reasoning-with-marker-text"),
+    // Probes bellwether's reference refused for these templates (main 5bcd7b0b0): each slug's
+    // common set holds its other cases and not these.
+    (
+        "ai21-jamba-reasoning-3b",
+        "parse/content-with-marker-in-code-fence",
+    ),
+    ("glm-4.5v", "parse/reasoning-with-marker-text"),
+    ("glm-4.6v", "parse/reasoning-with-marker-text"),
+    ("glm-4.6v-flash", "parse/reasoning-with-marker-text"),
+    ("glm-4.7", "parse/reasoning-with-marker-text"),
+    ("glm-4.7-flash", "parse/reasoning-with-marker-text"),
+    ("glm-5", "parse/reasoning-with-marker-text"),
+    ("glm-5.1", "parse/reasoning-with-marker-text"),
+    ("glm-5.2", "parse/reasoning-with-marker-text"),
+    // Its template renders no `reasoning_content`, so bellwether refused the reasoning probe's
+    // request (the recorded common set holds the fence probe and ten more, not it).
+    (
+        "llama-3-3-nemotron-super-49b-v1-5",
+        "parse/reasoning-with-marker-text",
+    ),
 ];
 
 /// The reasoning probe: its reasoning holds a `</think>`, which every table with that marker

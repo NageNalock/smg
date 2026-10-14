@@ -138,6 +138,7 @@ impl GrpcRouter {
             multimodal,
             tokenizer_autoload: !ctx.router_config.disable_tokenizer_autoload,
             tokenizer_load_failures: ctx.tokenizer_load_failures.clone(),
+            parser: ctx.router_config.parser,
             token_dump: ctx.token_dump.clone(),
         });
 
@@ -769,7 +770,8 @@ impl GrpcRouter {
                     .as_ref(),
             ));
         };
-        let chat_tools = message_utils::template_tools(tools, tool_choice);
+        let chat_tools =
+            message_utils::template_tools(tools, tool_choice, tokenizer.renderer_capabilities());
         let media = message_utils::resolve_messages_media(
             &self.shared_components,
             model_id,

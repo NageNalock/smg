@@ -510,6 +510,8 @@ struct Router {
     tokenizer_path: Option<String>,
     chat_template: Option<String>,
     disable_tokenizer_autoload: bool,
+    /// `legacy` or `symphony`: which parser reads a chat completion's output.
+    parser: String,
     tokenizer_cache_enable_l0: bool,
     tokenizer_cache_l0_max_entries: usize,
     tokenizer_cache_l0_max_memory: usize,
@@ -941,6 +943,13 @@ impl Router {
             otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
         });
 
+        let parser = config::ParserChoice::parse(&self.parser).ok_or_else(|| {
+            config::ConfigError::InvalidValue {
+                field: "parser".to_string(),
+                value: self.parser.clone(),
+                reason: "expected legacy or symphony".to_string(),
+            }
+        })?;
         let history_backend = match self.history_backend {
             HistoryBackendType::Memory => config::HistoryBackend::Memory,
             HistoryBackendType::None => config::HistoryBackend::None,
@@ -1097,6 +1106,7 @@ impl Router {
                 l1_max_memory: self.tokenizer_cache_l1_max_memory,
             })
             .disable_tokenizer_autoload(self.disable_tokenizer_autoload)
+            .parser(parser)
             .history_backend(history_backend)
             .memory_config(config::MemoryConfig {
                 max_responses: self.history_memory_max_responses,
@@ -1299,6 +1309,7 @@ impl Router {
         control_plane_auth = None,
         schema_config = None,
         disable_tokenizer_autoload = false,
+        parser = String::from("legacy"),
         enable_mesh = false,
         mesh_server_name = None,
         mesh_host = String::from("0.0.0.0"),
@@ -1506,6 +1517,7 @@ impl Router {
         control_plane_auth: Option<PyControlPlaneAuthConfig>,
         schema_config: Option<String>,
         disable_tokenizer_autoload: bool,
+        parser: String,
         enable_mesh: bool,
         mesh_server_name: Option<String>,
         mesh_host: String,
@@ -1734,6 +1746,7 @@ impl Router {
             tokenizer_path,
             chat_template,
             disable_tokenizer_autoload,
+            parser,
             tokenizer_cache_enable_l0,
             tokenizer_cache_l0_max_entries,
             tokenizer_cache_l0_max_memory,
@@ -1992,9 +2005,22 @@ fn get_available_tool_call_parsers() -> Vec<String> {
     PARSERS
         .get_or_init(|| {
             let factory = tool_parser::ParserFactory::new();
-            factory.list_parsers()
+            with_symphony_tables(factory.list_parsers())
         })
         .clone()
+}
+
+/// The legacy parsers' names and Symphony's tables' (`symphony::formats::Table::name`), which
+/// `--parser symphony` reads with when both flags name one, sorted, each once.
+fn with_symphony_tables(mut names: Vec<String>) -> Vec<String> {
+    names.extend(
+        symphony::formats::Table::ALL
+            .iter()
+            .map(|table| table.name().to_string()),
+    );
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Get the list of available reasoning parsers from the Rust factory.
@@ -2004,7 +2030,7 @@ fn get_available_reasoning_parsers() -> Vec<String> {
     PARSERS
         .get_or_init(|| {
             let factory = reasoning_parser::ParserFactory::new();
-            factory.list_parsers()
+            with_symphony_tables(factory.list_parsers())
         })
         .clone()
 }

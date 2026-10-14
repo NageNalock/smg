@@ -50,3 +50,46 @@ pushed for the prompt, and its first `</think>` closes it; Qwen3 writes its own 
 prompt that disables thinking ends with `<think>\n\n</think>\n\n`, which leaves the engine in
 content. A prompt that leaves an arguments state open is read as content for now (a prefilled call
 is a later step).
+
+## What a table read from a response template adds
+
+- A table can say that the stream's stop closes the call in a state (`Format::closes_at_stop`),
+  for a family whose last call ends with a stop token the stop decoder hides: a stream that stops
+  there ends the call as its closing terminal would, with no bytes. One cut for length, aborted,
+  or ended with any finish but `Stop` is cut as before; a driver hands a stop sequence of the
+  request's that matched inside the call over as such a finish, so that it never completes the
+  call (the stop row in `format`).
+- A table can say that the template discards the text of a state (`Format::framing`): Hugging
+  Face's null sink, the space around a response template's fields. Every byte of text there, a
+  terminal with no row from the state and what the scanner held at the end included, is
+  `Dropped { Wrapper }` at every finish; the state's rows still move the engine.
+- A table can trim a state's text stay by stay (`Format::trims`), as Hugging Face's `text` parser
+  strips a field's value: whitespace before a stay's first other character is
+  `Dropped { Whitespace }` as it arrives, and a run of it after the last one is held, with any
+  terminal the table ignores inside it, until more text in the stay shows it was inside the text,
+  which releases it as the state's text, or a row ends the stay or the stream ends, which drops
+  it. Held bytes have not reached the ledger, so the tokens are counted in the output's order
+  whatever the run turns out to be.
+- A table can join a state's stays with a text (`Format::joins`): a later stay shows the joiner
+  first, as the state's text with no tokens. A stay of the turn's own state counts once its first
+  byte arrives, a stay of any other state from the row that enters it; stays the prompt's replay
+  saw count too.
+- A call given as data (`CallSyntax::Shaped`) opens only when the header after its terminal
+  matches: the engine holds the terminal and every byte after it, and takes no row, until the
+  header decides. A header that cannot match gives the terminal back: its first character is the
+  text of the state it came in, and the rest, with every byte the header read, is scanned again
+  from there, as a regular expression's search goes on after the place its pattern failed at.
+  None of those bytes was emitted, so the tokens are still counted in the output's order. A
+  closing terminal closes a shaped call only where the call's trailer ends right before it; any
+  other is the call's text. The stream's stop, where the table says it closes the call, closes
+  one JSON value or object where its trailer ends with the stream, and tagged parameters wherever
+  the trailer stands, as a template's reader closes the region at the end of its text.
+- A shaped call's values read through the table's reader (`Format::reads_values_with`) with the
+  parameter's schema from the request's tools.
+
+A table with turn anchors (`Format::turn_anchor`) is replayed from the end of the last anchor, in
+the state that anchor names, and not at all when the prompt holds none. A table with a start row
+(`Format::starts_in`) lets the turn's first piece decide: a terminal whose row leads into another
+state moves the engine as any terminal does, and anything else starts the turn in the start state,
+where it is read; the first piece is the replay's first, or the output's when the prompt left
+nothing to replay.

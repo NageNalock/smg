@@ -809,6 +809,13 @@ impl RequestPipeline {
                 response.headers_mut().insert("x-smg-cache-trace", value);
             }
         }
+        // Which parser read a chat completion, so a client comparing the two can tell.
+        if let Some(parser) = ctx.parser {
+            response.headers_mut().insert(
+                "x-smg-parser",
+                http::HeaderValue::from_static(parser.name()),
+            );
+        }
         if let Some(workers) = ctx.workers.as_ref() {
             let worker = match workers {
                 WorkerSelection::Single { worker } => worker,
@@ -1674,6 +1681,7 @@ mod alias_pipeline_tests {
             multimodal: None,
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
+            parser: crate::config::ParserChoice::Legacy,
             token_dump: None,
         });
         let request: GenerateRequest = serde_json::from_value(json!({
@@ -2195,6 +2203,7 @@ mod request_release_tests {
             multimodal,
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
+            parser: crate::config::ParserChoice::Legacy,
             token_dump: None,
         })
     }
@@ -3744,6 +3753,7 @@ mod request_release_tests {
             multimodal,
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
+            parser: crate::config::ParserChoice::Legacy,
             token_dump: None,
         })
     }
@@ -4222,6 +4232,7 @@ mod request_release_tests {
             multimodal: None,
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
+            parser: crate::config::ParserChoice::Legacy,
             token_dump: None,
         });
 
@@ -4321,6 +4332,7 @@ mod rate_limit_reserve_tests {
             multimodal: None,
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
+            parser: crate::config::ParserChoice::Legacy,
             token_dump: None,
         })
     }

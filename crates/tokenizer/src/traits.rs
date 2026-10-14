@@ -54,6 +54,11 @@ pub struct RendererCapabilities {
     /// reference's tolerance (non-object and double-encoded values); the
     /// gateway must forward them as written instead of pre-parsing them.
     pub raw_tool_call_arguments: bool,
+    /// The renderer declares the request's tools when `tool_choice` is
+    /// `none` and tells the model not to call them, as its reference does;
+    /// the gateway keeps the tools for it. Without it the gateway renders no
+    /// tool under `none`, so the model is not offered a call it may not make.
+    pub declares_tools_under_tool_choice_none: bool,
 }
 
 /// How the `text` of a [`ChatTemplateOutput`] becomes token ids.
@@ -361,6 +366,30 @@ pub trait Tokenizer: Encoder + Decoder {
     /// Models can have multiple EOS tokens (e.g., Llama 3: end_of_text + eom_id + eot_id).
     fn eos_token_ids(&self) -> &[TokenIdType] {
         &[]
+    }
+
+    /// The added tokens that are not special and are extracted from the raw
+    /// text, in the same pass as the special tokens (`normalized: false`):
+    /// strings the tokenizer takes whole before pre-tokenization. A cache
+    /// that splits text at special tokens must not split inside one of these
+    /// (a special token can be a substring of a longer added token), so it
+    /// matches them too, as text that is never a boundary. The added tokens
+    /// matched after normalization, on the pieces that pass leaves, are not
+    /// listed: they can never take a raw-pass token's place. Empty when a
+    /// tokenizer has none.
+    fn added_token_strings(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The added tokens, special or not, that are matched after
+    /// normalization rather than on the raw text (`normalized: true`). A
+    /// cache that splits text at special tokens does not split at any of
+    /// these, whatever a configuration calls them (a BOS or EOS named there
+    /// can be such a token): where they are extracted depends on the
+    /// normalized text and on the other tokens of that pass. Empty when a
+    /// tokenizer has none.
+    fn added_tokens_after_normalization(&self) -> Vec<String> {
+        Vec::new()
     }
 }
 

@@ -506,13 +506,54 @@ impl DtypeOverrides {
 /// picked. `None` for an empty or a disagreeing set, and whenever a worker is
 /// served otherwise (the pixels' own bytes for an engine that normalizes on
 /// device, a wire that carries no preprocessed floats): the per-destination
-/// write then stays as it is.
+/// write then stays as it is. `None` as well unless [`ONE_PASS_WIRE_ENV`]
+/// opts the one-pass write in: by default every request takes the two-pass
+/// path.
 pub(crate) fn mm_shared_image_wire_dtype_over(
     registry: &WorkerRegistry,
     model_id: &str,
     pools: &[RoutingPool],
 ) -> Option<EncoderDtype> {
+    if !one_pass_wire_enabled() {
+        return None;
+    }
     shared_image_wire_dtype_over(registry, model_id, pools, &DtypeOverrides::from_env())
+}
+
+/// Opts the one-pass wire write in (`1`, `true`, `yes` or `on`, like the
+/// other `SMG_MM_` switches): the images of a request whose workers all read
+/// one wire dtype are then preprocessed straight into it.
+/// Off, the request takes the two-pass path (the patch layout, then the
+/// write in the worker's dtype at assembly), whose layout pass is the faster
+/// one on every image size but one since the vectorised patch layout landed;
+/// the one-pass writer is turned back on by default once it is at least as
+/// fast at every size.
+pub const ONE_PASS_WIRE_ENV: &str = "SMG_MM_ONE_PASS_WIRE";
+
+fn one_pass_wire_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let on = one_pass_wire_opted_in(std::env::var(ONE_PASS_WIRE_ENV).ok().as_deref());
+        if on {
+            info!(
+                env = ONE_PASS_WIRE_ENV,
+                "the one-pass wire write is opted in: images are preprocessed straight into the workers' shared wire dtype"
+            );
+        }
+        on
+    })
+}
+
+/// The switch's value read as the other `SMG_MM_` switches read theirs:
+/// `1`, `true`, `yes` or `on`, any case, surrounding space ignored; unset or
+/// anything else leaves the opt-in off.
+fn one_pass_wire_opted_in(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn shared_image_wire_dtype_over(
@@ -839,6 +880,71 @@ mod tests {
         assert_eq!(
             shared_image_wire_dtype(&[worker("http://f", RuntimeType::Sglang, &[])], &plain),
             Some(EncoderDtype::Float32)
+        );
+    }
+
+    /// Without the opt-in the stages get no wire dtype, whatever the fleet
+    /// agrees on: every request takes the two-pass path. The resolution
+    /// itself still answers, for the opt-in and the tests of its rules. The
+    /// switch's spellings are checked on explicit values; the wrapper is
+    /// checked against the process's own setting, so the test holds whether
+    /// or not the environment it runs in opts in.
+    #[test]
+    fn the_one_pass_wire_write_is_opt_in() {
+        use crate::{
+            routers::grpc::mode::Mode,
+            worker::{ConnectionMode, WorkerRegistry},
+        };
+
+        let registry = WorkerRegistry::new();
+        for url in ["grpc://regular-1:8000", "grpc://regular-2:8000"] {
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new("qwen3-vl"))
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(RuntimeType::TokenSpeed)
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .build(),
+                ))
+                .expect("register");
+        }
+        let pools = Mode::Regular.multimodal_wire_pools();
+        assert_eq!(
+            shared_image_wire_dtype_over(&registry, "qwen3-vl", pools, &DtypeOverrides::default()),
+            Some(EncoderDtype::BFloat16),
+            "the fleet agrees on one dtype"
+        );
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some("off"),
+            Some("maybe"),
+        ] {
+            assert!(
+                !one_pass_wire_opted_in(value),
+                "{value:?} leaves the opt-in off"
+            );
+        }
+        for value in ["1", "true", "yes", "on", "TRUE", " On "] {
+            assert!(one_pass_wire_opted_in(Some(value)), "{value:?} opts in");
+        }
+        let expected = if one_pass_wire_enabled() {
+            Some(EncoderDtype::BFloat16)
+        } else {
+            None
+        };
+        assert_eq!(
+            mm_shared_image_wire_dtype_over(&registry, "qwen3-vl", pools),
+            expected,
+            "the stages see the fleet's wire dtype only with the opt-in"
         );
     }
 

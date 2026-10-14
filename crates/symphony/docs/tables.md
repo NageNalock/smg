@@ -140,6 +140,98 @@ table has no terminal for it, so such a message sits in the named-JSON header un
 `<|end_message|>` and comes back whole as `Malformed` (a name without a call), no byte lost; a
 recording of one decides what it is.
 
+## Mistral v13 (`mistral_v13`)
+
+What the table says beyond the others:
+
+- **A call has no closing marker.** `[TOOL_CALLS]` opens the call state, and the state's own rows
+  are the next `[TOOL_CALLS]` and the end of the turn: the arguments object's close ends the call
+  (`json::named_arguments`), the next opener or the turn's end ends the region. Text after a closed
+  object and before the next opener is the template's wrapping: whitespace dropped, anything else
+  malformed. The tool's name is the text between the opener and `[ARGS]`, taken as written; the
+  object after `[ARGS]` is the arguments alone, so `ToolCallStart` carries the name and the marker
+  as its source, and the fragments are the object's bytes.
+- **The prompt ends at `[/INST]`, or after a tool result.** The template writes no assistant opener
+  and no thought in the prompt, whatever the request says: the model writes `[THINK]` itself. After
+  a tool result the prompt ends in `[/TOOL_RESULTS]`, and its last `[/INST]` stands before the
+  previous turn's calls; the replay walks into the call state, which the prompt never enters, so
+  the output starts in content, where the template puts it.
+- **A forced call's tag has no end.** `Format::grammar` writes a tag per tool from `[TOOL_CALLS]`,
+  the name and `[ARGS]` to the schema, and nothing after it, as the template writes nothing: the
+  object the schema accepts ends the tag. The gateway's older `mistral` parser and its tag read
+  Mistral 7B v0.3's `[TOOL_CALLS][{…}]` list, another syntax, so nothing is pinned to it; the
+  table's name keeps that parser's apart, so `--tool-call-parser mistral` stays with it under
+  `--parser symphony`, and the registry picks this table for the v13 groups.
+
+What the table leaves open: whether every engine takes a tag whose `end` is empty (xgrammar's
+structural tag allows it; the Symphony e2e lane says so for the engines it runs); and the older
+list syntax, which no recorded group writes.
+
+## JSON (`json`)
+
+What the table says beyond the others:
+
+- **One state, no markers, an object or a list.** As `xlam`, the output starts in the arguments
+  state and the assembler decides at the first byte that is not whitespace; unlike `xlam`, a `{`
+  there is one call alone (`json::list::Assembler::object_or_list`), whose object reads as a
+  list's object does, `arguments`, `parameters` or `args` naming the arguments. What follows the
+  object is the template's wrapping: whitespace dropped, anything else malformed.
+- **Prose before the JSON is content, whole.** The gateway's older `json` parser searches the
+  output for the first `{` or `[`; this table does not, as no other table scans for a marker.
+- **A forced call is the list.** `Format::grammar` writes the `xlam` list, as the older parser's
+  forced calls were written.
+
+What the table leaves open: the format is Llama 3.1's own template's, which six recorded groups
+write (Nemotron Ultra 253B CPT, the UltraLong 1M, 2M and 4M, Safety Guard 8B v3, the 70B Reward
+Principle): one call alone, `parameters` naming the arguments, and never a list, content beside a
+call or a thought, since the template refuses them; the list and the wrapping after an object rest
+on the unit tests until a group writes them.
+
+## The forced call (`forced`)
+
+Not a table an operator names: the gateway picks this format for a request whose `tool_choice`
+names a function and whose constraint is the JSON schema the older path builds for it (the
+function's `parameters`), so the whole output is that function's arguments, with no marker and no
+name in it. The name comes from the request (`Declared::forcing`), and `ToolCallStart` carries it
+with no source byte of its own. The value streams through `json::Arguments` (`json::forced` drives
+it): the whitespace before it is dropped, a fragment for every byte that keeps it a JSON prefix,
+malformed from the first that does not, and the call's end where the value is whole or where the
+stream ends; the engine reports text after a whole value as text after the object. A required call
+under the same path is a list of `{"name": …, "parameters": …}` objects, which the `json` table
+reads.
+
+What the format leaves open: it derives no grammar, since its constraint is the request's own
+schema; bellwether #19 records the constrained outputs, which replay here when they land, so the
+format stands on its unit tests and on the gateway's reading of the same outputs until then.
+
+## Llama Nemotron (`llama_nemotron`)
+
+What the table says beyond the others:
+
+- **The calls are one list between markers.** `<TOOLCALL>` opens the call state and `</TOOLCALL>`
+  closes it; inside, the list assembler (`json::list`) reads `[{"name": …, "arguments": {…}},
+  …]` as it reads xLAM's bare list: each object a call, the brackets and the commas the template's
+  wrapping. Between markers prose has no place, so text where the list should be, a `[` that opens
+  no list of calls included, is malformed where the bare list takes it for content; the engine
+  picks that form for a table with a row into the arguments state. After the `]`, whitespace is
+  dropped and other text malformed, as for the bare list.
+- **The thought is the Super template's, and the model's own.** Llama-3.3-Nemotron-Super-49B-v1.5's
+  template renders an assistant message's content from its `</think>` on, so the model writes
+  `<think>…</think>` itself; `/no_think` in the system prompt makes the template close the thought
+  in the prompt (`<think>\n\n</think>\n\n`), and the request's `enable_thinking` changes nothing.
+  The Nano 8B and DLER templates have no thought. Bellwether records no reasoning case for the three
+  groups (their templates render no `reasoning_content`), so the thought's rows rest on the Super
+  template and the model cards, not on a replay.
+- **The tag is one tag around the list.** `Format::grammar` writes `<TOOLCALL>`, the tools' calls
+  as the list, `</TOOLCALL>`, and the table's thought takes the prefix the JSON syntax takes. The
+  gateway's older parsers have no tag for this syntax (`llama` reads Llama 3.2's pythonic calls,
+  `json` the bare object), so nothing is pinned.
+
+What the table leaves open: the thought's rows against a recorded reasoning case; Nemotron Nano 4B
+v1.1, whose template writes each call one `}` short (`{"name": …, "arguments": {…}]`), which
+bellwether's reference heals and this table does not read; and Nemotron Ultra's bare
+`{"name": …, "parameters": …}` object, Llama 3.1's own syntax, which the `json` table reads.
+
 ## MiniCPM5 (`minicpm5`)
 
 The template writes the turn as `<think>\n`, the reasoning, `\n</think>\n\n`, the content, a newline
@@ -183,6 +275,25 @@ The template sorts a call's keys, so a call's arguments come back with the keys 
 whatever order the request gave them: the replay counts such a case as respelled, not as a
 difference (bellwether #110). `Format::grammar` writes a forced call's tag in this spelling, the
 keys sorted the same way (the grammar's `gemma` module).
+
+## FunctionGemma (`function_gemma`)
+
+What the table says beyond the others:
+
+- **Gemma's shape in the template's own tokens.** Each call stands between `<start_function_call>`
+  and `<end_function_call>`, `call:NAME{key:value,…}` inside with the keys sorted as Gemma 4 sorts
+  them; a string's text stands between `<escape>` tokens and a null is written `None`, while
+  `true` and `false` keep JSON's words (`gemma::Spelling::FUNCTION_GEMMA`). The assembler and the
+  grammar take the spelling from the table, so Gemma 4 and FunctionGemma share both. A bare
+  `null`, which this template never writes, comes back as the string `"null"`, as any bare text
+  the spelling does not know.
+- **No thought, content before the calls.** The generation prompt is `<start_of_turn>model\n`
+  whatever the request says, and the template renders no `reasoning_content`; the calls follow the
+  content one after another with nothing between them, and the turn ends after the last.
+
+What the table leaves open: the spellings come from the recorded common set, since the template is
+gated on the Hub: `true`, `None`, integers and a decimal are seen there, `false` and an exponent
+are not, so they follow Gemma 4's words and Python's print of a number until a set shows otherwise.
 
 ## K2-Horizon (`k2_horizon`)
 

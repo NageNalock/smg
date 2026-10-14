@@ -23,9 +23,12 @@ blocks of `<parameter name="…">` tags for MiniMax M2 (the `attributed` module)
 per line or as a list, each value in the template's spelling, for Olmo 3 and LFM2.5 (the `pythonic`
 module); xLAM's bare list of JSON objects, written from the tools alone since its table has no
 markers; for MiniMax M3, the XML tree of elements with the table's separator before every tag (the
-`xml` module); Gemma 4's `call:NAME{key:value}` spelling, the keys sorted and each string between
-`<|"|>` tokens (the `gemma` module); for Inkling, the call marker and a JSON object whose `args` the
-schema accepts, wherever the marker stands in a message. The gateway's old parsers wrote these tags
+`xml` module); Gemma's `call:NAME{key:value}` spelling, the keys sorted and each string between the
+table's tokens, `<|"|>` for Gemma 4 and `<escape>` for FunctionGemma, which also writes a null as
+`None` (the `gemma` module); for Inkling, the call marker and a JSON object whose `args` the
+schema accepts, wherever the marker stands in a message. The forced call's format (`forced`) derives
+no tag: its constraint is the request's own schema, which the gateway writes. The gateway's old
+parsers wrote these tags
 by hand, one function per parser; where one exists for a format Symphony has, the derived tag is
 pinned to it in the tests, so the switch changes nothing an engine sees.
 
@@ -45,5 +48,51 @@ the close returns; from any other state, its own row into the block. So the mode
 the prompt left open on its way to the calls, whichever that was.
 
 Inkling's named JSON takes the tag the gateway's old Inkling parser writes, the call marker its
-trigger inside whatever message the model is writing. A table without calls gives `None`, and the
-gateway takes the JSON-schema path for it.
+trigger inside whatever message the model is writing. Mistral's named arguments take a tag per tool
+from `[TOOL_CALLS]`, the name and `[ARGS]` to the tool's schema, with no end, as the template writes
+nothing after the object. Llama Nemotron's list takes one tag around it, `<TOOLCALL>`, the tools'
+calls as a JSON list, `</TOOLCALL>`; xLAM's bare list is the same list with no tag, alone in the
+turn. A table without calls gives `None`, and the gateway takes the JSON-schema path for it.
+
+## What a table read from a response template adds
+
+A table read from a response template has rows of its own (`Format::framing`,
+`Format::stop_tokens`). A framing state, whose text the template drops, lies between the messages
+as a wrapper state does: a way in passes through it, and it holds no answer. A stop token ends the
+region it closes at the model's stop, and the stop decoder hides it, so no tag writes it: a
+region's close is never one, no way in steps on one, and an answer a stop token may close ends with
+nothing after its JSON. Such a table may also have a layout (`Format::with_layout`): its tags then
+write the thought and the answer with the text the layout writes around them. For a call given as
+data, the tag writes its tagged parameters as the table's layout says the model's chat template
+writes them (the `shaped` module), and a table without a layout has no tag.
+
+The thought's close a tag writes is the row from the reasoning state back to where the thought
+opened, the one the table's layout names where the template closes the thought more than one way.
+The rows a way in follows are a path through the template's framing, the shortest the table has:
+one row for Kimi K3, and more where a template frames each message (the thought's close, the row
+that starts the next message, the row into the block), so a state with no row of its own into the
+block still has a way in when the framing leads there.
+
+`Format::grammar_for` takes what the request asks as `Options`, one call among them: a named
+function, or `parallel_tool_calls: false`. Every syntax's tag then stops after its first call
+(`stop_after_first`), a region that holds calls (a block, a list, Python's calls) holds that one,
+and the call's end carries the terminal that ends the turn wherever the model stands, where the
+table has one (Kimi K3's message close), since nothing may follow; a turn a stop token ends has
+nothing after the call.
+
+`Format::answer_grammar` is the tag for an answer that is JSON a schema accepts, the
+`response_format` of a request, from the same table: the rows into the state the answer is written
+in, the schema, and the answer's close with the end of the turn. Where the output starts in
+content, as in ChatML's tables, it is the schema alone, after the prefix when the prompt left the
+model inside its thought.
+
+Whether a thought comes before the call or the answer is the table's, not the syntax's: a table
+whose template writes the thought before every call and answer (`Format::thinks_first`) gets it
+written first, its opener, its text and its close, where the prompt has not opened it; every other
+table leaves the thought to the model, as gpt-oss's template leaves its analysis channel.
+
+A marker that is one token of the model's vocabulary (`Format::marker_tokens`: a terminal, a
+structural token, one of the syntax's own tags (`CallSyntax::tag_texts`), or a token inside one) is
+written as that token (`Grammar::Token`) wherever a tag writes it inside a tag or between tags, so
+the model cannot spell it in ordinary tokens there; a tag's begin and end and its triggers stay
+text, as the engines' `triggered_tags` takes them.

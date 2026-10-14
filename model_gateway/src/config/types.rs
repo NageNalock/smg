@@ -22,6 +22,41 @@ use crate::{
     },
 };
 
+/// The parser that reads a chat completion's output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ParserChoice {
+    /// The tool-call and reasoning parser crates, one parser per model family.
+    #[default]
+    Legacy,
+    /// Symphony's tables: the one a model's parser names select (its worker labels, else the
+    /// `--tool-call-parser` and `--reasoning-parser` flags) when a table answers to the name, its
+    /// own or a legacy parser's that reads its format (`qwen` for `qwen3`, `qwen_xml` for
+    /// `qwen3_tagged`); the registry's for the models it knows when they name nothing, or only a
+    /// reasoning parser no table answers to, `passthrough` excepted; any other legacy tool-call
+    /// parser's name, `passthrough`, and every other model, keep the legacy parsers.
+    Symphony,
+}
+
+impl ParserChoice {
+    /// The choice `name` spells, `legacy` or `symphony` in any case; `None` for any other text.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "legacy" => Some(Self::Legacy),
+            "symphony" => Some(Self::Symphony),
+            _ => None,
+        }
+    }
+
+    /// The name the flag and the header spell this choice as.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Symphony => "symphony",
+        }
+    }
+}
+
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
@@ -446,6 +481,11 @@ pub struct RouterConfig {
     /// Disable automatic tokenizer loading at startup and worker registration
     #[serde(default)]
     pub disable_tokenizer_autoload: bool,
+    /// Which parser reads a chat completion's reasoning and tool calls: the per-model
+    /// parsers (`legacy`, the default) or Symphony (`symphony`) for the models its
+    /// registry knows. A request's `X-SMG-Parser` header overrides it for that request.
+    #[serde(default)]
+    pub parser: ParserChoice,
     #[serde(default = "default_history_backend")]
     pub history_backend: HistoryBackend,
     /// Required when history_backend = "oracle"
@@ -1739,6 +1779,7 @@ impl Default for RouterConfig {
             tokenizer_path: None,
             chat_template: None,
             disable_tokenizer_autoload: false,
+            parser: ParserChoice::default(),
             model_aliases: HashMap::new(),
             history_backend: default_history_backend(),
             oracle: None,
