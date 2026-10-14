@@ -2919,7 +2919,8 @@ fn parse_cli_args(clap_args: Vec<String>) -> (CliArgs, bool) {
 }
 
 /// Phase 4, serve: the async runtime (sized by `runtime_worker_threads`:
-/// the gateway's budget unless `--runtime-worker-threads` pins one; the size
+/// the flag, else `TOKIO_WORKER_THREADS`, else the gateway's budget; a
+/// malformed variable is refused here, before any thread starts; the size
 /// is logged by `startup` once the log subscriber is up), the server until it stops,
 /// then the log writers flushed; the tracer is shut down after a clean stop
 /// (a failed start-up returns before it, as it always did). The runtime is
