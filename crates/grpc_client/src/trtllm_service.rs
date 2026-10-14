@@ -894,7 +894,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_connect_invalid_endpoint() {
-        let result = TrtllmServiceClient::connect("invalid://endpoint").await;
+        // A loopback port nothing listens on: refused at once on any host, with
+        // no name service involved. A bare bogus host name is not a safe
+        // stand-in: a resolver that answers any name (a wildcard, as some
+        // corporate networks run) lets the connect succeed.
+        let result = TrtllmServiceClient::connect("http://127.0.0.1:1").await;
         assert!(result.is_err());
     }
 
