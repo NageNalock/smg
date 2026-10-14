@@ -1859,7 +1859,12 @@ impl Router {
             duration_buckets: self.prometheus_duration_buckets.clone(),
         });
 
-        let runtime = tokio::runtime::Runtime::new()
+        // Sized as the CLI sizes its runtime: the gateway's budget, not the
+        // container's quota (the launcher exposes no flag for it).
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(server::runtime_worker_threads(None))
+            .enable_all()
+            .build()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         // Release the GIL while the server runs so Python threads can make progress.

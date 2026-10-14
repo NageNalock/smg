@@ -1613,9 +1613,11 @@ struct CliArgs {
     webrtc_stun_server: Option<String>,
 
     // ==================== Runtime ====================
-    /// Explicit async runtime worker-thread count, at least 1. Leave unset to
-    /// use tokio's default (`available_parallelism()`), which already honors the
-    /// cgroup CPU quota on Rust 1.95+ and is therefore container-aware.
+    /// Async runtime worker-thread count, at least 1. Unset: the available
+    /// parallelism (the container's CPU quota) capped at 8, the gateway's own
+    /// budget: idle workers park and unpark on every streamed chunk, so a
+    /// runtime the size of a large quota costs CPU for no work. Set it to
+    /// size the runtime for a heavier deployment.
     #[arg(long, help_heading = "Runtime")]
     runtime_worker_threads: Option<usize>,
 }
@@ -2915,20 +2917,19 @@ fn parse_cli_args(clap_args: Vec<String>) -> (CliArgs, bool) {
     (cli_args, igw_enabled_for_discovery)
 }
 
-/// Phase 4, serve: the async runtime (tokio's container-aware default size
-/// unless `--runtime-worker-threads` pins one; the size is logged by
-/// `startup` once the log subscriber is up), the server until it stops,
+/// Phase 4, serve: the async runtime (sized by `runtime_worker_threads`:
+/// the gateway's budget unless `--runtime-worker-threads` pins one; the size
+/// is logged by `startup` once the log subscriber is up), the server until it stops,
 /// then the log writers flushed; the tracer is shut down after a clean stop
 /// (a failed start-up returns before it, as it always did). The runtime is
 /// built only now: a refusal before this point costs no threads.
 fn serve(server_config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let runtime = match server_config.runtime_worker_threads {
-        Some(n) => tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(n)
-            .enable_all()
-            .build()?,
-        None => tokio::runtime::Runtime::new()?,
-    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(server::runtime_worker_threads(
+            server_config.runtime_worker_threads,
+        ))
+        .enable_all()
+        .build()?;
     let served = runtime.block_on(Box::pin(server::startup(server_config)));
     // The writer threads outlive `startup` (a process may start more than one
     // router); flush and stop them now that this process is done logging.
