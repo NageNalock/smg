@@ -1205,6 +1205,7 @@ pub fn groups() -> impl Iterator<Item = (&'static str, &'static [&'static str], 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::Emits;
 
     #[test]
     fn a_primary_resolves_by_its_id_in_any_case_with_or_without_the_organisation() {
@@ -1347,6 +1348,37 @@ mod tests {
                 assert!(!seen.contains(&lower), "{repository} is listed twice");
                 seen.push(lower);
             }
+        }
+    }
+
+    #[test]
+    fn every_tables_variants_without_reasoning_or_calls_still_validate() {
+        for table in Table::ALL {
+            let format = table.format();
+            let silent = format.clone().without_reasoning();
+            silent
+                .validate()
+                .unwrap_or_else(|e| panic!("{}: without_reasoning: {e}", table.name()));
+            assert!(
+                (0..silent.states()).all(|state| silent.emits(state) != Emits::Reasoning),
+                "{}: a thought state remains",
+                table.name()
+            );
+            let unread = format.without_calls();
+            unread
+                .validate()
+                .unwrap_or_else(|e| panic!("{}: without_calls: {e}", table.name()));
+            assert_eq!(unread.call_syntax(), None, "{}", table.name());
+            assert!(
+                (0..unread.states()).all(|state| unread.emits(state) != Emits::Arguments),
+                "{}: an arguments state remains",
+                table.name()
+            );
+            assert!(
+                (1..unread.states()).all(|state| unread.emits(state) != Emits::Wrapper),
+                "{}: a calls wrapper remains",
+                table.name()
+            );
         }
     }
 }

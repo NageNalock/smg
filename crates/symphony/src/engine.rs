@@ -705,10 +705,16 @@ impl Engine {
         let taken =
             self.emits() == Emits::Arguments && self.close_call(Closed::ByMarker, &terminal, out);
         if !taken {
-            out.push(Event::Dropped {
-                text: self.tokens.text(&terminal),
-                why: DropReason::Wrapper,
-            });
+            let text = self.tokens.text(&terminal);
+            if self.format.shown(index) {
+                // A marker of a channel the request does not separate: the client sees it.
+                out.push_content(text);
+            } else {
+                out.push(Event::Dropped {
+                    text,
+                    why: DropReason::Wrapper,
+                });
+            }
         }
         self.enter_with(next, call, out);
         // A stay of any state but the turn's own counts for its joiner from the row that enters it.

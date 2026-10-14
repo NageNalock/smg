@@ -275,6 +275,9 @@ struct Terminal {
     text: String,
     /// Dropped wherever it stands, never a move.
     ignored: bool,
+    /// Read as content text where it moves the engine, in place of being dropped: a table's
+    /// variant shows the markers of the channel a request does not separate.
+    shown: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -357,6 +360,7 @@ impl Format {
             name: name.to_string(),
             text: text.to_string(),
             ignored: false,
+            shown: false,
         });
         self
     }
@@ -369,6 +373,7 @@ impl Format {
             name: name.to_string(),
             text: text.to_string(),
             ignored: true,
+            shown: false,
         });
         self
     }
@@ -623,6 +628,105 @@ impl Format {
         self.layout.as_deref()
     }
 
+    /// The table for a request that does not separate reasoning (`separate_reasoning: false`), as
+    /// the legacy path runs no reasoning parser then: the thought's text is content, and every
+    /// marker that is not a call's is shown, read as content text where it moves the engine, so
+    /// the bytes stay in the content as the model wrote them. The rows stay, so a call inside or
+    /// after the thought reads as before, from wherever a start row, an anchor or the prompt's
+    /// replay puts the turn. A call's markers are the terminals on the rows into or out of an
+    /// arguments state or a calls wrapper; a table whose thought is framed by them alone
+    /// (Inkling's) shows none. A state's own text rows stay with it: a trimmed stay is still
+    /// trimmed, a framing state's text still dropped, a joiner still shown; and a tag the end cut
+    /// short is still dropped, as the legacy parsers drop it on both their paths. A table without
+    /// a thought changes only in what it shows; the thought-first mark and the layout, which
+    /// serve the tags alone, go.
+    #[must_use]
+    pub fn without_reasoning(mut self) -> Self {
+        let calls = self.terminals_of_calls();
+        for (index, terminal) in self.terminals.iter_mut().enumerate() {
+            if !terminal.ignored && !calls.contains(&index) {
+                terminal.shown = true;
+            }
+        }
+        for state in &mut self.states {
+            if state.emits == Emits::Reasoning {
+                state.emits = Emits::Content;
+            }
+        }
+        self.thinks_first = false;
+        self.layout = None;
+        self
+    }
+
+    /// The table for a request that declares no tools or whose `tool_choice` is `none`, as the
+    /// legacy path runs no tool parser then: the arguments states and the calls wrappers are
+    /// content, with no call syntax to read them, and a call's markers are shown, read as content
+    /// text where they move the engine, so a call's bytes stay in the content as the model wrote
+    /// them; a marker that also opens the thought is not shown, so the thought reads as before,
+    /// its markers dropped. The turn's own wrapper, where a table starts in one (Kimi K3's
+    /// message), is the turn's frame, not a calls region: it and its markers stay. A table whose
+    /// output starts in its calls (`json`, `xlam`, `forced`) becomes content from its first byte.
+    /// A state's own text rows stay with it, as in [`Self::without_reasoning`]. A stop that closed
+    /// a call closes nothing; the layout goes.
+    #[must_use]
+    pub fn without_calls(mut self) -> Self {
+        let demoted = self.calls_regions();
+        let calls = self.terminals_of_calls();
+        let opens_thought: Vec<usize> = self
+            .transitions
+            .iter()
+            .filter(|row| self.states[row.to].emits == Emits::Reasoning)
+            .map(|row| row.on)
+            .collect();
+        for (index, terminal) in self.terminals.iter_mut().enumerate() {
+            if calls.contains(&index) && !opens_thought.contains(&index) {
+                terminal.shown = true;
+            }
+        }
+        for (index, state) in self.states.iter_mut().enumerate() {
+            if demoted[index] {
+                state.emits = Emits::Content;
+            }
+        }
+        self.stop_closes.retain(|&index| !demoted[index]);
+        self.calls = None;
+        self.layout = None;
+        self
+    }
+
+    /// Which states are a call's region: the arguments states, and the wrapper states other than
+    /// the first, since a table that starts in a wrapper (Kimi K3's message) starts in the turn's
+    /// frame.
+    fn calls_regions(&self) -> Vec<bool> {
+        self.states
+            .iter()
+            .enumerate()
+            .map(|(index, state)| match state.emits {
+                Emits::Arguments => true,
+                Emits::Wrapper => index != 0,
+                Emits::Content | Emits::Reasoning => false,
+            })
+            .collect()
+    }
+
+    /// The terminals that are a call's markers: those whose every row enters or leaves a call's
+    /// region ([`Self::calls_regions`]). A terminal with a row between two other states as well
+    /// (Kimi K3's message close) frames the turn, not a call.
+    fn terminals_of_calls(&self) -> Vec<usize> {
+        let regions = self.calls_regions();
+        (0..self.terminals.len())
+            .filter(|&on| {
+                let mut rows = self.transitions.iter().filter(|row| row.on == on);
+                let mut any = false;
+                let all = rows.all(|row| {
+                    any = true;
+                    regions[row.from] || regions[row.to]
+                });
+                any && all
+            })
+            .collect()
+    }
+
     /// The turn opener, if the table names one.
     pub(crate) fn turn_opener(&self) -> Option<&str> {
         self.turn_opener.as_deref()
@@ -845,6 +949,11 @@ impl Format {
     /// Whether terminal `index` is one the engine drops wherever it stands.
     pub(crate) fn ignored(&self, index: usize) -> bool {
         self.terminals[index].ignored
+    }
+
+    /// Whether terminal `index` is read as content text where it moves the engine.
+    pub(crate) fn shown(&self, index: usize) -> bool {
+        self.terminals[index].shown
     }
 
     /// What the text in state `index` is.
@@ -1142,6 +1251,331 @@ mod tests {
                     .to_string()
             )
         );
+    }
+
+    /// A thought and calls, the calls' opener read inside the thought too, as Gemma 4 and dots3
+    /// have it.
+    fn with_calls() -> Format {
+        Format::new("q")
+            .terminal("think_open", "<think>")
+            .terminal("think_close", "</think>")
+            .terminal("call_open", "<tool_call>")
+            .terminal("call_close", "</tool_call>")
+            .state("content", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("calls", Emits::Arguments)
+            .transition("content", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "content")
+            .transition("content", "call_open", "calls")
+            .transition("calls", "call_close", "content")
+            .transition("reasoning", "call_open", "calls")
+            .calls(CallSyntax::Json)
+            .opens_turn("<|im_start|>assistant")
+    }
+
+    fn events(format: Format, prompt: &str, output: &str) -> Vec<crate::event::Event> {
+        use crate::{
+            engine::Engine,
+            event::Events,
+            input::{EngineFinish, Input},
+            parser::Parser,
+            tagged::Declared,
+        };
+        let mut parser = Engine::new(format, Declared::default());
+        let mut out = Events::new();
+        parser
+            .feed(
+                Input::Prompt {
+                    token_ids: &[],
+                    text: prompt,
+                },
+                &mut out,
+            )
+            .expect("prompt");
+        parser
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: output,
+                    spans: &[],
+                },
+                &mut out,
+            )
+            .expect("delta");
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        out.drain()
+    }
+
+    fn said(events: &[crate::event::Event]) -> (String, String, usize) {
+        use crate::event::Event;
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut calls = 0;
+        for event in events {
+            match event {
+                Event::Content(text) => content.push_str(&text.text),
+                Event::Reasoning(text) => reasoning.push_str(&text.text),
+                Event::ToolCallStart { .. } => calls += 1,
+                _ => {}
+            }
+        }
+        (content, reasoning, calls)
+    }
+
+    #[test]
+    fn without_reasoning_shows_the_thoughts_markers_and_reads_the_calls() {
+        let format = with_calls().without_reasoning();
+        assert!(format.validate().is_ok());
+        assert_eq!(
+            format.emits(1),
+            Emits::Content,
+            "the thought is content now"
+        );
+        assert_eq!(
+            format.next(0, 0),
+            Some(1),
+            "its opener still moves the engine"
+        );
+        assert!(
+            format.shown(0) && format.shown(1),
+            "and is shown, as its closer is"
+        );
+        assert!(
+            !format.shown(2) && !format.shown(3),
+            "the call's markers are not"
+        );
+        let output = "<think>a thought</think>an answer<tool_call>\n{\"name\": \"f\", \
+                      \"arguments\": {}}\n</tool_call>";
+        let (content, reasoning, calls) = said(&events(format.clone(), "", output));
+        assert_eq!(content, "<think>a thought</think>an answer");
+        assert_eq!(reasoning, "");
+        assert_eq!(calls, 1);
+        // A prompt that opened the thought leaves the output in it: its text and its closer are
+        // content, and the call after it reads.
+        let (content, reasoning, calls) = said(&events(
+            format,
+            "<|im_start|>assistant\n<think>\n",
+            "still a thought</think><tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n\
+             </tool_call>",
+        ));
+        assert_eq!(
+            (content.as_str(), reasoning.as_str(), calls),
+            ("still a thought</think>", "", 1)
+        );
+        // A table without a thought or a marker is itself.
+        let plain = Format::new("p").state("c", Emits::Content);
+        assert_eq!(plain.clone().without_reasoning(), plain);
+    }
+
+    #[test]
+    fn without_calls_shows_the_calls_markers_and_reads_the_thought() {
+        let format = with_calls().without_calls();
+        assert!(format.validate().is_ok());
+        assert_eq!(
+            format.emits(2),
+            Emits::Content,
+            "the calls state is content now"
+        );
+        assert_eq!(format.call_syntax(), None);
+        assert!(
+            format.shown(2) && format.shown(3),
+            "the call's markers are shown"
+        );
+        assert!(
+            !format.shown(0) && !format.shown(1),
+            "the thought's are not"
+        );
+        let output = "<think>a thought</think><tool_call>\n{\"name\": \"f\", \
+                      \"arguments\": {}}\n</tool_call>";
+        let (content, reasoning, calls) = said(&events(format, "", output));
+        assert_eq!(
+            content,
+            "<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call>"
+        );
+        assert_eq!(reasoning, "a thought");
+        assert_eq!(calls, 0);
+        // A trimmed stay is still trimmed up to the shown marker; the call's own text is not.
+        let trimmed = with_calls().trims("content").without_calls();
+        let (content, _, _) = said(&events(
+            trimmed,
+            "",
+            "an answer \n<tool_call>\n{}\n</tool_call>",
+        ));
+        assert_eq!(content, "an answer<tool_call>\n{}\n</tool_call>");
+        // A table whose output starts in its calls is content from its first byte.
+        let alone = Format::new("j")
+            .state("calls", Emits::Arguments)
+            .calls(CallSyntax::JsonList)
+            .opens_turn("<|a|>")
+            .without_calls();
+        assert!(alone.validate().is_ok());
+        assert_eq!(alone.turn_opener(), Some("<|a|>"));
+        assert_eq!(alone.emits(0), Emits::Content);
+        let (content, _, calls) =
+            said(&events(alone, "", "[{\"name\": \"f\", \"arguments\": {}}]"));
+        assert_eq!(content, "[{\"name\": \"f\", \"arguments\": {}}]");
+        assert_eq!(calls, 0);
+    }
+
+    /// Kimi K3's turn after its opener: a thought, an answer and one call.
+    const KIMI_TURN: &str = concat!(
+        "<|open|>think<|sep|>a thought<|close|>think<|sep|>",
+        "<|open|>response<|sep|>an answer<|close|>response<|sep|>",
+        "<|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>",
+        "<|open|>argument key=\"q\" type=\"string\"<|sep|>x<|close|>argument<|sep|>",
+        "<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+    );
+    const KIMI_OPENER: &str = "<|open|>message role=\"assistant\"<|sep|>";
+
+    #[test]
+    fn without_reasoning_shows_kimi_k3s_frame_and_still_reads_its_call() {
+        // The legacy reasoning parser removes the think, response and message tags and leaves the
+        // tools channel to the tool parser; without it those tags are text, and the call reads.
+        let format = crate::formats::kimi_k3().without_reasoning();
+        assert!(format.validate().is_ok());
+        let (content, reasoning, calls) = said(&events(format, KIMI_OPENER, KIMI_TURN));
+        assert_eq!(
+            content,
+            "<|open|>think<|sep|>a thought<|close|>think<|sep|><|open|>response<|sep|>an answer\
+             <|close|>response<|sep|><|close|>message<|sep|>"
+        );
+        assert_eq!(reasoning, "");
+        assert_eq!(calls, 1);
+        // A tag the end cut short is dropped, shown or not: the legacy parsers drop it on both
+        // paths, so a response the length cut inside its closing tag ends the same way.
+        let cut = "<|open|>response<|sep|>an answer<|close|>response";
+        let out = events(
+            crate::formats::kimi_k3().without_reasoning(),
+            KIMI_OPENER,
+            cut,
+        );
+        assert_eq!(said(&out).0, "<|open|>response<|sep|>an answer");
+        let dropped = out.iter().rev().nth(1);
+        assert!(
+            matches!(dropped, Some(crate::event::Event::Dropped { text, .. })
+                if text.text == "<|close|>response"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn without_calls_keeps_kimi_k3s_frame_and_reads_its_thought_and_answer() {
+        let format = crate::formats::kimi_k3().without_calls();
+        assert!(format.validate().is_ok());
+        assert_eq!(
+            format.emits(0),
+            Emits::Wrapper,
+            "the message is the turn's frame"
+        );
+        let out = events(format, KIMI_OPENER, KIMI_TURN);
+        let (content, reasoning, calls) = said(&out);
+        assert_eq!(reasoning, "a thought");
+        assert_eq!(
+            content,
+            "an answer<|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>\
+             <|open|>argument key=\"q\" type=\"string\"<|sep|>x<|close|>argument<|sep|>\
+             <|close|>call<|sep|><|close|>tools<|sep|>"
+        );
+        assert_eq!(calls, 0);
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e, crate::event::Event::Malformed { .. })),
+            "{out:?}"
+        );
+    }
+
+    /// Inkling's turn after its opener: a thought, an answer and one call, then the sampling end.
+    const INKLING_TURN: &str = concat!(
+        "<|content_thinking|>check sources<|end_message|>",
+        "<|message_model|><|content_text|>Here is the answer.<|end_message|>",
+        "<|message_model|>search<|content_invoke_tool_json|>",
+        "{\"name\": \"search\", \"args\": {\"q\": \"rust\"}}<|end_message|>",
+        "<|content_model_end_sampling|>"
+    );
+
+    #[test]
+    fn without_calls_keeps_inklings_thought_and_shows_its_call_message_as_text() {
+        // The message header is Inkling's arguments state, so its framing is shown here where the
+        // legacy reasoning parser removes it; the thought still reads, the ignored terminal is
+        // still dropped, and the call's message is text.
+        let format = crate::formats::inkling().without_calls();
+        assert!(format.validate().is_ok());
+        let out = events(format, "<|message_model|>", INKLING_TURN);
+        let (content, reasoning, calls) = said(&out);
+        assert_eq!(reasoning, "check sources");
+        assert_eq!(calls, 0);
+        assert!(
+            content.contains("Here is the answer.")
+                && content.contains(
+                    "search<|content_invoke_tool_json|>{\"name\": \"search\", \"args\": \
+                     {\"q\": \"rust\"}}"
+                ),
+            "{content}"
+        );
+        assert!(
+            !content.contains("<|content_model_end_sampling|>"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn without_reasoning_reads_inklings_call_after_a_thinking_message() {
+        let format = crate::formats::inkling().without_reasoning();
+        assert!(format.validate().is_ok());
+        let (content, reasoning, calls) = said(&events(format, "<|message_model|>", INKLING_TURN));
+        assert_eq!(reasoning, "");
+        assert_eq!(calls, 1);
+        assert_eq!(content, "check sourcesHere is the answer.");
+    }
+
+    #[test]
+    fn without_reasoning_keeps_both_of_minimax_m3s_thought_markers() {
+        let format = crate::formats::minimax_m3().without_reasoning();
+        let output = "<mm:think>a thought</mm:think>an answer";
+        let (content, reasoning, calls) = said(&events(format, "]~b]ai\n", output));
+        assert_eq!(content, output);
+        assert_eq!((reasoning.as_str(), calls), ("", 0));
+    }
+
+    #[test]
+    fn without_reasoning_reads_a_call_after_a_thought_the_turn_starts_in() {
+        // ERNIE-style: the turn starts inside the thought, with no opener to read.
+        let format = Format::new("e")
+            .terminal("think_close", "</think>")
+            .terminal("call_open", "<tool_call>")
+            .terminal("call_close", "</tool_call>")
+            .state("outside", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("call", Emits::Arguments)
+            .transition("reasoning", "think_close", "outside")
+            .transition("outside", "call_open", "call")
+            .transition("call", "call_close", "outside")
+            .calls(CallSyntax::Json)
+            .turn_anchor("Assistant:")
+            .starts_in("reasoning")
+            .without_reasoning();
+        assert!(format.validate().is_ok());
+        let output =
+            "a thought</think>\n<tool_call>{\"name\": \"f\", \"arguments\": {}}</tool_call>";
+        let (content, reasoning, calls) = said(&events(format, "User: hi\nAssistant:", output));
+        assert_eq!(
+            (content.as_str(), reasoning.as_str(), calls),
+            ("a thought</think>\n", "", 1)
+        );
+    }
+
+    #[test]
+    fn without_reasoning_drops_the_thought_first_mark_with_the_thought() {
+        let format = with_calls().thinks_first();
+        assert!(format.validate().is_ok());
+        assert!(format.without_reasoning().validate().is_ok());
     }
 
     #[test]
