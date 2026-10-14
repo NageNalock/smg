@@ -26,7 +26,7 @@ use std::{
 };
 
 use crate::{
-    chat::{ChatCompletionRequest, ChatMessage},
+    chat::{thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessage},
     common::Tool,
     ext::retain_if,
 };
@@ -118,6 +118,27 @@ impl ProviderProfile {
             .get(model)
             .copied();
         registered.unwrap_or_else(|| Self::from_model_segments(model))
+    }
+
+    /// The thinking on/off preference the profile reads from a request's
+    /// effective `reasoning_effort` (`thinking.effort`, else the top-level
+    /// field) when the request states no `thinking.type`. The OpenAI reading
+    /// ([`thinking_from_reasoning_effort`]: `none` and `minimal` switch
+    /// thinking off, every other value leaves the template's default) for
+    /// every profile but MiniMax, whose contract keeps thinking on for every
+    /// value: `none` is the model's default depth and `minimal` is `low`.
+    pub fn thinking_from_reasoning_effort(self, reasoning_effort: Option<&str>) -> Option<bool> {
+        match self {
+            ProviderProfile::Minimax => None,
+            _ => thinking_from_reasoning_effort(reasoning_effort),
+        }
+    }
+
+    /// Whether an explicit `reasoning_effort` outranks `thinking.type:
+    /// disabled`: under the MiniMax contract it does (an effort asks for
+    /// thinking at that depth); every other profile honours the toggle.
+    pub fn effort_outranks_thinking_disabled(self) -> bool {
+        matches!(self, ProviderProfile::Minimax)
     }
 
     /// Record the configured model aliases (`alias -> served model id`).
