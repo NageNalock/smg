@@ -181,8 +181,24 @@ const CHAT_DETAIL_COUNTERS: [&str; 6] = [
     "/completion_tokens_details/rejected_prediction_tokens",
 ];
 
+/// The Harmony encoding, obtained off the async runtime before a test uses
+/// the sync loader: on a cold cache the loader downloads the vocab with a
+/// blocking client, which inside a `#[tokio::test]` drops a runtime in an
+/// async context and panics (the production path loads it in `spawn_blocking`
+/// at worker registration). A load error fails the test with the loader's
+/// message, as the sync builder tests' `expect` does.
+async fn load_harmony_encoding() {
+    if let Err(e) = tokio::task::spawn_blocking(try_harmony_encoding)
+        .await
+        .expect("the Harmony encoding loader task completes")
+    {
+        panic!("the Harmony encoding must load: {e}");
+    }
+}
+
 #[tokio::test]
 async fn harmony_chat_usage_is_the_same_streamed_and_not() {
+    load_harmony_encoding().await;
     let plain = Counters {
         prompt: 10,
         cached: 0,
@@ -252,6 +268,7 @@ fn iteration_usage(result: ResponsesIterationResult) -> Value {
 
 #[tokio::test]
 async fn harmony_responses_iteration_usage_is_the_same_streamed_and_not() {
+    load_harmony_encoding().await;
     let counters = Counters {
         prompt: 12,
         cached: 4,
