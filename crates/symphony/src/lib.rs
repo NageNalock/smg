@@ -35,6 +35,7 @@ pub mod json;
 pub mod markers;
 pub mod parser;
 pub mod pythonic;
+pub mod shape;
 pub mod tagged;
 pub mod tokens;
 
@@ -49,5 +50,6 @@ pub use grammar::{Grammar, Tag};
 pub use input::{EngineFinish, Input, TokenSpan};
 pub use markers::{Piece, Scanner};
 pub use parser::{ParseError, Parser};
+pub use shape::{Inferred, ValueRead};
 pub use tagged::Declared;
 pub use tokens::Ledger;

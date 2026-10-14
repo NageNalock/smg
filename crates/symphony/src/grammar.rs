@@ -5,18 +5,22 @@
 //! [`Grammar`] is Symphony's own tree, in the shape the engines' structural-tag format takes
 //! (xgrammar's, which the serving engines accept): a `triggered_tags` of per-tool `tag`s, each a
 //! `begin`, a content grammar and an `end`; `sequence`, `or`, `star`, `plus` and `optional` to
-//! compose; `const_string`, `any_text`, `regex` and `json_schema` as leaves. [`Grammar::to_json`]
-//! writes it as the engine reads it, and [`Grammar::payload`] wraps it as the request carries it.
+//! compose; `const_string`, `any_text`, `regex`, `json_schema` and `token` as leaves.
+//! [`Grammar::to_json`] writes it as the engine reads it, and [`Grammar::payload`] wraps it as the
+//! request carries it.
 //!
 //! [`Format::grammar`] derives the tree from the table's rows and the request's tools, one spelling
 //! per call syntax. Notes on how, and on what it leaves open: `docs/grammar.md`.
+
+use std::collections::VecDeque;
 
 use openai_protocol::common::Tool;
 use serde_json::{json, Value};
 
 use crate::{
     format::{CallSyntax, Emits, Format},
-    tagged::{assembler::TAGS as TAGGED_TAGS, attributed::Typing, keyed::Tags as KeyedTags},
+    shape::{Layout, Message},
+    tagged::{attributed::Typing, keyed::Tags as KeyedTags},
 };
 
 mod attributed;
@@ -24,6 +28,7 @@ mod gemma;
 mod keyed;
 mod pythonic;
 mod schema;
+mod shaped;
 mod tagged;
 mod xml;
 mod xtml;
@@ -55,17 +60,24 @@ pub enum Grammar {
     Plus(Box<Grammar>),
     /// `begin`, the content, `end`.
     Tag(Tag),
-    /// Free text until one of `triggers` opens a tag; with `at_least_one`, at least one tag.
+    /// One token of the model's vocabulary, by its text: a marker written as that token, never
+    /// spelled in others ([`Format::marker_tokens`]).
+    Token(String),
+    /// Free text until one of `triggers` opens a tag; with `at_least_one`, at least one tag, the
+    /// first at once; with `stop_after_first`, nothing after the first tag.
     TriggeredTags {
         triggers: Vec<String>,
         tags: Vec<Tag>,
         at_least_one: bool,
+        stop_after_first: bool,
     },
-    /// Tags one after another with `separator` between them; with `at_least_one`, at least one.
+    /// Tags one after another with `separator` between them; with `at_least_one`, at least one;
+    /// with `stop_after_first`, at most one.
     TagsWithSeparator {
         tags: Vec<Tag>,
         separator: String,
         at_least_one: bool,
+        stop_after_first: bool,
     },
 }
 
@@ -122,26 +134,35 @@ impl Grammar {
             Self::Star(content) => json!({"type": "star", "content": content.to_json()}),
             Self::Plus(content) => json!({"type": "plus", "content": content.to_json()}),
             Self::Tag(tag) => tag.to_json(),
+            Self::Token(token) => json!({"type": "token", "token": token}),
             Self::TriggeredTags {
                 triggers,
                 tags,
                 at_least_one,
-            } => json!({
-                "type": "triggered_tags",
-                "triggers": triggers,
-                "tags": tags.iter().map(Tag::to_json).collect::<Vec<_>>(),
-                "at_least_one": at_least_one,
-            }),
+                stop_after_first,
+            } => stopping(
+                json!({
+                    "type": "triggered_tags",
+                    "triggers": triggers,
+                    "tags": tags.iter().map(Tag::to_json).collect::<Vec<_>>(),
+                    "at_least_one": at_least_one,
+                }),
+                *stop_after_first,
+            ),
             Self::TagsWithSeparator {
                 tags,
                 separator,
                 at_least_one,
-            } => json!({
-                "type": "tags_with_separator",
-                "tags": tags.iter().map(Tag::to_json).collect::<Vec<_>>(),
-                "separator": separator,
-                "at_least_one": at_least_one,
-            }),
+                stop_after_first,
+            } => stopping(
+                json!({
+                    "type": "tags_with_separator",
+                    "tags": tags.iter().map(Tag::to_json).collect::<Vec<_>>(),
+                    "separator": separator,
+                    "at_least_one": at_least_one,
+                }),
+                *stop_after_first,
+            ),
         }
     }
 
@@ -155,7 +176,7 @@ impl Grammar {
     /// long string weighing its length), since the definitions attached to it are copied with it.
     pub(crate) fn nodes(&self) -> usize {
         1 + match self {
-            Self::ConstString(_) | Self::AnyText { .. } | Self::Regex(_) => 0,
+            Self::ConstString(_) | Self::AnyText { .. } | Self::Regex(_) | Self::Token(_) => 0,
             Self::JsonSchema { schema, .. } => json_nodes(schema) / 4,
             Self::Sequence(elements) | Self::Or(elements) => elements.iter().map(Self::nodes).sum(),
             Self::Optional(content) | Self::Star(content) | Self::Plus(content) => content.nodes(),
@@ -165,6 +186,99 @@ impl Grammar {
             }
         }
     }
+}
+
+/// `grammar` with each of `tokens`, marker texts the longest first, written as a token element
+/// where it stands in a constant string; a tag keeps its begin and end, and a tag list its
+/// separator.
+fn bound(grammar: Grammar, tokens: &[String]) -> Grammar {
+    let in_tag = |tag: Tag| Tag {
+        content: Box::new(bound(*tag.content, tokens)),
+        ..tag
+    };
+    let all = |elements: Vec<Grammar>| -> Vec<Grammar> {
+        elements
+            .into_iter()
+            .map(|element| bound(element, tokens))
+            .collect()
+    };
+    match grammar {
+        Grammar::ConstString(text) => split_tokens(text, tokens),
+        Grammar::Sequence(elements) => Grammar::Sequence(all(elements)),
+        Grammar::Or(elements) => Grammar::Or(all(elements)),
+        Grammar::Optional(content) => Grammar::Optional(Box::new(bound(*content, tokens))),
+        Grammar::Star(content) => Grammar::Star(Box::new(bound(*content, tokens))),
+        Grammar::Plus(content) => Grammar::Plus(Box::new(bound(*content, tokens))),
+        Grammar::Tag(tag) => Grammar::Tag(in_tag(tag)),
+        Grammar::TriggeredTags {
+            triggers,
+            tags,
+            at_least_one,
+            stop_after_first,
+        } => Grammar::TriggeredTags {
+            triggers,
+            tags: tags.into_iter().map(in_tag).collect(),
+            at_least_one,
+            stop_after_first,
+        },
+        Grammar::TagsWithSeparator {
+            tags,
+            separator,
+            at_least_one,
+            stop_after_first,
+        } => Grammar::TagsWithSeparator {
+            tags: tags.into_iter().map(in_tag).collect(),
+            separator,
+            at_least_one,
+            stop_after_first,
+        },
+        leaf @ (Grammar::AnyText { .. }
+        | Grammar::Regex(_)
+        | Grammar::JsonSchema { .. }
+        | Grammar::Token(_)) => leaf,
+    }
+}
+
+/// `text` as constant strings and tokens: each of `tokens` where it stands, leftmost first and of
+/// two at one place the longer; `text` as it is when it holds none.
+fn split_tokens(text: String, tokens: &[String]) -> Grammar {
+    if !tokens.iter().any(|token| text.contains(token.as_str())) {
+        return Grammar::ConstString(text);
+    }
+    let mut pieces: Vec<Grammar> = Vec::new();
+    let mut plain = String::new();
+    let mut rest = text.as_str();
+    while let Some(first) = rest.chars().next() {
+        if let Some(token) = tokens.iter().find(|token| rest.starts_with(token.as_str())) {
+            if !plain.is_empty() {
+                pieces.push(Grammar::ConstString(std::mem::take(&mut plain)));
+            }
+            pieces.push(Grammar::Token(token.clone()));
+            rest = &rest[token.len()..];
+        } else {
+            plain.push(first);
+            rest = &rest[first.len_utf8()..];
+        }
+    }
+    if !plain.is_empty() {
+        pieces.push(Grammar::ConstString(plain));
+    }
+    if pieces.len() == 1 {
+        if let Some(piece) = pieces.pop() {
+            return piece;
+        }
+    }
+    Grammar::Sequence(pieces)
+}
+
+/// `written` with `stop_after_first` set when the tags stop after the first: the key is left out
+/// otherwise, the engines' default, so a tag that asks for any number of calls is written as it
+/// was before the key existed.
+fn stopping(mut written: Value, stop_after_first: bool) -> Value {
+    if stop_after_first {
+        written["stop_after_first"] = Value::Bool(true);
+    }
+    written
 }
 
 /// The nodes of a JSON value: one per scalar, one per object or array and one per member, and
@@ -201,31 +315,39 @@ struct Block<'a> {
     close: &'a str,
 }
 
-/// One way into a block of calls, from a state with a row into it: from a region with a close of
-/// its own (a thought, an answer) whose home has a row into the block, that close first, then the
-/// home's row, so the model closes what the prompt left open and goes on from where that leaves
-/// it; from any other state (the turn's own, one with no close, one whose home has no row into
-/// the block), the opener of its own row. Every way in is a path the table has.
+/// One way into a block of calls, from a state with a path into it: from a region with a close of
+/// its own (a thought, an answer) whose close leaves the engine where a path into the block
+/// starts, that close first, then the path, so the model closes what the prompt left open and
+/// goes on from where that leaves it; from any other state (the turn's own, one with no close,
+/// one whose close leads nowhere into the block), its own path. A path is the rows from one state
+/// to the block through framing states alone, the shortest there is: one row where a state has a
+/// row into the block, and more where the template frames its messages (the close of a thought,
+/// the row that starts the next message, the row into the block). Every way in is a path the
+/// table has.
 struct WayIn<'a> {
     close: Option<&'a str>,
-    open: &'a str,
+    rows: Vec<&'a str>,
 }
 
 impl WayIn<'_> {
     /// What the model writes to enter the block this way.
     fn begin(&self) -> String {
-        format!("{}{}", self.close.unwrap_or(""), self.open)
+        let mut begin = self.close.unwrap_or("").to_string();
+        begin.extend(self.rows.iter().copied());
+        begin
     }
 
-    /// The text that triggers this way in: the close when there is one, else the opener.
+    /// The text that triggers this way in: the close when there is one, else the first row's.
     fn trigger(&self) -> &str {
-        self.close.unwrap_or(self.open)
+        self.close
+            .or_else(|| self.rows.first().copied())
+            .unwrap_or("")
     }
 }
 
 /// A block of calls as the engine takes it: one tag per way in, each `content` between the way's
 /// text and the block's close, triggered by each way's first text, the same trigger once.
-fn block_of(ways_in: &[WayIn<'_>], content: Grammar, close: &str, at_least_one: bool) -> Grammar {
+fn block_of(ways_in: &[WayIn<'_>], content: Grammar, close: &str, count: Count<'_>) -> Grammar {
     let tags = ways_in
         .iter()
         .map(|way| Tag::new(way.begin(), content.clone(), close))
@@ -236,10 +358,81 @@ fn block_of(ways_in: &[WayIn<'_>], content: Grammar, close: &str, at_least_one: 
             triggers.push(trigger.to_string());
         }
     }
-    Grammar::TriggeredTags {
-        triggers,
-        tags,
-        at_least_one,
+    count.triggered(triggers, tags)
+}
+
+/// What a structural tag is asked for: how many calls the request lets the model make, and where
+/// its prompt left the model.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Options {
+    /// At least one call: `tool_choice` `required`, a named function, or an allowed-tools list in
+    /// `required` mode.
+    pub at_least_one: bool,
+    /// The prompt left the model inside its thought.
+    pub reasoning_open: bool,
+    /// At most one call: a named function, or `parallel_tool_calls: false`. The tag stops after
+    /// the first call, and the call's end carries what the template writes after the last call to
+    /// end the turn, so nothing else can follow.
+    pub one_call: bool,
+}
+
+/// How many calls a syntax's tag holds, and what follows the last: the request's two bounds and
+/// the table's end of the turn, which the tag writes after its one call.
+#[derive(Clone, Copy)]
+struct Count<'a> {
+    at_least_one: bool,
+    one: bool,
+    /// The terminal that ends the turn wherever the model stands (Kimi K3's message close), or
+    /// nothing for a table whose turn a stop token ends.
+    last: &'a str,
+}
+
+impl Count<'_> {
+    /// `end`, followed by the end of the turn when the tag holds one call: nothing may follow it.
+    fn end(&self, end: impl Into<String>) -> String {
+        let mut end = end.into();
+        if self.one {
+            end.push_str(self.last);
+        }
+        end
+    }
+
+    /// The calls a region holds: `call` once when the tag holds one, else one or more of it.
+    fn calls(&self, call: Grammar) -> Grammar {
+        if self.one {
+            call
+        } else {
+            Grammar::Plus(Box::new(call))
+        }
+    }
+
+    /// Tags `triggers` open in free text, as many as the count lets the model write; with one
+    /// call, each tag's end carries the end of the turn.
+    fn triggered(&self, triggers: Vec<String>, tags: Vec<Tag>) -> Grammar {
+        let tags = tags
+            .into_iter()
+            .map(|tag| Tag {
+                end: self.end(tag.end),
+                ..tag
+            })
+            .collect();
+        Grammar::TriggeredTags {
+            triggers,
+            tags,
+            at_least_one: self.at_least_one,
+            stop_after_first: self.one,
+        }
+    }
+
+    /// Tags one after another with nothing between them, as many as the count lets the model
+    /// write; the end of the turn is the caller's to write, after what closes them.
+    fn separated(&self, tags: Vec<Tag>) -> Grammar {
+        Grammar::TagsWithSeparator {
+            tags,
+            separator: String::new(),
+            at_least_one: self.at_least_one,
+            stop_after_first: self.one,
+        }
     }
 }
 
@@ -263,13 +456,32 @@ impl Format {
     /// its block is entered from, the state's close first when it has one, so it is the same
     /// either way; so is MiniMax M3's, whose block is entered the same way from every state and
     /// whose thought closes in the free text before the trigger; so is xLAM's list, whose table
-    /// has no thought.
+    /// has no thought. The tag for any number of calls: [`Self::grammar_for`] with these two and
+    /// [`Options::one_call`] unset.
     pub fn grammar(
         &self,
         tools: &[Tool],
         at_least_one: bool,
         reasoning_open: bool,
     ) -> Option<Grammar> {
+        self.grammar_for(
+            tools,
+            Options {
+                at_least_one,
+                reasoning_open,
+                one_call: false,
+            },
+        )
+    }
+
+    /// The structural tag for a call to one of `tools` as `options` ask: [`Self::grammar`]'s tag,
+    /// and with [`Options::one_call`] the same tag holding one call. A tag of one call stops after
+    /// it (`stop_after_first`): a region that holds calls (a block, a list, Python's calls)
+    /// holds that one, and the call's end carries the terminal that ends the turn wherever the
+    /// model stands, when the table has one (Kimi K3's message close), since nothing may follow;
+    /// a table whose turn ends at a stop token writes nothing after the call. `None` as for
+    /// [`Self::grammar`].
+    pub fn grammar_for(&self, tools: &[Tool], options: Options) -> Option<Grammar> {
         let named: Vec<&Tool> = tools
             .iter()
             .filter(|tool| !tool.function.name.is_empty())
@@ -277,94 +489,270 @@ impl Format {
         if named.is_empty() {
             return None;
         }
+        let count = Count {
+            at_least_one: options.at_least_one,
+            one: options.one_call,
+            last: self.turn_end(),
+        };
         // The markers are the syntaxes' with a region of calls; xLAM's list has none.
         let markers = self.call_markers();
         let markers = markers.as_ref();
-        let calls = match self.call_syntax()? {
+        // Whether the tag takes the prefix when the prompt left the thought open: the syntaxes
+        // whose tag enters the calls from the thought on its own way in (Kimi K3's, MiniMax M3's,
+        // Inkling's) and xLAM's list, whose table has no thought, take none.
+        let (calls, prefixed) = match self.call_syntax()? {
             // xLAM's list stands alone in the turn, no marker before or after it, and its table
             // has no thought: the list is the same either way; a call alone (`json`) is forced as
             // the list, as the gateway's older `json` parser forces it. Between markers (Llama
-            // Nemotron) the list is one tag's content, and the thought takes the prefix below.
+            // Nemotron) the list is one tag's content, and the thought takes the prefix.
             CallSyntax::JsonList | CallSyntax::JsonAlone => match markers {
-                None => return Some(Self::json_list_calls(&named, at_least_one)),
-                Some(markers) => Self::json_list_tag(markers, &named, at_least_one),
+                None => (Self::json_list_calls(&named, count), false),
+                Some(markers) => (Self::json_list_tag(markers, &named, count), true),
             },
-            CallSyntax::Json => Self::json_calls(markers?, &named, at_least_one),
+            CallSyntax::Json => (Self::json_calls(markers?, &named, count), true),
             CallSyntax::Keyed(tags) if *tags == KeyedTags::PLAIN => {
-                Self::keyed_calls(markers?, &named, at_least_one)
+                (Self::keyed_calls(markers?, &named, count), true)
             }
             // XTML's grammar is its own: the block's ways in come from the table.
             CallSyntax::Attributed(tags) if tags.typing == Typing::TypeAttribute => {
                 let markers = markers?;
                 let ways_in = self.ways_into(markers.block.as_ref()?.state);
-                return xtml::calls(markers, &ways_in, &named, at_least_one);
+                (xtml::calls(markers, &ways_in, &named, count)?, false)
             }
             CallSyntax::Attributed(tags) => {
-                attributed::calls(markers?, tags, &named, at_least_one)?
+                (attributed::calls(markers?, tags, &named, count)?, true)
             }
             CallSyntax::Keyed(tags) => {
                 let markers = markers?;
                 let ways_in = self.ways_into_block(markers);
-                keyed::calls(markers, &ways_in, tags, &named, at_least_one)
+                (keyed::calls(markers, &ways_in, tags, &named, count), true)
             }
             CallSyntax::Tagged(spelling, _) => {
                 let markers = markers?;
                 let ways_in = self.ways_into_block(markers);
-                tagged::calls(markers, &ways_in, *spelling, &named, at_least_one)
+                (
+                    tagged::calls(markers, &ways_in, *spelling, &named, count),
+                    true,
+                )
             }
             CallSyntax::Pythonic(dialect) => {
-                pythonic::calls(markers?, *dialect, &named, at_least_one)
-            }
-            CallSyntax::Xml => {
-                return xml::calls(markers?, self.separator(), &named, at_least_one);
-            }
-            CallSyntax::Gemma(spelling) => gemma::calls(markers?, *spelling, &named, at_least_one),
-            CallSyntax::NamedJson(marker) => {
-                return self.named_json_calls(marker, &named, at_least_one);
+                (pythonic::calls(markers?, *dialect, &named, count), true)
             }
             CallSyntax::NamedArguments(marker) => {
-                self.named_arguments_calls(marker, &named, at_least_one)?
+                (self.named_arguments_calls(marker, &named, count)?, true)
             }
+            CallSyntax::Xml => (
+                xml::calls(markers?, self.separator(), &named, count)?,
+                false,
+            ),
+            CallSyntax::Gemma(spelling) => (gemma::calls(markers?, *spelling, &named, count), true),
+            CallSyntax::NamedJson(marker) => (self.named_json_calls(marker, &named, count)?, false),
+            // A template's patterns do not say which text a run of whitespace or a skipped
+            // attribute stands for, and a tag writes only what the template renders: a shaped
+            // call's tag is written from the layout its chat template renders, and a table
+            // without one has none. With no call owed, the tag takes no prefix: its own free text
+            // writes the thought, where a prefix before it would let an engine end the prefix
+            // inside the call's terminal and write the rest as free text, a call no tag constrains.
+            CallSyntax::Shaped(shape) => (
+                shaped::calls(self, shape, self.layout()?, &named, count)?,
+                options.at_least_one,
+            ),
         };
-        if !reasoning_open {
-            return Some(calls);
+        self.led(calls, options.reasoning_open, prefixed)
+            .map(|grammar| self.bounded(grammar))
+    }
+
+    /// The structural tag for an answer that is JSON `schema` accepts (`response_format`
+    /// `json_schema`, or `json_object` with an object's schema): the rows into the state the
+    /// answer is written in, the JSON, and the answer's close with what ends the turn after it.
+    /// Where the output starts in that state (the content of ChatML's tables, of Gemma 4's,
+    /// MiniMax's, DeepSeek's), the tag is the schema alone, after the prefix [`Self::grammar`]
+    /// writes when the prompt left the model inside its thought; a table whose turn ends at a
+    /// stop token writes nothing after it. Otherwise the model starts in the turn's own state, or
+    /// in its thought when the prompt opened it, and the tag is one `tag`: the way into the answer
+    /// from there, the thought's close first as a call's way in has it, the schema, then the
+    /// answer's close and the end of the turn (Kimi K3's response region, Inkling's text message);
+    /// an answer a stop token may close ends at the model's stop, with nothing after the schema.
+    /// The answer's state is the first content state whose text the template keeps: a framing
+    /// state, whose text a response template drops, holds no answer. `None` for a table with no
+    /// such state (xLAM, whose answer is anything but a list), with no way into it from where the
+    /// model starts, or, with the thought open, a thought that does not close back to where it
+    /// opened, as for [`Self::grammar`].
+    pub fn answer_grammar(&self, schema: &Value, reasoning_open: bool) -> Option<Grammar> {
+        let answer = Grammar::JsonSchema {
+            schema: schema.clone(),
+            style: None,
+        };
+        let content = self.answer_state()?;
+        let (before, after) = self.around(|layout| layout.answer.as_ref());
+        if content == 0 {
+            let mut parts = vec![answer];
+            if !before.is_empty() {
+                parts.insert(0, Grammar::ConstString(before.to_string()));
+            }
+            let end = format!("{after}{}", self.turn_end());
+            if !end.is_empty() {
+                parts.push(Grammar::ConstString(end));
+            }
+            let answer = match parts.len() {
+                1 => parts.remove(0),
+                _ => Grammar::Sequence(parts),
+            };
+            return self
+                .led(answer, reasoning_open, true)
+                .map(|grammar| self.bounded(grammar));
         }
+        // The model starts in its thought when the prompt opened it, and otherwise in the turn's
+        // own state, which a thought written first also closes back to.
+        let start = match self.state_emitting(Emits::Reasoning) {
+            Some(reasoning) if reasoning_open => reasoning,
+            _ => 0,
+        };
+        let way = self.way_in(start, content)?;
+        // The thought's close and what the layout writes after a thought, then the rows into the
+        // answer, what the layout writes before an answer standing right before the last of them,
+        // the terminal that opens it.
+        let mut begin = way.close.unwrap_or("").to_string();
+        if way.close.is_some() {
+            begin.push_str(self.around(|layout| layout.thought.as_ref()).1);
+        }
+        match way.rows.split_last() {
+            Some((opener, rows)) => {
+                begin.extend(rows.iter().copied());
+                begin.push_str(before);
+                begin.push_str(opener);
+            }
+            None => begin.push_str(before),
+        }
+        // An answer the stop ends, as the layout writes it or where a stop token may close it,
+        // ends at the model's stop, which writes nothing.
+        let stops = self
+            .layout()
+            .and_then(|layout| layout.answer.as_ref())
+            .map_or_else(|| self.stopped(content), |message| message.stops);
+        let mut end = match self.close_of(content) {
+            Some((close, _)) if !stops => close.to_string(),
+            _ => String::new(),
+        };
+        end.push_str(after);
+        end.push_str(self.turn_end());
+        self.led(
+            Grammar::Tag(Tag::new(begin, answer, end)),
+            reasoning_open,
+            false,
+        )
+        .map(|grammar| self.bounded(grammar))
+    }
+
+    /// `body` after what the model writes before it. With the prompt's thought open, the prefix
+    /// for a tag that takes one (`prefixed`, [`Self::after_the_thought`]), and nothing for a tag
+    /// whose ways in close the thought themselves. With the thought not open, the thought itself
+    /// where the table writes one before every call and answer ([`Format::thinks_first`]): the
+    /// thought's opener, its text, which writes none of the table's terminals nor the call
+    /// syntax's inner tags, and its close; `None` when the thought does not open from the turn's
+    /// own state, where the output starts, and close back there. A table that does not write its
+    /// thought first has nothing before `body`.
+    fn led(&self, body: Grammar, reasoning_open: bool, prefixed: bool) -> Option<Grammar> {
+        if reasoning_open {
+            return if prefixed {
+                self.after_the_thought(body)
+            } else {
+                Some(body)
+            };
+        }
+        if !self.writes_thought_first() {
+            return Some(body);
+        }
+        let reasoning = self.state_emitting(Emits::Reasoning)?;
+        let thought = self.region(reasoning, |state| self.is_call_state(state))?;
+        if thought.home != 0 {
+            return None;
+        }
+        let text = Grammar::AnyText {
+            excludes: self.excluded_but(&[]),
+        };
+        let (before, after) = self.around(|layout| layout.thought.as_ref());
+        Some(Grammar::Sequence(vec![
+            Grammar::Tag(Tag::new(
+                format!("{before}{}", thought.open),
+                text,
+                format!("{}{after}", thought.close),
+            )),
+            body,
+        ]))
+    }
+
+    /// What the table's layout writes before a region's opener and after its close, for the
+    /// region `which` picks (a thought or an answer); nothing for a table without one.
+    fn around(&self, which: impl Fn(&Layout) -> Option<&Message>) -> (&str, &str) {
+        self.layout()
+            .and_then(which)
+            .map_or(("", ""), |message| (&*message.before, &*message.after))
+    }
+
+    /// `body` after the prefix a prompt's open thought takes: free text that can write none of the
+    /// table's terminals but the thought's own, nor the call syntax's inner tags, with nothing
+    /// owed at its end. A table without a thought has no prefix, and gives `body` as it is; a
+    /// thought that does not close back to where it opened has no prefix yet, and gives `None`.
+    fn after_the_thought(&self, body: Grammar) -> Option<Grammar> {
         let Some(reasoning) = self.state_emitting(Emits::Reasoning) else {
-            return Some(calls);
+            return Some(body);
         };
         // The thought's own markers stay writable: the model closes its thought inside the
         // prefix where the engine applies the grammar from the first token, and an engine that
-        // runs a reasoning parser has consumed them before the grammar starts. XTML's tag never
-        // comes this far: it closes the thought on its own way into the block.
+        // runs a reasoning parser has consumed them before the grammar starts. They are its
+        // opener and every close back to where it opened, since the model writes the one its chat
+        // template renders, whichever the tags would write.
         let thought = self.region(reasoning, |state| self.is_call_state(state))?;
+        let turn_close = self.turn_close();
+        let own: Vec<&str> = std::iter::once(thought.open)
+            .chain(
+                self.transitions()
+                    .filter(|&(source, on, target)| {
+                        source == reasoning
+                            && target == thought.home
+                            && Some(on) != turn_close
+                            && !self.stops(on)
+                    })
+                    .map(|(_, on, _)| self.terminal_text(on)),
+            )
+            .collect();
+        let excludes = self.excluded_but(&own);
+        Some(Grammar::Sequence(vec![Grammar::AnyText { excludes }, body]))
+    }
+
+    /// What free text before a tag may not write: the table's terminals, but `kept` and those
+    /// written inside one of them (a kept close `<e></t>` holds the terminal `<e>`, and free text
+    /// that excluded `<e>` could never write the close), and the call syntax's inner tags.
+    fn excluded_but(&self, kept: &[&str]) -> Vec<String> {
         let mut excludes: Vec<String> = self
             .terminal_texts()
-            .filter(|text| *text != thought.open && *text != thought.close)
+            .filter(|text| !kept.iter().any(|kept| kept.contains(text)))
             .map(str::to_string)
             .collect();
-        let inner: &[&str] = match self.call_syntax() {
-            Some(CallSyntax::Keyed(tags)) => &[
-                tags.key_open,
-                tags.key_close,
-                tags.value_open,
-                tags.value_close,
-            ],
-            Some(CallSyntax::Attributed(tags)) => &[tags.parameter_open, tags.parameter_close],
-            Some(CallSyntax::Tagged(..)) => &TAGGED_TAGS,
-            Some(CallSyntax::Gemma(spelling)) => std::slice::from_ref(&spelling.string),
-            Some(CallSyntax::NamedArguments(marker)) => std::slice::from_ref(marker),
-            _ => &[],
-        };
+        let inner = self
+            .call_syntax()
+            .map(CallSyntax::tag_texts)
+            .unwrap_or_default();
         excludes.extend(inner.iter().map(|tag| tag.to_string()));
-        Some(Grammar::Sequence(vec![
-            Grammar::AnyText { excludes },
-            calls,
-        ]))
+        excludes
+    }
+
+    /// `grammar` with every marker that is one token ([`Format::marker_tokens`]) written as that
+    /// token where it stands in a constant string: inside a tag's content and between tags. A
+    /// tag's begin and end, its triggers, a separator and the texts free text excludes stay
+    /// strings, as the engines take them. Without such markers, `grammar` as it is.
+    fn bounded(&self, grammar: Grammar) -> Grammar {
+        let tokens = self.marker_token_texts();
+        if tokens.is_empty() {
+            return grammar;
+        }
+        bound(grammar, tokens)
     }
 
     /// The JSON family: each call is the call markers around one JSON object whose `name` is the
     /// tool's and whose `arguments` the tool's schema accepts, the template's newlines included.
-    fn json_calls(markers: &CallMarkers<'_>, tools: &[&Tool], at_least_one: bool) -> Grammar {
+    fn json_calls(markers: &CallMarkers<'_>, tools: &[&Tool], count: Count<'_>) -> Grammar {
         let tags = tools
             .iter()
             .map(|tool| {
@@ -379,11 +767,7 @@ impl Format {
                 )
             })
             .collect();
-        Grammar::TriggeredTags {
-            triggers: vec![markers.call_open.to_string()],
-            tags,
-            at_least_one,
-        }
+        count.triggered(vec![markers.call_open.to_string()], tags)
     }
 
     /// Inkling's named JSON: the tag the gateway's old Inkling parser hand-writes. The marker that
@@ -400,12 +784,7 @@ impl Format {
     /// no opener between) is writable here and reads as that message's text, so an output written
     /// there satisfies `at_least_one` and yields no call; the model does not write it, the
     /// sequence being off its training. `None` for a table whose messages have no close.
-    fn named_json_calls(
-        &self,
-        marker: &str,
-        tools: &[&Tool],
-        at_least_one: bool,
-    ) -> Option<Grammar> {
+    fn named_json_calls(&self, marker: &str, tools: &[&Tool], count: Count<'_>) -> Option<Grammar> {
         let (_, close, _) = self
             .transitions()
             .find(|&(source, _, target)| source == 0 && self.emits(target) == Emits::Wrapper)?;
@@ -424,11 +803,7 @@ impl Format {
                 )
             })
             .collect();
-        Some(Grammar::TriggeredTags {
-            triggers: vec![marker.to_string()],
-            tags,
-            at_least_one,
-        })
+        Some(count.triggered(vec![marker.to_string()], tags))
     }
 
     /// Mistral's named arguments: the call's opener triggers a tag per tool, the opener, the
@@ -441,7 +816,7 @@ impl Format {
         &self,
         marker: &str,
         tools: &[&Tool],
-        at_least_one: bool,
+        count: Count<'_>,
     ) -> Option<Grammar> {
         let (_, open, _) = self
             .transitions()
@@ -460,11 +835,7 @@ impl Format {
                 )
             })
             .collect();
-        Some(Grammar::TriggeredTags {
-            triggers: vec![open.to_string()],
-            tags,
-            at_least_one,
-        })
+        Some(count.triggered(vec![open.to_string()], tags))
     }
 
     /// xLAM's list: the whole output is `[`, the calls joined by `, `, `]`, each call a JSON object
@@ -477,8 +848,9 @@ impl Format {
     /// narrower than the assembler: an output that starts with `[` and opens no object is content
     /// to the assembler and not writable here.
     /// The list of the tools' calls as xLAM and Llama Nemotron write it: `[`, each call as
-    /// `{"name": NAME, "arguments": ` and the tool's schema, `, ` between calls, `]`.
-    fn json_list(tools: &[&Tool]) -> Grammar {
+    /// `{"name": NAME, "arguments": ` and the tool's schema, `, ` between calls, `]`; with one
+    /// call, that call alone, and after the `]` what the count writes after the last call.
+    fn json_list(tools: &[&Tool], count: Count<'_>) -> Grammar {
         let one_call = Grammar::Or(
             tools
                 .iter()
@@ -495,22 +867,22 @@ impl Format {
                 })
                 .collect(),
         );
-        Grammar::Sequence(vec![
-            Grammar::ConstString("[".to_string()),
-            one_call.clone(),
-            Grammar::Star(Box::new(Grammar::Sequence(vec![
+        let mut list = vec![Grammar::ConstString("[".to_string()), one_call.clone()];
+        if !count.one {
+            list.push(Grammar::Star(Box::new(Grammar::Sequence(vec![
                 Grammar::ConstString(", ".to_string()),
                 one_call,
-            ]))),
-            Grammar::ConstString("]".to_string()),
-        ])
+            ]))));
+        }
+        list.push(Grammar::ConstString(count.end("]")));
+        Grammar::Sequence(list)
     }
 
     /// xLAM's list alone in the turn: the list, or, when no call is required, prose that does
     /// not start with a bracket.
-    fn json_list_calls(tools: &[&Tool], at_least_one: bool) -> Grammar {
-        let list = Self::json_list(tools);
-        if at_least_one {
+    fn json_list_calls(tools: &[&Tool], count: Count<'_>) -> Grammar {
+        let list = Self::json_list(tools, count);
+        if count.at_least_one {
             list
         } else {
             Grammar::Or(vec![
@@ -526,16 +898,17 @@ impl Format {
     }
 
     /// Llama Nemotron's list between its markers: one tag, the opener, the list, the closer.
-    fn json_list_tag(markers: &CallMarkers<'_>, tools: &[&Tool], at_least_one: bool) -> Grammar {
-        Grammar::TriggeredTags {
-            triggers: vec![markers.call_open.to_string()],
-            tags: vec![Tag::new(
+    fn json_list_tag(markers: &CallMarkers<'_>, tools: &[&Tool], count: Count<'_>) -> Grammar {
+        // The tag's end carries the end of the turn, so the list inside it writes none.
+        let inside = Count { last: "", ..count };
+        count.triggered(
+            vec![markers.call_open.to_string()],
+            vec![Tag::new(
                 markers.call_open,
-                Self::json_list(tools),
+                Self::json_list(tools, inside),
                 markers.call_close,
             )],
-            at_least_one,
-        }
+        )
     }
 
     /// Keyed arguments in the compact spelling (GLM 4.7 and later, IQuest): each call is the call
@@ -543,7 +916,7 @@ impl Format {
     /// and `<arg_value>` pairs with nothing between them), and the call's close; the shape
     /// xgrammar's built-in GLM tag has and the gateway writes today. Ling's and Hy4's spellings
     /// are not this one, and are written from their own tags instead (the `keyed` module).
-    fn keyed_calls(markers: &CallMarkers<'_>, tools: &[&Tool], at_least_one: bool) -> Grammar {
+    fn keyed_calls(markers: &CallMarkers<'_>, tools: &[&Tool], count: Count<'_>) -> Grammar {
         let tags = tools
             .iter()
             .map(|tool| {
@@ -557,11 +930,7 @@ impl Format {
                 )
             })
             .collect();
-        Grammar::TriggeredTags {
-            triggers: vec![markers.call_open.to_string()],
-            tags,
-            at_least_one,
-        }
+        count.triggered(vec![markers.call_open.to_string()], tags)
     }
 
     /// The text the table drops wherever it stands, which the template writes before every tag
@@ -623,6 +992,20 @@ impl Format {
         (0..self.states()).find(|&state| self.emits(state) == emits)
     }
 
+    /// The state an answer is written in: the first content state whose text the template keeps,
+    /// a framing row's state (the text outside a response template's fields) being none.
+    fn answer_state(&self) -> Option<usize> {
+        (0..self.states())
+            .find(|&state| self.emits(state) == Emits::Content && !self.is_framing(state))
+    }
+
+    /// Whether a stop token closes the region `state` is: a row out of it on one, which the
+    /// model's stop takes.
+    fn stopped(&self, state: usize) -> bool {
+        self.transitions()
+            .any(|(source, on, target)| source == state && target != state && self.stops(on))
+    }
+
     /// The states with a row into `state`, other than itself and the states `within` it, in the
     /// order of the states: the states the region is entered from.
     fn entered_from(&self, state: usize, within: impl Fn(usize) -> bool) -> Vec<usize> {
@@ -637,19 +1020,31 @@ impl Format {
     }
 
     /// The markers of the region `state` is: its close is the terminal of the row from `state`
-    /// back to a state it is entered from, other than the end of the turn, and its opener the
+    /// back to a state it is entered from, other than the end of the turn and a stop token (the
+    /// model's stop ends the region there, with no text a tag could write), and its opener the
     /// terminal of that state's row into `state`; that state is its home. The states name the
-    /// markers, not the order of the rows. The turn's own state, where the opener leaves the
-    /// engine, is no region: the rows back into it close the regions it holds.
+    /// markers, not the order of the rows. Where the template closes the region more than one way,
+    /// the close is the one the table's layout names for a thought or an answer, the one its chat
+    /// template renders, and otherwise the first such row. The turn's own state, where the opener
+    /// leaves the engine, is no region: the rows back into it close the regions it holds.
     fn region(&self, state: usize, within: impl Fn(usize) -> bool + Copy) -> Option<Region<'_>> {
         if state == 0 {
             return None;
         }
         let from = self.entered_from(state, within);
         let turn_close = self.turn_close();
-        let (_, close, home) = self.transitions().find(|&(source, on, target)| {
-            source == state && from.contains(&target) && Some(on) != turn_close
-        })?;
+        let closes = || {
+            self.transitions().filter(|&(source, on, target)| {
+                source == state
+                    && from.contains(&target)
+                    && Some(on) != turn_close
+                    && !self.stops(on)
+            })
+        };
+        let written = self.written_close(state);
+        let (_, close, home) = written
+            .and_then(|text| closes().find(|&(_, on, _)| self.terminal_text(on) == text))
+            .or_else(|| closes().next())?;
         let (_, open, _) = self
             .transitions()
             .find(|&(source, _, target)| source == home && target == state)?;
@@ -660,31 +1055,142 @@ impl Format {
         })
     }
 
-    /// The ways into the block `state` is, one per state it is entered from, in the order of the
-    /// states, the same way in once: from a region with a close whose home has a row into the
-    /// block, the close and then that row; from any other state, its own row.
-    fn ways_into(&self, state: usize) -> Vec<WayIn<'_>> {
-        let door = |from: usize| {
-            self.transitions()
-                .find(|&(source, _, target)| source == from && target == state)
-                .map(|(_, on, _)| self.terminal_text(on))
+    /// The close the table's layout names for the region `state` is, the thought or the answer:
+    /// the terminal its chat template renders there.
+    fn written_close(&self, state: usize) -> Option<&str> {
+        let layout = self.layout()?;
+        let message = if Some(state) == self.state_emitting(Emits::Reasoning) {
+            layout.thought.as_ref()
+        } else if Some(state) == self.answer_state() {
+            layout.answer.as_ref()
+        } else {
+            None
         };
+        message?.close.as_deref()
+    }
+
+    /// The ways into the block `state` is, one per state with a path into it (a row into it, or
+    /// rows through framing states), in the order of the states, the same way in once: from a
+    /// region with a close that leaves the engine where a path into the block starts, the close
+    /// and then that path; from any other state, its own path.
+    fn ways_into(&self, state: usize) -> Vec<WayIn<'_>> {
         let mut ways: Vec<WayIn<'_>> = Vec::new();
-        for from in self.entered_from(state, |state| self.is_arguments(state)) {
-            let through_home = self
-                .region(from, |state| self.is_call_state(state))
-                .and_then(|Region { close, home, .. }| Some((Some(close), door(home)?)));
-            let (close, open) = match through_home {
-                Some((close, open)) => (close, Some(open)),
-                None => (None, door(from)),
+        let reaching = (0..self.states()).filter(|&from| {
+            from != state && !self.is_arguments(from) && self.path(from, state).is_some()
+        });
+        for from in reaching {
+            let Some(way) = self.way_in(from, state) else {
+                continue;
             };
-            let Some(open) = open else { continue };
-            let way = WayIn { close, open };
             if !ways.iter().any(|known| known.begin() == way.begin()) {
                 ways.push(way);
             }
         }
         ways
+    }
+
+    /// The way into `state` from `from`: the close of the region `from` is, when it has one and a
+    /// path into `state` starts where the close leaves the engine, then that path; else the path
+    /// from `from` itself.
+    fn way_in(&self, from: usize, state: usize) -> Option<WayIn<'_>> {
+        let through_close = self.close_of(from).and_then(|(close, landing)| {
+            Some(WayIn {
+                close: Some(close),
+                rows: self.path(landing, state)?,
+            })
+        });
+        through_close.or_else(|| {
+            Some(WayIn {
+                close: None,
+                rows: self.path(from, state)?,
+            })
+        })
+    }
+
+    /// The close of the region `state` is, and the state it leaves the engine in: the row back to
+    /// the state the region opened from, its home ([`Self::region`]); for a region with no such
+    /// row, its row into a framing state, as a thought closes into the wrapping between the
+    /// template's messages (Inkling's message close). Neither is the end of the turn, a stop token
+    /// or a row into the calls' block; the turn's own state is no region and has no close.
+    fn close_of(&self, state: usize) -> Option<(&str, usize)> {
+        if let Some(Region { close, home, .. }) =
+            self.region(state, |state| self.is_call_state(state))
+        {
+            return Some((close, home));
+        }
+        if state == 0 {
+            return None;
+        }
+        let turn_close = self.turn_close();
+        let block = self
+            .call_markers()
+            .and_then(|markers| markers.block)
+            .map(|block| block.state);
+        self.transitions()
+            .find(|&(source, on, target)| {
+                source == state
+                    && target != state
+                    && Some(on) != turn_close
+                    && !self.stops(on)
+                    && self.between_messages(target)
+                    && Some(target) != block
+            })
+            .map(|(_, on, target)| (self.terminal_text(on), target))
+    }
+
+    /// The shortest path of rows from `from` to `to` through framing states alone, the terminals
+    /// in the order the model writes them; `None` when there is none. One row where `from` has a
+    /// row into `to`. The end of the turn is no step of a path, nor is a stop token: a way in that
+    /// wrote either would end the turn before the calls. Rows are tried in the table's order, so
+    /// of two paths of one length the one whose rows come first is taken: the first row into `to`
+    /// when there are two.
+    fn path(&self, from: usize, to: usize) -> Option<Vec<&str>> {
+        if from == to {
+            return Some(Vec::new());
+        }
+        let turn_close = self.turn_close();
+        let mut reached_by: Vec<Option<(usize, usize)>> = vec![None; self.states()];
+        let mut seen = vec![false; self.states()];
+        seen[from] = true;
+        let mut frontier = VecDeque::from([from]);
+        while let Some(state) = frontier.pop_front() {
+            for (source, on, target) in self.transitions() {
+                if source != state || seen[target] || Some(on) == turn_close || self.stops(on) {
+                    continue;
+                }
+                seen[target] = true;
+                reached_by[target] = Some((state, on));
+                if target == to {
+                    let mut rows = Vec::new();
+                    let mut at = to;
+                    while let Some((before, on)) = reached_by[at] {
+                        rows.push(self.terminal_text(on));
+                        at = before;
+                    }
+                    rows.reverse();
+                    return Some(rows);
+                }
+                if self.between_messages(target) {
+                    frontier.push_back(target);
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether `state` lies between the template's messages: its wrapping (a wrapper state), or
+    /// text the template discards (a framing row: the text outside a response template's
+    /// fields). The model writes only the markers around its messages and calls there, so a way
+    /// in may pass through it.
+    fn between_messages(&self, state: usize) -> bool {
+        self.emits(state) == Emits::Wrapper || self.is_framing(state)
+    }
+
+    /// Whether terminal `on` is a token the model stops on ([`Format::is_stop_token`]): the stop
+    /// decoder hides it, so a tag cannot write it, and the region it closes ends at the model's
+    /// stop.
+    fn stops(&self, on: usize) -> bool {
+        self.is_stop_token(self.terminal_text(on))
     }
 
     /// Whether `state` emits a call's arguments.
@@ -713,6 +1219,13 @@ impl Format {
                     .any(|(source, t, target)| source == state && t == on && target == 0)
             })
         })
+    }
+
+    /// What the model writes to end its turn wherever it stands: the end of the turn's terminal,
+    /// or nothing for a table without one, whose turn a stop token ends.
+    fn turn_end(&self) -> &str {
+        self.turn_close()
+            .map_or("", |close| self.terminal_text(close))
     }
 }
 
@@ -979,6 +1492,114 @@ mod tests {
         assert_eq!(as_xtml["format"]["triggers"], value!(["<tool_call>"]));
         assert_eq!(begins(&as_xtml), ["<tool_call>"]);
         assert_eq!(as_xtml["format"]["tags"][0]["end"], "</tool_call>");
+    }
+
+    #[test]
+    fn a_way_in_follows_the_framing_between_messages() {
+        // A turn of messages: `<|start|>` opens one from the wrapping between them, its kind
+        // follows, and `<|end|>` closes a thought back into the wrapping. The block is entered
+        // from a message's header alone, so the turn's start goes in by starting a message, and
+        // the thought by closing, starting the next message and entering the block: a close, a
+        // row between messages and the block's opener. The header, with its own row, keeps it.
+        let messages = Format::new("messages")
+            .terminal("start", "<|start|>")
+            .terminal("think", "<|think|>")
+            .terminal("end", "<|end|>")
+            .terminal("calls_open", "<|calls|>")
+            .terminal("calls_close", "<|/calls|>")
+            .terminal("call_open", "<|call|>")
+            .terminal("call_close", "<|/call|>")
+            .state("between", Emits::Wrapper)
+            .state("header", Emits::Wrapper)
+            .state("reasoning", Emits::Reasoning)
+            .state("calls", Emits::Wrapper)
+            .state("call", Emits::Arguments)
+            .transition("between", "start", "header")
+            .transition("header", "think", "reasoning")
+            .transition("reasoning", "end", "between")
+            .transition("header", "calls_open", "calls")
+            .transition("calls", "call_open", "call")
+            .transition("call", "call_close", "calls")
+            .transition("calls", "calls_close", "header")
+            .calls(CallSyntax::Attributed(AttributedTags::XTML));
+        let tools = weather_tools();
+        let payload = messages
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
+        assert_eq!(
+            begins(&payload),
+            [
+                "<|start|><|calls|>",
+                "<|calls|>",
+                "<|end|><|start|><|calls|>"
+            ]
+        );
+        assert_eq!(
+            payload["format"]["triggers"],
+            value!(["<|start|>", "<|calls|>", "<|end|>"])
+        );
+        assert_eq!(payload["format"]["tags"][0]["end"], "<|/calls|>");
+        // The open thought changes nothing: the tag closes it on its own way in.
+        assert_eq!(
+            messages.grammar(&tools, true, true),
+            messages.grammar(&tools, true, false)
+        );
+        // The end of the turn is no step of a way in. Here the answer closes into an aside, and
+        // the aside's rows back to the turn's state are the end of the turn, the first of them,
+        // and `<|next|>`: the answer's way in closes it and goes on by `<|next|>`, as the aside's
+        // own does, never by ending the turn.
+        let aside = Format::new("aside")
+            .terminal("response_open", "<|response|>")
+            .terminal("response_close", "<|/response|>")
+            .terminal("next", "<|next|>")
+            .terminal("calls_open", "<|calls|>")
+            .terminal("calls_close", "<|/calls|>")
+            .terminal("call_open", "<|call|>")
+            .terminal("call_close", "<|/call|>")
+            .terminal("turn_end", "<|turn_end|>")
+            .state("turn", Emits::Wrapper)
+            .state("content", Emits::Content)
+            .state("aside", Emits::Wrapper)
+            .state("calls", Emits::Wrapper)
+            .state("call", Emits::Arguments)
+            .transition("turn", "response_open", "content")
+            .transition("content", "response_close", "aside")
+            .transition("aside", "turn_end", "turn")
+            .transition("aside", "next", "turn")
+            .transition("turn", "calls_open", "calls")
+            .transition("calls", "call_open", "call")
+            .transition("call", "call_close", "calls")
+            .transition("calls", "calls_close", "turn")
+            .transition("turn", "turn_end", "turn")
+            .transition("content", "turn_end", "turn")
+            .transition("calls", "turn_end", "turn")
+            .transition("call", "turn_end", "turn")
+            .calls(CallSyntax::Attributed(AttributedTags::XTML));
+        let payload = aside
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
+        assert_eq!(
+            begins(&payload),
+            [
+                "<|calls|>",
+                "<|/response|><|next|><|calls|>",
+                "<|next|><|calls|>"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_thought_that_closes_into_its_answer_has_no_way_of_its_own() {
+        // Hy4's shape: the block is entered from content alone, and the thought closes into
+        // content, which is text, not framing; the thought has no path of its own, and the open
+        // thought takes the prefix instead, as before.
+        let payload = formats::hy4()
+            .grammar(&weather_tools(), true, false)
+            .expect("a grammar")
+            .payload();
+        assert_eq!(begins(&payload), ["<tool_calls:opensource>"]);
     }
 
     /// The `begin` of each way into a block, from a `triggered_tags` payload.
@@ -1485,6 +2106,1284 @@ mod tests {
                 .payload()["format"]["at_least_one"],
             false
         );
+    }
+
+    /// The tag for one call to one of `tools`.
+    fn one_call(
+        format: &Format,
+        tools: &[Tool],
+        at_least_one: bool,
+        reasoning_open: bool,
+    ) -> Value {
+        format
+            .grammar_for(
+                tools,
+                Options {
+                    at_least_one,
+                    reasoning_open,
+                    one_call: true,
+                },
+            )
+            .expect("a grammar")
+            .payload()
+    }
+
+    /// `payload` with `stop_after_first` set on the node at `pointer`.
+    fn stopping_at(mut payload: Value, pointer: &str) -> Value {
+        payload.pointer_mut(pointer).expect("the node")["stop_after_first"] = Value::Bool(true);
+        payload
+    }
+
+    #[test]
+    fn one_call_is_the_qwen3_tag_stopping_after_the_first() {
+        // A named function, or `parallel_tool_calls: false`: one tag per named tool, as for any
+        // number of calls, and the tags stop after the first. A stop token ends the turn, so
+        // nothing follows the call's close.
+        let schema = value!({"type": "object", "properties": {"city": {"type": "string"}}});
+        let per_tool = |name: &str, schema: &Value| {
+            value!({
+                "type": "tag",
+                "begin": format!("<tool_call>\n{{\"name\": \"{name}\", \"arguments\": "),
+                "content": {"type": "json_schema", "json_schema": schema},
+                "end": "}\n</tool_call>",
+            })
+        };
+        assert_eq!(
+            one_call(
+                &formats::qwen3(CallSyntax::Json),
+                &weather_tools(),
+                true,
+                false
+            ),
+            value!({"format": {
+                "type": "triggered_tags",
+                "triggers": ["<tool_call>"],
+                "tags": [
+                    per_tool("get_weather", &schema),
+                    per_tool("lookup", &schema),
+                    per_tool("ping", &value!({})),
+                ],
+                "at_least_one": true,
+                "stop_after_first": true,
+            }})
+        );
+    }
+
+    #[test]
+    fn one_call_stops_glm_and_gemma4_after_the_first_and_changes_nothing_else() {
+        // Each call is a tag of its own and a stop token ends the turn: the tags for any number
+        // of calls, pinned above and in `gemma`, stopping after the first, with the call optional
+        // or required and with the thought open or not (the prefix is the same).
+        let tools = weather_tools();
+        for format in [formats::glm(), formats::gemma4(), formats::iquest()] {
+            for at_least_one in [true, false] {
+                let many = format
+                    .grammar(&tools, at_least_one, false)
+                    .expect("a grammar")
+                    .payload();
+                assert_eq!(
+                    one_call(&format, &tools, at_least_one, false),
+                    stopping_at(many, "/format"),
+                    "{}",
+                    format.name()
+                );
+                let open = format
+                    .grammar(&tools, at_least_one, true)
+                    .expect("a grammar")
+                    .payload();
+                assert_eq!(
+                    one_call(&format, &tools, at_least_one, true),
+                    stopping_at(open, "/format/elements/1"),
+                    "{}",
+                    format.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn one_call_in_a_block_of_invokes_is_one_invoke_then_the_blocks_close() {
+        // MiniMax M2's one block around the turn's calls and DeepSeek V4.1's: the block opens as
+        // before, holds one invoke, and closes; the invokes are tags with nothing between them,
+        // which stop after the first.
+        let tools = weather_tools();
+        for (format, block) in [(formats::minimax_m2(), 1), (formats::deepseek_v4_1(), 1)] {
+            let many = format
+                .grammar(&tools, true, false)
+                .expect("a grammar")
+                .payload();
+            assert_eq!(
+                one_call(&format, &tools, true, false),
+                stopping_at(many, &format!("/format/elements/{block}")),
+                "{}",
+                format.name()
+            );
+        }
+        let one = one_call(&formats::minimax_m2(), &tools, true, false);
+        assert_eq!(
+            one["format"]["elements"][0]["value"],
+            "\n<minimax:tool_call>\n"
+        );
+        assert_eq!(
+            one["format"]["elements"][1]["tags"][0]["begin"],
+            "<invoke name=\"get_weather\">\n"
+        );
+        assert_eq!(
+            one["format"]["elements"][2]["value"],
+            "</minimax:tool_call>"
+        );
+        // dots3's block around each call: a tag per tool, stopping after the first.
+        let dots3 = formats::dots3()
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
+        assert_eq!(
+            one_call(&formats::dots3(), &tools, true, false),
+            stopping_at(dots3, "/format")
+        );
+    }
+
+    #[test]
+    fn one_call_in_kimi_k3s_block_holds_one_call_and_ends_the_turn() {
+        // Kimi K3 writes its turn's close after the block, and a tag of one call has nothing after
+        // it: each way in holds one call, not one or more, and the block's close is followed by
+        // the end of the turn.
+        let tools = weather_tools();
+        let many = formats::kimi_k3()
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
+        let one = one_call(&formats::kimi_k3(), &tools, true, false);
+        assert_eq!(one["format"]["stop_after_first"], true);
+        assert_eq!(one["format"]["triggers"], many["format"]["triggers"]);
+        assert_eq!(begins(&one), begins(&many));
+        for (tag, before) in one["format"]["tags"]
+            .as_array()
+            .expect("tags")
+            .iter()
+            .zip(many["format"]["tags"].as_array().expect("tags"))
+        {
+            assert_eq!(tag["end"], "<|close|>tools<|sep|><|close|>message<|sep|>");
+            assert_eq!(
+                tag["content"], before["content"]["content"],
+                "one call, no plus"
+            );
+        }
+    }
+
+    #[test]
+    fn one_call_is_one_item_of_a_list_and_one_python_call() {
+        // xLAM's list holds one call between its brackets, and so do LFM2.5's list and Olmo 3's
+        // lines; Hy4's block and MiniMax M3's hold one call each.
+        let tools = weather_tools();
+        let xlam = one_call(&formats::xlam(), &tools, true, false);
+        let elements = xlam["format"]["elements"].as_array().expect("the list");
+        assert_eq!(elements.len(), 3, "`[`, one call, `]`");
+        assert_eq!(elements[0]["value"], "[");
+        assert_eq!(elements[1]["type"], "or");
+        assert_eq!(elements[2]["value"], "]");
+        assert!(xlam["format"].get("stop_after_first").is_none());
+        for format in [formats::lfm2_5(), formats::olmo3()] {
+            let one = one_call(&format, &tools, true, false);
+            assert_eq!(one["format"]["stop_after_first"], true, "{}", format.name());
+            assert_eq!(
+                one["format"]["tags"][0]["content"]["type"],
+                "or",
+                "{}: one call of one of the tools",
+                format.name()
+            );
+        }
+        let hy4 = one_call(&formats::hy4(), &tools, true, false);
+        assert_eq!(hy4["format"]["stop_after_first"], true);
+        assert_ne!(hy4["format"]["tags"][0]["content"]["type"], "plus");
+        let m3 = one_call(&formats::minimax_m3(), &tools, true, false);
+        assert_eq!(m3["format"]["stop_after_first"], true);
+        let invokes = &m3["format"]["tags"][0]["content"];
+        assert_eq!(invokes["type"], "tags_with_separator");
+        assert_eq!(invokes["at_least_one"], true);
+        assert_eq!(invokes["stop_after_first"], true);
+    }
+
+    #[test]
+    fn without_one_call_every_tag_is_the_one_grammar_gives() {
+        let tools = weather_tools();
+        for table in [
+            formats::Table::Qwen3,
+            formats::Table::Qwen3Tagged,
+            formats::Table::DeepSeekV4_1,
+            formats::Table::Hy4,
+            formats::Table::Xlam,
+            formats::Table::MinimaxM3,
+            formats::Table::KimiK3,
+            formats::Table::Inkling,
+            formats::Table::Gemma4,
+        ] {
+            let format = table.format();
+            for (at_least_one, reasoning_open) in
+                [(true, false), (true, true), (false, false), (false, true)]
+            {
+                assert_eq!(
+                    format.grammar_for(
+                        &tools,
+                        Options {
+                            at_least_one,
+                            reasoning_open,
+                            one_call: false,
+                        },
+                    ),
+                    format.grammar(&tools, at_least_one, reasoning_open),
+                    "{}",
+                    format.name()
+                );
+            }
+        }
+    }
+
+    /// The message `output` reads as under `format` after `prompt`, typed by `tools`.
+    fn read(format: &Format, tools: &[Tool], prompt: &str, output: &str) -> Value {
+        use crate::{
+            adapt,
+            engine::Engine,
+            event::Events,
+            input::{EngineFinish, Input},
+            parser::Parser as _,
+            tagged::Declared,
+        };
+        let mut engine = Engine::new(format.clone(), Declared::of(tools));
+        let mut out = Events::new();
+        engine
+            .feed(
+                Input::Prompt {
+                    token_ids: &[],
+                    text: prompt,
+                },
+                &mut out,
+            )
+            .expect("the prompt");
+        engine
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: output,
+                    spans: &[],
+                },
+                &mut out,
+            )
+            .expect("the output");
+        engine
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("the end");
+        let events = out.drain();
+        let message = adapt::chat::message(0, &events).message;
+        let calls: Vec<Value> = message
+            .tool_calls
+            .unwrap_or_default()
+            .iter()
+            .map(|call| {
+                let arguments = call.function.arguments.as_deref().unwrap_or("{}");
+                value!({
+                    "name": call.function.name,
+                    "arguments": serde_json::from_str::<Value>(arguments).expect("JSON"),
+                })
+            })
+            .collect();
+        value!({
+            "content": message.content,
+            "reasoning": message.reasoning_content,
+            "calls": calls,
+        })
+    }
+
+    #[test]
+    fn a_one_call_tags_sample_reads_back_as_that_call() {
+        // Each table's one-call tag written out for a call to `get_weather` (the samples an engine
+        // checks against the tags): the table reads it back as that call and nothing else.
+        let tools = weather_tools();
+        let call = value!({
+            "content": null,
+            "reasoning": null,
+            "calls": [{"name": "get_weather", "arguments": {"city": "Paris"}}],
+        });
+        for (format, sample) in [
+            (
+                formats::qwen3(CallSyntax::Json),
+                "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n\
+                 </tool_call>",
+            ),
+            (
+                formats::glm(),
+                "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>\
+                 </tool_call>",
+            ),
+            (
+                formats::gemma4(),
+                "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>",
+            ),
+            (
+                formats::minimax_m2(),
+                "\n<minimax:tool_call>\n<invoke name=\"get_weather\">\n<parameter \
+                 name=\"city\">Paris</parameter>\n</invoke>\n</minimax:tool_call>",
+            ),
+        ] {
+            assert_eq!(read(&format, &tools, "", sample), call, "{}", format.name());
+        }
+    }
+
+    /// A JSON answer's schema.
+    fn answer_schema() -> Value {
+        value!({"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]})
+    }
+
+    /// The JSON answer's tag for `format`, as a payload.
+    fn answer(format: &Format, reasoning_open: bool) -> Option<Value> {
+        format
+            .answer_grammar(&answer_schema(), reasoning_open)
+            .map(|grammar| grammar.payload())
+    }
+
+    #[test]
+    fn a_json_answer_where_the_output_starts_in_content_is_the_schema_alone() {
+        // Qwen3, GLM, Gemma 4 and MiniMax M2 start their output in content and end their turn at
+        // a stop token: the answer is the schema and nothing else, the constraint the gateway
+        // gives a `json_schema` response today.
+        let alone = value!({"format": {"type": "json_schema", "json_schema": answer_schema()}});
+        for format in [
+            formats::qwen3(CallSyntax::Json),
+            formats::glm(),
+            formats::gemma4(),
+            formats::minimax_m2(),
+            formats::deepseek_v4_1(),
+            formats::plain(),
+        ] {
+            assert_eq!(
+                answer(&format, false),
+                Some(alone.clone()),
+                "{}",
+                format.name()
+            );
+        }
+    }
+
+    #[test]
+    fn with_the_thought_open_the_answer_follows_the_prefix_a_forced_call_takes() {
+        // The prefix is the forced call's: the thought's own markers writable, so the model
+        // closes its thought where the engine runs the grammar from the first token; every other
+        // terminal and the syntax's inner tags not; nothing owed at its end.
+        let schema = value!({"type": "json_schema", "json_schema": answer_schema()});
+        assert_eq!(
+            answer(&formats::qwen3(CallSyntax::Json), true),
+            Some(value!({"format": {"type": "sequence", "elements": [
+                {"type": "any_text", "excludes": ["<tool_call>", "</tool_call>"]},
+                schema,
+            ]}}))
+        );
+        let tools = weather_tools();
+        for format in [
+            formats::glm(),
+            formats::gemma4(),
+            formats::minimax_m2(),
+            formats::deepseek_v4_1(),
+        ] {
+            let call = format
+                .grammar(&tools, true, true)
+                .expect("a grammar")
+                .payload();
+            assert_eq!(
+                answer(&format, true),
+                Some(value!({"format": {"type": "sequence", "elements": [
+                    call["format"]["elements"][0].clone(),
+                    schema,
+                ]}})),
+                "{}",
+                format.name()
+            );
+        }
+        // A table without a thought has no prefix.
+        assert_eq!(
+            answer(&formats::plain(), true),
+            answer(&formats::plain(), false)
+        );
+    }
+
+    #[test]
+    fn kimi_k3s_answer_is_its_response_region_then_the_end_of_the_turn() {
+        // The turn is regions: the answer opens the response region from the turn's own state,
+        // and closes it and the turn. The prompt opens the thought, so the answer's way in closes
+        // it first, as the block of calls' does.
+        let closed = value!({"format": {
+            "type": "tag",
+            "begin": "<|open|>response<|sep|>",
+            "content": {"type": "json_schema", "json_schema": answer_schema()},
+            "end": "<|close|>response<|sep|><|close|>message<|sep|>",
+        }});
+        assert_eq!(answer(&formats::kimi_k3(), false), Some(closed.clone()));
+        let mut open = closed;
+        open["format"]["begin"] = Value::from("<|close|>think<|sep|><|open|>response<|sep|>");
+        assert_eq!(answer(&formats::kimi_k3(), true), Some(open));
+    }
+
+    #[test]
+    fn inklings_answer_is_a_text_message() {
+        // The output starts after the message's opener, where the text marker makes the message
+        // the answer, and the message's close ends it. The generation prompt opens no thought; a
+        // thought a prompt left open reaches a text message only through the next message's
+        // header, which reads calls and is no framing, so it has no answer tag.
+        assert_eq!(
+            answer(&formats::inkling(), false),
+            Some(value!({"format": {
+                "type": "tag",
+                "begin": "<|content_text|>",
+                "content": {"type": "json_schema", "json_schema": answer_schema()},
+                "end": "<|end_message|>",
+            }}))
+        );
+        assert_eq!(answer(&formats::inkling(), true), None);
+    }
+
+    #[test]
+    fn a_table_without_content_or_with_a_thought_that_does_not_close_home_has_no_answer_tag() {
+        // xLAM's one state reads calls, and its answer is whatever is not a list. MiniMax M3's
+        // thought closes into a content state of its own, not where it opened: as for a forced
+        // call, the open thought has no prefix yet.
+        assert_eq!(answer(&formats::xlam(), false), None);
+        assert!(answer(&formats::minimax_m3(), false).is_some());
+        assert_eq!(answer(&formats::minimax_m3(), true), None);
+    }
+
+    #[test]
+    fn a_json_answers_sample_reads_back_as_that_content_and_no_call() {
+        let json = "{\"city\": \"Paris\"}";
+        for (format, prompt, sample) in [
+            (formats::qwen3(CallSyntax::Json), "", json.to_string()),
+            (
+                formats::qwen3(CallSyntax::Json),
+                "<|im_start|>assistant\n<think>\n",
+                format!("Paris, then.\n</think>\n\n{json}"),
+            ),
+            (formats::gemma4(), "", json.to_string()),
+            (
+                formats::kimi_k3(),
+                "<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+                format!(
+                    "<|close|>think<|sep|><|open|>response<|sep|>{json}<|close|>response<|sep|>\
+                     <|close|>message<|sep|>"
+                ),
+            ),
+            (
+                formats::inkling(),
+                "<|message_model|>",
+                format!("<|content_text|>{json}<|end_message|>"),
+            ),
+        ] {
+            let message = read(&format, &[], prompt, &sample);
+            assert_eq!(
+                message["content"].as_str().map(str::trim),
+                Some(json),
+                "{}",
+                format.name()
+            );
+            assert_eq!(message["calls"], value!([]), "{}", format.name());
+        }
+    }
+
+    /// A ChatML turn up to the assistant's opener, the user asking for the weather.
+    const CHATML_TURN: &str =
+        "<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n";
+
+    #[test]
+    fn the_prompts_replay_says_whether_the_thought_is_open_wherever_the_prompt_ends() {
+        // Read where the prompt ends, not by whether it ends at the opener: Qwen 3.5's generation
+        // prompt opens the thought after the opener, and with thinking off opens and closes it
+        // there, as Nemotron 3's does without the newlines; Qwen3 writes its own `<think>`.
+        let qwen3_5 = formats::Table::Qwen3Tagged.format();
+        assert!(qwen3_5.reasoning_open(&format!("{CHATML_TURN}<think>\n")));
+        assert!(!qwen3_5.reasoning_open(&format!("{CHATML_TURN}<think>\n\n</think>\n\n")));
+        assert!(!qwen3_5.reasoning_open(&format!("{CHATML_TURN}<think></think>")));
+        assert!(!formats::qwen3(CallSyntax::Json).reasoning_open(CHATML_TURN));
+        // A thought quoted in an earlier turn moves nothing: the replay starts at the last opener.
+        assert!(!qwen3_5.reasoning_open(
+            "<|im_start|>user\nWhat is <think>?<|im_end|>\n<|im_start|>assistant\n"
+        ));
+        // DeepSeek's templates open the thought after `<｜Assistant｜>`, R1's distills with a
+        // newline after it; Kimi K3's after its message tag.
+        let deepseek = formats::deepseek_v4_1();
+        assert!(deepseek.reasoning_open("<｜User｜>Weather in Paris?<｜Assistant｜><think>"));
+        assert!(deepseek.reasoning_open("<｜User｜>Weather in Paris?<｜Assistant｜><think>\n"));
+        assert!(!deepseek.reasoning_open("<｜User｜>Hi<｜Assistant｜><think>\n\n</think>\n\n"));
+        assert!(formats::kimi_k3()
+            .reasoning_open("<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>"));
+        // A table without a thought never has one open.
+        assert!(!formats::qwen2_5().reasoning_open(&format!("{CHATML_TURN}<think>\n")));
+    }
+
+    #[test]
+    fn a_prompt_left_inside_the_thought_gets_the_prefixed_tag_not_a_refusal() {
+        // Where the replay leaves the model in its thought, the forced call and the JSON answer
+        // follow the prefix, so the model finishes its thought first; neither is refused.
+        let tools = weather_tools();
+        let prompt = format!("{CHATML_TURN}<think>\n");
+        for table in [formats::Table::Qwen3Tagged, formats::Table::Qwen3] {
+            let format = table.format();
+            let reasoning_open = format.reasoning_open(&prompt);
+            assert!(reasoning_open, "{table:?}");
+            for one_call in [false, true] {
+                let call = format
+                    .grammar_for(
+                        &tools,
+                        Options {
+                            at_least_one: true,
+                            reasoning_open,
+                            one_call,
+                        },
+                    )
+                    .expect("a tag")
+                    .payload();
+                assert_eq!(call["format"]["type"], "sequence", "{table:?}");
+                assert_eq!(call["format"]["elements"][0]["type"], "any_text");
+            }
+            let answer = answer(&format, reasoning_open).expect("an answer");
+            assert_eq!(answer["format"]["elements"][0]["type"], "any_text");
+        }
+        let deepseek = formats::deepseek_v4_1();
+        let reasoning_open = deepseek.reasoning_open("<｜User｜>q<｜Assistant｜><think>\n");
+        let call = deepseek
+            .grammar(&tools, true, reasoning_open)
+            .expect("a tag")
+            .payload();
+        assert_eq!(call["format"]["elements"][0]["type"], "any_text");
+    }
+
+    #[test]
+    fn the_replay_agrees_with_where_the_engine_starts_the_output() {
+        // The engine replays the same walk: the output is reasoning exactly where the replay says
+        // the thought is open.
+        for (format, prompt) in [
+            (
+                formats::Table::Qwen3Tagged.format(),
+                format!("{CHATML_TURN}<think>\n"),
+            ),
+            (
+                formats::Table::Qwen3Tagged.format(),
+                format!("{CHATML_TURN}<think>\n\n</think>\n\n"),
+            ),
+            (formats::qwen3(CallSyntax::Json), CHATML_TURN.to_string()),
+            (
+                formats::deepseek_v4_1(),
+                "<｜User｜>q<｜Assistant｜><think>".to_string(),
+            ),
+            (
+                formats::kimi_k3(),
+                "<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>".to_string(),
+            ),
+            (formats::inkling(), "<|message_model|>".to_string()),
+        ] {
+            let read = read(&format, &[], &prompt, "Paris.");
+            assert_eq!(
+                read["reasoning"].is_string(),
+                format.reasoning_open(&prompt),
+                "{}: {prompt:?}",
+                format.name()
+            );
+        }
+    }
+
+    /// A table whose template writes a thought before every call and answer: `<think>` blocks
+    /// and `<tool_call>` blocks of JSON calls, everything else content, the turn's thought first.
+    fn thinking_first() -> Format {
+        Format::new("thinking_first")
+            .terminal("think_open", "<think>")
+            .terminal("think_close", "</think>")
+            .terminal("call_open", "<tool_call>")
+            .terminal("call_close", "</tool_call>")
+            .state("content", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("call", Emits::Arguments)
+            .transition("content", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "content")
+            .transition("content", "call_open", "call")
+            .transition("call", "call_close", "content")
+            .calls(CallSyntax::Json)
+            .thinks_first()
+    }
+
+    /// The thought a table that thinks first writes before a tag, as a payload node.
+    fn thought_node(excludes: Value) -> Value {
+        value!({
+            "type": "tag",
+            "begin": "<think>",
+            "content": {"type": "any_text", "excludes": excludes},
+            "end": "</think>",
+        })
+    }
+
+    #[test]
+    fn a_table_that_thinks_first_writes_the_thought_before_the_call() {
+        // The template writes a thought before every call, so the forced call's tag does too
+        // when the prompt has not opened it: the thought's opener, text that writes no marker, its
+        // close, then the call the table's syntax writes. With the thought open, the prefix as for
+        // any table; nothing is owed there, as an engine that runs a reasoning parser has read the
+        // thought's close before the grammar starts.
+        let tools = weather_tools();
+        let format = thinking_first();
+        let excludes = value!(["<think>", "</think>", "<tool_call>", "</tool_call>"]);
+        let plain = formats::qwen3(CallSyntax::Json);
+        for one_call in [false, true] {
+            let options = Options {
+                at_least_one: true,
+                reasoning_open: false,
+                one_call,
+            };
+            let calls = plain
+                .grammar_for(&tools, options)
+                .expect("a grammar")
+                .to_json();
+            assert_eq!(
+                format
+                    .grammar_for(&tools, options)
+                    .expect("a grammar")
+                    .payload(),
+                value!({"format": {"type": "sequence", "elements": [
+                    thought_node(excludes.clone()),
+                    calls,
+                ]}})
+            );
+        }
+        assert_eq!(
+            format.grammar(&tools, true, true),
+            plain.grammar(&tools, true, true)
+        );
+        // The same rows without the property, Qwen3's, give the tag alone.
+        assert_eq!(
+            plain
+                .grammar(&tools, true, false)
+                .expect("a grammar")
+                .payload()["format"]["type"],
+            "triggered_tags"
+        );
+    }
+
+    #[test]
+    fn a_table_that_thinks_first_writes_the_thought_before_the_answer() {
+        // The answer where the output starts in content: the thought, then the schema. With the
+        // thought open, the prefix and the schema, as for any table.
+        let format = thinking_first();
+        let schema = value!({"type": "json_schema", "json_schema": answer_schema()});
+        assert_eq!(
+            answer(&format, false),
+            Some(value!({"format": {"type": "sequence", "elements": [
+                thought_node(value!(["<think>", "</think>", "<tool_call>", "</tool_call>"])),
+                schema,
+            ]}}))
+        );
+        assert_eq!(
+            answer(&format, true),
+            answer(&formats::qwen3(CallSyntax::Json), true)
+        );
+    }
+
+    #[test]
+    fn a_turn_of_regions_that_thinks_first_closes_the_thought_then_goes_in() {
+        // Kimi K3's regions, thinking first: the thought is written whole, and the block of
+        // calls and the answer are entered from where its close leaves the engine, the turn's
+        // own state, as Kimi K3's prompt does not open the thought here.
+        let tools = weather_tools();
+        let format = formats::kimi_k3().thinks_first();
+        let calls = format
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
+        assert_eq!(calls["format"]["type"], "sequence");
+        assert_eq!(
+            calls["format"]["elements"][0]["begin"],
+            "<|open|>think<|sep|>"
+        );
+        assert_eq!(
+            calls["format"]["elements"][0]["end"],
+            "<|close|>think<|sep|>"
+        );
+        assert_eq!(
+            calls["format"]["elements"][1],
+            formats::kimi_k3()
+                .grammar(&tools, true, false)
+                .expect("a grammar")
+                .to_json()
+        );
+        let answer = answer(&format, false).expect("an answer");
+        assert_eq!(
+            answer["format"]["elements"][1]["begin"],
+            "<|open|>response<|sep|>"
+        );
+        // With the prompt's thought open, Kimi K3's tags as they are.
+        assert_eq!(
+            format.grammar(&tools, true, true),
+            formats::kimi_k3().grammar(&tools, true, true)
+        );
+    }
+
+    #[test]
+    fn a_thought_written_first_opens_where_the_output_starts() {
+        // The thought opens from a message's header, not from the turn's own state where the
+        // output starts: no lead the table has writes it first there, so the tags give `None`
+        // rather than a thought the model could not open.
+        let tools = weather_tools();
+        let headed = Format::new("headed")
+            .terminal("start", "<|start|>")
+            .terminal("think", "<|think|>")
+            .terminal("end", "<|end|>")
+            .terminal("calls_open", "<|calls|>")
+            .terminal("calls_close", "<|/calls|>")
+            .terminal("call_open", "<|call|>")
+            .terminal("call_close", "<|/call|>")
+            .state("between", Emits::Wrapper)
+            .state("header", Emits::Wrapper)
+            .state("reasoning", Emits::Reasoning)
+            .state("calls", Emits::Wrapper)
+            .state("call", Emits::Arguments)
+            .transition("between", "start", "header")
+            .transition("header", "think", "reasoning")
+            .transition("reasoning", "end", "header")
+            .transition("header", "calls_open", "calls")
+            .transition("calls", "call_open", "call")
+            .transition("call", "call_close", "calls")
+            .transition("calls", "calls_close", "header")
+            .calls(CallSyntax::Attributed(AttributedTags::XTML));
+        assert!(headed.grammar(&tools, true, false).is_some());
+        assert!(headed
+            .clone()
+            .thinks_first()
+            .grammar(&tools, true, false)
+            .is_none());
+        assert_eq!(
+            headed.clone().thinks_first().grammar(&tools, true, true),
+            headed.grammar(&tools, true, true)
+        );
+    }
+
+    #[test]
+    fn a_thought_first_samples_read_back_as_the_thought_and_the_call() {
+        let tools = weather_tools();
+        let sample = "<think>Paris it is.</think><tool_call>\n{\"name\": \"get_weather\", \
+                      \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>";
+        assert_eq!(
+            read(&thinking_first(), &tools, "", sample),
+            value!({
+                "content": null,
+                "reasoning": "Paris it is.",
+                "calls": [{"name": "get_weather", "arguments": {"city": "Paris"}}],
+            })
+        );
+    }
+
+    /// A table spelled as a response template's fields read, on abstract tags: the text outside
+    /// every field is framing; a thought between `<t>` and `</t>`; an answer after `<a>` that
+    /// `</a>` closes, or the stop token `<s>`, whose row comes first; and calls of JSON between
+    /// `<c>` and `</c>`.
+    fn framed() -> Format {
+        Format::new("framed")
+            .terminal("think_open", "<t>")
+            .terminal("think_close", "</t>")
+            .terminal("answer_open", "<a>")
+            .terminal("answer_close", "</a>")
+            .terminal("stop", "<s>")
+            .terminal("call_open", "<c>")
+            .terminal("call_close", "</c>")
+            .state("outside", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("content", Emits::Content)
+            .state("call", Emits::Arguments)
+            .transition("outside", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "outside")
+            .transition("outside", "answer_open", "content")
+            .transition("content", "stop", "outside")
+            .transition("content", "answer_close", "outside")
+            .transition("outside", "call_open", "call")
+            .transition("call", "call_close", "outside")
+            .calls(CallSyntax::Json)
+            .framing("outside")
+            .stop_tokens(["<s>"])
+    }
+
+    #[test]
+    fn a_framing_state_holds_no_answer_and_a_stop_token_ends_one() {
+        // The answer is the first content state the template keeps, not the framing the turn
+        // starts in; a stop token closes it, so the tag ends at the model's stop.
+        let schema = answer_schema();
+        let json_schema = value!({"type": "json_schema", "json_schema": schema});
+        let format = framed();
+        assert_eq!(
+            answer(&format, false),
+            Some(value!({"format": {
+                "type": "tag",
+                "begin": "<a>",
+                "content": json_schema,
+                "end": "",
+            }}))
+        );
+        // With the thought open, the way in is its close, then the row into the answer.
+        assert_eq!(
+            answer(&format, true).map(|payload| payload["format"]["begin"].clone()),
+            Some(value!("</t><a>"))
+        );
+        // Without the stop token, the answer's own close ends it.
+        let format = Format::new("framed")
+            .terminal("answer_open", "<a>")
+            .terminal("answer_close", "</a>")
+            .state("outside", Emits::Content)
+            .state("content", Emits::Content)
+            .transition("outside", "answer_open", "content")
+            .transition("content", "answer_close", "outside")
+            .framing("outside");
+        assert_eq!(
+            answer(&format, false).map(|payload| payload["format"]["end"].clone()),
+            Some(value!("</a>"))
+        );
+        let json = "{\"city\": \"Paris\"}";
+        let message = read(&framed(), &[], "", &format!("<a>{json}"));
+        assert_eq!(message["content"], value!(json));
+        assert_eq!(message["calls"], value!([]));
+    }
+
+    #[test]
+    fn a_regions_close_and_a_ways_step_are_never_a_stop_token() {
+        // The stop row out of the answer comes first in the table, but a tag cannot write the
+        // stop token: the region's close is the answer's own, and no path steps on the token.
+        let format = framed();
+        let content = format.answer_state().expect("an answer state");
+        let region = format
+            .region(content, |state| format.is_call_state(state))
+            .expect("the answer's region");
+        assert_eq!((region.open, region.close), ("<a>", "</a>"));
+        assert_eq!(format.close_of(content), Some(("</a>", 0)));
+        assert_eq!(
+            format.path(content, 3),
+            Some(vec!["</a>", "<c>"]),
+            "out through the answer's close and the framing, not the stop token"
+        );
+        assert!(format.stopped(content));
+        assert!(!format.stopped(1));
+    }
+
+    #[test]
+    fn a_way_in_passes_through_the_framing_between_two_markers() {
+        // The thought closes into framing of its own, and a second marker leads on into the
+        // framing the turn starts in, from where the answer opens: the way in is all three.
+        let format = Format::new("two markers")
+            .terminal("think_open", "<t>")
+            .terminal("think_close", "</t>")
+            .terminal("next", "<n>")
+            .terminal("answer_open", "<a>")
+            .terminal("answer_close", "</a>")
+            .state("outside", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("gap", Emits::Content)
+            .state("content", Emits::Content)
+            .transition("outside", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "gap")
+            .transition("gap", "next", "outside")
+            .transition("outside", "answer_open", "content")
+            .transition("content", "answer_close", "outside")
+            .framing("outside")
+            .framing("gap");
+        assert_eq!(format.validate(), Ok(()));
+        assert_eq!(format.path(2, 3), Some(vec!["<n>", "<a>"]));
+        assert_eq!(
+            answer(&format, true).map(|payload| payload["format"]["begin"].clone()),
+            Some(value!("</t><n><a>"))
+        );
+        let json = "{\"city\": \"Paris\"}";
+        let message = read(&format, &[], "<t>", &format!("plan</t><n><a>{json}</a>"));
+        assert_eq!(message["content"], value!(json));
+        assert_eq!(message["reasoning"], value!("plan"));
+    }
+
+    #[test]
+    fn a_layouts_text_before_an_answer_stands_before_the_terminal_that_opens_it() {
+        // The way in from the open thought is its close and two rows, `<n>` and the answer's
+        // opener `<a>`: the layout's text after a thought follows the close, and its text before
+        // an answer comes right before `<a>`, not before the first row.
+        let format = Format::new("two markers")
+            .terminal("think_open", "<t>")
+            .terminal("think_close", "</t>")
+            .terminal("next", "<n>")
+            .terminal("answer_open", "<a>")
+            .terminal("answer_close", "</a>")
+            .state("outside", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("gap", Emits::Content)
+            .state("content", Emits::Content)
+            .transition("outside", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "gap")
+            .transition("gap", "next", "outside")
+            .transition("outside", "answer_open", "content")
+            .transition("content", "answer_close", "outside")
+            .framing("outside")
+            .framing("gap")
+            .with_layout(Layout {
+                thought: Some(Message {
+                    after: "\n".into(),
+                    ..Message::default()
+                }),
+                answer: Some(Message {
+                    before: " ".into(),
+                    ..Message::default()
+                }),
+                ..Layout::default()
+            });
+        assert_eq!(
+            answer(&format, true).map(|payload| payload["format"]["begin"].clone()),
+            Some(value!("</t>\n<n> <a>"))
+        );
+        assert_eq!(
+            answer(&format, false).map(|payload| payload["format"]["begin"].clone()),
+            Some(value!(" <a>"))
+        );
+    }
+
+    /// A thought the template closes two ways, `<u>` or `<e></t>`, the row on `<u>` first in the
+    /// table; `<e>` alone closes the answer; calls of JSON between `<c>` and `</c>`. The template
+    /// writes the thought before every call and answer.
+    fn closed_two_ways() -> Format {
+        Format::new("closed two ways")
+            .terminal("think_open", "<t>")
+            .terminal("think_close", "<u>")
+            .terminal("think_end", "<e></t>")
+            .terminal("answer_open", "<a>")
+            .terminal("answer_close", "<e>")
+            .terminal("call_open", "<c>")
+            .terminal("call_close", "</c>")
+            .state("outside", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("content", Emits::Content)
+            .state("call", Emits::Arguments)
+            .transition("outside", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "outside")
+            .transition("reasoning", "think_end", "outside")
+            .transition("outside", "answer_open", "content")
+            .transition("content", "answer_close", "outside")
+            .transition("outside", "call_open", "call")
+            .transition("call", "call_close", "outside")
+            .calls(CallSyntax::Json)
+            .framing("outside")
+            .thinks_first()
+    }
+
+    #[test]
+    fn a_thought_closed_more_than_one_way_is_closed_as_its_layout_says_the_template_writes_it() {
+        let format = closed_two_ways();
+        assert_eq!(format.validate(), Ok(()));
+        let thought_end = |format: &Format| {
+            answer(format, false).map(|payload| payload["format"]["elements"][0]["end"].clone())
+        };
+        // Without a layout that names one, the tags write the first row out of the thought.
+        assert_eq!(thought_end(&format), Some(value!("<u>")));
+        // The layout names the close the chat template renders: the thought written first ends
+        // with it, and with the thought open the way into the answer starts with it.
+        let format = format.with_layout(Layout {
+            thought: Some(Message {
+                close: Some("<e></t>".into()),
+                ..Message::default()
+            }),
+            ..Layout::default()
+        });
+        assert_eq!(thought_end(&format), Some(value!("<e></t>")));
+        assert_eq!(
+            answer(&format, true).map(|payload| payload["format"]["begin"].clone()),
+            Some(value!("<e></t><a>"))
+        );
+        // With the thought open, the prefix a forced call takes keeps both of the thought's closes
+        // writable, and `<e>` inside the one the template renders, but no other marker.
+        let wrapped = format
+            .grammar(&weather_tools(), true, true)
+            .expect("a grammar")
+            .to_json();
+        assert_eq!(
+            wrapped["elements"][0],
+            value!({"type": "any_text", "excludes": ["<a>", "<c>", "</c>"]})
+        );
+        // Either close ends the thought, and `<e>` alone is the thought's text.
+        let json = "{\"city\": \"Paris\"}";
+        let message = read(&format, &[], "<t>", &format!("plan<e></t><a>{json}<e>"));
+        assert_eq!(message["reasoning"], value!("plan"));
+        assert_eq!(message["content"], value!(json));
+        let message = read(&format, &[], "<t>", "plan<e>more<u><a>x<e>");
+        assert_eq!(message["reasoning"], value!("plan<e>more"));
+        assert_eq!(message["content"], value!("x"));
+    }
+
+    #[test]
+    fn an_answer_closed_more_than_one_way_ends_as_its_layout_says_the_template_writes_it() {
+        // `closed_two_ways` with its answer closed by `</a>` as well, the row on `<e>` first.
+        let format = closed_two_ways().terminal("answer_end", "</a>");
+        let format = format.transition("content", "answer_end", "outside");
+        assert_eq!(format.validate(), Ok(()));
+        let answer_end = |format: &Format| {
+            answer(format, false).map(|payload| payload["format"]["elements"][1]["end"].clone())
+        };
+        // Without a layout that names one, the answer ends with the first row out of it.
+        assert_eq!(answer_end(&format), Some(value!("<e>")));
+        // The layout names the close the chat template renders, and the answer ends with it.
+        let format = format.with_layout(Layout {
+            answer: Some(Message {
+                close: Some("</a>".into()),
+                ..Message::default()
+            }),
+            ..Layout::default()
+        });
+        assert_eq!(answer_end(&format), Some(value!("</a>")));
+    }
+
+    /// Every node of `payload` of `kind`, depth first.
+    fn nodes_of<'v>(payload: &'v Value, kind: &str, out: &mut Vec<&'v Value>) {
+        match payload {
+            Value::Object(map) => {
+                if map.get("type").and_then(Value::as_str) == Some(kind) {
+                    out.push(payload);
+                }
+                for member in map.values() {
+                    nodes_of(member, kind, out);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    nodes_of(item, kind, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `grammar` with every token written back as its text: each constant string a marker
+    /// token cut apart joined again, so a bounded tag compares with the tag without tokens.
+    fn unbound(grammar: Grammar) -> Grammar {
+        let in_tag = |tag: Tag| Tag {
+            content: Box::new(unbound(*tag.content)),
+            ..tag
+        };
+        match grammar {
+            Grammar::Token(text) => Grammar::ConstString(text),
+            Grammar::Sequence(elements) => {
+                let cut = elements.iter().any(|e| matches!(e, Grammar::Token(_)))
+                    && elements
+                        .iter()
+                        .all(|e| matches!(e, Grammar::Token(_) | Grammar::ConstString(_)));
+                if cut {
+                    let mut text = String::new();
+                    for element in elements {
+                        if let Grammar::Token(piece) | Grammar::ConstString(piece) = element {
+                            text.push_str(&piece);
+                        }
+                    }
+                    return Grammar::ConstString(text);
+                }
+                Grammar::Sequence(elements.into_iter().map(unbound).collect())
+            }
+            Grammar::Or(elements) => Grammar::Or(elements.into_iter().map(unbound).collect()),
+            Grammar::Optional(content) => Grammar::Optional(Box::new(unbound(*content))),
+            Grammar::Star(content) => Grammar::Star(Box::new(unbound(*content))),
+            Grammar::Plus(content) => Grammar::Plus(Box::new(unbound(*content))),
+            Grammar::Tag(tag) => Grammar::Tag(in_tag(tag)),
+            Grammar::TriggeredTags {
+                triggers,
+                tags,
+                at_least_one,
+                stop_after_first,
+            } => Grammar::TriggeredTags {
+                triggers,
+                tags: tags.into_iter().map(in_tag).collect(),
+                at_least_one,
+                stop_after_first,
+            },
+            Grammar::TagsWithSeparator {
+                tags,
+                separator,
+                at_least_one,
+                stop_after_first,
+            } => Grammar::TagsWithSeparator {
+                tags: tags.into_iter().map(in_tag).collect(),
+                separator,
+                at_least_one,
+                stop_after_first,
+            },
+            other => other,
+        }
+    }
+
+    #[test]
+    fn a_marker_that_is_one_token_is_written_as_that_token_inside_a_tag() {
+        // Gemma 4's string delimiter is one token of its vocabulary: inside each call's tag,
+        // every string stands between that token, not its spelling in other tokens; the tag's
+        // begin and end, the trigger and the prefix's excludes stay text, as the engines take
+        // them. Written back as text, the tag is the one without tokens.
+        let tools = weather_tools();
+        let plain = formats::gemma4();
+        let bounded = formats::gemma4().marker_tokens(["<|\"|>", "<|tool_call>", "<tool_call|>"]);
+        for (at_least_one, reasoning_open, one_call) in [
+            (true, false, false),
+            (true, true, false),
+            (false, false, true),
+        ] {
+            let options = Options {
+                at_least_one,
+                reasoning_open,
+                one_call,
+            };
+            let before = plain.grammar_for(&tools, options).expect("a grammar");
+            let after = bounded.grammar_for(&tools, options).expect("a grammar");
+            assert_eq!(unbound(after.clone()), before);
+            let payload = after.payload();
+            let (mut tokens, mut strings) = (Vec::new(), Vec::new());
+            nodes_of(&payload, "token", &mut tokens);
+            nodes_of(&payload, "const_string", &mut strings);
+            assert!(!tokens.is_empty());
+            assert!(tokens.iter().all(|token| token["token"] == "<|\"|>"));
+            assert!(strings
+                .iter()
+                .all(|string| !string["value"].as_str().unwrap_or("").contains("<|\"|>")));
+            let tags = if reasoning_open {
+                &payload["format"]["elements"][1]
+            } else {
+                &payload["format"]
+            };
+            assert_eq!(tags["triggers"], value!(["<|tool_call>"]));
+            assert_eq!(tags["tags"][0]["begin"], "<|tool_call>call:get_weather{");
+        }
+        // The answer holds no marker, and is the same.
+        assert_eq!(answer(&bounded, true), answer(&plain, true));
+    }
+
+    #[test]
+    fn a_token_inside_a_longer_marker_is_cut_out_of_it() {
+        // DeepSeek V4.1's block opener begins with one token, `<｜DSML｜`: the opener, written
+        // before the invokes, takes that token and the rest as text; the close, which does not
+        // hold it, stays text, and the invokes' tags keep their begins and ends.
+        let tools = weather_tools();
+        let plain = formats::deepseek_v4_1();
+        let bounded = formats::deepseek_v4_1().marker_tokens(["<｜DSML｜"]);
+        let grammar = bounded.grammar(&tools, true, false).expect("a grammar");
+        assert_eq!(
+            Some(unbound(grammar.clone())),
+            plain.grammar(&tools, true, false)
+        );
+        let payload = grammar.payload();
+        assert_eq!(
+            payload["format"]["elements"][0],
+            value!({"type": "sequence", "elements": [
+                {"type": "const_string", "value": "\n\n"},
+                {"type": "token", "token": "<｜DSML｜"},
+                {"type": "const_string", "value": " calls>\n"},
+            ]})
+        );
+        assert_eq!(
+            payload["format"]["elements"][2],
+            value!({"type": "const_string", "value": "</｜DSML｜ calls>"})
+        );
+        assert_eq!(
+            payload["format"]["elements"][1]["tags"][0]["begin"],
+            "<｜DSML｜ invoke name=\"get_weather\">\n"
+        );
+        // Kimi K3's tags are made of its structural tokens: every argument tag inside a call
+        // writes them as tokens, and the block's ways in stay text.
+        let kimi = formats::kimi_k3().marker_tokens(["<|open|>", "<|close|>", "<|sep|>"]);
+        let grammar = kimi.grammar(&tools, true, true).expect("a grammar");
+        assert_eq!(
+            Some(unbound(grammar.clone())),
+            formats::kimi_k3().grammar(&tools, true, true)
+        );
+        let payload = grammar.payload();
+        let mut tokens = Vec::new();
+        nodes_of(&payload, "token", &mut tokens);
+        assert!(tokens.iter().any(|token| token["token"] == "<|sep|>"));
+        assert_eq!(
+            payload["format"]["triggers"],
+            value!([
+                "<|open|>tools<|sep|>",
+                "<|close|>think<|sep|>",
+                "<|close|>response<|sep|>"
+            ])
+        );
+    }
+
+    #[test]
+    fn the_marker_tokens_are_the_tables_own_the_longest_first() {
+        // A token no marker holds is no marker's; the empty text is none; of two, the longer is
+        // tried first, so a token inside a longer one never cuts it.
+        let format = formats::kimi_k3().marker_tokens([
+            "<|sep|>",
+            "hello",
+            "",
+            "<|open|>",
+            "<|close|>message<|sep|>",
+            "<|sep|>",
+        ]);
+        assert_eq!(
+            format.marker_token_texts(),
+            ["<|close|>message<|sep|>", "<|open|>", "<|sep|>"]
+        );
+        assert!(formats::kimi_k3().marker_token_texts().is_empty());
+        // The syntax's own tags count: Gemma 4's string delimiter is no terminal.
+        assert_eq!(
+            formats::gemma4()
+                .marker_tokens(["<|\"|>"])
+                .marker_token_texts(),
+            ["<|\"|>"]
+        );
+    }
+
+    #[test]
+    fn every_syntax_says_its_inner_tags() {
+        use crate::{pythonic::Dialect, tagged::attributed::Tags as AttributedTags};
+        assert_eq!(
+            CallSyntax::Tagged(
+                crate::tagged::Spelling::Json,
+                crate::tagged::Placement::OwnLine
+            )
+            .tag_texts(),
+            ["<function=", "<parameter=", "</parameter>", "</function>"]
+        );
+        assert_eq!(
+            CallSyntax::Keyed(KeyedTags::PLAIN).tag_texts(),
+            ["<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>"]
+        );
+        assert_eq!(
+            CallSyntax::Attributed(AttributedTags::DSML).tag_texts(),
+            [
+                AttributedTags::DSML.parameter_open,
+                AttributedTags::DSML.parameter_close
+            ]
+        );
+        assert_eq!(
+            CallSyntax::Attributed(AttributedTags::MINIMAX_M2).tag_texts(),
+            ["<parameter name=\"", "</parameter>"]
+        );
+        assert_eq!(
+            CallSyntax::Attributed(AttributedTags::XTML).tag_texts(),
+            [
+                "<|open|>argument key=\"",
+                "<|close|>argument<|sep|>",
+                "<|sep|>"
+            ]
+        );
+        assert_eq!(
+            CallSyntax::Gemma(crate::gemma::Spelling::GEMMA4).tag_texts(),
+            ["<|\"|>"]
+        );
+        assert_eq!(
+            CallSyntax::NamedJson("<|content_invoke_tool_json|>").tag_texts(),
+            ["<|content_invoke_tool_json|>"]
+        );
+        for syntax in [
+            CallSyntax::Json,
+            CallSyntax::JsonList,
+            CallSyntax::Xml,
+            CallSyntax::Pythonic(Dialect::OLMO3),
+        ] {
+            assert!(syntax.tag_texts().is_empty(), "{syntax:?}");
+        }
     }
 
     #[test]

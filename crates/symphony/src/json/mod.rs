@@ -7,8 +7,10 @@
 //! as they arrive, whether the argument bytes are still a prefix of a value. [`assembler`] turns
 //! one call's growing object into the events of that call, on top of the outline and the prefix;
 //! [`named_arguments`] does the same for a call whose name stands before a marker and whose object
-//! is the arguments alone.
+//! is the arguments alone; [`arguments`] for a call's arguments alone, written as one value, the
+//! call named elsewhere.
 
+pub mod arguments;
 pub mod assembler;
 pub mod list;
 pub mod named;
@@ -17,6 +19,7 @@ pub mod outline;
 pub mod partial;
 pub mod prefix;
 
+pub use arguments::Arguments;
 pub use assembler::Assembler;
 pub use outline::{outline, Outline, Span};
 pub use partial::{is_complete, PartialJson, PartialJsonError};

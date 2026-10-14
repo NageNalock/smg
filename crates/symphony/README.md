@@ -22,7 +22,7 @@ the three APIs the adapters render. Everything else here is the model families' 
 ```text
 prompt, output bytes --> Engine, running a Format table --> Events --> adapter --> API response
                          |                                   ^
-                         +---- the call syntax's assembler --+   (json, tagged, pythonic)
+                         +---- the call syntax's assembler --+   (json, tagged, pythonic, shape)
 
 request tools, Format table --> Format::grammar --> Grammar --> the engine's structural tag
 ```
@@ -49,12 +49,14 @@ and a client that wants the raw text back can have it.
 | `Event`, `Events`, `Text` | The output: `Content`, `ReasoningStart`/`Reasoning`/`ReasoningEnd`, `ToolCallStart`/`ToolCallArguments`/`ToolCallEnd`, `Dropped`, `Malformed`, `Finish`. `Text` carries the bytes and the engine tokens they cost. |
 | `DropReason`, `MalformedReason`, `FinishReason` | Why bytes were dropped, why a region could not be parsed, and the refined finish (`tool_calls` when calls were made). |
 | `ParseError` | Buffer overflow, lifecycle misuse, or a defect in a parser; what was pushed before the error is final. |
-| `Format`, `Emits`, `CallSyntax` | A model family's table: terminals (the marker strings), states (what the text in them is: content, reasoning, a call's arguments, wrapping), rows (`state + terminal = state`), the call syntax inside the arguments state, and the turn opener. Built with a small builder and checked by `Format::validate`. |
+| `Format`, `Emits`, `CallSyntax` | A model family's table: terminals (the marker strings), states (what the text in them is: content, reasoning, a call's arguments, wrapping), rows (`state + terminal = state`), the call syntax inside the arguments state, and the turn opener. The call syntax is a family's, or a call given as data (`CallSyntax::Shaped`, a `shape::CallShape`) as a response template writes it. A table read from a response template has the rows its fields need as well: turn anchors, the state a turn starts in, framing whose text is dropped, stays trimmed or joined as the template's fields are, a stop that closes a call, and the terminals that are stop tokens. Built with a small builder and checked by `Format::validate`. `Format::replay` cuts the prompt to the part the engine replays, and `Format::reasoning_open` says whether that replay leaves the model inside its thought; `Format::thinks_first` says the template writes the thought before every call and answer. |
 | `Engine` | The one parser that runs any table: `Engine::new(format, declared)`. |
+| `ValueRead`, `Inferred`, `Format::reads_values_with` | How a shaped call's values read: a tagged value's text by the template's parser (`shape::ValueParser`), typed by its parameter's schema; a member of JSON arguments held and typed where the reader says; a key written twice. A table names its reader; `Inferred`, the default, reads as the tagged tables do, and a crate that implements a template library's semantics gives its own. |
+| `shape::Layout`, `Format::with_layout` | How the model's chat template writes a turn where a response template's patterns leave the text open: the whitespace a `\s*` stands for, the text outside every field, each part of a call, the values, a thought and an answer, and which close the template writes for a region it closes more than one way. Whoever compiles the table learns it from a rendering, reading the call's shape through `Format::call_syntax` and the markers through `Format::terminal_texts`, and gives it to the table; `Layout::check` says whether it fits. Parsing does not read it; the structural tags of a shaped call are written from it. |
 | `Declared` | The parameter types the request's tools declare, which type a tagged call's values. |
 | `formats::*` | One function per family, each returning its table: `qwen3(syntax)`, `qwen2_5()`, `deepseek_v4_1()`, `seed_oss()`, `hy4()`, `ling()`, `iquest()`, `glm()`, `glm4()`, `k2_horizon()`, `olmo3()`, `lfm2_5()`, `xlam()`, `json()`, `minimax_m2()`, `minimax_m3()`, `kimi_k3()`, `inkling()`, `minicpm5()`, `dots3()`, `gemma4()`, `function_gemma()`, `mistral()`, `llama_nemotron()`, `plain()`. |
 | `adapt::chat`, `adapt::responses`, `adapt::messages` | Pure functions from events to Chat Completions, Responses and Messages API shapes, streamed (`delta`, `Stream`) and whole (`message`, `output`); the driver adds only the envelope. |
-| `Grammar`, `Tag`, `Format::grammar` | The structural tag an engine takes for a forced or required call, derived from the same table and the request's tools, or `None` for a table without calls: `to_json()` as the engine reads it, `payload()` as a request carries it. |
+| `Grammar`, `Tag`, `Format::grammar`, `Format::grammar_for`, `grammar::Options` | The structural tag an engine takes for a forced or required call, derived from the same table and the request's tools, or `None` for a table without calls: `to_json()` as the engine reads it, `payload()` as a request carries it. `grammar_for` takes the request's `Options`, one call among them (a named function, `parallel_tool_calls: false`); `Format::answer_grammar` is the tag for an answer that is JSON a schema accepts (`response_format`). A table given its vocabulary's added tokens (`Format::marker_tokens`) writes each marker that is one token as that token (`Grammar::Token`) inside its tags; `CallSyntax::tag_texts` lists each syntax's own tags. A call given as data gets its tag from the table's layout (`Format::with_layout`): what the model's chat template writes, and no tag without one. |
 | `Scanner`, `Piece` | Marker matching across chunk boundaries, holding back a half-arrived marker. |
 | `Ledger` | Token accounting: which tokens wrote which bytes, so every text event can say what it cost. |
 
@@ -73,6 +75,15 @@ and a client that wants the raw text back can have it.
   Kimi K3's XTML), MiniMax M3's XML tree; and the value reader that turns a value's text into the
   JSON the request's tools declare.
 - `pythonic`: calls written as Python, `name(key=value)`.
+- `shape`: a call's parts given as data, as a template's own patterns write them: linear patterns
+  (literals, runs of a class of characters, `\b`, optional literals) and the ways a value ends,
+  checked for what a stream can decide; a matcher that runs them over the output as it arrives
+  and answers as Python's `regex` module does for the whole text, and a search that finds where
+  the text before a closing marker starts; an interner that keeps a shape built at run time
+  `'static`; and the call they make up, its header after the region's marker, its arguments (one
+  JSON value, an object that names the call, or tagged parameters found as `finditer` finds them)
+  and its trailer before the closing marker, with the assembler that reads it: a marker whose
+  header does not match opens no call and is given back to the state it came in.
 - `grammar`: the structural-tag derivation and its per-syntax spellings (`keyed`, `xtml`,
   `tagged`, `pythonic`, `attributed` for MiniMax M2's, dots3's, MiniCPM5's and DSML's, and `xml`
   for MiniMax M3's; the JSON, compact keyed, list, Inkling and Mistral spellings in the module
@@ -92,7 +103,10 @@ A model of a known syntax costs a table and evidence, no engine change:
 3. Replay the whole set on a checkout; the models table below records the result.
 
 A new call syntax costs an assembler under `json`, `tagged` or `pythonic`, a `CallSyntax` variant,
-and a grammar module under `grammar`, each with the same evidence.
+and a grammar module under `grammar`, each with the same evidence. A syntax a template writes as
+patterns (a response template's) costs none of them: it is a `shape::CallShape`, data the shaped
+syntax runs. Its structural tag comes from the layout its chat template renders, which no table
+derives yet.
 
 ### Evidence
 

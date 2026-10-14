@@ -20,18 +20,19 @@ use serde_json::{json, Value};
 
 use super::{
     schema::{joined, keyword, shape, Definitions},
-    CallMarkers, Grammar, Tag,
+    CallMarkers, Count, Grammar, Tag,
 };
 use crate::pythonic::{Dialect, Framing, Values};
 
 /// The calls for `tools` in the region the table's markers frame: one tag, opened by the region's
-/// opener (and the list's `[`), holding one call or more in the dialect's framing, each value in
-/// its spelling, closed by the list's `]` and the region's close.
+/// opener (and the list's `[`), holding one call or more in the dialect's framing (one, when
+/// `count` asks for one), each value in its spelling, closed by the list's `]` and the region's
+/// close.
 pub(super) fn calls(
     markers: &CallMarkers<'_>,
     dialect: Dialect,
     tools: &[&Tool],
-    at_least_one: bool,
+    count: Count<'_>,
 ) -> Grammar {
     let one_call = Grammar::Or(
         tools
@@ -49,22 +50,25 @@ pub(super) fn calls(
         Framing::OnePerLine => ("", "\n", ""),
         Framing::List => ("[", ", ", "]"),
     };
-    let content = Grammar::Sequence(vec![
-        one_call.clone(),
-        Grammar::Star(Box::new(Grammar::Sequence(vec![
-            Grammar::ConstString(between.to_string()),
-            one_call,
-        ]))),
-    ]);
-    Grammar::TriggeredTags {
-        triggers: vec![markers.call_open.to_string()],
-        tags: vec![Tag::new(
+    let content = if count.one {
+        one_call
+    } else {
+        Grammar::Sequence(vec![
+            one_call.clone(),
+            Grammar::Star(Box::new(Grammar::Sequence(vec![
+                Grammar::ConstString(between.to_string()),
+                one_call,
+            ]))),
+        ])
+    };
+    count.triggered(
+        vec![markers.call_open.to_string()],
+        vec![Tag::new(
             format!("{}{open}", markers.call_open),
             content,
             format!("{close}{}", markers.call_close),
         )],
-        at_least_one,
-    }
+    )
 }
 
 /// One call: the name and `(`, the arguments, `)`.

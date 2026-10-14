@@ -20,18 +20,18 @@ use serde_json::Value;
 use super::{
     block_of,
     schema::{self, shape, Definitions},
-    CallMarkers, Grammar, Tag, WayIn,
+    CallMarkers, Count, Grammar, Tag, WayIn,
 };
 use crate::tagged::keyed::Tags;
 
-/// The calls for `tools`: in a block, the block's ways in around one or more calls; without one,
-/// one tag per tool, triggered by the call's opener.
+/// The calls for `tools`: in a block, the block's ways in around one or more calls (one, when
+/// `count` asks for one); without one, one tag per tool, triggered by the call's opener.
 pub(super) fn calls(
     markers: &CallMarkers<'_>,
     ways_in: &[WayIn<'_>],
     tags: &Tags,
     tools: &[&Tool],
-    at_least_one: bool,
+    count: Count<'_>,
 ) -> Grammar {
     let ends = Ends {
         value_close: tags.value_close,
@@ -68,20 +68,19 @@ pub(super) fn calls(
                     Grammar::Sequence(vec![Grammar::ConstString(before.to_string()), one_call])
                 }
             };
-            let all = Grammar::Plus(Box::new(each));
+            let all = count.calls(each);
             let inside = match newlines.block_before_close {
                 "" => all,
                 before => Grammar::Sequence(vec![all, Grammar::ConstString(before.to_string())]),
             };
-            block_of(ways_in, inside, block.close, at_least_one)
+            block_of(ways_in, inside, block.close, count)
         }
-        None => Grammar::TriggeredTags {
-            triggers: vec![markers.call_open.to_string()],
-            tags: calls
+        None => count.triggered(
+            vec![markers.call_open.to_string()],
+            calls
                 .map(|(begin, content, end)| Tag::new(begin, content, end))
                 .collect(),
-            at_least_one,
-        },
+        ),
     }
 }
 
