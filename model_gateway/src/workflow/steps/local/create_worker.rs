@@ -727,8 +727,10 @@ fn validate_zmq_worker_type(
 /// worker's only window: a discovered window under the other name is
 /// dropped, since the reader prefers `max_num_seqs` to `max_running_requests`
 /// and would otherwise take the engine's figure over the operator's, on
-/// every worker, expanded per rank or not.
-fn merge_labels(
+/// every worker, expanded per rank or not. A label update through the admin
+/// API merges the same way (`update_worker_properties`), so the rule holds
+/// after registration too.
+pub(super) fn merge_labels(
     discovered: &HashMap<String, String>,
     by_hand: &HashMap<String, String>,
 ) -> HashMap<String, String> {
@@ -771,15 +773,12 @@ fn labels_for_rank(
     let Some(width) = attention_dp_width(&labels, size) else {
         return labels;
     };
+    // A hand-set window is the worker's only window (the merge dropped the
+    // discovered one): nothing to share.
     if WINDOW_LABELS
         .iter()
         .any(|key| set_by_hand.contains_key(*key))
     {
-        for key in WINDOW_LABELS {
-            if !set_by_hand.contains_key(key) {
-                labels.remove(key);
-            }
-        }
         return labels;
     }
     for key in WINDOW_LABELS {
