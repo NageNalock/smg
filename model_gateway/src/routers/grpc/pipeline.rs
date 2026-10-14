@@ -1851,6 +1851,7 @@ mod request_release_tests {
             Ok(ts::GenerateResponse {
                 request_id: request_id.to_string(),
                 response: Some(GenResp::Chunk(ts::GenerateStreamChunk {
+                    input_logprobs: None,
                     token_ids: vec![100],
                     prompt_tokens: 2,
                     completion_tokens: 1,

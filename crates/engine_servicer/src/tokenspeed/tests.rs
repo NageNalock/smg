@@ -194,6 +194,8 @@ fn batch(
         num_waiting,
         kv_active_pages,
         kv_total_pages,
+        weight_version: None,
+        ..Default::default()
     }
 }
 

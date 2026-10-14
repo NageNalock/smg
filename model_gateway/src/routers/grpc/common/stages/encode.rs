@@ -27,8 +27,7 @@ use uuid::Uuid;
 use super::PipelineStage;
 use crate::{
     routers::grpc::{
-        backend_client::BackendClient,
-        client::GrpcClient,
+        backend_client::{encode_endpoint, BackendClient},
         context::{ClientSelection, EncodeOutputs, RequestContext, WorkerSelection},
         multimodal::{
             assemble_tokenspeed_for_encode, assembly_error_response, mm_rdma_exporter,
@@ -291,7 +290,13 @@ fn build_plan(
         });
         jobs.push(PreparedEncodeJob {
             item,
-            endpoint: assignment.worker.url().to_string(),
+            endpoint: encode_endpoint(
+                *assignment.worker.connection_mode(),
+                assignment.worker.url(),
+                &assignment.worker.metadata().spec.labels,
+            )
+            .map_err(|message| anyhow!(message))?
+            .to_string(),
             bootstrap_room,
         });
     }
@@ -309,19 +314,11 @@ fn prepare_items(
 ) -> Result<Vec<PreparedEncodeItem>> {
     let clients = clients.ok_or_else(|| anyhow!("Client acquisition stage not completed"))?;
     match clients {
-        ClientSelection::Disaggregated {
-            prefill: BackendClient::Grpc(GrpcClient::TokenSpeed(_)),
-            ..
-        } => prepare_tokenspeed_items(intermediate, workers),
-        // TokenSpeed supports EPD encode, but only over gRPC — name the
-        // transport, not the engine, so the error points at the real limit.
-        ClientSelection::Disaggregated {
-            prefill: prefill @ BackendClient::Zmq(_),
-            ..
-        } if prefill.runtime_type() == RuntimeType::TokenSpeed => Err(anyhow!(
-            "EPD encode requires a gRPC TokenSpeed prefill worker; the direct-ZMQ backend has \
-             no encode dispatch"
-        )),
+        ClientSelection::Disaggregated { prefill, .. }
+            if prefill.runtime_type() == RuntimeType::TokenSpeed =>
+        {
+            prepare_tokenspeed_items(intermediate, workers)
+        }
         ClientSelection::Disaggregated { prefill, .. } => Err(anyhow!(
             "EPD encode is not implemented for {} backend",
             backend_name(prefill)

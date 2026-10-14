@@ -44,6 +44,7 @@ fn context(
             connection_mode: Some(connection),
             http2: None,
             http_client_handle: None,
+            control_metadata_started: None,
             detected_runtime_type: None,
             discovered_labels: Default::default(),
             dp_info: None,

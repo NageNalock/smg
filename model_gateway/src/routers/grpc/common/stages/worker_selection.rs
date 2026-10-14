@@ -2311,6 +2311,43 @@ mod tests {
     }
 
     #[test]
+    fn select_pd_pair_accepts_tokenspeed_zmq_legs() {
+        let model_id = "test-tokenspeed-zmq-pd";
+        let registry = Arc::new(WorkerRegistry::new());
+        for (role, url) in [
+            (WorkerType::Prefill, "ipc:///tmp/prefill"),
+            (WorkerType::Decode, "ipc:///tmp/decode"),
+        ] {
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new(model_id))
+                        .worker_type(role)
+                        .runtime_type(RuntimeType::TokenSpeed)
+                        .label("zmq_pd", "true")
+                        .connection_mode(ConnectionMode::Zmq)
+                        .health_config(no_health_check())
+                        .build(),
+                ))
+                .unwrap();
+        }
+        let policies = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let stage =
+            WorkerSelectionStage::new(registry, policies, WorkerSelectionMode::PrefillDecode, None);
+        let (prefill, decode, _) = stage
+            .select_pd_pair(
+                model_id,
+                PlacementInputs::default(),
+                None,
+                None,
+                VisionDemand::default(),
+            )
+            .unwrap();
+        assert_eq!(prefill.url(), "ipc:///tmp/prefill");
+        assert_eq!(decode.url(), "ipc:///tmp/decode");
+    }
+
+    #[test]
     fn select_pd_pair_ignores_zmq_legs() {
         // The ZMQ wire carries no KV-transfer rendezvous, so ZMQ prefill/decode
         // workers must never be paired even if they reach the registry.

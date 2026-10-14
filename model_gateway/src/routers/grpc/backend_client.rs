@@ -8,6 +8,8 @@
 //! pipeline (which works against [`ProtoStream`]/[`ProtoGenerateRequest`]) is
 //! shared unchanged.
 
+use std::{collections::HashMap, ops::Deref, sync::Arc, time::Duration};
+
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
     messages::CreateMessageRequest, worker::WorkerLoadResponse,
@@ -17,6 +19,7 @@ use smg_grpc_client::{
     SglangGenerateRequestOptions, SglangSchedulerClient, TokenSpeedSchedulerClient,
     VllmEngineClient,
 };
+use tokio::sync::OnceCell;
 
 use crate::{
     routers::grpc::{
@@ -31,7 +34,7 @@ use crate::{
         zmq_client::{self, fold_tokenizer_eos_backstop, ZmqDialect, ZmqEngineClient},
         MultimodalData,
     },
-    worker::RuntimeType,
+    worker::{ConnectionMode, RuntimeType},
 };
 
 /// A backend connection: gRPC (any engine) or direct ZMQ (vLLM EngineCore,
@@ -39,7 +42,202 @@ use crate::{
 #[derive(Clone)]
 pub enum BackendClient {
     Grpc(GrpcClient),
-    Zmq(ZmqEngineClient),
+    Zmq(ZmqBackendClient),
+}
+
+/// Explicit control endpoints must refer to the same scheduler group as the
+/// generation worker. Generation is always dispatched through `data`.
+pub const ZMQ_CONTROL_URL_LABEL: &str = "zmq_control_url";
+pub const ZMQ_ENCODE_URL_LABEL: &str = "zmq_encode_url";
+pub const ZMQ_CONNECT_TIMEOUT_LABEL: &str = "zmq_connect_timeout_secs";
+
+pub(crate) fn zmq_connect_timeout(labels: &HashMap<String, String>) -> Result<Duration, String> {
+    let secs = labels
+        .get(ZMQ_CONNECT_TIMEOUT_LABEL)
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| "zmq_connect_timeout_secs must be a positive integer".to_string())
+        })
+        .transpose()?
+        .unwrap_or(600);
+    if secs == 0 {
+        return Err("zmq_connect_timeout_secs must be positive".to_string());
+    }
+    Ok(Duration::from_secs(secs))
+}
+
+/// The operations implemented by each direct transport. A control endpoint
+/// does not imply the generation wire can carry KV-transfer rendezvous.
+pub(crate) fn supports_pd(
+    mode: ConnectionMode,
+    runtime: RuntimeType,
+    labels: &HashMap<String, String>,
+) -> bool {
+    mode == ConnectionMode::Grpc
+        || (mode == ConnectionMode::Zmq
+            && runtime == RuntimeType::TokenSpeed
+            && labels.get("zmq_pd").is_some_and(|value| value == "true"))
+}
+
+fn explicit_grpc_endpoint(url: &str) -> Result<&str, String> {
+    let normalized = url
+        .strip_prefix("grpc://")
+        .or_else(|| url.strip_prefix("grpcs://"))
+        .ok_or_else(|| format!("control endpoint {url:?} must use grpc:// or grpcs://"))?;
+    let parsed: http::Uri = format!("http://{normalized}")
+        .parse()
+        .map_err(|e| format!("invalid control endpoint {url:?}: {e}"))?;
+    if parsed.host().is_none_or(str::is_empty)
+        || parsed.port_u16().is_none()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+    {
+        return Err(format!(
+            "control endpoint {url:?} must name a host and port without a path"
+        ));
+    }
+    Ok(url)
+}
+
+pub(crate) fn control_endpoint(labels: &HashMap<String, String>) -> Result<Option<&str>, String> {
+    labels
+        .get(ZMQ_CONTROL_URL_LABEL)
+        .map(|url| explicit_grpc_endpoint(url))
+        .transpose()
+}
+
+pub(crate) fn encode_endpoint<'a>(
+    mode: ConnectionMode,
+    worker_url: &'a str,
+    labels: &'a HashMap<String, String>,
+) -> Result<&'a str, String> {
+    match mode {
+        ConnectionMode::Grpc => Ok(worker_url),
+        ConnectionMode::Zmq => labels
+            .get(ZMQ_ENCODE_URL_LABEL)
+            .or_else(|| labels.get(ZMQ_CONTROL_URL_LABEL))
+            .ok_or_else(|| {
+                "ZMQ encode worker requires zmq_encode_url or zmq_control_url".to_string()
+            })
+            .and_then(|url| explicit_grpc_endpoint(url)),
+        ConnectionMode::Http => {
+            Err("typed encode dispatch requires a gRPC encoder endpoint".to_string())
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ZmqBackendClient {
+    data: ZmqEngineClient,
+    control_url: Option<String>,
+    control: Arc<OnceCell<GrpcClient>>,
+}
+
+impl From<ZmqEngineClient> for ZmqBackendClient {
+    fn from(data: ZmqEngineClient) -> Self {
+        Self {
+            data,
+            control_url: None,
+            control: Arc::new(OnceCell::new()),
+        }
+    }
+}
+
+impl Deref for ZmqBackendClient {
+    type Target = ZmqEngineClient;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+impl ZmqBackendClient {
+    pub(crate) fn with_control_endpoint(mut self, url: Option<String>) -> Self {
+        if self.control_url != url {
+            self.control = Arc::new(OnceCell::new());
+            self.control_url = url;
+        }
+        self
+    }
+
+    async fn control(&self, operation: &str) -> Result<&GrpcClient, tonic::Status> {
+        let endpoint = self.control_url.as_deref().ok_or_else(|| {
+            tonic::Status::unimplemented(format!(
+                "{operation} requires an explicit zmq_control_url for this ZMQ backend"
+            ))
+        })?;
+        self.control
+            .get_or_try_init(|| async {
+                GrpcClient::connect(endpoint, self.runtime().as_str())
+                    .await
+                    .map_err(|e| {
+                        tonic::Status::unavailable(format!(
+                            "connect to control endpoint {endpoint}: {e}"
+                        ))
+                    })
+            })
+            .await
+    }
+
+    async fn flush_cache(
+        &self,
+        timeout_s: f32,
+    ) -> Result<common_proto::FlushCacheResponse, tonic::Status> {
+        // Use the native rank-broadcast utility where the engine implements it.
+        let deadline = Duration::from_secs_f32(timeout_s.max(0.0))
+            + smg_grpc_client::FLUSH_RPC_DEADLINE_MARGIN;
+        let (success, message) = match self.runtime() {
+            RuntimeType::Vllm => {
+                let success = self.reset_prefix_cache(deadline).await?;
+                (
+                    success,
+                    if success {
+                        "Cache flushed successfully"
+                    } else {
+                        "Cache flush refused by an engine rank"
+                    }
+                    .to_string(),
+                )
+            }
+            RuntimeType::Sglang => self.flush_cache_sglang(timeout_s, deadline).await?,
+            _ => {
+                return self
+                    .control("FlushCache")
+                    .await?
+                    .flush_cache(timeout_s)
+                    .await
+            }
+        };
+        Ok(common_proto::FlushCacheResponse { success, message })
+    }
+
+    async fn profile(
+        &self,
+        req: Option<common_proto::StartProfileRequest>,
+    ) -> Result<common_proto::ProfileResponse, tonic::Status> {
+        if self.runtime() == RuntimeType::Sglang {
+            let start = req.map(|req| engine_zmq_adapter::SglangProfileStart {
+                output_dir: req.output_dir,
+                start_step: req.start_step.map(i64::from),
+                num_steps: req.num_steps.map(i64::from),
+                activities: req.activities,
+                with_stack: req.with_stack,
+                record_shapes: req.record_shapes,
+                profile_by_stage: req.profile_by_stage,
+                profile_id: uuid::Uuid::now_v7().to_string(),
+            });
+            let (success, message) = self
+                .profile_sglang(start, smg_grpc_client::PROFILE_RPC_DEADLINE)
+                .await?;
+            return Ok(common_proto::ProfileResponse { success, message });
+        }
+        let control = self.control("Profile").await?;
+        match req {
+            Some(req) => control.start_profile(req).await,
+            None => control.stop_profile().await,
+        }
+    }
 }
 
 /// The native request builders of the ZMQ dialects for one request kind — the
@@ -97,6 +295,20 @@ type SglangPlainBuilder<B, T> =
     fn(String, &B, T, Vec<u32>) -> Result<sglang_proto::GenerateRequest, String>;
 
 impl BackendClient {
+    pub(crate) fn zmq_control_endpoint(&self) -> Option<&str> {
+        match self {
+            Self::Zmq(client) => client.control_url.as_deref(),
+            Self::Grpc(_) => None,
+        }
+    }
+
+    pub(crate) fn with_zmq_control_endpoint(mut self, url: Option<String>) -> Self {
+        if let Self::Zmq(ref mut client) = self {
+            *client = client.clone().with_control_endpoint(url);
+        }
+        self
+    }
+
     /// Runtime type backing this client.
     pub fn runtime_type(&self) -> RuntimeType {
         match self {
@@ -123,7 +335,7 @@ impl BackendClient {
     pub fn finalize_generate_request(
         &self,
         request: &mut ProtoGenerateRequest,
-        tokenizer: Option<&std::sync::Arc<dyn llm_tokenizer::traits::Tokenizer>>,
+        tokenizer: Option<&Arc<dyn llm_tokenizer::traits::Tokenizer>>,
     ) -> Vec<String> {
         let token_only_wire = self.is_zmq();
         let router_stops = helpers::resolve_string_stops(request, tokenizer, token_only_wire);
@@ -183,14 +395,26 @@ impl BackendClient {
     pub async fn get_model_info(&self) -> Result<ModelInfo, tonic::Status> {
         match self {
             Self::Grpc(client) => client.get_model_info().await,
-            Self::Zmq(client) => Ok(zmq_client::model_info(client)),
+            Self::Zmq(client) => match client.control_url {
+                Some(_) => client.control("GetModelInfo").await?.get_model_info().await,
+                None => Ok(zmq_client::model_info(client)),
+            },
         }
     }
 
     pub async fn get_server_info(&self) -> Result<ServerInfo, tonic::Status> {
         match self {
             Self::Grpc(client) => client.get_server_info().await,
-            Self::Zmq(client) => Ok(zmq_client::server_info(client)),
+            Self::Zmq(client) => match client.control_url {
+                Some(_) => {
+                    client
+                        .control("GetServerInfo")
+                        .await?
+                        .get_server_info()
+                        .await
+                }
+                None => Ok(zmq_client::server_info(client)),
+            },
         }
     }
 
@@ -207,9 +431,7 @@ impl BackendClient {
     ) -> Result<common_proto::FlushCacheResponse, tonic::Status> {
         match self {
             Self::Grpc(client) => client.flush_cache(timeout_s).await,
-            Self::Zmq(_) => Err(tonic::Status::unimplemented(
-                "FlushCache not supported over ZMQ",
-            )),
+            Self::Zmq(client) => client.flush_cache(timeout_s).await,
         }
     }
 
@@ -219,18 +441,14 @@ impl BackendClient {
     ) -> Result<common_proto::ProfileResponse, tonic::Status> {
         match self {
             Self::Grpc(client) => client.start_profile(req).await,
-            Self::Zmq(_) => Err(tonic::Status::unimplemented(
-                "StartProfile not supported over ZMQ",
-            )),
+            Self::Zmq(client) => client.profile(Some(req)).await,
         }
     }
 
     pub async fn stop_profile(&self) -> Result<common_proto::ProfileResponse, tonic::Status> {
         match self {
             Self::Grpc(client) => client.stop_profile().await,
-            Self::Zmq(_) => Err(tonic::Status::unimplemented(
-                "StopProfile not supported over ZMQ",
-            )),
+            Self::Zmq(client) => client.profile(None).await,
         }
     }
 
@@ -253,7 +471,7 @@ impl BackendClient {
             Self::Grpc(client) => client.get_tokenizer().await,
             // EngineCore does not serve tokenizer artifacts over ZMQ; the
             // tokenizer is configured at worker registration instead.
-            Self::Zmq(_) => Err("ZMQ backend does not serve a tokenizer bundle".into()),
+            Self::Zmq(client) => client.control("GetTokenizer").await?.get_tokenizer().await,
         }
     }
 
@@ -553,3 +771,109 @@ fn mm_variant_mismatch(expected: &str, got: &MultimodalData) -> String {
     };
     format!("multimodal data variant mismatch: {expected} ZMQ backend got {got} data")
 }
+
+#[cfg(test)]
+mod capability_tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::worker::ConnectionMode;
+
+    #[test]
+    fn zmq_connect_timeout_is_validated_and_can_cover_model_loading() {
+        assert_eq!(zmq_connect_timeout(&HashMap::new()).unwrap().as_secs(), 600);
+        let labels = HashMap::from([(ZMQ_CONNECT_TIMEOUT_LABEL.to_string(), "7200".to_string())]);
+        assert_eq!(zmq_connect_timeout(&labels).unwrap().as_secs(), 7200);
+        for bad in ["0", "-1", "abc", "1.5"] {
+            assert!(zmq_connect_timeout(&HashMap::from([(
+                ZMQ_CONNECT_TIMEOUT_LABEL.to_string(),
+                bad.to_string()
+            )]))
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn zmq_pd_requires_a_runtime_with_transfer_support() {
+        let labels = HashMap::from([("zmq_pd".to_string(), "true".to_string())]);
+        assert!(supports_pd(
+            ConnectionMode::Zmq,
+            RuntimeType::TokenSpeed,
+            &labels
+        ));
+        assert!(!supports_pd(
+            ConnectionMode::Zmq,
+            RuntimeType::TokenSpeed,
+            &HashMap::new()
+        ));
+        assert!(!supports_pd(
+            ConnectionMode::Zmq,
+            RuntimeType::Vllm,
+            &labels
+        ));
+        assert!(!supports_pd(
+            ConnectionMode::Zmq,
+            RuntimeType::Sglang,
+            &labels
+        ));
+        assert!(!supports_pd(
+            ConnectionMode::Zmq,
+            RuntimeType::Unspecified,
+            &labels
+        ));
+        assert!(supports_pd(
+            ConnectionMode::Grpc,
+            RuntimeType::Vllm,
+            &HashMap::new()
+        ));
+    }
+
+    #[test]
+    fn encode_endpoint_uses_explicit_control_endpoint() {
+        let mut labels = HashMap::from([(
+            ZMQ_CONTROL_URL_LABEL.to_string(),
+            "grpc://encoder:50051".to_string(),
+        )]);
+        assert_eq!(
+            encode_endpoint(ConnectionMode::Zmq, "ipc:///tmp/encode", &labels).unwrap(),
+            "grpc://encoder:50051"
+        );
+        labels.insert(
+            ZMQ_ENCODE_URL_LABEL.to_string(),
+            "grpcs://encoder:50052".to_string(),
+        );
+        assert_eq!(
+            encode_endpoint(ConnectionMode::Zmq, "ipc:///tmp/encode", &labels).unwrap(),
+            "grpcs://encoder:50052"
+        );
+        assert_eq!(
+            encode_endpoint(ConnectionMode::Grpc, "grpc://encoder:50053", &labels).unwrap(),
+            "grpc://encoder:50053"
+        );
+        assert!(
+            encode_endpoint(ConnectionMode::Zmq, "ipc:///tmp/encode", &HashMap::new()).is_err()
+        );
+    }
+
+    #[test]
+    fn control_urls_are_explicit_and_validated() {
+        for url in [
+            "ipc:///tmp/engine",
+            "http://worker:1",
+            "worker:1",
+            "grpc://",
+        ] {
+            let labels = HashMap::from([(ZMQ_CONTROL_URL_LABEL.to_string(), url.to_string())]);
+            assert!(control_endpoint(&labels).is_err(), "{url}");
+        }
+        let labels = HashMap::from([(
+            ZMQ_CONTROL_URL_LABEL.to_string(),
+            "grpc://worker:1".to_string(),
+        )]);
+        assert_eq!(control_endpoint(&labels).unwrap(), Some("grpc://worker:1"));
+    }
+}
+
+#[cfg(test)]
+#[path = "backend_client_tests.rs"]
+mod control_tests;

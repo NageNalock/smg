@@ -18,7 +18,8 @@ use super::{
     },
 };
 use crate::{
-    observability::metrics::Metrics, routers::grpc::backend_client::BackendClient,
+    observability::metrics::Metrics,
+    routers::grpc::backend_client::{BackendClient, ZMQ_CONTROL_URL_LABEL},
     worker::pd_pairing::PdPairing,
 };
 
@@ -312,6 +313,10 @@ impl BasicWorkerBuilder {
         // localhost).
         if self.spec.connection_mode != ConnectionMode::Zmq {
             self.spec.bootstrap_host = parse_bootstrap_host(&self.spec.url);
+        } else if self.spec.bootstrap_host.is_empty() {
+            if let Some(endpoint) = self.spec.labels.get(ZMQ_CONTROL_URL_LABEL) {
+                self.spec.bootstrap_host = parse_bootstrap_host(endpoint);
+            }
         }
 
         // Resolve health config: use explicit config if set, otherwise
@@ -319,6 +324,9 @@ impl BasicWorkerBuilder {
         let health_config = self
             .health_config
             .unwrap_or_else(|| self.spec.health.apply_to(&HealthCheckConfig::default()));
+
+        let control_metadata_ready = self.spec.connection_mode != ConnectionMode::Zmq
+            || !self.spec.labels.contains_key(ZMQ_CONTROL_URL_LABEL);
 
         let metadata = WorkerMetadata {
             overload: OverloadThresholds::resolve(&self.spec.overload, self.overload_defaults),
@@ -375,6 +383,9 @@ impl BasicWorkerBuilder {
             metadata,
             backend_client,
             zmq_connect_started: Arc::new(AtomicBool::new(false)),
+            control_metadata_ready: Arc::new(AtomicBool::new(control_metadata_ready)),
+            background_tasks_retired: Arc::new(AtomicBool::new(false)),
+            zmq_driver_lock: Arc::new(parking_lot::Mutex::new(())),
             zmq_connect_abort: Arc::new(ArcSwapOption::empty()),
             connect_signal_tx: self.connect_signal_tx,
             models_override: Arc::new(ArcSwap::from_pointee(WorkerModels::Wildcard)),
@@ -512,6 +523,30 @@ mod tests {
         // No block, no defaults: protection stays off for this worker.
         let plain = BasicWorkerBuilder::new("http://w:2").build();
         assert!(!plain.metadata().overload.is_enabled());
+    }
+
+    #[test]
+    fn zmq_bootstrap_host_uses_control_endpoint_and_preserves_explicit_host() {
+        let worker = BasicWorkerBuilder::new("ipc:///tmp/ts")
+            .connection_mode(ConnectionMode::Zmq)
+            .label("zmq_control_url", "grpc://prefill:50051")
+            .build();
+        assert_eq!(worker.metadata().spec.bootstrap_host, "prefill");
+        let mut spec = WorkerSpec::new("ipc:///tmp/ts");
+        spec.connection_mode = ConnectionMode::Zmq;
+        spec.bootstrap_host = "transfer-host".to_string();
+        spec.labels.insert(
+            "zmq_control_url".to_string(),
+            "grpc://prefill:50051".to_string(),
+        );
+        assert_eq!(
+            BasicWorkerBuilder::from_spec(spec)
+                .build()
+                .metadata()
+                .spec
+                .bootstrap_host,
+            "transfer-host"
+        );
     }
 
     #[test]

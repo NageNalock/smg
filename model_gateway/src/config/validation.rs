@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     net::{IpAddr, SocketAddr},
     path::Path,
 };
@@ -310,6 +311,17 @@ impl ConfigValidator {
             Self::validate_trace(trace_config)?;
         }
 
+        let mut startup_spec_urls = HashSet::new();
+        for spec in &config.worker_specs {
+            validate_worker_url(&spec.url)?;
+            if !startup_spec_urls.insert(&spec.url) {
+                return Err(ConfigError::InvalidValue {
+                    field: "worker_specs".to_string(),
+                    value: spec.url.clone(),
+                    reason: "duplicate explicit worker URL".to_string(),
+                });
+            }
+        }
         Self::validate_compatibility(config)?;
 
         let retry_cfg = config.effective_retry_config();
@@ -474,7 +486,7 @@ impl ConfigValidator {
     }
 
     fn validate_storage_context_headers(config: &RouterConfig) -> ConfigResult<()> {
-        let mut seen_context_keys = std::collections::HashSet::new();
+        let mut seen_context_keys = HashSet::new();
 
         for (header_name, context_key) in &config.storage_context_headers {
             let header_name = header_name.trim();
@@ -1869,7 +1881,15 @@ impl ConfigValidator {
         // Under dp_aware each URL registers one worker per DP rank.
         if !has_service_discovery && !config.dp_aware {
             if let PolicyConfig::PowerOfTwo { .. } = &config.policy {
-                let worker_count = config.mode.worker_count();
+                let extra = config
+                    .worker_specs
+                    .iter()
+                    .filter(|spec| match &config.mode {
+                        RoutingMode::Regular { worker_urls } => !worker_urls.contains(&spec.url),
+                        _ => true,
+                    })
+                    .count();
+                let worker_count = config.mode.worker_count() + extra;
                 if worker_count < 2 {
                     return Err(ConfigError::IncompatibleConfig {
                         reason: "Power-of-two policy requires at least 2 workers".to_string(),

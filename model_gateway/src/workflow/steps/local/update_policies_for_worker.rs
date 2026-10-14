@@ -60,7 +60,9 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdatePoliciesForWorkerStep {
             }
 
             // Notify policy registry of the update
-            app_context.policy_registry.on_worker_added(model_id, None);
+            if app_context.policy_registry.get_policy(model_id).is_none() {
+                app_context.policy_registry.on_worker_added(model_id, None);
+            }
             for worker in workers.iter() {
                 worker.set_completion_sink(Some(app_context.policy_registry.completion_sink()));
             }

@@ -20,8 +20,8 @@ pub use local::{
     UpdateWorkerPropertiesStep, WorkerRemovalRequest,
 };
 use local::{
-    DetectBackendStep, DiscoverDPInfoStep as DPStep, EnsureHarmonyEncodingStep,
-    SubmitTokenizerJobStep,
+    DetectBackendStep, DiscoverDPInfoStep as DPStep, DiscoverZmqControlMetadataStep,
+    EnsureHarmonyEncodingStep, SubmitTokenizerJobStep,
 };
 use openai_protocol::worker::WorkerSpec;
 pub use shared::{ActivateWorkersStep, RegisterWorkersStep, UpdatePoliciesStep, WorkerList};
@@ -30,6 +30,8 @@ use wfaas::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, Workflo
 use crate::{
     app_context::AppContext,
     config::RouterConfig,
+    routers::grpc::backend_client::zmq_connect_timeout,
+    worker::ConnectionMode,
     workflow::data::{WorkerRegistrationMode, WorkerWorkflowData},
 };
 
@@ -66,7 +68,15 @@ use crate::{
 pub fn create_worker_registration_workflow(
     router_config: &RouterConfig,
 ) -> WorkflowDefinition<WorkerWorkflowData> {
-    let detect_timeout = Duration::from_secs(router_config.worker_startup_timeout_secs);
+    let explicit_startup_timeout = router_config
+        .worker_specs
+        .iter()
+        .filter(|spec| spec.connection_mode == ConnectionMode::Zmq)
+        .filter_map(|spec| zmq_connect_timeout(&spec.labels).ok())
+        .max()
+        .unwrap_or_default();
+    let detect_timeout = Duration::from_secs(router_config.worker_startup_timeout_secs)
+        .max(explicit_startup_timeout);
     let startup_delay = Duration::from_secs(router_config.worker_startup_delay_secs);
     let check_interval = Duration::from_secs(router_config.worker_startup_check_interval_secs);
 
@@ -273,6 +283,24 @@ pub fn create_worker_registration_workflow(
             .with_failure_action(FailureAction::FailWorkflow)
             .depends_on(&["register_workers"]),
         )
+        .add_step(
+            StepDefinition::new(
+                "discover_zmq_control_metadata",
+                "Discover ZMQ Control Metadata",
+                Arc::new(DiscoverZmqControlMetadataStep),
+            )
+            .with_retry(RetryPolicy {
+                max_attempts: u32::MAX,
+                backoff: BackoffStrategy::Fixed(check_interval),
+            })
+            .with_timeout(Duration::from_secs(10))
+            .with_failure_action(FailureAction::ContinueNextStep)
+            .depends_on(&[
+                "activate_workers",
+                "update_policies",
+                "submit_tokenizer_job",
+            ]),
+        )
 }
 
 /// Create initial workflow data for the unified worker registration workflow.
@@ -289,6 +317,7 @@ pub fn create_worker_workflow_data(
         http2: None,
         http_client_handle: None,
         detected_runtime_type: None,
+        control_metadata_started: None,
         discovered_labels: std::collections::HashMap::new(),
         dp_info: None,
         model_cards: Vec::new(),

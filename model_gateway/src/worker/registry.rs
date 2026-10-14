@@ -32,6 +32,7 @@ use uuid::Uuid;
 use crate::{
     config::types::RetryConfig,
     observability::metrics::{metrics_labels, Metrics},
+    routers::grpc::backend_client::supports_pd,
     worker::{
         circuit_breaker::CircuitState,
         event::{WorkerConnected, WorkerEvent},
@@ -97,14 +98,13 @@ pub struct WorkerDescriptor {
 pub(crate) enum RoutingPool {
     HttpRegular,
     GrpcPipelineRegular,
-    /// Strictly gRPC, unlike [`Self::GrpcPipelineRegular`]: the ZMQ wire
-    /// carries no KV-transfer rendezvous, so a ZMQ worker must never join a
-    /// PD leg even though it rides the gRPC pipeline elsewhere.
+    /// Typed pipeline workers whose generation wire supports KV-transfer
+    /// rendezvous (gRPC and TokenSpeed direct ZMQ).
     GrpcPrefill,
-    /// Strictly gRPC (see [`Self::GrpcPrefill`]).
+    /// Same transfer capability requirement as [`Self::GrpcPrefill`].
     GrpcDecode,
-    /// Strictly gRPC: encode dispatch is a gRPC encoder RPC the direct-ZMQ
-    /// worker has no path for.
+    /// Encode dispatch requires a gRPC encoder endpoint, either the worker
+    /// URL or an explicitly associated endpoint for TokenSpeed ZMQ.
     GrpcEncode,
     /// HTTP-transport prefill pool for the HTTP PD router: it proxies plain
     /// HTTP to the selected worker's URL, so a gRPC or ZMQ worker must never
@@ -147,13 +147,23 @@ impl RoutingPool {
             }
             Self::GrpcPrefill => {
                 *worker.worker_type() == WorkerType::Prefill
-                    && *worker.connection_mode() == ConnectionMode::Grpc
+                    && supports_pd(
+                        *worker.connection_mode(),
+                        worker.metadata().spec.runtime_type,
+                        &worker.metadata().spec.labels,
+                    )
             }
             Self::GrpcDecode => {
                 *worker.worker_type() == WorkerType::Decode
-                    && *worker.connection_mode() == ConnectionMode::Grpc
+                    && supports_pd(
+                        *worker.connection_mode(),
+                        worker.metadata().spec.runtime_type,
+                        &worker.metadata().spec.labels,
+                    )
             }
             Self::GrpcEncode => {
+                // TokenSpeed's encode role serves the dedicated encoder RPC;
+                // it has no direct generation scheduler handshake lifecycle.
                 *worker.worker_type() == WorkerType::Encode
                     && *worker.connection_mode() == ConnectionMode::Grpc
             }
@@ -1403,6 +1413,10 @@ impl WorkerRegistry {
                 "replace() did not preserve shared mutable worker state"
             );
         }
+
+        // Hand off an inherited in-flight handshake before publication. The
+        // newly visible worker must already own the sole driver handle.
+        old_worker.transfer_background_tasks_to(new_worker.as_ref());
 
         // Overwrite worker object atomically. The membership-order read
         // guard keeps the rebuild scan from interleaving with this write.

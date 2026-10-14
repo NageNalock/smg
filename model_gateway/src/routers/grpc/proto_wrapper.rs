@@ -1533,7 +1533,9 @@ impl ProtoGenerateRequest {
                             .collect()
                     })
                     .unwrap_or_default();
-                let clone = Self::TokenSpeed(req.clone());
+                let mut decoded = req.clone();
+                decoded.metadata_only = Some(true);
+                let clone = Self::TokenSpeed(decoded);
                 if let Some(mm) = req.mm_inputs.as_mut() {
                     for (item, encoder_input) in mm.items.iter_mut().zip(detached) {
                         item.encoder_input = encoder_input;
@@ -2306,7 +2308,7 @@ impl ProtoGenerateStreamChunk {
         }
     }
 
-    /// Get input logprobs (SGLang and vLLM only - streaming chunks don't have prompt logprobs)
+    /// Get input logprobs from runtimes that carry prompt scores in chunks.
     pub fn input_logprobs(&self) -> Option<ProtoInputLogProbs> {
         match self {
             Self::Sglang(c) => c
@@ -2317,8 +2319,11 @@ impl ProtoGenerateStreamChunk {
                 .input_logprobs
                 .as_ref()
                 .map(|lp| convert_input_logprobs!(lp)),
-            // TRT-LLM, MLX, and TokenSpeed streaming chunks don't have input_logprobs
-            Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
+            Self::TokenSpeed(c) => c
+                .input_logprobs
+                .as_ref()
+                .map(|lp| convert_input_logprobs!(lp)),
+            Self::Trtllm(_) | Self::Mlx(_) => None,
         }
     }
 
@@ -2371,7 +2376,11 @@ impl ProtoGenerateStreamChunk {
                 .weight_version
                 .as_deref()
                 .filter(|v| is_reported_version(v)),
-            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => None,
+            Self::Vllm(c) => c
+                .weight_version
+                .as_deref()
+                .filter(|v| is_reported_version(v)),
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) => None,
         }
     }
 }
@@ -2614,7 +2623,11 @@ impl ProtoGenerateComplete {
                 .weight_version
                 .as_deref()
                 .filter(|v| is_reported_version(v)),
-            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => None,
+            Self::Vllm(c) => c
+                .weight_version
+                .as_deref()
+                .filter(|v| is_reported_version(v)),
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) => None,
         }
     }
 
@@ -2640,7 +2653,7 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Get input/prompt logprobs (SGLang, vLLM, and TensorRT-LLM)
+    /// Get input/prompt logprobs.
     pub fn input_logprobs(&self) -> Option<ProtoInputLogProbs> {
         match self {
             Self::Sglang(c) => c
@@ -2675,8 +2688,11 @@ impl ProtoGenerateComplete {
                     })
                 }
             }
-            // MLX and TokenSpeed do not have input_logprobs
-            Self::Mlx(_) | Self::TokenSpeed(_) => None,
+            Self::TokenSpeed(c) => c
+                .input_logprobs
+                .as_ref()
+                .map(|lp| convert_input_logprobs!(lp)),
+            Self::Mlx(_) => None,
         }
     }
 
@@ -4163,6 +4179,31 @@ mod engine_error_tests {
 #[cfg(test)]
 mod tests {
     use prost::Message;
+
+    #[test]
+    fn tokenspeed_prompt_logprobs_preserve_nulls_in_chunks_and_complete() {
+        let prompt = tokenspeed::InputLogProbs {
+            token_logprobs: vec![
+                tokenspeed::InputTokenLogProb { value: None },
+                tokenspeed::InputTokenLogProb { value: Some(-0.25) },
+            ],
+            token_ids: vec![4, 7],
+            top_logprobs: vec![],
+        };
+        let chunk = ProtoGenerateStreamChunk::TokenSpeed(tokenspeed::GenerateStreamChunk {
+            input_logprobs: Some(prompt.clone()),
+            ..Default::default()
+        });
+        let complete = ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete {
+            input_logprobs: Some(prompt),
+            ..Default::default()
+        });
+        for converted in [chunk.input_logprobs(), complete.input_logprobs()] {
+            let converted = converted.expect("TokenSpeed prompt scores must reach responses");
+            assert_eq!(converted.token_logprobs, vec![None, Some(-0.25)]);
+            assert_eq!(converted.token_ids, vec![4, 7]);
+        }
+    }
 
     #[test]
     fn inline_bytes_counts_every_inline_tensor_and_raw_image() {

@@ -753,6 +753,13 @@ fn apply_connect_signal(
         debug!(worker_url = %url, "Connect signal for a worker being removed; ignoring");
         return;
     }
+    if registry
+        .get(&worker_id)
+        .is_some_and(|worker| !worker.control_metadata_ready())
+    {
+        debug!(worker_url = %url, "Generation handshake completed; awaiting associated control metadata");
+        return;
+    }
     match registry.transition_status_if_revision(&worker_id, revision, WorkerStatus::Ready) {
         Some((old, new)) => {
             debug!(worker_url = %url, ?old, ?new, "Promoted worker on connect signal");
@@ -884,6 +891,12 @@ fn compute_next_status(
     probe_ok: bool,
     health_config: &HealthCheckConfig,
 ) -> Option<WorkerStatus> {
+    if !worker.control_metadata_ready() {
+        // The registration workflow owns this startup deadline. A model may
+        // load longer than the health Pending cap; neither successful nor
+        // failed probes may publish provisional metadata as Ready.
+        return None;
+    }
     let current_status = worker.status();
     let success_threshold = health_config.success_threshold as usize;
     let failure_threshold = health_config.failure_threshold as usize;
@@ -1069,23 +1082,18 @@ impl WorkerManager {
             .iter()
             .filter(|w| matches!(w.connection_mode(), ConnectionMode::Http))
             .count();
-        // ZMQ engines have no cache-flush RPC; fan out only to workers that can
-        // succeed instead of reporting every ZMQ worker as failed.
-        let (workers, zmq_workers): (Vec<_>, Vec<_>) = all_workers
-            .into_iter()
-            .partition(|w| !matches!(w.connection_mode(), ConnectionMode::Zmq));
-        let zmq_skipped = zmq_workers.len();
-        let grpc_workers = total_workers - http_workers - zmq_skipped;
+        let zmq_workers = all_workers
+            .iter()
+            .filter(|worker| *worker.connection_mode() == ConnectionMode::Zmq)
+            .count();
+        let grpc_workers = total_workers - http_workers - zmq_workers;
+        // Worker dispatch checks the operation's capabilities: native vLLM/
+        // SGLang utilities and explicitly associated TokenSpeed controls can
+        // flush, while unsupported peers return a visible failure.
+        let workers = all_workers;
 
         if workers.is_empty() {
-            let message = if zmq_skipped > 0 {
-                format!(
-                    "No cache-flush-capable workers available \
-                     ({zmq_skipped} ZMQ workers skipped: no cache-flush RPC)"
-                )
-            } else {
-                "No workers available for cache flush".to_string()
-            };
+            let message = "No workers available for cache flush".to_string();
             info!("{}", message);
             return FlushCacheResult {
                 successful: vec![],
@@ -1093,23 +1101,23 @@ impl WorkerManager {
                 total_workers,
                 http_workers,
                 grpc_workers,
-                zmq_workers: zmq_skipped,
+                zmq_workers,
                 message,
             };
         }
 
         info!(
-            "Flushing cache on {} workers ({} HTTP, {} gRPC, {} ZMQ skipped)",
+            "Flushing cache on {} workers ({} HTTP, {} gRPC, {} ZMQ)",
             workers.len(),
             http_workers,
             grpc_workers,
-            zmq_skipped
+            zmq_workers
         );
 
         let (successful, failed) =
             Self::admin_fan_out(workers, |w| async move { w.flush_cache().await }).await;
 
-        let mut message = if failed.is_empty() {
+        let message = if failed.is_empty() {
             format!(
                 "Successfully flushed cache on all {} workers",
                 successful.len()
@@ -1121,11 +1129,6 @@ impl WorkerManager {
                 failed.len()
             )
         };
-        if zmq_skipped > 0 {
-            message.push_str(&format!(
-                " ({zmq_skipped} ZMQ workers skipped: no cache-flush RPC)"
-            ));
-        }
 
         info!("{}", message);
 
@@ -1135,7 +1138,7 @@ impl WorkerManager {
             total_workers,
             http_workers,
             grpc_workers,
-            zmq_workers: zmq_skipped,
+            zmq_workers,
             message,
         }
     }
@@ -1802,6 +1805,51 @@ mod tests {
             WorkerStatus::Ready,
             "a contact from the import promotes it: it is not being removed"
         );
+    }
+
+    #[test]
+    fn associated_control_metadata_gates_both_connect_and_probe_readiness() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("ipc:///tmp/ts-ready")
+                .connection_mode(ConnectionMode::Zmq)
+                .label("zmq_control_url", "grpc://worker:50051")
+                .build(),
+        );
+        registry.register(Arc::clone(&worker)).unwrap();
+        let mut next_check = HashMap::new();
+        apply_connect_signal(
+            &registry,
+            WorkerConnected {
+                url: worker.url().to_string(),
+                revision: worker.revision(),
+            },
+            &mut next_check,
+            &test_config(),
+        );
+        assert_eq!(worker.status(), WorkerStatus::Pending);
+        for _ in 0..100 {
+            worker.total_pending_probes_increment();
+            assert_eq!(
+                compute_next_status(&worker, true, &HealthCheckConfig::default()),
+                None
+            );
+            assert_eq!(
+                compute_next_status(&worker, false, &HealthCheckConfig::default()),
+                None
+            );
+        }
+        worker.mark_control_metadata_ready();
+        apply_connect_signal(
+            &registry,
+            WorkerConnected {
+                url: worker.url().to_string(),
+                revision: worker.revision(),
+            },
+            &mut next_check,
+            &test_config(),
+        );
+        assert_eq!(worker.status(), WorkerStatus::Ready);
     }
 
     #[test]

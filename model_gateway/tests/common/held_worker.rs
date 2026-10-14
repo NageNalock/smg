@@ -56,6 +56,7 @@ impl TokenSpeedScheduler for HeldWorker {
             items.push(Ok(ts::GenerateResponse {
                 request_id: request_id.clone(),
                 response: Some(GenResp::Chunk(ts::GenerateStreamChunk {
+                    input_logprobs: None,
                     token_ids: vec![*id],
                     prompt_tokens: 1,
                     completion_tokens: 1,

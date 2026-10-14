@@ -141,6 +141,10 @@ pub struct WorkerWorkflowData {
     #[serde(skip, default)]
     pub http_client_handle: Option<Arc<reqwest::Client>>,
     pub detected_runtime_type: Option<String>,
+    /// Live deadline origin for post-handshake metadata, preserved by retry
+    /// context snapshots and restarted after persistent workflow restoration.
+    #[serde(skip, default)]
+    pub control_metadata_started: Option<std::time::Instant>,
     pub discovered_labels: HashMap<String, String>,
     pub dp_info: Option<super::steps::local::DpInfo>,
     // -- External-only fields --

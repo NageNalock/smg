@@ -77,6 +77,14 @@ pub fn mm_pad_value(modality: TokenSpeedWireModality, hash: u64) -> u32 {
 /// wire"), `feature_shm` is a same-host optimization, and `encode_handshake`
 /// is EPD-only — this sender emits inline `feature` tensors and nil for all
 /// four.
+/// Per-item EPD rendezvous, matching Python's `encode_handshake` mapping.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct TokenSpeedEncodeHandshake {
+    pub bootstrap_host: String,
+    pub bootstrap_port: i32,
+    pub bootstrap_room: i64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TokenSpeedWireMmItem {
     pub modality: TokenSpeedWireModality,
@@ -90,9 +98,10 @@ pub struct TokenSpeedWireMmItem {
     pub offsets: Vec<(u64, u64)>,
     /// Primary encoder tensor. Kwarg naming (`pixel_values` vs `patches`) is
     /// the engine model integration's concern; the slot is anonymous.
-    pub feature: WireTensor,
+    pub feature: Option<WireTensor>,
     /// Side tensors (grids, types, per-item sizes) with wire dtype preserved.
     pub model_specific_data: BTreeMap<String, WireTensor>,
+    pub encode_handshake: Option<TokenSpeedEncodeHandshake>,
 }
 
 impl Serialize for TokenSpeedWireMmItem {
@@ -108,7 +117,7 @@ impl Serialize for TokenSpeedWireMmItem {
         tuple.serialize_element(&self.model_specific_data)?;
         tuple.serialize_element(&NIL)?; // encoded (scheduler-local)
         tuple.serialize_element(&NIL)?; // encoded_deepstack (scheduler-local)
-        tuple.serialize_element(&NIL)?; // encode_handshake (EPD only)
+        tuple.serialize_element(&self.encode_handshake)?; // encode_handshake (EPD only)
         tuple.end()
     }
 }
@@ -160,8 +169,9 @@ mod tests {
             hash: 0xDEAD_BEEF,
             pad_value: mm_pad_value(TokenSpeedWireModality::Image, 0xDEAD_BEEF),
             offsets: vec![(2, 4)],
-            feature: WireTensor::from_raw("bfloat16", vec![3, 2], vec![0u8; 12]),
+            feature: Some(WireTensor::from_raw("bfloat16", vec![3, 2], vec![0u8; 12])),
             model_specific_data,
+            encode_handshake: None,
         }
     }
 

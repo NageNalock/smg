@@ -393,6 +393,7 @@ class RouterArgs:
     # ("legacy") or Symphony ("symphony") for the models its registry knows; a request's
     # X-SMG-Parser header overrides it; appended last for the same reason
     parser: str = "legacy"
+    worker_specs: str | None = None
 
     @staticmethod
     def add_cli_args(
@@ -520,6 +521,12 @@ class RouterArgs:
                 help="Port number to bind the router server",
             )
 
+        worker_group.add_argument(
+            f"--{prefix}worker-specs",
+            type=str,
+            default=None,
+            help="JSON array of startup WorkerSpec objects, including labels and transport settings",
+        )
         worker_group.add_argument(
             "--worker-urls",
             type=str,

@@ -12,6 +12,7 @@ use tracing::warn;
 
 use crate::{
     config::RouterConfig,
+    routers::grpc::backend_client::ZMQ_CONTROL_URL_LABEL,
     worker::{registry::WorkerId, Worker, WorkerHttpClientCache, WorkerRegistry},
 };
 
@@ -96,7 +97,13 @@ impl RegistryRlView {
             .get(CONTROL_URL_LABEL)
             .map(String::as_str)
             .filter(|v| !v.trim().is_empty())
-            .map(|advertised| resolve_control_url(advertised, worker.base_url()));
+            .map(|advertised| {
+                let base = spec
+                    .labels
+                    .get(ZMQ_CONTROL_URL_LABEL)
+                    .map_or_else(|| worker.base_url(), String::as_str);
+                resolve_control_url(advertised, base)
+            });
         (url, self.control_client(&spec.http_pool))
     }
 
@@ -214,6 +221,22 @@ mod tests {
             "wildcard bind host resolves to the worker host"
         );
         assert!(info.control_client.is_ok());
+    }
+
+    #[test]
+    fn zmq_rl_wildcard_control_resolves_via_associated_endpoint() {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("ipc:///tmp/ts")
+                .connection_mode(ConnectionMode::Zmq)
+                .label("zmq_control_url", "grpc://engine-host:50051")
+                .label("rl.control_url", "http://0.0.0.0:40100")
+                .build(),
+        );
+        let info = view_over(vec![worker]).list().pop().unwrap();
+        assert_eq!(
+            info.control_url.as_deref(),
+            Some("http://engine-host:40100")
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use once_cell::sync::OnceCell;
+use openai_protocol::worker::WorkerSpec;
 use pyo3::prelude::*;
 
 // Jemalloc for all Rust-side allocations in the extension. Prefixed symbols
@@ -420,6 +421,7 @@ struct Router {
     health_check_port: Option<u16>,
     routing_key_override: bool,
     worker_urls: Vec<String>,
+    worker_specs: Option<String>,
     policy: PolicyType,
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval: u64,
@@ -1019,6 +1021,18 @@ impl Router {
                 None
             };
 
+        let worker_specs: Vec<WorkerSpec> = self
+            .worker_specs
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| config::ConfigError::InvalidValue {
+                field: "worker_specs".to_string(),
+                value: "JSON array".to_string(),
+                reason: format!("{e}"),
+            })?
+            .unwrap_or_default();
+
         config::RouterConfig::builder()
             .mode(mode)
             .policy(policy)
@@ -1029,6 +1043,7 @@ impl Router {
             .connection_mode(self.connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
             .zmq_engine_count(self.zmq_engine_count)
+            .worker_specs(worker_specs)
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
@@ -1404,6 +1419,7 @@ impl Router {
         mesh_tls_key = None,
         power_of_two_load_metric = String::from("expected_wait"),
         discovery = None,
+        worker_specs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -1605,6 +1621,7 @@ impl Router {
         mesh_tls_key: Option<String>,
         power_of_two_load_metric: String,
         discovery: Option<Bound<'_, PyAny>>,
+        worker_specs: Option<String>,
     ) -> PyResult<Self> {
         // Two spellings of one choice: refuse both rather than pick one.
         if service_discovery && discovery.is_some() {
@@ -1618,7 +1635,19 @@ impl Router {
             .transpose()?
             .flatten();
 
+        let worker_specs_json = worker_specs.clone();
+        let worker_specs: Vec<WorkerSpec> = worker_specs
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "invalid worker-specs JSON array: {e}"
+                ))
+            })?
+            .unwrap_or_default();
         let mut all_urls = worker_urls.clone();
+        all_urls.extend(worker_specs.iter().map(|spec| spec.url.clone()));
 
         if let Some(ref encode_urls) = encode_urls {
             for (url, _) in encode_urls {
@@ -1644,6 +1673,7 @@ impl Router {
             health_check_port,
             routing_key_override,
             worker_urls,
+            worker_specs: worker_specs_json,
             policy,
             worker_startup_timeout_secs,
             worker_startup_check_interval,

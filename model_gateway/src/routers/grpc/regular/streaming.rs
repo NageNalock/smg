@@ -1405,7 +1405,6 @@ impl StreamingProcessor {
     }
 
     /// Process streaming chunks for generate endpoint (no tool/reasoning parsing)
-    /// TODO: add streaming logprob support
     async fn process_generate_streaming(
         tokenizer: Arc<dyn Tokenizer>,
         mut stream: ProtoStream,
@@ -1413,6 +1412,18 @@ impl StreamingProcessor {
         tx: &SseSender,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
+        if ctx.return_logprob {
+            return Self::process_generate_streaming_with_input_logprobs(
+                tokenizer,
+                stream,
+                ctx,
+                None,
+                tx,
+                None,
+                reservation,
+            )
+            .await;
+        }
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
 
@@ -1612,7 +1623,7 @@ impl StreamingProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         mut stream: ProtoStream,
         ctx: GenerateStreamContext,
-        input_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
+        mut input_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
         tx: &SseSender,
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
@@ -1641,6 +1652,12 @@ impl StreamingProcessor {
 
             match gen_response.into_response() {
                 ProtoResponseVariant::Chunk(chunk) => {
+                    if ctx.return_logprob && input_token_logprobs.is_none() {
+                        input_token_logprobs = chunk
+                            .input_logprobs()
+                            .as_ref()
+                            .map(utils::convert_generate_input_logprobs);
+                    }
                     // Track TTFT immediately on first chunk received from backend
                     if first_token_time.is_none() {
                         first_token_time = Some(Instant::now());
@@ -1717,6 +1734,12 @@ impl StreamingProcessor {
                         .map_err(|_| "Failed to send chunk".to_string())?;
                 }
                 ProtoResponseVariant::Complete(complete) => {
+                    if ctx.return_logprob && input_token_logprobs.is_none() {
+                        input_token_logprobs = complete
+                            .input_logprobs()
+                            .as_ref()
+                            .map(utils::convert_generate_input_logprobs);
+                    }
                     let index = complete.index();
                     let accumulated_text =
                         accumulated_texts.get(&index).cloned().unwrap_or_default();
@@ -4289,6 +4312,119 @@ mod usage_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tokenspeed_zmq_generate_stream_exposes_prompt_and_sampled_logprobs() {
+        use std::time::Duration;
+
+        use engine_zmq_client::{
+            codec::encode_msgpack,
+            mock_engine::{connect_to_frontend, default_ready_response},
+            protocol::tokenspeed::output::BatchTokenIDOutSlim,
+            EngineId,
+        };
+        use llm_tokenizer::mock::MockTokenizer;
+        use smg_grpc_client::tokenspeed_proto;
+        use tokio::sync::mpsc;
+
+        use crate::{
+            routers::grpc::{
+                backend_client::BackendClient,
+                proto_wrapper::ProtoGenerateRequest,
+                zmq_client::{EosTokenIds, ZmqEngineClient},
+            },
+            worker::RuntimeType,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let address = |name| format!("ipc://{}", dir.path().join(name).display());
+        let (handshake, input, output) =
+            (address("handshake"), address("input"), address("output"));
+        let (client, engine) = tokio::join!(
+            ZmqEngineClient::connect(
+                &handshake,
+                &input,
+                &output,
+                1,
+                "model".to_string(),
+                EosTokenIds::default(),
+                RuntimeType::TokenSpeed,
+                Duration::from_secs(5),
+            ),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response(),
+            ),
+        );
+        let mut engine = engine.unwrap();
+        let mut backend = BackendClient::Zmq(client.unwrap().into());
+        let request =
+            ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed_proto::GenerateRequest {
+                request_id: "scores".to_string(),
+                tokenized: Some(tokenspeed_proto::TokenizedInput {
+                    input_ids: vec![4, 7],
+                    ..Default::default()
+                }),
+                return_logprob: true,
+                logprob_start_len: Some(0),
+                stream: true,
+                ..Default::default()
+            }));
+        let (stream, request) = tokio::join!(backend.generate(request), engine.recv_request());
+        request.unwrap();
+        let batch = BatchTokenIDOutSlim {
+            rids: vec!["scores".to_string()],
+            output_ids: vec![vec![10]],
+            finished_reasons: vec!["length".to_string()],
+            prompt_tokens: vec![2],
+            completion_tokens: vec![1],
+            cached_tokens: vec![0],
+            output_token_logprobs_val: vec![vec![-0.5]],
+            output_token_logprobs_idx: vec![vec![10]],
+            input_token_logprobs_val: Some(vec![vec![None, Some(-0.25)]]),
+            input_token_logprobs_idx: Some(vec![vec![4, 7]]),
+            ..Default::default()
+        };
+        engine
+            .send_output(vec![Bytes::from(encode_msgpack(&batch).unwrap())])
+            .await
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        StreamingProcessor::process_generate_streaming(
+            Arc::new(MockTokenizer::new()),
+            stream.unwrap(),
+            GenerateStreamContext {
+                request_id: "scores".to_string(),
+                weight_version: "test".to_string(),
+                return_logprob: true,
+                backend_type: "tokenspeed",
+                model: "model".to_string(),
+                expected_choices: 1,
+            },
+            &tx,
+            None,
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        let mut events = 0;
+        while let Some(event) = rx.recv().await {
+            let event = event.unwrap();
+            let body = event.strip_prefix(b"data: ").unwrap();
+            let json: Value = serde_json::from_slice(body).unwrap();
+            assert_eq!(
+                json["meta_info"]["input_token_logprobs"],
+                json!([[null, 4.0], [-0.25, 7.0]])
+            );
+            assert_eq!(
+                json["meta_info"]["output_token_logprobs"],
+                json!([[-0.5, 10.0]])
+            );
+            events += 1;
+        }
+        assert_eq!(events, 2, "both the token chunk and final SSE carry scores");
+    }
 
     /// The frames write exactly the bytes of the serialized whole chunk
     /// structs, so a field added to a struct turns up here, not on the wire

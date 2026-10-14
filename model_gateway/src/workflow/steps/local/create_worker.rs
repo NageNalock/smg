@@ -15,7 +15,13 @@ use super::discover_dp::DpInfo;
 use crate::{
     config::ParserChoice,
     routers::grpc::{
-        multimodal::SUPPORTS_VISION_LABEL, regular::symphony::check_names, utils::Names,
+        backend_client::{
+            control_endpoint, encode_endpoint, supports_pd, zmq_connect_timeout,
+            ZMQ_ENCODE_URL_LABEL,
+        },
+        multimodal::SUPPORTS_VISION_LABEL,
+        regular::symphony::check_names,
+        utils::Names,
         zmq_client::zmq_handshake_address,
     },
     worker::{
@@ -173,7 +179,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             });
         }
 
-        validate_zmq_worker_type(*connection_mode, config.worker_type, &config.url)?;
+        validate_zmq_capabilities(config, *connection_mode, runtime_type, &labels)?;
 
         // A grouped ZMQ worker (`dp_size: N` on the spec) awaits N engines on
         // one socket set. Every ZMQ runtime routes per rank: vLLM by in-request
@@ -313,7 +319,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
     }
 }
 
-fn take_kv_transfer_metadata(
+pub(super) fn take_kv_transfer_metadata(
     config: &WorkerSpec,
     labels: &mut HashMap<String, String>,
 ) -> (Option<String>, Option<String>, Option<String>) {
@@ -430,7 +436,7 @@ fn validate_parser_overrides(
     })
 }
 
-fn build_model_card(
+pub(super) fn build_model_card(
     model_id: &str,
     config: &WorkerSpec,
     labels: &HashMap<String, String>,
@@ -704,10 +710,8 @@ fn normalize_url(url: &str, connection_mode: ConnectionMode) -> String {
 /// field for the bootstrap info PD injects, so a ZMQ prefill/decode leg would
 /// silently drop it and degrade to a decode-side recompute or a stalled KV
 /// wait. Encode fares no better: encode dispatch is a gRPC encoder RPC a
-/// direct-ZMQ worker has no path for. `Regular` is therefore the only role the
-/// ZMQ lane serves, and every disaggregated leg is rejected at registration —
-/// matching the gRPC-only PD/EPD selection folds, which would otherwise leave
-/// such a worker registered but never selected.
+/// direct-ZMQ runtime has no implementation for. Supported capabilities are
+/// admitted by `validate_zmq_capabilities` before this explicit refusal.
 fn validate_zmq_worker_type(
     connection_mode: ConnectionMode,
     worker_type: WorkerType,
@@ -723,8 +727,7 @@ fn validate_zmq_worker_type(
             step_id: StepId::new("create_worker"),
             message: format!(
                 "ZMQ worker {url} cannot serve worker type {worker_type}: the direct-ZMQ \
-                 backend carries no KV-transfer metadata and has no encode path, so \
-                 encode/prefill/decode disaggregation requires a gRPC worker"
+                 backend for this runtime has no KV-transfer or encode implementation"
             ),
         });
     }
@@ -807,6 +810,40 @@ fn attention_dp_width(labels: &HashMap<String, String>, size: usize) -> Option<u
         .get("enable_dp_attention")
         .is_some_and(|value| value == "true")
         .then_some(size as u64)
+}
+
+/// Validate each configured operation separately. The control endpoint may
+/// supplement a direct worker, but it cannot add transfer support to its wire.
+fn validate_zmq_capabilities(
+    config: &WorkerSpec,
+    mode: ConnectionMode,
+    runtime: RuntimeType,
+    labels: &HashMap<String, String>,
+) -> Result<(), WorkflowError> {
+    let fail = |message| WorkflowError::StepFailed {
+        step_id: StepId::new("create_worker"),
+        message,
+    };
+    if mode != ConnectionMode::Zmq {
+        if control_endpoint(labels).map_err(&fail)?.is_some()
+            || labels.contains_key(ZMQ_ENCODE_URL_LABEL)
+        {
+            return Err(fail(
+                "zmq_control_url and zmq_encode_url apply only to ZMQ workers".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    control_endpoint(labels).map_err(&fail)?;
+    zmq_connect_timeout(labels).map_err(&fail)?;
+    if labels.contains_key(ZMQ_ENCODE_URL_LABEL) {
+        encode_endpoint(mode, &config.url, labels).map_err(&fail)?;
+    }
+    match config.worker_type {
+        WorkerType::Prefill | WorkerType::Decode if supports_pd(mode, runtime, labels) => Ok(()),
+        WorkerType::Encode => Err(fail(format!("ZMQ worker {} cannot serve encode: TokenSpeed's encoder is a dedicated gRPC service and has no direct scheduler handshake lifecycle", config.url))),
+        _ => validate_zmq_worker_type(mode, config.worker_type, &config.url),
+    }
 }
 
 /// Ranks to register for a dp-aware worker. A width above one expands into
@@ -1581,6 +1618,48 @@ mod tests {
                 .disable_health_check,
             "other transports keep the operator's choice"
         );
+    }
+
+    #[test]
+    fn tokenspeed_zmq_registration_validates_role_capabilities() {
+        let mut spec = WorkerSpec::new("ipc:///tmp/ts");
+        let pd_labels = HashMap::from([("zmq_pd".to_string(), "true".to_string())]);
+        for role in [WorkerType::Prefill, WorkerType::Decode] {
+            spec.worker_type = role;
+            assert!(validate_zmq_capabilities(
+                &spec,
+                ConnectionMode::Zmq,
+                RuntimeType::TokenSpeed,
+                &pd_labels
+            )
+            .is_ok());
+            assert!(validate_zmq_capabilities(
+                &spec,
+                ConnectionMode::Zmq,
+                RuntimeType::Vllm,
+                &HashMap::new()
+            )
+            .is_err());
+        }
+        spec.worker_type = WorkerType::Encode;
+        assert!(validate_zmq_capabilities(
+            &spec,
+            ConnectionMode::Zmq,
+            RuntimeType::TokenSpeed,
+            &HashMap::new()
+        )
+        .is_err());
+        let labels = HashMap::from([(
+            "zmq_encode_url".to_string(),
+            "grpc://encoder:50051".to_string(),
+        )]);
+        assert!(validate_zmq_capabilities(
+            &spec,
+            ConnectionMode::Zmq,
+            RuntimeType::TokenSpeed,
+            &labels
+        )
+        .is_err());
     }
 
     #[test]

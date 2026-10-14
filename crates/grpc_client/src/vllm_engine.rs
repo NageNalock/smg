@@ -1041,6 +1041,7 @@ mod tests {
             output_logprobs: None,
             input_logprobs: None,
             index: 0,
+            weight_version: None,
         };
 
         assert_eq!(chunk.token_ids, vec![1234, 5678]);

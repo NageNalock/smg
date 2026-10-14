@@ -1284,8 +1284,8 @@ pub struct FlushCacheResult {
     pub http_workers: usize,
     #[serde(default)]
     pub grpc_workers: usize,
-    /// Workers skipped because their transport has no cache-flush RPC
-    /// (direct-ZMQ engines). Keeps `total = http + grpc + zmq` exact.
+    /// ZMQ workers included in cache-flush fanout. Unsupported operations
+    /// are reported in `failed`. Keeps `total = http + grpc + zmq` exact.
     #[serde(default)]
     pub zmq_workers: usize,
     pub message: String,
@@ -1579,7 +1579,8 @@ impl IntoResponse for FlushCacheResult {
             "workers_flushed": self.successful.len(),
             "total_http_workers": self.http_workers,
             "total_grpc_workers": self.grpc_workers,
-            "total_zmq_workers_skipped": self.zmq_workers,
+            "total_zmq_workers": self.zmq_workers,
+            "total_zmq_workers_skipped": 0,
             "total_workers": self.total_workers
         });
 

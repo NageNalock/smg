@@ -72,12 +72,8 @@ impl EngineProtocol for TokenSpeedProtocol {
         &request.rid
     }
 
-    fn data_parallel_rank(_request: &Self::Request) -> Option<u32> {
-        // The TokenSpeed generate request carries no DP-rank field and needs
-        // none: rank routing is purely by ZMQ identity — the connector selects
-        // a rank and sends on that rank's socket identity. `None` means "never
-        // pinned", so every request goes through least-loaded selection.
-        None
+    fn data_parallel_rank(request: &Self::Request) -> Option<u32> {
+        request.data_parallel_rank
     }
 
     fn validate(_request: &Self::Request) -> Result<()> {
@@ -163,6 +159,8 @@ mod tests {
             num_waiting: 5,
             kv_active_pages: 100,
             kv_total_pages: 400,
+            weight_version: None,
+            ..Default::default()
         }
     }
 

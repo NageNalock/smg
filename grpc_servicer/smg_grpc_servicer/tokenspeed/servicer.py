@@ -1688,6 +1688,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 completion_tokens=int(meta.get("completion_tokens", len(token_ids))),
                 cached_tokens=int(meta.get("cached_tokens", 0)),
                 output_logprobs=self._convert_output_logprobs_to_proto(output, len(token_ids)),
+                input_logprobs=self._convert_input_logprobs_to_proto(output),
                 index=choice_index,
                 # protobuf treats None as unset for an optional field.
                 weight_version=_version_str(meta.get("weight_version")),
@@ -1731,11 +1732,43 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 spec_accepted_tokens=int(meta.get("spec_accepted_tokens", 0)),
                 spec_draft_tokens=int(meta.get("spec_draft_tokens", 0)),
                 output_logprobs=self._convert_output_logprobs_to_proto(output, len(token_ids)),
+                input_logprobs=self._convert_input_logprobs_to_proto(output),
                 index=choice_index,
                 # protobuf treats None as unset for an optional field.
                 weight_version=_version_str(meta.get("weight_version")),
                 **matched_kwargs,
             ),
+        )
+
+    @staticmethod
+    def _convert_input_logprobs_to_proto(
+        output: dict,
+    ) -> tokenspeed_scheduler_pb2.InputLogProbs | None:
+        """Preserve the native prompt scores, including the unscored first token.
+
+        Prompt metadata is cumulative, independent of the generated token slice.
+        Empty top-K entries keep its position alignment with the sampled scores.
+        """
+        meta = output.get("meta_info", {}) or {}
+        scores = meta.get("input_token_logprobs") or []
+        if not scores:
+            return None
+        raw_top = meta.get("input_top_logprobs") or []
+        top_proto = []
+        for index in range(len(scores)):
+            top = (raw_top[index] or []) if index < len(raw_top) else []
+            top_proto.append(
+                tokenspeed_scheduler_pb2.TopLogProbs(
+                    values=[entry[0] for entry in top],
+                    token_ids=[entry[1] for entry in top],
+                )
+            )
+        return tokenspeed_scheduler_pb2.InputLogProbs(
+            token_logprobs=[
+                tokenspeed_scheduler_pb2.InputTokenLogProb(value=entry[0]) for entry in scores
+            ],
+            token_ids=[entry[1] for entry in scores],
+            top_logprobs=top_proto,
         )
 
     @staticmethod

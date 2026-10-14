@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use openai_protocol::worker::HealthCheckConfig as ProtocolHealthCheckConfig;
+use openai_protocol::worker::{HealthCheckConfig as ProtocolHealthCheckConfig, WorkerSpec};
 pub use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use serde::{de, Deserialize, Deserializer, Serialize};
 // Re-export storage config types from data_connector
@@ -58,6 +58,10 @@ impl ParserChoice {
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
+    /// Explicit startup worker specifications. For a URL also present in the
+    /// routing mode, this specification replaces its URL-derived defaults.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_specs: Vec<WorkerSpec>,
     pub mode: RoutingMode,
     #[serde(default)]
     pub connection_mode: ConnectionMode,
@@ -1755,6 +1759,7 @@ impl Default for RouterConfig {
             connection_mode: ConnectionMode::Http,
             startup_worker_runtime_type: None,
             zmq_engine_count: None,
+            worker_specs: Vec::new(),
             model_path: None,
             tokenizer_path: None,
             chat_template: None,

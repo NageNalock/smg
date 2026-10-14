@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use openai_protocol::worker::{MmProcessingMode, TransportMode};
+use openai_protocol::worker::{MmProcessingMode, TransportMode, WorkerSpec};
 use smg_mcp::McpConfig;
 
 use super::{
@@ -172,6 +172,11 @@ impl RouterConfigBuilder {
     /// `RouterConfig::zmq_engine_count`).
     pub fn zmq_engine_count(mut self, count: Option<usize>) -> Self {
         self.config.zmq_engine_count = count;
+        self
+    }
+
+    pub fn worker_specs(mut self, specs: Vec<WorkerSpec>) -> Self {
+        self.config.worker_specs = specs;
         self
     }
 

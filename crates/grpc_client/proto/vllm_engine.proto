@@ -288,6 +288,9 @@ message GenerateStreamChunk {
 
   // Index for n>1 support (0-indexed, identifies which of n outputs this belongs to)
   uint32 index = 7;
+
+  // Optional engine provenance carried by the shared ZMQ response adapter.
+  optional string weight_version = 8;
 }
 
 message GenerateComplete {
@@ -327,6 +330,9 @@ message GenerateComplete {
   // pixel-less MultimodalInputs per modality (hashes, placeholders, grid
   // tensors). Absent on non-PD requests and from older servicers.
   MediaIdentity media_identity = 15;
+
+  // Optional engine provenance carried by the shared ZMQ response adapter.
+  optional string weight_version = 16;
 }
 
 // What the prefill worker learned about the media it processed, in the shape

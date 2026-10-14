@@ -52,13 +52,10 @@ impl TokenSpeedRequestType {
 
 /// TokenSpeed tokenized generate request sent from frontend to engine.
 ///
-/// Models the leading prefix of the Python class, through `stream` — the
-/// fields SMG sets, plus the neutral logprob carry-over values between them.
-/// The encoder emits exactly this 11-element array (tag + 10 fields); the
-/// engine's decoder fills every later field (`input_embeds`, `session_params`,
-/// multimodal payloads, ...) from its defaults, since msgspec tolerates
-/// missing trailing fields. The decoder here accepts full-length arrays and
-/// skips the unmodeled trailing fields.
+/// Text requests emit the short 11-element prefix. Multimodal and PD requests
+/// fill the existing native positional slots through multimodal_inputs (22),
+/// and a rank pin extends the array through data_parallel_rank (24). The engine
+/// fills omitted tails from defaults. Unmodeled native fields remain neutral.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TokenizedGenerateReqInput {
     /// Request id (the routing/registry key).
@@ -74,8 +71,8 @@ pub struct TokenizedGenerateReqInput {
     pub sampling_params: SamplingParams,
     /// Whether to return the sampled token's logprob for this request.
     pub return_logprob: bool,
-    /// Prompt-logprob start offset. Neutral `-1`: prompt logprobs are not
-    /// supported on this wire.
+    /// Prompt-logprob start offset. `-1` requests only sampled output scores;
+    /// supported engines accept a prompt position and return nullable prompt rows.
     pub logprob_start_len: i32,
     /// Output top-k logprob count. Neutral `0`: only the sampled token's
     /// logprob is materialized.
@@ -93,6 +90,12 @@ pub struct TokenizedGenerateReqInput {
     /// bypasses the engine's `InputProcessor`, which does that rewriting on
     /// other paths.
     pub multimodal_inputs: Option<TokenSpeedWireMmInputs>,
+    /// Existing native PD rendezvous slots (16, 17 and 18).
+    pub bootstrap_host: Option<String>,
+    pub bootstrap_port: Option<i32>,
+    pub bootstrap_room: Option<i64>,
+    /// Attention-DP pin, native wire slot 24.
+    pub data_parallel_rank: Option<u32>,
 }
 
 impl Default for TokenizedGenerateReqInput {
@@ -112,6 +115,10 @@ impl Default for TokenizedGenerateReqInput {
             stream: false,
             input_ids_unpadded: None,
             multimodal_inputs: None,
+            bootstrap_host: None,
+            bootstrap_port: None,
+            bootstrap_room: None,
+            data_parallel_rank: None,
         }
     }
 }
@@ -124,8 +131,20 @@ impl Serialize for TokenizedGenerateReqInput {
         // the engine's declared defaults for the unmodeled fields between
         // `stream` (10) and `input_ids_unpadded` (21); msgspec fills fields
         // after the last emitted element from defaults either way.
-        let multimodal = self.multimodal_inputs.is_some() || self.input_ids_unpadded.is_some();
-        let mut tuple = serializer.serialize_tuple(if multimodal { 23 } else { 11 })?;
+        let extended = self.multimodal_inputs.is_some()
+            || self.input_ids_unpadded.is_some()
+            || self.bootstrap_host.is_some()
+            || self.bootstrap_port.is_some()
+            || self.bootstrap_room.is_some()
+            || self.data_parallel_rank.is_some();
+        let len = if self.data_parallel_rank.is_some() {
+            25
+        } else if extended {
+            23
+        } else {
+            11
+        };
+        let mut tuple = serializer.serialize_tuple(len)?;
         tuple.serialize_element(TOKENIZED_GENERATE_REQ_INPUT_TAG)?;
         tuple.serialize_element(&self.rid)?;
         tuple.serialize_element(&self.http_worker_ipc)?;
@@ -137,19 +156,23 @@ impl Serialize for TokenizedGenerateReqInput {
         tuple.serialize_element(&self.top_logprobs_num)?;
         tuple.serialize_element(&self.token_ids_logprob)?;
         tuple.serialize_element(&self.stream)?;
-        if multimodal {
+        if extended {
             tuple.serialize_element(&NIL)?; // input_embeds
             tuple.serialize_element(&NIL)?; // session_params
             tuple.serialize_element(&NIL)?; // custom_logit_processor
             tuple.serialize_element(&false)?; // return_hidden_states
             tuple.serialize_element(&0.0f64)?; // created_time
-            tuple.serialize_element(&NIL)?; // bootstrap_host
-            tuple.serialize_element(&NIL)?; // bootstrap_port
-            tuple.serialize_element(&NIL)?; // bootstrap_room
+            tuple.serialize_element(&self.bootstrap_host)?; // bootstrap_host
+            tuple.serialize_element(&self.bootstrap_port)?; // bootstrap_port
+            tuple.serialize_element(&self.bootstrap_room)?; // bootstrap_room
             tuple.serialize_element(&NIL)?; // input_multi_ids
             tuple.serialize_element(&NIL)?; // input_extra_infos
             tuple.serialize_element(&self.input_ids_unpadded)?;
             tuple.serialize_element(&self.multimodal_inputs)?;
+            if self.data_parallel_rank.is_some() {
+                tuple.serialize_element(&NIL)?; // validation_error, engine-owned
+                tuple.serialize_element(&self.data_parallel_rank)?;
+            }
         }
         tuple.end()
     }
@@ -168,7 +191,7 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
                 expect_tag(&mut seq, TOKENIZED_GENERATE_REQ_INPUT_TAG)?;
-                let request = TokenizedGenerateReqInput {
+                let mut request = TokenizedGenerateReqInput {
                     rid: next_field(&mut seq, "rid")?,
                     http_worker_ipc: next_field(&mut seq, "http_worker_ipc")?,
                     input_text: next_field(&mut seq, "input_text")?,
@@ -183,7 +206,21 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                     // drains everything after `stream`.
                     input_ids_unpadded: None,
                     multimodal_inputs: None,
+                    bootstrap_host: None,
+                    bootstrap_port: None,
+                    bootstrap_room: None,
+                    data_parallel_rank: None,
                 };
+                for _ in 11..16 {
+                    let _ = seq.next_element::<serde::de::IgnoredAny>()?;
+                }
+                request.bootstrap_host = seq.next_element::<Option<String>>()?.flatten();
+                request.bootstrap_port = seq.next_element::<Option<i32>>()?.flatten();
+                request.bootstrap_room = seq.next_element::<Option<i64>>()?.flatten();
+                for _ in 19..24 {
+                    let _ = seq.next_element::<serde::de::IgnoredAny>()?;
+                }
+                request.data_parallel_rank = seq.next_element::<Option<u32>>()?.flatten();
                 drain_trailing(&mut seq)?;
                 Ok(request)
             }
@@ -354,8 +391,13 @@ mod tests {
                 hash: 0xDEAD_BEEF,
                 pad_value: pad,
                 offsets: vec![(1, 3)],
-                feature: WireTensor::from_raw("bfloat16", vec![3, 2], (0u8..12).collect()),
+                feature: Some(WireTensor::from_raw(
+                    "bfloat16",
+                    vec![3, 2],
+                    (0u8..12).collect(),
+                )),
                 model_specific_data,
+                encode_handshake: None,
             }],
             im_token_id: Some(9),
             video_token_id: None,
@@ -403,6 +445,79 @@ mod tests {
         assert_eq!(decoded.input_ids, request.input_ids);
         assert_eq!(decoded.input_ids_unpadded, None);
         assert_eq!(decoded.multimodal_inputs, None);
+    }
+
+    #[test]
+    fn native_python_pd_epd_fixture_matches_rust_encoding() {
+        use std::collections::BTreeMap;
+
+        use crate::{
+            codec::tensor::WireTensor,
+            protocol::{
+                tokenspeed::{
+                    multimodal::{
+                        TokenSpeedEncodeHandshake, TokenSpeedWireMmItem, TokenSpeedWireModality,
+                    },
+                    TokenSpeedProtocol,
+                },
+                EngineProtocol,
+            },
+        };
+        let mut sampling_params = SamplingParams {
+            temperature: 0.0,
+            seed: Some(123),
+            max_new_tokens: Some(2),
+            ..Default::default()
+        };
+        sampling_params.normalize();
+        let mut side_tensors = BTreeMap::new();
+        side_tensors.insert(
+            "image_grid_thw".into(),
+            WireTensor::from_raw(
+                "int64",
+                vec![1, 3],
+                [1_i64, 2, 4]
+                    .into_iter()
+                    .flat_map(i64::to_le_bytes)
+                    .collect(),
+            ),
+        );
+        let request = TokenizedGenerateReqInput {
+            rid: "pd-epd".into(),
+            input_ids: vec![10, 1_000_001, 1_000_001, 20],
+            sampling_params,
+            stream: true,
+            bootstrap_host: Some("prefill.local".into()),
+            bootstrap_port: Some(9001),
+            bootstrap_room: Some(1_i64 << 50),
+            data_parallel_rank: Some(2),
+            input_ids_unpadded: Some(vec![10, 9, 9, 20]),
+            multimodal_inputs: Some(TokenSpeedWireMmInputs {
+                mm_items: vec![TokenSpeedWireMmItem {
+                    modality: TokenSpeedWireModality::Image,
+                    hash: 1,
+                    pad_value: 1_000_001,
+                    offsets: vec![(1, 2)],
+                    feature: None,
+                    model_specific_data: side_tensors,
+                    encode_handshake: Some(TokenSpeedEncodeHandshake {
+                        bootstrap_host: "encode.local".into(),
+                        bootstrap_port: 9100,
+                        bootstrap_room: 1_i64 << 51,
+                    }),
+                }],
+                im_token_id: Some(9),
+                video_token_id: None,
+            }),
+            ..Default::default()
+        };
+        let fixture = include_bytes!("../../../tests/fixtures/tokenspeed_pd_epd_request.msgpack");
+        assert_eq!(encode_msgpack(&request).unwrap(), fixture);
+        let decoded: TokenizedGenerateReqInput = decode_msgpack(fixture).unwrap();
+        assert_eq!(decoded.bootstrap_host, request.bootstrap_host);
+        assert_eq!(decoded.bootstrap_port, request.bootstrap_port);
+        assert_eq!(decoded.bootstrap_room, request.bootstrap_room);
+        assert_eq!(TokenSpeedProtocol::data_parallel_rank(&decoded), Some(2));
     }
 
     #[test]

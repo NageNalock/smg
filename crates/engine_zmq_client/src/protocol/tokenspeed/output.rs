@@ -69,11 +69,33 @@ pub struct BatchTokenIDOutSlim {
     pub kv_active_pages: u64,
     /// Usable KV pages on the rank (the usage ratio's denominator).
     pub kv_total_pages: u64,
+    /// Live producing engine weight identity. Appended slot 14; absent from older peers.
+    pub weight_version: Option<String>,
+    /// Full native finish metadata, indexed by request. Missing on older peers.
+    pub finished_reason_details: Option<Vec<serde_json::Value>>,
+    pub spec_accepted_tokens: Option<Vec<u32>>,
+    pub spec_draft_tokens: Option<Vec<u32>>,
+    pub input_token_logprobs_val: Option<Vec<Vec<Option<f64>>>>,
+    pub input_token_logprobs_idx: Option<Vec<Vec<u32>>>,
 }
 
 impl Serialize for BatchTokenIDOutSlim {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        let mut tuple = serializer.serialize_tuple(14)?;
+        let prompt =
+            self.input_token_logprobs_val.is_some() || self.input_token_logprobs_idx.is_some();
+        let metadata = prompt
+            || self.finished_reason_details.is_some()
+            || self.spec_accepted_tokens.is_some()
+            || self.spec_draft_tokens.is_some();
+        let mut tuple = serializer.serialize_tuple(if prompt {
+            20
+        } else if metadata {
+            18
+        } else if self.weight_version.is_some() {
+            15
+        } else {
+            14
+        })?;
         tuple.serialize_element(BATCH_TOKEN_ID_OUT_SLIM_TAG)?;
         tuple.serialize_element(&self.rids)?;
         tuple.serialize_element(&self.output_ids)?;
@@ -88,6 +110,18 @@ impl Serialize for BatchTokenIDOutSlim {
         tuple.serialize_element(&self.num_waiting)?;
         tuple.serialize_element(&self.kv_active_pages)?;
         tuple.serialize_element(&self.kv_total_pages)?;
+        if metadata || self.weight_version.is_some() {
+            tuple.serialize_element(&self.weight_version)?;
+        }
+        if metadata {
+            tuple.serialize_element(&self.finished_reason_details)?;
+            tuple.serialize_element(&self.spec_accepted_tokens)?;
+            tuple.serialize_element(&self.spec_draft_tokens)?;
+        }
+        if prompt {
+            tuple.serialize_element(&self.input_token_logprobs_val)?;
+            tuple.serialize_element(&self.input_token_logprobs_idx)?;
+        }
         tuple.end()
     }
 }
@@ -126,6 +160,18 @@ impl<'de> Deserialize<'de> for BatchTokenIDOutSlim {
                     num_waiting: seq.next_element::<u64>()?.unwrap_or(0),
                     kv_active_pages: seq.next_element::<u64>()?.unwrap_or(0),
                     kv_total_pages: seq.next_element::<u64>()?.unwrap_or(0),
+                    weight_version: seq.next_element::<Option<String>>()?.flatten(),
+                    finished_reason_details: seq
+                        .next_element::<Option<Vec<serde_json::Value>>>()?
+                        .flatten(),
+                    spec_accepted_tokens: seq.next_element::<Option<Vec<u32>>>()?.flatten(),
+                    spec_draft_tokens: seq.next_element::<Option<Vec<u32>>>()?.flatten(),
+                    input_token_logprobs_val: seq
+                        .next_element::<Option<Vec<Vec<Option<f64>>>>>()?
+                        .flatten(),
+                    input_token_logprobs_idx: seq
+                        .next_element::<Option<Vec<Vec<u32>>>>()?
+                        .flatten(),
                 };
                 drain_trailing(&mut seq)?;
                 Ok(batch)
@@ -158,6 +204,12 @@ pub struct TokenSpeedOutput {
     /// Token id each logprob in `output_logprobs_val` belongs to. Empty when
     /// logprobs were not requested.
     pub output_logprobs_idx: Vec<u32>,
+    pub weight_version: Option<String>,
+    pub finished_reason_details: Option<serde_json::Value>,
+    pub spec_accepted_tokens: u32,
+    pub spec_draft_tokens: u32,
+    pub input_logprobs_val: Vec<Option<f64>>,
+    pub input_logprobs_idx: Vec<u32>,
 }
 
 impl EngineOutput for TokenSpeedOutput {
@@ -181,7 +233,28 @@ impl BatchTokenIDOutSlim {
             || self.completion_tokens.len() != n
             || self.cached_tokens.len() != n
             || self.output_token_logprobs_val.len() != n
-            || self.output_token_logprobs_idx.len() != n;
+            || self.output_token_logprobs_idx.len() != n
+            || self
+                .finished_reason_details
+                .as_ref()
+                .is_some_and(|values| values.len() != n)
+            || self
+                .spec_accepted_tokens
+                .as_ref()
+                .is_some_and(|values| values.len() != n)
+            || self
+                .spec_draft_tokens
+                .as_ref()
+                .is_some_and(|values| values.len() != n);
+        let ragged = ragged
+            || self
+                .input_token_logprobs_val
+                .as_ref()
+                .is_some_and(|values| values.len() != n)
+            || self
+                .input_token_logprobs_idx
+                .as_ref()
+                .is_some_and(|values| values.len() != n);
         if ragged {
             return Err(Error::Decode {
                 target_type: "BatchTokenIDOutSlim",
@@ -217,9 +290,15 @@ impl BatchTokenIDOutSlim {
             num_waiting: _,
             kv_active_pages: _,
             kv_total_pages: _,
+            weight_version,
+            finished_reason_details,
+            spec_accepted_tokens,
+            spec_draft_tokens,
+            input_token_logprobs_val,
+            input_token_logprobs_idx,
         } = self;
 
-        Ok(rids
+        let mut outputs: Vec<_> = rids
             .into_iter()
             .zip(output_ids)
             .zip(finished_reasons)
@@ -243,10 +322,35 @@ impl BatchTokenIDOutSlim {
                         cached_tokens: cached,
                         output_logprobs_val: logprobs_val,
                         output_logprobs_idx: logprobs_idx,
+                        weight_version: weight_version.clone(),
+                        ..Default::default()
                     }
                 },
             )
-            .collect())
+            .collect();
+        for (index, output) in outputs.iter_mut().enumerate() {
+            output.finished_reason_details = finished_reason_details
+                .as_ref()
+                .map(|values| values[index].clone())
+                .filter(|value| !value.is_null());
+            output.spec_accepted_tokens = spec_accepted_tokens
+                .as_ref()
+                .map_or(0, |values| values[index]);
+            output.spec_draft_tokens = spec_draft_tokens.as_ref().map_or(0, |values| values[index]);
+            output.input_logprobs_val = input_token_logprobs_val
+                .as_ref()
+                .map_or_else(Vec::new, |values| values[index].clone());
+            output.input_logprobs_idx = input_token_logprobs_idx
+                .as_ref()
+                .map_or_else(Vec::new, |values| values[index].clone());
+            if output.input_logprobs_val.len() != output.input_logprobs_idx.len() {
+                return Err(Error::Decode {
+                    target_type: "BatchTokenIDOutSlim",
+                    message: "ragged prompt logprob row".into(),
+                });
+            }
+        }
+        Ok(outputs)
     }
 }
 
@@ -306,6 +410,12 @@ mod tests {
             num_waiting: 5,
             kv_active_pages: 100,
             kv_total_pages: 400,
+            weight_version: None,
+            finished_reason_details: None,
+            spec_accepted_tokens: None,
+            spec_draft_tokens: None,
+            input_token_logprobs_val: None,
+            input_token_logprobs_idx: None,
         }
     }
 
@@ -409,11 +519,133 @@ mod tests {
             Value::Array(array) => array,
             other => panic!("expected array, got {other:?}"),
         };
+        with_extra.push(Value::Nil); // weight_version
+        with_extra.push(Value::Nil); // finished_reason_details
+        with_extra.push(Value::Nil); // spec_accepted_tokens
+        with_extra.push(Value::Nil); // spec_draft_tokens
+        with_extra.push(Value::Nil); // input_token_logprobs_val
+        with_extra.push(Value::Nil); // input_token_logprobs_idx
         with_extra.push(Value::Array(vec![Value::from(99)]));
         let mut bytes = Vec::new();
         rmpv::encode::write_value(&mut bytes, &Value::Array(with_extra)).unwrap();
         let decoded: BatchTokenIDOutSlim = decode_msgpack(&bytes).unwrap();
         assert_eq!(decoded, vector_batch());
+    }
+
+    #[test]
+    fn appended_weight_version_survives_batch_split_and_old_sender_defaults() {
+        let mut array = match decode_value(&python_output_bytes()).unwrap() {
+            Value::Array(array) => array,
+            other => panic!("expected positional array, got {other:?}"),
+        };
+        array.push(Value::from("v9"));
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &Value::Array(array)).unwrap();
+        let batch: BatchTokenIDOutSlim = decode_msgpack(&bytes).unwrap();
+        assert_eq!(
+            batch.clone().into_outputs().unwrap()[0]
+                .weight_version
+                .as_deref(),
+            Some("v9")
+        );
+        assert_eq!(encode_msgpack(&batch).unwrap(), bytes);
+        let old: BatchTokenIDOutSlim = decode_msgpack(&python_output_bytes()).unwrap();
+        assert_eq!(old.into_outputs().unwrap()[0].weight_version, None);
+    }
+
+    #[test]
+    fn native_python_weight_output_fixture_matches_rust_roundtrip() {
+        let fixture = include_bytes!("../../../tests/fixtures/tokenspeed_weight_output.msgpack");
+        let batch: BatchTokenIDOutSlim = decode_msgpack(fixture).unwrap();
+        assert_eq!(encode_msgpack(&batch).unwrap(), fixture);
+        let output = batch.into_outputs().unwrap().remove(0);
+        assert_eq!(output.request_id, "pd-epd");
+        assert_eq!(output.weight_version.as_deref(), Some("v9"));
+        assert_eq!(output.finish_reason.as_deref(), Some("length"));
+    }
+
+    #[test]
+    fn appended_finish_and_speculative_metadata_survive_batch_split() {
+        let mut array = match decode_value(&python_output_bytes()).unwrap() {
+            Value::Array(v) => v,
+            other => panic!("expected positional array, got {other:?}"),
+        };
+        array.push(Value::from("v9"));
+        array.push(Value::Array(vec![Value::Map(vec![
+            (Value::from("type"), Value::from("stop")),
+            (Value::from("matched"), Value::from(3)),
+        ])]));
+        array.push(Value::Array(vec![Value::from(4)]));
+        array.push(Value::Array(vec![Value::from(6)]));
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &Value::Array(array)).unwrap();
+        let batch: BatchTokenIDOutSlim = decode_msgpack(&bytes).unwrap();
+        let output = batch.into_outputs().unwrap().remove(0);
+        assert_eq!(
+            output.finished_reason_details.unwrap()["matched"],
+            serde_json::json!(3)
+        );
+        assert_eq!(output.spec_accepted_tokens, 4);
+        assert_eq!(output.spec_draft_tokens, 6);
+    }
+
+    #[test]
+    fn native_python_finish_metadata_fixture_preserves_match_and_spec_counts() {
+        let fixture =
+            include_bytes!("../../../tests/fixtures/tokenspeed_finish_metadata_output.msgpack");
+        let batch: BatchTokenIDOutSlim = decode_msgpack(fixture).unwrap();
+        let output = batch.into_outputs().unwrap().remove(0);
+        assert_eq!(
+            output.finished_reason_details.unwrap()["matched"],
+            serde_json::json!(3)
+        );
+        assert_eq!(output.spec_accepted_tokens, 4);
+        assert_eq!(output.spec_draft_tokens, 6);
+    }
+
+    #[test]
+    fn appended_prompt_logprob_columns_preserve_nullable_first_position() {
+        let mut array = match decode_value(&python_output_bytes()).unwrap() {
+            Value::Array(v) => v,
+            other => panic!("expected array, got {other:?}"),
+        };
+        for _ in 14..18 {
+            array.push(Value::Nil);
+        }
+        array.push(Value::Array(vec![Value::Array(vec![
+            Value::Nil,
+            Value::from(-0.25),
+            Value::from(-0.5),
+        ])]));
+        array.push(Value::Array(vec![Value::Array(vec![
+            Value::from(1),
+            Value::from(2),
+            Value::from(3),
+        ])]));
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &Value::Array(array)).unwrap();
+        let output = decode_msgpack::<BatchTokenIDOutSlim>(&bytes)
+            .unwrap()
+            .into_outputs()
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            output.input_logprobs_val,
+            vec![None, Some(-0.25), Some(-0.5)]
+        );
+        assert_eq!(output.input_logprobs_idx, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn native_python_prompt_fixture_matches_rust_nullable_rows() {
+        let fixture = include_bytes!("../../../tests/fixtures/tokenspeed_prompt_output.msgpack");
+        let batch: BatchTokenIDOutSlim = decode_msgpack(fixture).unwrap();
+        let output = batch.into_outputs().unwrap().remove(0);
+        assert_eq!(
+            output.input_logprobs_val,
+            vec![None, Some(-0.25), Some(-0.5)]
+        );
+        assert_eq!(output.input_logprobs_idx, vec![1, 2, 3]);
     }
 
     #[test]

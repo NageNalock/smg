@@ -152,6 +152,10 @@ impl SamplingParams {
             self.temperature = 1.0;
             self.top_k = 1;
         }
+        if self.top_k == 1 {
+            // Python pins greedy to a stable random stream for exact-logit ties.
+            self.seed = Some(0);
+        }
         if self.top_k == -1 {
             self.top_k = TOP_K_DISABLED;
         }

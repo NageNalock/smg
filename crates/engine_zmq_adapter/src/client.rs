@@ -35,10 +35,11 @@ use crate::{
         translate_embed_request_sglang, translate_request_sglang, SglangGenerateStream,
         SglangProfileStart,
     },
-    sockets::{ensure_ipc_socket_dir, zmq_socket_addresses, Handshake, ZMQ_CONNECT_TIMEOUT},
+    sockets::{ensure_ipc_socket_dir, zmq_socket_addresses, Handshake},
     stream::ZmqGenerateStream,
     tokenspeed::{
-        fan_out_tokenspeed_requests, translate_request_tokenspeed, TokenSpeedGenerateStream,
+        fan_out_tokenspeed_requests, pin_tokenspeed_bootstrap_rank, translate_request_tokenspeed,
+        TokenSpeedGenerateStream,
     },
     vllm::{
         fan_out_requests, has_media, kv_transfer_params, now_secs, ranked_candidate_count,
@@ -116,13 +117,14 @@ pub(crate) struct ZmqConnectionMeta {
 /// the config-resolved served model (EngineCore reports none). `engine_count`
 /// is the number of DP engines that will dial this worker's sockets (1 for an
 /// ungrouped worker). Errors are plain reasons; the worker layer wraps them in
-/// its own error type.
+/// its own error type. `startup` allows a launcher to match its model-load budget.
 pub async fn connect_for_worker(
     base_url: &str,
     model_id: String,
     runtime: RuntimeType,
     handshake_override: Option<&str>,
     engine_count: usize,
+    startup: Duration,
 ) -> Result<ZmqEngineClient, String> {
     // The engine can't stop at EOS on its own (it has no tokenizer or model
     // config); resolve the EOS ids from the local model dir so every request
@@ -148,7 +150,7 @@ pub async fn connect_for_worker(
         Handshake::registered(handshake_override),
         engine_count,
         eos,
-        ZMQ_CONNECT_TIMEOUT,
+        startup,
     )
     .await
 }
@@ -158,7 +160,7 @@ pub async fn connect_for_worker(
 /// the handshake. For a frontend that already knows the model's EOS ids from
 /// the engine's own config (the Rust gRPC servicer) and has no model dir to
 /// read them from. `startup` bounds the handshake: the gateway's connector
-/// passes [`ZMQ_CONNECT_TIMEOUT`]; a servicer that launches its own engine
+/// passes its worker startup timeout; a servicer that launches its own engine
 /// passes a [`StartupBudget`] shaped by what that engine's start may take
 /// and by the signs of life it sees from the engine process. `handshake` is
 /// the endpoint the engine dials: a registered worker's is tcp-only
@@ -662,21 +664,32 @@ impl ZmqEngineClient {
     /// others (the gRPC servicer matches string stops per choice).
     pub async fn generate_tokenspeed_streams(
         &self,
-        req: tokenspeed_proto::GenerateRequest,
+        mut req: tokenspeed_proto::GenerateRequest,
     ) -> Result<Vec<TokenSpeedGenerateStream>, tonic::Status> {
         let ZmqBackend::TokenSpeed(client) = &self.backend else {
             return Err(tonic::Status::internal(
                 "vLLM ZMQ backend expects a vLLM generate request",
             ));
         };
+        pin_tokenspeed_bootstrap_rank(&mut req, client.engines().len())
+            .map_err(tonic::Status::invalid_argument)?;
         // Sub-streams submitted before a mid-loop failure are dropped with the
         // error, which auto-aborts their engine-side requests.
         let mut streams = Vec::new();
         for (index, sub) in fan_out_tokenspeed_requests(req).into_iter().enumerate() {
+            let metadata_only = sub.metadata_only.unwrap_or(false);
             let request =
                 translate_request_tokenspeed(sub).map_err(tonic::Status::invalid_argument)?;
+            let expects_prompt_logprobs = request.return_logprob
+                && request.logprob_start_len >= 0
+                && (request.logprob_start_len as usize) < request.input_ids.len().saturating_sub(1)
+                && !metadata_only;
             let stream = client.submit(request).await.map_err(zmq_status)?;
-            streams.push(TokenSpeedGenerateStream::new(stream, index as u32));
+            streams.push(TokenSpeedGenerateStream::new(
+                stream,
+                index as u32,
+                expects_prompt_logprobs,
+            ));
         }
         Ok(streams)
     }

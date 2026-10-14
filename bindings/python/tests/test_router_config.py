@@ -484,15 +484,15 @@ class TestDiscoveryMapping:
 class TestRouterPositionalSignature:
     """External callers construct ``_Router(...)`` positionally, so the order
     of its parameters is a public contract: a new parameter is appended after
-    the last positional one and before the keyword-only ``discovery``."""
+    the last positional one; ``discovery`` and ``worker_specs`` are keyword-only."""
 
     @staticmethod
     def positional_names():
         import inspect
 
         params = list(inspect.signature(_Router).parameters.values())
-        assert params[-1].name == "discovery"
-        assert params[-1].kind is inspect.Parameter.KEYWORD_ONLY
+        keyword_only = [p.name for p in params if p.kind is inspect.Parameter.KEYWORD_ONLY]
+        assert keyword_only[-2:] == ["discovery", "worker_specs"]
         return [p.name for p in params if p.kind is not inspect.Parameter.KEYWORD_ONLY]
 
     def test_appended_parameters_follow_prefill_queue_timeout(self):

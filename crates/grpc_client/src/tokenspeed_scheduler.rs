@@ -232,6 +232,7 @@ impl TokenSpeedSchedulerClient {
             // Attention-DP pin injected later via
             // ProtoGenerateRequest::set_data_parallel_rank, if applicable.
             data_parallel_rank: None,
+            metadata_only: None,
         })
     }
 

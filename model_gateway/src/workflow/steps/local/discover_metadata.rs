@@ -393,7 +393,7 @@ async fn sampling_defaults_label(path: &std::path::Path) -> HashMap<String, Stri
 }
 
 /// Rename gRPC-specific keys to canonical names and strip transient state.
-fn normalize_grpc_keys(labels: &mut HashMap<String, String>) {
+pub(super) fn normalize_grpc_keys(labels: &mut HashMap<String, String>) {
     for &(from, to) in &[
         ("tensor_parallel_size", "tp_size"),
         // TokenSpeed reports no `tp_size`: `attn_tp_size` is its attention
@@ -514,6 +514,9 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
             // engines, so it cannot be probed here and the configured or
             // detected runtime is preserved.
             ConnectionMode::Zmq => {
+                // Never contact the control frontend before registering the
+                // direct worker: it can wait for this worker's ZMQ handshake.
+                // Control metadata is fetched after registration and handshake.
                 let router_model = context
                     .data
                     .app_context

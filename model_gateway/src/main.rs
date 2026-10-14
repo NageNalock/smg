@@ -1,6 +1,7 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use openai_protocol::worker::WorkerSpec;
 
 // Jemalloc as the global allocator: glibc malloc retains freed pages badly
 // under the gateway's allocation churn. Prefixed symbols only — vendored C
@@ -185,6 +186,12 @@ impl DiscoveryProvider {
     }
 }
 
+fn parse_worker_specs_json(value: &str) -> Result<String, String> {
+    serde_json::from_str::<Vec<WorkerSpec>>(value)
+        .map_err(|e| format!("invalid worker-specs JSON array: {e}"))?;
+    Ok(value.to_string())
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "shepherd-model-gateway", alias = "smg", alias = "amg")]
 #[command(about = "Shepherd Model Gateway - High-performance inference gateway")]
@@ -362,6 +369,10 @@ struct CliArgs {
     /// `http_pool.http2` on a worker spec pins the version instead.
     #[arg(long, default_value_t = false, help_heading = "Worker Configuration")]
     upstream_http2: bool,
+    /// JSON array of explicit startup WorkerSpec objects, including labels
+    /// and transport configuration. Overrides defaults for matching URLs.
+    #[arg(long, value_parser = parse_worker_specs_json, help_heading = "Worker Configuration")]
+    worker_specs: Option<String>,
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
@@ -2589,7 +2600,20 @@ impl CliArgs {
             enable_trace: self.enable_trace,
             otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
         });
-        let connection_mode = Self::determine_connection_mode(&Self::startup_worker_urls(&mode));
+        let worker_specs: Vec<WorkerSpec> = self
+            .worker_specs
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| ConfigError::InvalidValue {
+                field: "worker_specs".to_string(),
+                value: "JSON array".to_string(),
+                reason: format!("{e}"),
+            })?
+            .unwrap_or_default();
+        let mut startup_urls = Self::startup_worker_urls(&mode);
+        startup_urls.extend(worker_specs.iter().map(|spec| spec.url.clone()));
+        let connection_mode = Self::determine_connection_mode(&startup_urls);
         let startup_worker_runtime_type = self.startup_worker_runtime_type(connection_mode);
         let history_backend = match self.history_backend.as_str() {
             "none" => HistoryBackend::None,
@@ -2619,6 +2643,7 @@ impl CliArgs {
             .connection_mode(connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
             .zmq_engine_count(self.zmq_engine_count)
+            .worker_specs(worker_specs)
             .host(&self.host)
             .port(self.port)
             .health_check_port(self.health_check_port)
@@ -3639,6 +3664,23 @@ mod tests {
     /// A grouped ZMQ handshake needs at least one engine, so `0` (and any
     /// non-positive value) must be rejected at parse time rather than silently
     /// degrading to an ungrouped worker.
+    #[test]
+    fn worker_specs_flow_into_both_configs() {
+        let cli = cli_args_from(&[
+            "--worker-specs",
+            r#"[{"url":"ipc:///tmp/ts","runtime_type":"tokenspeed","connection_mode":"zmq","labels":{"zmq_control_url":"grpc://127.0.0.1:50051"}}]"#,
+        ]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router.connection_mode, ConnectionMode::Zmq);
+        let server = cli.to_server_config(router).unwrap();
+        assert_eq!(
+            server.router_config.worker_specs[0].labels["zmq_control_url"],
+            "grpc://127.0.0.1:50051"
+        );
+        assert!(cli_args_from(&[]).worker_specs.is_none());
+        assert!(CliArgs::try_parse_from(["smg", "--worker-specs", "{}"]).is_err());
+    }
+
     #[test]
     fn zmq_engine_count_rejects_non_positive() {
         assert_eq!(

@@ -284,3 +284,31 @@ class TestGenerateStampsVersion:
         assert complete.complete.weight_version == "42"
         chunk = s._chunk_response("r", output, None, 0)
         assert chunk.chunk.weight_version == "42"
+
+
+class TestGeneratePromptLogprobs:
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_prompt_scores_preserve_null_first_token_and_token_alignment(self, stream):
+        output = {
+            "output_ids": [9],
+            "meta_info": {
+                "input_token_logprobs": [(None, 4, None), (-0.25, 7, None)],
+                "input_top_logprobs": [],
+            },
+        }
+        servicer = _servicer()
+        response = (
+            servicer._chunk_response("r", output, None).chunk
+            if stream
+            else servicer._complete_response("r", output, {"type": "length"}).complete
+        )
+        assert response.HasField("input_logprobs")
+        prompt = response.input_logprobs
+        assert list(prompt.token_ids) == [4, 7]
+        assert not prompt.token_logprobs[0].HasField("value")
+        assert prompt.token_logprobs[1].value == pytest.approx(-0.25)
+        assert len(prompt.top_logprobs) == 2
+
+    def test_absent_prompt_scores_leave_the_field_unset(self):
+        response = _servicer()._chunk_response("r", {"output_ids": [9]}, None)
+        assert not response.chunk.HasField("input_logprobs")

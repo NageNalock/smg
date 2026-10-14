@@ -8,7 +8,8 @@ use engine_zmq_client::{
     connector::TokenSpeedStream,
     protocol::tokenspeed::{
         multimodal::{
-            mm_pad_value, TokenSpeedWireMmInputs, TokenSpeedWireMmItem, TokenSpeedWireModality,
+            mm_pad_value, TokenSpeedEncodeHandshake, TokenSpeedWireMmInputs, TokenSpeedWireMmItem,
+            TokenSpeedWireModality,
         },
         output::TokenSpeedOutput,
         request::TokenizedGenerateReqInput,
@@ -17,7 +18,6 @@ use engine_zmq_client::{
 };
 use futures::Stream;
 use smg_grpc_client::{common_proto as common, tokenspeed_proto, vllm_proto as vllm};
-use tracing::warn;
 
 use crate::{
     fanout::fan_out_n,
@@ -37,15 +37,51 @@ pub struct TokenSpeedGenerateStream {
     /// tokens: streaming frontends decode text/logprobs from chunks only, so
     /// the tick's delta goes out as a `Chunk` first.
     pending: Option<vllm::GenerateResponse>,
+    input_logprobs_emitted: bool,
+    expects_prompt_logprobs: bool,
 }
 
 impl TokenSpeedGenerateStream {
-    pub(crate) fn new(inner: TokenSpeedStream, index: u32) -> Self {
+    pub(crate) fn new(inner: TokenSpeedStream, index: u32, expects_prompt_logprobs: bool) -> Self {
         Self {
             inner,
             state: StreamState::default(),
             index,
             pending: None,
+            input_logprobs_emitted: false,
+            expects_prompt_logprobs,
+        }
+    }
+
+    fn attach_input_logprobs(&mut self, response: &mut vllm::GenerateResponse) {
+        if self.state.prompt_logprobs.is_empty() {
+            return;
+        }
+        let state = &self.state;
+        let build = || vllm::InputLogProbs {
+            token_logprobs: state.prompt_logprobs.clone(),
+            token_ids: state.prompt_token_ids.clone(),
+            top_logprobs: state.prompt_top_logprobs.clone(),
+        };
+        if let Some(vllm::generate_response::Response::Complete(parked)) = self
+            .pending
+            .as_mut()
+            .and_then(|pending| pending.response.as_mut())
+        {
+            parked.input_logprobs = Some(build());
+        }
+        match response.response.as_mut() {
+            Some(vllm::generate_response::Response::Chunk(chunk))
+                if !self.input_logprobs_emitted && !chunk.token_ids.is_empty() =>
+            {
+                chunk.input_logprobs = Some(build());
+                self.input_logprobs_emitted = true;
+            }
+            Some(vllm::generate_response::Response::Chunk(_)) => {}
+            Some(vllm::generate_response::Response::Complete(complete)) => {
+                complete.input_logprobs = Some(build());
+            }
+            None => {}
         }
     }
 
@@ -94,21 +130,22 @@ impl TokenSpeedGenerateStream {
         let mut pending = None;
         // No new tokens on a frontend finish, so `emit_tick` yields the
         // `Complete` directly and parks nothing.
-        self.state.emit_tick(
+        let mut response = self.state.emit_tick(
             self.index,
             Vec::new(),
             None,
             Some((finish_reason, matched)),
             &mut pending,
-        )
+        );
+        self.attach_input_logprobs(&mut response);
+        response
     }
 }
 
 /// A vLLM-proto response of a TokenSpeed stream as the TokenSpeed proto the
 /// `TokenSpeedScheduler` service answers with, under `request_id` (the
 /// vLLM proto carries none): the two carry the same chunk and completion
-/// fields (TokenSpeed's `OutputLogProbs` has no prompt side, and the ZMQ wire
-/// reports no speculative counters).
+/// fields (TokenSpeed's `OutputLogProbs` has no prompt side).
 pub fn to_tokenspeed_response(
     request_id: &str,
     response: vllm::GenerateResponse,
@@ -129,6 +166,24 @@ pub fn to_tokenspeed_response(
                 .collect(),
         })
     };
+    let input_logprobs = |logprobs: Option<vllm::InputLogProbs>| {
+        logprobs.map(|lp| tokenspeed_proto::InputLogProbs {
+            token_logprobs: lp
+                .token_logprobs
+                .into_iter()
+                .map(|value| tokenspeed_proto::InputTokenLogProb { value: value.value })
+                .collect(),
+            token_ids: lp.token_ids,
+            top_logprobs: lp
+                .top_logprobs
+                .into_iter()
+                .map(|top| tokenspeed_proto::TopLogProbs {
+                    values: top.values,
+                    token_ids: top.token_ids,
+                })
+                .collect(),
+        })
+    };
     let mapped = response.response.map(|inner| match inner {
         Response::Chunk(chunk) => TsResponse::Chunk(tokenspeed_proto::GenerateStreamChunk {
             token_ids: chunk.token_ids,
@@ -136,7 +191,8 @@ pub fn to_tokenspeed_response(
             completion_tokens: chunk.completion_tokens,
             cached_tokens: chunk.cached_tokens,
             output_logprobs: logprobs(chunk.output_logprobs),
-            weight_version: None,
+            weight_version: chunk.weight_version,
+            input_logprobs: input_logprobs(chunk.input_logprobs),
             index: chunk.index,
         }),
         Response::Complete(complete) => {
@@ -148,13 +204,16 @@ pub fn to_tokenspeed_response(
                 prompt_tokens: complete.prompt_tokens,
                 completion_tokens: complete.completion_tokens,
                 cached_tokens: complete.cached_tokens,
+                weight_version: complete.weight_version,
+                spec_accepted_tokens: complete.spec_accepted_tokens,
+                spec_draft_tokens: complete.spec_draft_tokens,
                 output_logprobs: logprobs(complete.output_logprobs),
                 matched_stop: complete.matched_stop.map(|matched| match matched {
                     MatchedStop::MatchedTokenId(id) => TsMatchedStop::MatchedTokenId(id),
                     MatchedStop::MatchedStopStr(text) => TsMatchedStop::MatchedStopStr(text),
                 }),
                 index: complete.index,
-                ..Default::default()
+                input_logprobs: input_logprobs(complete.input_logprobs),
             })
         }
     });
@@ -181,6 +240,11 @@ impl MappedGenerateStream for TokenSpeedGenerateStream {
         output: TokenSpeedOutput,
     ) -> Result<vllm::GenerateResponse, tonic::Status> {
         let state = &mut self.state;
+        if output.weight_version.is_some() {
+            state.weight_version.clone_from(&output.weight_version);
+        }
+        state.spec_accepted_tokens = output.spec_accepted_tokens;
+        state.spec_draft_tokens = output.spec_draft_tokens;
         // TokenSpeed reports per-request token counts directly (cumulative for
         // completions), rather than vLLM's per-output prefill-stats deltas.
         if output.prompt_tokens > 0 {
@@ -213,6 +277,19 @@ impl MappedGenerateStream for TokenSpeedGenerateStream {
             .output_logprobs_idx
             .extend(output.output_logprobs_idx.iter().copied());
 
+        state
+            .prompt_logprobs
+            .extend(
+                output
+                    .input_logprobs_val
+                    .iter()
+                    .map(|value| vllm::InputTokenLogProb {
+                        value: value.map(|lp| lp as f32),
+                    }),
+            );
+        state
+            .prompt_token_ids
+            .extend(output.input_logprobs_idx.iter().copied());
         // An engine-side failure must surface as an error, not a normal
         // completion with empty output — mirroring the vLLM stream's guard.
         if output.finish_reason.as_deref() == Some("error") {
@@ -220,18 +297,44 @@ impl MappedGenerateStream for TokenSpeedGenerateStream {
                 "engine finished the request with an error (see engine logs)",
             ));
         }
-        // No matched_stop on this wire: TokenSpeed reports the finish reason
-        // only, and the router-side stop machinery owns string matching.
+        if self.expects_prompt_logprobs
+            && state.prompt_logprobs.is_empty()
+            && output
+                .finish_reason
+                .as_deref()
+                .is_some_and(|reason| reason != "abort")
+        {
+            return Err(tonic::Status::unimplemented(
+                "TokenSpeed engine completed without requested prompt logprobs; incompatible engine wire revision or unsupported prompt scoring",
+            ));
+        }
+        let matched = output
+            .finished_reason_details
+            .as_ref()
+            .and_then(|details| details.get("matched"))
+            .and_then(|value| {
+                value
+                    .as_u64()
+                    .and_then(|id| u32::try_from(id).ok())
+                    .map(vllm::generate_complete::MatchedStop::MatchedTokenId)
+                    .or_else(|| {
+                        value.as_str().map(|text| {
+                            vllm::generate_complete::MatchedStop::MatchedStopStr(text.to_string())
+                        })
+                    })
+            });
         let finish = output
             .finish_reason
-            .map(|reason| (normalize_finish_reason(&reason).to_string(), None));
-        Ok(state.emit_tick(
+            .map(|reason| (normalize_finish_reason(&reason).to_string(), matched));
+        let mut response = state.emit_tick(
             self.index,
             output.output_ids,
             chunk_logprobs,
             finish,
             &mut self.pending,
-        ))
+        );
+        self.attach_input_logprobs(&mut response);
+        Ok(response)
     }
 }
 
@@ -265,6 +368,26 @@ pub(crate) fn fan_out_tokenspeed_requests(
     })
 }
 
+/// Native PD routes a room to its residue DP group, overriding a caller pin.
+/// Apply this before submission because direct ZMQ owns physical rank routing.
+pub(crate) fn pin_tokenspeed_bootstrap_rank(
+    req: &mut tokenspeed_proto::GenerateRequest,
+    engine_count: usize,
+) -> Result<(), String> {
+    let Some(bootstrap) = &req.kv_bootstrap_info else {
+        return Ok(());
+    };
+    if engine_count == 0 {
+        return Err("TokenSpeed PD requires at least one connected engine".into());
+    }
+    let room = u64::try_from(bootstrap.bootstrap_room)
+        .map_err(|_| "bootstrap_room must be non-negative")?;
+    let rank = i32::try_from(room % engine_count as u64)
+        .map_err(|_| "TokenSpeed PD rank exceeds the supported range")?;
+    req.data_parallel_rank = Some(rank);
+    Ok(())
+}
+
 /// Translate a TokenSpeed proto `GenerateRequest` into the wire
 /// `TokenizedGenerateReqInput`. ZMQ mode requires pre-tokenized input (SMG
 /// tokenizes upstream).
@@ -277,15 +400,70 @@ pub(crate) fn translate_request_tokenspeed(
             return Err("ZMQ mode requires pre-tokenized input; no input provided".to_string());
         }
     };
-    let (input_ids_unpadded, multimodal_inputs) = match req.mm_inputs {
+    let (input_ids_unpadded, mut multimodal_inputs) = match req.mm_inputs {
         Some(mm) => {
             let (unpadded, inputs) = translate_tokenspeed_multimodal(mm, &mut input_ids)?;
             (Some(unpadded), Some(inputs))
         }
         None => (None, None),
     };
+    if let Some(bootstrap) = req.encode_bootstrap_info {
+        let mm = multimodal_inputs
+            .as_mut()
+            .ok_or("encode_bootstrap_info requires mm_inputs")?;
+        for item in bootstrap.items {
+            let count = mm.mm_items.len();
+            let target = mm
+                .mm_items
+                .get_mut(item.item_index as usize)
+                .ok_or_else(|| {
+                    format!(
+                        "EPD encode bootstrap item_index {} out of range for {count} mm items",
+                        item.item_index
+                    )
+                })?;
+            target.encode_handshake = Some(TokenSpeedEncodeHandshake {
+                bootstrap_host: item.bootstrap_host,
+                bootstrap_port: item.bootstrap_port,
+                bootstrap_room: item.bootstrap_room,
+            });
+        }
+    }
+    let metadata_only = req.metadata_only.unwrap_or(false);
+    if metadata_only && req.kv_bootstrap_info.is_none() {
+        return Err("metadata-only TokenSpeed decode requires kv_bootstrap_info".to_string());
+    }
+    if let Some(mm) = &multimodal_inputs {
+        if mm
+            .mm_items
+            .iter()
+            .any(|item| item.feature.is_none() && item.encode_handshake.is_none() && !metadata_only)
+        {
+            return Err(
+                "multimodal item carried no encoder_input or EPD encode handshake".to_string(),
+            );
+        }
+    }
+    let data_parallel_rank = req
+        .data_parallel_rank
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| "data_parallel_rank must be non-negative")?;
+    let (bootstrap_host, bootstrap_port, bootstrap_room) = match req.kv_bootstrap_info {
+        Some(info) => (
+            (!info.bootstrap_host.is_empty()).then_some(info.bootstrap_host),
+            Some(info.bootstrap_port),
+            Some(info.bootstrap_room),
+        ),
+        None => (None, None, None),
+    };
+    let logprob_start_len = req.logprob_start_len.unwrap_or(-1);
+    if req.return_logprob && (logprob_start_len < -1 || logprob_start_len >= input_ids.len() as i32)
+    {
+        return Err("logprob_start_len must be -1 or a valid prompt position".to_string());
+    }
     // Over the ZMQ wire TokenSpeed returns only the single sampled-token logprob
-    // per token: no top-k candidates (`top_logprobs_num > 1`) and no prompt
+    // per token: no top-k candidates (`top_logprobs_num > 1`) or selected-token
     // logprobs (`token_ids_logprob`). Reject both rather than silently return
     // fewer than asked. A bare `logprobs: true` (count 0/1) is the plain
     // sampled-token logprob and is wired end-to-end via `return_logprob`.
@@ -294,7 +472,7 @@ pub(crate) fn translate_request_tokenspeed(
     }
     if !req.token_ids_logprob.is_empty() {
         return Err(
-            "prompt logprobs are not supported over the TokenSpeed ZMQ backend".to_string(),
+            "selected-token logprobs are not supported over the TokenSpeed ZMQ backend".to_string(),
         );
     }
     Ok(TokenizedGenerateReqInput {
@@ -309,9 +487,14 @@ pub(crate) fn translate_request_tokenspeed(
                 params
             }),
         return_logprob: req.return_logprob,
+        logprob_start_len,
         stream: req.stream,
         input_ids_unpadded,
         multimodal_inputs,
+        bootstrap_host,
+        bootstrap_port,
+        bootstrap_room,
+        data_parallel_rank,
         // Every other field keeps its neutral default (text requests do not
         // even emit the fields after `stream`; the engine fills them from
         // defaults).
@@ -396,26 +579,10 @@ pub(crate) fn translate_tokenspeed_multimodal(
             TokenSpeedWireModality::Audio => {}
         }
 
-        let feature = wire_tensor_tokenspeed(
-            item.encoder_input
-                .ok_or("multimodal item carried no encoder_input")?,
-        )?;
+        let feature = item.encoder_input.map(wire_tensor_tokenspeed).transpose()?;
         let mut model_specific_data = BTreeMap::new();
         for (name, tensor) in item.model_specific_tensors {
             model_specific_data.insert(name, wire_tensor_tokenspeed(tensor)?);
-        }
-        // Nothing on the msgpack path computes `mrope_positions` (the engine's
-        // InputProcessor is bypassed), and shipping nil silently degrades
-        // image grounding to 1-D positions. For the known MRoPE families the
-        // grid tensors are the tell: fail loudly rather than succeed wrong.
-        for key in ["image_grid_thw", "video_grid_thw"] {
-            if model_specific_data.contains_key(key) {
-                return Err(format!(
-                    "multimodal item carries {key:?}: MRoPE position tensors are not \
-                     derivable over the TokenSpeed ZMQ wire yet; use the gRPC transport \
-                     for this model"
-                ));
-            }
         }
         mm_items.push(TokenSpeedWireMmItem {
             modality,
@@ -424,18 +591,9 @@ pub(crate) fn translate_tokenspeed_multimodal(
             offsets,
             feature,
             model_specific_data,
+            encode_handshake: None,
         });
     }
-    // Surface the position-tensor gap in the gateway's own logs (once per
-    // process): models outside the gated MRoPE families still receive no
-    // mrope_positions on this wire.
-    static MROPE_POSITIONS_NOTE: std::sync::Once = std::sync::Once::new();
-    MROPE_POSITIONS_NOTE.call_once(|| {
-        warn!(
-            "TokenSpeed ZMQ multimodal requests carry no mrope_positions; models that \
-             require them fall back to 1-D positions engine-side"
-        );
-    });
     Ok((
         unpadded,
         TokenSpeedWireMmInputs {
@@ -654,6 +812,8 @@ mod tests {
                 cached_tokens: vec![0],
                 output_token_logprobs_val: vec![vec![-0.5]],
                 output_token_logprobs_idx: vec![vec![10]],
+                input_token_logprobs_val: Some(vec![vec![None, Some(-0.25), Some(-0.5)]]),
+                input_token_logprobs_idx: Some(vec![vec![1, 2, 3]]),
                 ..Default::default()
             };
             let done = BatchTokenIDOutSlim {
@@ -689,6 +849,7 @@ mod tests {
             }),
             // Plain sampled-token logprob; must be wired through.
             return_logprob: true,
+            logprob_start_len: Some(0),
             stream: true,
             ..Default::default()
         };
@@ -699,6 +860,16 @@ mod tests {
             Some(vllm::generate_response::Response::Chunk(chunk)) => {
                 assert_eq!(chunk.token_ids, vec![10]);
                 assert_eq!(chunk.prompt_tokens, 3);
+                let prompt = chunk.input_logprobs.expect("prompt rows on first output");
+                assert_eq!(prompt.token_ids, vec![1, 2, 3]);
+                assert_eq!(
+                    prompt
+                        .token_logprobs
+                        .iter()
+                        .map(|lp| lp.value)
+                        .collect::<Vec<_>>(),
+                    vec![None, Some(-0.25), Some(-0.5)]
+                );
                 let logprobs = chunk.output_logprobs.expect("chunk logprobs");
                 assert_eq!(logprobs.token_logprobs, vec![-0.5]);
                 assert_eq!(logprobs.token_ids, vec![10]);
@@ -711,6 +882,7 @@ mod tests {
         match second.response {
             Some(vllm::generate_response::Response::Chunk(chunk)) => {
                 assert_eq!(chunk.token_ids, vec![11]);
+                assert!(chunk.input_logprobs.is_none());
                 let logprobs = chunk.output_logprobs.expect("chunk logprobs");
                 assert_eq!(logprobs.token_logprobs, vec![-1.25]);
                 assert_eq!(logprobs.token_ids, vec![11]);
@@ -727,6 +899,9 @@ mod tests {
                 assert_eq!(complete.output_ids, vec![10, 11]);
                 assert_eq!(complete.finish_reason, "length");
                 assert_eq!(complete.completion_tokens, 2);
+                let prompt = complete.input_logprobs.expect("cumulative prompt rows");
+                assert_eq!(prompt.token_ids, vec![1, 2, 3]);
+                assert_eq!(prompt.token_logprobs[0].value, None);
                 // Chunks carry the tick's incremental logprobs; the terminal
                 // `Complete` carries the cumulative set, parallel to `output_ids`
                 // (the non-streaming renderer reads only the `Complete`).
@@ -815,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn tokenspeed_rejects_top_logprobs_and_prompt_logprobs() {
+    fn tokenspeed_rejects_top_logprobs_and_selected_token_logprobs() {
         // Top-k logprobs (count > 1) cannot be honored over the wire.
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         req.top_logprobs_num = 5;
@@ -832,6 +1007,167 @@ mod tests {
             req.top_logprobs_num = count;
             assert!(translate_request_tokenspeed(req).is_ok());
         }
+    }
+
+    #[test]
+    fn tokenspeed_pd_rank_uses_bootstrap_room_residue_before_submission() {
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        req.kv_bootstrap_info = Some(tokenspeed_proto::KvBootstrapInfo {
+            bootstrap_room: (1_i64 << 50) + 1,
+            ..Default::default()
+        });
+        req.data_parallel_rank = Some(0);
+        pin_tokenspeed_bootstrap_rank(&mut req, 2).unwrap();
+        assert_eq!(req.data_parallel_rank, Some(1));
+        let mut plain = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        plain.data_parallel_rank = Some(0);
+        pin_tokenspeed_bootstrap_rank(&mut plain, 2).unwrap();
+        assert_eq!(plain.data_parallel_rank, Some(0));
+        req.kv_bootstrap_info.as_mut().unwrap().bootstrap_room = -1;
+        assert!(pin_tokenspeed_bootstrap_rank(&mut req, 2)
+            .unwrap_err()
+            .contains("non-negative"));
+    }
+
+    #[test]
+    fn tokenspeed_preserves_pd_bootstrap_and_dp_rank_wire_slots() {
+        use engine_zmq_client::{
+            codec::{decode_value, encode_msgpack},
+            protocol::{tokenspeed::TokenSpeedProtocol, EngineProtocol},
+        };
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        req.kv_bootstrap_info = Some(tokenspeed_proto::KvBootstrapInfo {
+            bootstrap_host: "prefill.local".into(),
+            bootstrap_port: 9001,
+            bootstrap_room: 1_i64 << 50,
+        });
+        req.data_parallel_rank = Some(2);
+        let wire = translate_request_tokenspeed(req).unwrap();
+        let encoded = encode_msgpack(&wire).unwrap();
+        let slots = decode_value(&encoded).unwrap();
+        let slots = slots.as_array().unwrap();
+        assert_eq!(slots.len(), 25);
+        assert_eq!(slots[16].as_str(), Some("prefill.local"));
+        assert_eq!(slots[17].as_i64(), Some(9001));
+        assert_eq!(slots[18].as_i64(), Some(1_i64 << 50));
+        assert_eq!(slots[24].as_i64(), Some(2));
+        assert_eq!(TokenSpeedProtocol::data_parallel_rank(&wire), Some(2));
+    }
+
+    #[test]
+    fn tokenspeed_attaches_epd_bootstrap_to_matching_item() {
+        use engine_zmq_client::codec::{decode_value, encode_msgpack};
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs {
+            items: vec![ts_mm_item(b"12345678", 0, 1), ts_mm_item(b"abcdefgh", 1, 1)],
+        });
+        req.mm_inputs.as_mut().unwrap().items[1].encoder_input = None;
+        req.encode_bootstrap_info = Some(tokenspeed_proto::EncodeBootstrapInfo {
+            items: vec![tokenspeed_proto::EncodeItemBootstrapInfo {
+                item_index: 1,
+                bootstrap_host: "encode.local".into(),
+                bootstrap_port: 9100,
+                bootstrap_room: 1_i64 << 51,
+            }],
+        });
+        let wire = translate_request_tokenspeed(req).unwrap();
+        let value = decode_value(&encode_msgpack(&wire).unwrap()).unwrap();
+        let items = value.as_array().unwrap()[22].as_array().unwrap()[0]
+            .as_array()
+            .unwrap();
+        assert!(items[0].as_array().unwrap()[9].is_nil());
+        let handshake = items[1].as_array().unwrap()[9].as_map().unwrap();
+        assert_eq!(
+            handshake
+                .iter()
+                .find(|(k, _)| k.as_str() == Some("bootstrap_room"))
+                .unwrap()
+                .1
+                .as_i64(),
+            Some(1_i64 << 51)
+        );
+    }
+
+    #[test]
+    fn tokenspeed_pixel_less_decode_requires_path_marker_and_pd_rendezvous() {
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        let mut item = ts_mm_item(b"12345678", 0, 1);
+        item.encoder_input = None;
+        req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });
+        assert!(translate_request_tokenspeed(req.clone()).is_err());
+        req.metadata_only = Some(true);
+        assert!(translate_request_tokenspeed(req.clone()).is_err());
+        req.kv_bootstrap_info = Some(tokenspeed_proto::KvBootstrapInfo {
+            bootstrap_host: "prefill.local".into(),
+            bootstrap_port: 9000,
+            bootstrap_room: 42,
+        });
+        let wire = translate_request_tokenspeed(req).unwrap();
+        assert!(wire.multimodal_inputs.unwrap().mm_items[0]
+            .feature
+            .is_none());
+    }
+
+    #[test]
+    fn tokenspeed_preserves_explicit_prompt_logprob_offset() {
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        req.return_logprob = true;
+        req.logprob_start_len = Some(0);
+        let wire = translate_request_tokenspeed(req).unwrap();
+        assert_eq!(wire.logprob_start_len, 0);
+    }
+
+    #[test]
+    fn tokenspeed_greedy_pins_seed_zero() {
+        for (temperature, top_k) in [(Some(0.0), None), (Some(1.0), Some(1))] {
+            let params = translate_sampling_tokenspeed(tokenspeed_proto::SamplingParams {
+                temperature,
+                top_k,
+                sampling_seed: Some(123),
+                ..Default::default()
+            });
+            assert_eq!(params.seed, Some(0));
+        }
+    }
+
+    #[test]
+    fn tokenspeed_weight_version_survives_shared_stream_and_native_conversion() {
+        let mut state = StreamState {
+            weight_version: Some("v9".into()),
+            prompt_tokens: 5,
+            spec_accepted_tokens: 4,
+            spec_draft_tokens: 6,
+            ..Default::default()
+        };
+        let mut pending = None;
+        let chunk = state.emit_tick(
+            0,
+            vec![3],
+            None,
+            Some((
+                "stop".into(),
+                Some(vllm::generate_complete::MatchedStop::MatchedTokenId(3)),
+            )),
+            &mut pending,
+        );
+        let native = to_tokenspeed_response("r1", chunk);
+        let Some(tokenspeed_proto::generate_response::Response::Chunk(chunk)) = native.response
+        else {
+            panic!("expected chunk");
+        };
+        assert_eq!(chunk.weight_version.as_deref(), Some("v9"));
+        let native = to_tokenspeed_response("r1", pending.unwrap());
+        let Some(tokenspeed_proto::generate_response::Response::Complete(done)) = native.response
+        else {
+            panic!("expected completion");
+        };
+        assert_eq!(done.weight_version.as_deref(), Some("v9"));
+        assert_eq!(done.spec_accepted_tokens, 4);
+        assert_eq!(done.spec_draft_tokens, 6);
+        assert_eq!(
+            done.matched_stop,
+            Some(tokenspeed_proto::generate_complete::MatchedStop::MatchedTokenId(3))
+        );
     }
 
     #[test]
@@ -989,8 +1325,7 @@ mod tests {
             .unwrap_err()
             .contains("modality"));
 
-        // Known MRoPE families fail loudly: nothing derives mrope_positions
-        // on this wire, and 1-D fallback would silently degrade grounding.
+        // Grid metadata reaches the shared engine-side MRoPE preparation.
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         let mut item = ts_mm_item(b"12345678", 0, 1);
         item.model_specific_tensors.insert(
@@ -1004,9 +1339,10 @@ mod tests {
             },
         );
         req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });
-        assert!(translate_request_tokenspeed(req)
-            .unwrap_err()
-            .contains("MRoPE"));
+        let mapped = translate_request_tokenspeed(req).unwrap();
+        assert!(mapped.multimodal_inputs.unwrap().mm_items[0]
+            .model_specific_data
+            .contains_key("image_grid_thw"));
     }
 
     #[test]
@@ -1149,6 +1485,167 @@ mod tests {
         assert!(completes.iter().all(|complete| complete.prompt_tokens == 3));
 
         engine_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn generate_pd_submits_to_bootstrap_room_rank() {
+        use engine_zmq_client::{
+            codec::{decode_msgpack, encode_msgpack},
+            protocol::tokenspeed::{
+                output::BatchTokenIDOutSlim, request::TokenizedGenerateReqInput,
+            },
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("tokenspeed-pd");
+        let input = format!("ipc://{}.input", base.display());
+        let output = format!("ipc://{}.output", base.display());
+        // Use an ephemeral TCP port so concurrent integration suites do not clash.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let handshake = format!("tcp://127.0.0.1:{port}");
+        let mut ready0 = default_ready_response();
+        ready0.data_parallel_size = 2;
+        let mut ready1 = ready0.clone();
+        ready1.data_parallel_rank = 1;
+        let (client, engine0, engine1) = tokio::join!(
+            ZmqEngineClient::connect(
+                &handshake,
+                &input,
+                &output,
+                2,
+                "m".into(),
+                EosTokenIds::default(),
+                RuntimeType::TokenSpeed,
+                Duration::from_secs(5)
+            ),
+            connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready0),
+            connect_to_frontend(&handshake, EngineId::from_engine_index(1), ready1),
+        );
+        let client = client.unwrap();
+        let _engine0 = engine0.unwrap();
+        let engine1 = engine1.unwrap();
+        let mut request = ts_tokenized_req(tokenspeed_proto::SamplingParams {
+            max_new_tokens: Some(1),
+            ..Default::default()
+        });
+        request.kv_bootstrap_info = Some(tokenspeed_proto::KvBootstrapInfo {
+            bootstrap_host: "prefill.local".into(),
+            bootstrap_port: 9000,
+            bootstrap_room: 1,
+        });
+        request.data_parallel_rank = Some(0);
+        let mut stream = client.generate_tokenspeed(request).await.unwrap();
+        let (mut input1, mut output1) = engine1.split();
+        let frames = tokio::time::timeout(Duration::from_secs(2), input1.recv_frames())
+            .await
+            .expect("PD must reach rank 1")
+            .unwrap();
+        let wire: TokenizedGenerateReqInput = decode_msgpack(frames[1].as_ref()).unwrap();
+        assert_eq!(wire.data_parallel_rank, Some(1));
+        assert_eq!(wire.bootstrap_room, Some(1));
+        let batch = BatchTokenIDOutSlim {
+            rids: vec![wire.rid],
+            output_ids: vec![vec![]],
+            finished_reasons: vec!["length".into()],
+            prompt_tokens: vec![3],
+            completion_tokens: vec![0],
+            cached_tokens: vec![0],
+            output_token_logprobs_val: vec![vec![]],
+            output_token_logprobs_idx: vec![vec![]],
+            engine_index: 1,
+            ..Default::default()
+        };
+        output1
+            .send_frames(vec![bytes::Bytes::from(encode_msgpack(&batch).unwrap())])
+            .await
+            .unwrap();
+        let done = stream.next().await.unwrap().unwrap();
+        assert!(matches!(
+            done.response,
+            Some(vllm::generate_response::Response::Complete(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn old_peer_missing_prompt_rows_is_visible_and_abort_is_preserved() {
+        use engine_zmq_client::{
+            codec::{decode_msgpack, encode_msgpack},
+            protocol::tokenspeed::{
+                output::BatchTokenIDOutSlim, request::TokenizedGenerateReqInput,
+            },
+        };
+        for reason in ["length", "abort"] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().join("tokenspeed-old-prompt");
+            let input = format!("ipc://{}.input", base.display());
+            let output = format!("ipc://{}.output", base.display());
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let handshake = format!("tcp://127.0.0.1:{port}");
+            let (client, engine) = tokio::join!(
+                ZmqEngineClient::connect(
+                    &handshake,
+                    &input,
+                    &output,
+                    1,
+                    "m".into(),
+                    EosTokenIds::default(),
+                    RuntimeType::TokenSpeed,
+                    Duration::from_secs(5)
+                ),
+                connect_to_frontend(
+                    &handshake,
+                    EngineId::from_engine_index(0),
+                    default_ready_response()
+                ),
+            );
+            let client = client.unwrap();
+            let engine = engine.unwrap();
+            let mut request = ts_tokenized_req(tokenspeed_proto::SamplingParams {
+                max_new_tokens: Some(0),
+                ..Default::default()
+            });
+            request.return_logprob = true;
+            request.logprob_start_len = Some(0);
+            let mut stream = client.generate_tokenspeed(request).await.unwrap();
+            let (mut input, mut output) = engine.split();
+            let frames = input.recv_frames().await.unwrap();
+            let wire: TokenizedGenerateReqInput = decode_msgpack(frames[1].as_ref()).unwrap();
+            let old = BatchTokenIDOutSlim {
+                rids: vec![wire.rid],
+                output_ids: vec![vec![]],
+                finished_reasons: vec![reason.into()],
+                prompt_tokens: vec![3],
+                completion_tokens: vec![0],
+                cached_tokens: vec![0],
+                output_token_logprobs_val: vec![vec![]],
+                output_token_logprobs_idx: vec![vec![]],
+                ..Default::default()
+            };
+            output
+                .send_frames(vec![bytes::Bytes::from(encode_msgpack(&old).unwrap())])
+                .await
+                .unwrap();
+            let result = stream.next().await.unwrap();
+            if reason == "abort" {
+                let response = result.unwrap();
+                let Some(vllm::generate_response::Response::Complete(done)) = response.response
+                else {
+                    panic!("expected abort completion");
+                };
+                assert_eq!(done.finish_reason, "abort");
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.code(), tonic::Code::Unimplemented);
+                assert!(error.message().contains("requested prompt logprobs"));
+            }
+        }
     }
 
     #[test]

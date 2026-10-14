@@ -277,6 +277,7 @@ impl TokenSpeedScheduler for MockScheduler {
             items.push(Ok(ts::GenerateResponse {
                 request_id: request_id.clone(),
                 response: Some(GenResp::Chunk(ts::GenerateStreamChunk {
+                    input_logprobs: None,
                     token_ids: vec![*id],
                     prompt_tokens: 1,
                     completion_tokens: 1,
@@ -627,6 +628,7 @@ fn generate_stream(
                         let resp = ts::GenerateResponse {
                             request_id: st.request_id.clone(),
                             response: Some(GenResp::Chunk(ts::GenerateStreamChunk {
+                                input_logprobs: None,
                                 token_ids: vec![token_id],
                                 prompt_tokens,
                                 completion_tokens: st.output_ids.len() as u32,

@@ -625,6 +625,15 @@ impl JobQueue {
                         "encode" => WorkerType::Encode,
                         _ => WorkerType::Regular,
                     };
+                    // Explicit specifications replace URL-derived defaults and
+                    // are submitted only once, below.
+                    if router_config
+                        .worker_specs
+                        .iter()
+                        .any(|spec| spec.url == url)
+                    {
+                        continue;
+                    }
                     let mut spec = WorkerSpec::new(url);
                     spec.worker_type = proto_worker_type;
                     spec.api_key.clone_from(&api_key);
@@ -643,6 +652,29 @@ impl JobQueue {
                                 "Failed to submit AddWorker job for {worker_type} worker {url_for_error}: {e}"
                             )
                         })?;
+                        worker_count += 1;
+                    } else {
+                        return Err("JobQueue not available".to_string());
+                    }
+                }
+
+                for spec in &router_config.worker_specs {
+                    let mut spec = spec.clone();
+                    if spec.api_key.is_none() {
+                        spec.api_key.clone_from(&api_key);
+                    }
+                    // Respect explicit transport, role, rank and labels. Global
+                    // startup runtime/group defaults apply only to URL entries.
+                    if let Some(queue) = context.worker_job_queue.get() {
+                        queue
+                            .submit(Job::AddWorker {
+                                config: Box::new(spec),
+                                registration_mode: WorkerRegistrationMode::Upsert,
+                            })
+                            .await
+                            .map_err(|e| {
+                                format!("Failed to submit explicit worker specification: {e}")
+                            })?;
                         worker_count += 1;
                     } else {
                         return Err("JobQueue not available".to_string());

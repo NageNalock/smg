@@ -8,6 +8,7 @@ use tracing::{debug, info};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
+    routers::grpc::backend_client::{ZMQ_CONTROL_URL_LABEL, ZMQ_ENCODE_URL_LABEL},
     worker::{
         overload::OverloadThresholds, service::MAX_WORKER_LABELS, BasicWorker, BasicWorkerBuilder,
         Worker,
@@ -64,6 +65,14 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 if let Some(ref new_labels) = request.labels {
                     for (key, value) in new_labels {
                         updated_labels.insert(key.clone(), value.clone());
+                    }
+                }
+                for label in [ZMQ_CONTROL_URL_LABEL, ZMQ_ENCODE_URL_LABEL] {
+                    if existing.get(label) != updated_labels.get(label) {
+                        return Err(WorkflowError::StepFailed {
+                            step_id: StepId::new("update_worker_properties"),
+                            message: format!("{label} is a transport association; change it through PUT /workers/{{worker_id}} with a full WorkerSpec so registration owns fresh control discovery"),
+                        });
                     }
                 }
                 if updated_labels.len() > existing.len() && updated_labels.len() > MAX_WORKER_LABELS {
@@ -179,7 +188,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             // update disables health checks, force the lifecycle to Ready so
             // the worker does not stay stuck in a non-routable pre-update
             // status while the manager correctly skips future probes.
-            if updated_health_config.disable_health_check {
+            if updated_health_config.disable_health_check && new_worker.control_metadata_ready() {
                 let _ = app_context
                     .worker_registry
                     .transition_status(&worker_id, WorkerStatus::Ready);
@@ -356,6 +365,33 @@ mod tests {
                 .unwrap(),
             StepResult::Success
         );
+    }
+
+    #[tokio::test]
+    async fn pending_control_discovery_cannot_be_bypassed_by_disabling_health_checks() {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("ipc:///tmp/control-pending")
+                .connection_mode(ConnectionMode::Zmq)
+                .label("zmq_control_url", "grpc://worker:50051")
+                .build(),
+        );
+        let app = make_app_context(std::slice::from_ref(&worker));
+        let mut context = make_context(app.clone(), worker, HashMap::new());
+        context.data.config.health = Some(HealthCheckUpdate {
+            disable_health_check: Some(true),
+            ..Default::default()
+        });
+        UpdateWorkerPropertiesStep
+            .execute(&mut context)
+            .await
+            .unwrap();
+        let updated = app
+            .worker_registry
+            .get_by_url("ipc:///tmp/control-pending")
+            .unwrap();
+        assert_eq!(updated.status(), WorkerStatus::Pending);
+        assert!(!updated.control_metadata_ready());
+        assert!(!updated.is_available());
     }
 
     #[tokio::test]
@@ -556,7 +592,7 @@ mod tests {
             ),
         );
         let _engine = engine.expect("mock engine");
-        let client = Arc::new(BackendClient::Zmq(client.expect("adapter connect")));
+        let client = Arc::new(BackendClient::Zmq(client.expect("adapter connect").into()));
 
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new(ep("ts0.ipc"))

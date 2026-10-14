@@ -52,6 +52,9 @@ pub(crate) struct StreamState {
     pub(crate) completion_tokens: u32,
     pub(crate) prompt_tokens: u32,
     pub(crate) cached_tokens: u32,
+    pub(crate) weight_version: Option<String>,
+    pub(crate) spec_accepted_tokens: u32,
+    pub(crate) spec_draft_tokens: u32,
     /// Cumulative sampled-token logprobs across ticks. The proto contract is
     /// incremental per streaming chunk but cumulative on the terminal
     /// `Complete`, so accumulate here and drain into `Complete`.
@@ -95,6 +98,7 @@ impl StreamState {
                 prompt_tokens: state.prompt_tokens,
                 completion_tokens: state.completion_tokens,
                 cached_tokens: state.cached_tokens,
+                weight_version: state.weight_version.clone(),
                 output_logprobs: chunk_logprobs,
                 index,
                 ..Default::default()
@@ -110,6 +114,9 @@ impl StreamState {
                             prompt_tokens: self.prompt_tokens,
                             completion_tokens: self.completion_tokens,
                             cached_tokens: self.cached_tokens,
+                            weight_version: self.weight_version.clone(),
+                            spec_accepted_tokens: self.spec_accepted_tokens,
+                            spec_draft_tokens: self.spec_draft_tokens,
                             matched_stop,
                             output_logprobs: self.take_complete_logprobs(),
                             index,

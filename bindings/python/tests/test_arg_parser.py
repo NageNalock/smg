@@ -1823,6 +1823,7 @@ class TestRouterArgsFieldOrder:
         "history_memory_max_items",
         "history_memory_retention_secs",
         "parser",
+        "worker_specs",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1980,3 +1981,11 @@ class TestParserFlag:
         RouterArgs.add_cli_args(parser)
         with pytest.raises(SystemExit):
             parser.parse_args(["--parser", "fast"])
+
+
+def test_worker_specs_cli_preserves_json():
+    parser = argparse.ArgumentParser()
+    RouterArgs.add_cli_args(parser)
+    value = '[{"url":"ipc:///tmp/ts","labels":{"zmq_control_url":"grpc://localhost:50051"}}]'
+    args = RouterArgs.from_cli_args(parser.parse_args(["--worker-specs", value]))
+    assert args.worker_specs == value

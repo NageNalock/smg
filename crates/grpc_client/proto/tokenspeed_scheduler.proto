@@ -136,6 +136,10 @@ message GenerateRequest {
   // residue (room % dp_size) stays the authoritative rank carrier. Only
   // forwarded when the engine advertises attention-DP support (dp_size label).
   optional int32 data_parallel_rank = 12;
+
+  // Internal PD decode annotation: the leg keeps grids/placeholders without pixels.
+  // Valid only together with kv_bootstrap_info; ordinary requests retain encoder input.
+  optional bool metadata_only = 13;
 }
 
 // EPD encode->prefill pairing handed to a prefill worker. Each multimodal item
@@ -255,6 +259,8 @@ message GenerateStreamChunk {
   // Weight version that produced these tokens, as the engine reports it.
   // Unset on engines that predate the field.
   optional string weight_version = 7;
+
+  InputLogProbs input_logprobs = 8;
 }
 
 message GenerateComplete {
@@ -283,6 +289,19 @@ message GenerateComplete {
   // Weight version that produced this completion, as the engine reports it.
   // Unset on engines that predate the field.
   optional string weight_version = 12;
+
+  InputLogProbs input_logprobs = 13;
+}
+
+// Prompt rows preserve an absent logprob for the first returned prompt token.
+message InputLogProbs {
+  repeated InputTokenLogProb token_logprobs = 1;
+  repeated uint32 token_ids = 2;
+  repeated TopLogProbs top_logprobs = 3;
+}
+
+message InputTokenLogProb {
+  optional float value = 1;
 }
 
 message OutputLogProbs {
