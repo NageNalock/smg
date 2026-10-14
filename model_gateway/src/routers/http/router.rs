@@ -4103,6 +4103,73 @@ mod tests {
         }
     }
 
+    /// The relay forwards the request as its provider profile normalized it:
+    /// a MiniMax stream sent without `stream_options` reaches the upstream
+    /// asking for the usage chunk the vendor's API always ends a stream with;
+    /// a plain served model's stream carries no field the client did not send.
+    #[tokio::test]
+    async fn the_relay_forwards_the_minimax_stream_usage_default() {
+        use openai_protocol::validated::Normalizable;
+        use tokio::sync::Mutex;
+
+        let bodies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&bodies);
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |body: Bytes| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    sink.lock()
+                        .await
+                        .push(serde_json::from_slice(&body).unwrap());
+                    ([(CONTENT_TYPE, "text/event-stream")], "data: [DONE]\n\n").into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![plain_worker(&format!("http://{addr}"))],
+        );
+        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+        for model in ["MiniMax-M3", "self-hosted-model"] {
+            let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true,
+            }))
+            .unwrap();
+            request.normalize();
+            let response = router
+                .route_chat(None, &tenant, request, crate::worker::UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{model}");
+        }
+
+        let bodies = bodies.lock().await;
+        assert_eq!(bodies.len(), 2, "one dispatch per model");
+        assert_eq!(
+            bodies[0]["stream_options"]["include_usage"],
+            json!(true),
+            "the MiniMax stream asks the upstream for the usage chunk"
+        );
+        assert!(
+            bodies[1].get("stream_options").is_none(),
+            "a plain served model's stream carries no stream_options the client did not send: {}",
+            bodies[1]
+        );
+    }
+
     /// A request pinned by a routing key whose worker answers a transient
     /// 503 is retried on another worker, not replayed on the one that just
     /// failed: one attempt there, the second on the other worker, 200.

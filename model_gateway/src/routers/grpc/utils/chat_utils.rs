@@ -427,11 +427,11 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
     combined
 }
 
-/// Typed `thinking.type` first, else the OpenAI mapping of the effective effort.
+/// The thinking preference the prompt is rendered with: the typed toggle,
+/// else the effective effort, both as the request's provider profile reads
+/// them (`ChatCompletionRequest::template_thinking`).
 fn resolve_template_thinking(request: &ChatCompletionRequest) -> Option<bool> {
-    request.thinking_toggle().or_else(|| {
-        openai_protocol::chat::thinking_from_reasoning_effort(request.effective_reasoning_effort())
-    })
+    request.template_thinking()
 }
 
 /// gRPC backends require content parts the gateway knows how to render.
@@ -1899,6 +1899,42 @@ mod tests {
         assert_eq!(
             resolve_template_thinking(&effort_request(Some("none"))),
             Some(false)
+        );
+    }
+
+    /// Under the MiniMax profile no effort value switches thinking off and an
+    /// explicit effort outranks `thinking.disabled`; the request renders the
+    /// template's default (thinking on, the model's own depth).
+    #[test]
+    fn minimax_effort_keeps_thinking_on() {
+        let minimax = |thinking: Option<Value>, reasoning_effort: Option<&str>| {
+            let mut request = effort_request(reasoning_effort);
+            request.model = "MiniMax-M3".to_string();
+            request.thinking = thinking.map(|value| serde_json::from_value(value).unwrap());
+            request
+        };
+        for effort in ["none", "minimal", "high"] {
+            assert_eq!(
+                resolve_template_thinking(&minimax(None, Some(effort))),
+                None,
+                "{effort}"
+            );
+            assert_eq!(
+                resolve_template_thinking(&minimax(
+                    Some(json!({"type": "disabled"})),
+                    Some(effort)
+                )),
+                None,
+                "{effort} outranks thinking.disabled"
+            );
+        }
+        assert_eq!(
+            resolve_template_thinking(&minimax(Some(json!({"type": "disabled"})), None)),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_template_thinking(&minimax(Some(json!({"type": "enabled"})), Some("none"))),
+            Some(true)
         );
     }
 

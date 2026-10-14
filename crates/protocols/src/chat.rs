@@ -450,6 +450,31 @@ impl ChatCompletionRequest {
         self.thinking.as_ref().and_then(ThinkingParam::toggle)
     }
 
+    /// [`Self::thinking_toggle`] as the request's provider profile reads it:
+    /// a profile whose contract lets an explicit effort outrank
+    /// `thinking.type: disabled` ([`ProviderProfile::effort_outranks_thinking_disabled`])
+    /// drops that toggle from a request that carries an effort.
+    pub fn effective_thinking_toggle(&self) -> Option<bool> {
+        let toggle = self.thinking_toggle();
+        if toggle == Some(false)
+            && self.effective_reasoning_effort().is_some()
+            && ProviderProfile::for_model(&self.model).effort_outranks_thinking_disabled()
+        {
+            return None;
+        }
+        toggle
+    }
+
+    /// The thinking preference the prompt is rendered with: the effective
+    /// typed toggle, else the provider profile's reading of the effective
+    /// `reasoning_effort` ([`ProviderProfile::thinking_from_reasoning_effort`]).
+    pub fn template_thinking(&self) -> Option<bool> {
+        self.effective_thinking_toggle().or_else(|| {
+            ProviderProfile::for_model(&self.model)
+                .thinking_from_reasoning_effort(self.effective_reasoning_effort())
+        })
+    }
+
     /// `thinking.effort` when present, else the top-level `reasoning_effort`.
     pub fn effective_reasoning_effort(&self) -> Option<&str> {
         self.thinking
@@ -471,6 +496,8 @@ impl ChatCompletionRequest {
 /// so the lowest OpenAI level is the closest available "do not reason".
 /// Level values return `None` — no opinion, defer to the template default or an
 /// explicit thinking kwarg.
+/// The default reading; a provider profile may read the field by its own
+/// contract ([`ProviderProfile::thinking_from_reasoning_effort`]).
 pub fn thinking_from_reasoning_effort(reasoning_effort: Option<&str>) -> Option<bool> {
     match reasoning_effort {
         Some("none") | Some("minimal") => Some(false),
@@ -1121,6 +1148,72 @@ mod tests {
         assert!(!back.skip_special_tokens);
         assert!(!back.separate_reasoning);
         assert!(!back.stream_reasoning);
+    }
+
+    /// The MiniMax contract reads `reasoning_effort` by its own rule: `none`
+    /// (the default depth) and `minimal` (`low`) keep thinking on, and an
+    /// explicit effort outranks `thinking.type: disabled`; every other
+    /// profile keeps the OpenAI reading and honours the toggle.
+    #[test]
+    fn minimax_profile_keeps_thinking_on_for_every_effort() {
+        let request = |model: &str, fields: Value| -> ChatCompletionRequest {
+            let mut value = json!({"model": model, "messages": []});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().cloned().unwrap_or_default());
+            serde_json::from_value(value).unwrap()
+        };
+        for effort in ["none", "minimal", "low", "high", "max"] {
+            assert_eq!(
+                request("MiniMax-M3", json!({"reasoning_effort": effort})).template_thinking(),
+                None,
+                "MiniMax {effort}: the template's default, thinking on"
+            );
+            assert_eq!(
+                request(
+                    "MiniMax-M3",
+                    json!({"reasoning_effort": effort, "thinking": {"type": "disabled"}})
+                )
+                .template_thinking(),
+                None,
+                "MiniMax {effort} outranks thinking.disabled"
+            );
+        }
+        assert_eq!(
+            request("MiniMax-M3", json!({"thinking": {"type": "disabled"}})).template_thinking(),
+            Some(false),
+            "thinking.disabled alone switches thinking off"
+        );
+        assert_eq!(
+            request(
+                "MiniMax-M3",
+                json!({"reasoning_effort": "none", "thinking": {"type": "enabled"}})
+            )
+            .template_thinking(),
+            Some(true)
+        );
+        for model in ["self-hosted-model", "kimi-k3", "deepseek-v4.1"] {
+            assert_eq!(
+                request(model, json!({"reasoning_effort": "none"})).template_thinking(),
+                Some(false),
+                "{model}: the OpenAI reading, none switches thinking off"
+            );
+            assert_eq!(
+                request(
+                    model,
+                    json!({"reasoning_effort": "high", "thinking": {"type": "disabled"}})
+                )
+                .template_thinking(),
+                Some(false),
+                "{model}: thinking.disabled wins"
+            );
+            assert_eq!(
+                request(model, json!({"reasoning_effort": "high"})).template_thinking(),
+                None,
+                "{model}"
+            );
+        }
     }
 
     #[test]
