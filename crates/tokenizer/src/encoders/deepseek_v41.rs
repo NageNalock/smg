@@ -11,7 +11,7 @@
 
 use std::fmt::Write as _;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 // `DsEncodingError` lives in `deepseek_common` (shared with V4); re-exported
 // here because it is part of this module's public API, and `pub(super)` items
@@ -20,13 +20,16 @@ pub use super::deepseek_common::DsEncodingError;
 // Reuse the public ThinkingMode enum from the V3.2 module to keep the
 // "thinking" / "chat" mode invariant identical across DeepSeek versions.
 pub use super::deepseek_v32::ThinkingMode;
-// Message-shape preprocessing, drop-thinking and DSML argument rendering are
-// identical to V4 except for the tag strings and the last-user definition; see
-// `deepseek_common` for the shared implementation and its own doc comments.
+// Message-shape preprocessing, drop-thinking, DSML argument rendering and the
+// tools template are V4's too, apart from the tag strings and the last-turn
+// definition; see `deepseek_common` for the shared implementation and its
+// own doc comments.
 use super::{
     deepseek_common::{
-        at_or_after_last_user, drop_thinking_messages, encode_arguments_to_dsml,
-        merge_tool_messages, sort_tool_results_by_call_order, DsmlTags,
+        after_last_user, at_or_after_last_user, drop_thinking_messages, encode_arguments_to_dsml,
+        has_tools, merge_tool_messages, render_v4_tools_template, sort_tool_results_by_call_order,
+        task_sp_token, to_json, tool_calls_from_openai_format, tool_schemas,
+        tools_from_openai_format, DsmlTags,
     },
     RendererProfile,
 };
@@ -57,24 +60,6 @@ const DSML_TAGS: DsmlTags = DsmlTags {
     invoke: " invoke",
     parameter: " parameter",
 };
-// Quick-instruction "task" tokens (`<｜action｜>`, `<｜query｜>`, etc.)
-const TASK_ACTION: &str = "<｜action｜>";
-const TASK_QUERY: &str = "<｜query｜>";
-const TASK_AUTHORITY: &str = "<｜authority｜>";
-const TASK_DOMAIN: &str = "<｜domain｜>";
-const TASK_TITLE: &str = "<｜title｜>";
-const TASK_READ_URL: &str = "<｜read_url｜>";
-fn task_sp_token(task: &str) -> Option<&'static str> {
-    match task {
-        "action" => Some(TASK_ACTION),
-        "query" => Some(TASK_QUERY),
-        "authority" => Some(TASK_AUTHORITY),
-        "domain" => Some(TASK_DOMAIN),
-        "title" => Some(TASK_TITLE),
-        "read_url" => Some(TASK_READ_URL),
-        _ => None,
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Reasoning effort
@@ -194,42 +179,10 @@ fn render_reasoning_effort(
 // ---------------------------------------------------------------------------
 // Templates
 // ---------------------------------------------------------------------------
-/// Mirrors V4.1's `TOOLS_TEMPLATE`.
-fn render_tools_template(tool_schemas: &str) -> String {
-    let dsml = DSML_TOKEN;
-    let tcb = TOOL_CALLS_BLOCK_NAME;
-    let invoke = DSML_TAGS.invoke;
-    let parameter = DSML_TAGS.parameter;
-    let tstart = THINKING_START_TOKEN;
-    let tend = THINKING_END_TOKEN;
-    format!(
-"## Tools
-
-You have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<{dsml}{tcb}>\" block like the following:
-
-<{dsml}{tcb}>
-<{dsml}{invoke} name=\"$TOOL_NAME\">
-<{dsml}{parameter} name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</{dsml}{parameter}>
-...
-</{dsml}{invoke}>
-<{dsml}{invoke} name=\"$TOOL_NAME2\">
-...
-</{dsml}{invoke}>
-</{dsml}{tcb}>
-
-String parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.
-
-If thinking_mode is enabled (triggered by {tstart}), you MUST output your complete reasoning inside {tstart}...{tend} BEFORE any tool calls or final response.
-
-Otherwise, output directly after {tend} with tool calls or final response.
-
-### Available Tool Schemas
-
-{tool_schemas}
-
-You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
-"
-    )
+/// Mirrors V4.1's `TOOLS_TEMPLATE`: the V4 family's text with this dialect's
+/// block name and spaced tags.
+fn render_tools(tools: &[Value]) -> String {
+    render_v4_tools_template(TOOL_CALLS_BLOCK_NAME, &DSML_TAGS, &tool_schemas(tools))
 }
 
 fn render_response_format(schema: &Value) -> String {
@@ -237,44 +190,6 @@ fn render_response_format(schema: &Value) -> String {
         "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{}",
         to_json(schema)
     )
-}
-
-// ---------------------------------------------------------------------------
-// JSON helpers (mirror V4)
-// ---------------------------------------------------------------------------
-// Python's `to_json` is `json.dumps(value, ensure_ascii=False)`: spaced
-// separators, raw UTF-8. Compact `serde_json::to_string` would change the
-// prompt bytes the model was trained on.
-fn to_json(value: &Value) -> String {
-    crate::json_dumps::to_string(value)
-}
-fn tools_from_openai_format(tools: &[Value]) -> Vec<Value> {
-    tools
-        .iter()
-        .filter_map(|tool| tool.get("function").cloned())
-        .collect()
-}
-fn tool_calls_from_openai_format(tool_calls: &[Value]) -> Vec<Value> {
-    tool_calls
-        .iter()
-        .filter_map(|tool_call| {
-            let function = tool_call.get("function")?;
-            Some(json!({
-                "name": function.get("name").cloned().unwrap_or(Value::Null),
-                "arguments": function.get("arguments").cloned().unwrap_or(Value::Null),
-            }))
-        })
-        .collect()
-}
-fn render_tools(tools: &[Value]) -> String {
-    let schemas: Vec<String> = tools.iter().map(to_json).collect();
-    render_tools_template(&schemas.join("\n"))
-}
-/// Python's `if msg.get("tools"):` — absent, null and `[]` are all falsy.
-fn has_tools(msg: &Value) -> bool {
-    msg.get("tools")
-        .and_then(|v| v.as_array())
-        .is_some_and(|tools| !tools.is_empty())
 }
 
 // ---------------------------------------------------------------------------
@@ -349,9 +264,11 @@ fn flatten_content_parts(parts: &[Value]) -> Result<String, DsEncodingError> {
 // ---------------------------------------------------------------------------
 // render_message — direct port of the V4.1 Python function with the same name.
 // ---------------------------------------------------------------------------
-/// Mirrors V4.1's `find_last_user_index`: unlike V4, a mid-conversation system
-/// message counts as a user turn. Returns `None` where Python returns -1.
-fn find_last_user_index(messages: &[Value]) -> Option<usize> {
+/// Mirrors V4.1's `find_last_user_index` under a name of its own, since the
+/// rule differs from [`super::deepseek_common::find_last_user_index`]: a
+/// mid-conversation system message counts as a user turn here. Returns
+/// `None` where Python returns -1.
+fn find_last_turn_index(messages: &[Value]) -> Option<usize> {
     for index in (0..messages.len()).rev() {
         let role = messages[index].get("role").and_then(|v| v.as_str());
         let counts = matches!(role, Some("user") | Some("developer"))
@@ -381,7 +298,7 @@ fn render_message(
         });
     }
     let msg = &messages[index];
-    let last_user_idx = find_last_user_index(messages);
+    let last_user_idx = find_last_turn_index(messages);
 
     let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
     let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
@@ -538,17 +455,12 @@ fn render_message(
                 && messages[index - 1]
                     .get("task")
                     .is_some_and(|task| !task.is_null());
-            if thinking_mode == ThinkingMode::Thinking && !prev_has_task {
-                // Python: `not drop_thinking or index > last_user_idx`, where a
-                // conversation without a user turn has last_user_idx == -1.
-                let after_last_user = match last_user_idx {
-                    Some(last) => index > last,
-                    None => true,
-                };
-                if !drop_thinking || after_last_user {
-                    thinking_part.push_str(reasoning_content);
-                    thinking_part.push_str(THINKING_END_TOKEN);
-                }
+            if thinking_mode == ThinkingMode::Thinking
+                && !prev_has_task
+                && (!drop_thinking || after_last_user(index, last_user_idx))
+            {
+                thinking_part.push_str(reasoning_content);
+                thinking_part.push_str(THINKING_END_TOKEN);
             }
             prompt.push_str(&thinking_part);
             prompt.push_str(content);
@@ -653,7 +565,7 @@ pub fn encode_messages(
         effective_drop_thinking = false;
     }
     if thinking_mode == ThinkingMode::Thinking && effective_drop_thinking {
-        let last_user_idx = find_last_user_index(&full_messages);
+        let last_user_idx = find_last_turn_index(&full_messages);
         full_messages = drop_thinking_messages(&full_messages, last_user_idx);
     }
     for idx in 0..full_messages.len() {
