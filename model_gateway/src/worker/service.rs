@@ -42,9 +42,9 @@ const MAX_WORKER_URL_BYTES: usize = 2048;
 pub(crate) const MAX_WORKER_LABELS: usize = 128;
 const MAX_LABEL_KEY_BYTES: usize = 128;
 const MAX_LABEL_VALUE_BYTES: usize = 4096;
-/// Labels the routers read as the decode window, a count from 1 to 65535
-/// (`Worker::max_running_requests`); any other value is read as "not
-/// reported", silently.
+/// Labels the routers read as the decode window, a positive count
+/// (`Worker::max_running_requests`, which saturates a figure wider than
+/// 65535); any other value is read as "not reported", silently.
 const WINDOW_LABELS: [&str; 2] = ["max_running_requests", "max_num_seqs"];
 /// Labels the routers read as a positive count.
 const COUNT_LABELS: [&str; 1] = ["dp_size"];
@@ -181,9 +181,9 @@ fn validate_labels(labels: &HashMap<String, String>) -> Result<(), WorkerService
             )));
         }
         let key_str = key.as_str();
-        if WINDOW_LABELS.contains(&key_str) && !value.parse::<u16>().is_ok_and(|n| n >= 1) {
+        if WINDOW_LABELS.contains(&key_str) && !value.parse::<u64>().is_ok_and(|n| n >= 1) {
             return Err(bad_request(format!(
-                "label '{key}' must be a count from 1 to 65535, not {value:?}"
+                "label '{key}' must be a positive count, not {value:?}"
             )));
         }
         if COUNT_LABELS.contains(&key_str) && !value.parse::<u64>().is_ok_and(|n| n >= 1) {
@@ -908,10 +908,6 @@ mod tests {
                 "max_running_requests",
             ),
             (
-                json!({"url": url, "labels": {"max_num_seqs": "70000"}}),
-                "max_num_seqs",
-            ),
-            (
                 json!({"url": url, "labels": {"dp_size": "zero"}}),
                 "dp_size",
             ),
@@ -952,10 +948,14 @@ mod tests {
             );
             assert!(err.to_string().contains(field), "{body}: {err}");
         }
+        // A window wider than 65535 passes the boundary: the routers saturate
+        // it. A window set here is kept as set on every dp-aware rank worker;
+        // only a discovered one is divided per rank.
         let spec: WorkerSpec = serde_json::from_value(json!({
             "url": url, "cost": 2.5, "kv_block_size": 16, "dp_rank": 1, "dp_size": 2,
             "labels": {
-                "max_running_requests": "256", "supports_vision": "true", "served_model_name": "m"
+                "max_running_requests": "256", "max_num_seqs": "70000",
+                "supports_vision": "true", "served_model_name": "m"
             }
         }))
         .expect("a valid spec");

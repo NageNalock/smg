@@ -19,12 +19,14 @@ use tokenizers::{
 use tracing::debug;
 
 use crate::{
+    byte_fallback::PieceTable,
     byte_level::{ByteLevelIncremental, ByteLevelTable, UnknownId},
     chat_template::{
         load_chat_template_from_file, ChatTemplateContentFormat, ChatTemplateParams,
         ChatTemplateState, ThinkingKeyName, ThinkingToggle,
     },
-    encoders::{deepseek_v32, deepseek_v4, deepseek_v41},
+    encode_path::{self, EncodePath},
+    encoders::{deepseek_v32, deepseek_v4, deepseek_v41, RendererProfile},
     native::NativeEncoder,
     traits::{
         DecodeStep, Decoder, Encoder, Encoding, IncrementalDecoder, SpecialTokens, TokenIdType,
@@ -40,6 +42,19 @@ enum Renderer {
     DeepseekV41,
 }
 
+impl Renderer {
+    /// The answers of a renderer with its own encoder (see
+    /// [`RendererProfile`]); the Jinja renderer answers from the template.
+    fn profile(self) -> Option<RendererProfile> {
+        match self {
+            Self::Jinja => None,
+            Self::DeepseekV32 => Some(deepseek_v32::PROFILE),
+            Self::DeepseekV4(encoding) => Some(encoding.profile()),
+            Self::DeepseekV41 => Some(deepseek_v41::PROFILE),
+        }
+    }
+}
+
 /// HuggingFace tokenizer wrapper
 pub struct HuggingFaceTokenizer {
     tokenizer: HfTokenizer,
@@ -51,11 +66,21 @@ pub struct HuggingFaceTokenizer {
     eos_token_ids: Vec<TokenIdType>,
     /// Which renderer applies chat templates for this model.
     renderer: Renderer,
+    /// What that renderer answers around a render when it has an encoder of
+    /// its own ([`Renderer::profile`]), built once with it.
+    profile: Option<RendererProfile>,
     /// Bytes per id, when the decoder is a plain `ByteLevel` (see `byte_level`).
     byte_level: Option<Arc<ByteLevelTable>>,
+    /// Text per id, when the decoder is the sentencepiece-style chain with
+    /// byte fallback (see `byte_fallback`): the streaming step's window
+    /// decodes read it instead of running the `tokenizers` decode.
+    pieces: Option<Arc<PieceTable>>,
     /// The direct encode path for byte-level BPE tokenizers of the common
-    /// shape (see `native`); `None` keeps every encode in `tokenizers`.
+    /// shape (see `native`), when [`DirectEncoders::choose`] took it;
+    /// `None` keeps every encode in `tokenizers`.
     native: Option<NativeEncoder>,
+    /// The opt-in v1 pipeline, when the choice took it (then `native` is
+    /// `None`).
     #[cfg(feature = "tokenizers-v1")]
     v1: Option<crate::v1::V1Encoder>,
     has_byte_fallback: bool,
@@ -117,25 +142,113 @@ struct AddedTokenConfig {
     special: bool,
 }
 
-impl HuggingFaceTokenizer {
-    /// Whether this tokenizer uses the opt-in tokenizers v1 encode pipeline.
-    /// Unsupported configurations retain the existing encode path.
-    #[cfg_attr(
-        not(feature = "tokenizers-v1"),
-        expect(
-            clippy::unused_self,
-            reason = "keep the instance API identical across features"
-        )
-    )]
-    pub fn uses_v1_encoder(&self) -> bool {
+/// The encoders a tokenizer may serve an encode with before `tokenizers`
+/// itself, chosen once per load by [`DirectEncoders::choose`].
+struct DirectEncoders {
+    #[cfg(feature = "tokenizers-v1")]
+    v1: Option<crate::v1::V1Encoder>,
+    native: Option<NativeEncoder>,
+}
+
+impl DirectEncoders {
+    /// The first path, in order of preference, that takes `tokenizer`: the
+    /// opt-in v1 pipeline (behind its feature), the direct byte-level
+    /// encoder, else none and `tokenizers` encodes. The choice is logged
+    /// once, with the reasons the paths before it declined, and counted per
+    /// path ([`encode_path::encode_path_loads`]).
+    fn choose(tokenizer: &HfTokenizer) -> Self {
         #[cfg(feature = "tokenizers-v1")]
-        {
-            self.v1.is_some()
+        let v1_declined = match crate::v1::V1Encoder::from_tokenizer(
+            tokenizer,
+            HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD,
+        ) {
+            Ok(v1) => {
+                encode_path::note_load(EncodePath::V1);
+                tracing::info!(path = %EncodePath::V1, "tokenizer encode path");
+                return Self {
+                    v1: Some(v1),
+                    native: None,
+                };
+            }
+            Err(declined) => declined,
+        };
+        let (native, path, native_declined) = match NativeEncoder::from_tokenizer(tokenizer) {
+            Ok(native) => (Some(native), EncodePath::Native, None),
+            Err(declined) => (None, EncodePath::Tokenizers, Some(declined.to_string())),
+        };
+        encode_path::note_load(path);
+        // The opt-in pipeline is for BPE tokenizers: one of those it declines
+        // is worth a warning (the opt-in did not take where it could have);
+        // any other model kind was never its business.
+        #[cfg(feature = "tokenizers-v1")]
+        if matches!(tokenizer.get_model(), ModelWrapper::BPE(_)) {
+            tracing::warn!(
+                path = %path,
+                v1_declined = %v1_declined,
+                native_declined = native_declined.as_deref(),
+                "the opt-in tokenizers v1 pipeline declined this BPE tokenizer; its encodes take the next path"
+            );
+        } else {
+            tracing::info!(
+                path = %path,
+                v1_declined = %v1_declined,
+                native_declined = native_declined.as_deref(),
+                "tokenizer encode path (the opt-in v1 pipeline takes BPE models only)"
+            );
         }
         #[cfg(not(feature = "tokenizers-v1"))]
-        {
-            false
+        tracing::info!(
+            path = %path,
+            native_declined = native_declined.as_deref(),
+            "tokenizer encode path"
+        );
+        Self {
+            #[cfg(feature = "tokenizers-v1")]
+            v1: None,
+            native,
         }
+    }
+
+    /// Words the `tokenizers` model may cache per thread: none behind the
+    /// direct encode path (`native`), whose own piece cache, owned by the
+    /// encoder and freed with it, answers in front of the model for every
+    /// piece of up to 256 bytes (the short ones by count, the long ones, a
+    /// clause in a script without word spaces say, within a byte budget; a
+    /// longer piece is rare and merged on every encode), else
+    /// [`HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD`]. The model's
+    /// cache outlives the model: it is a thread-local the crate never
+    /// clears, so every thread that encoded with a tokenizer the gateway
+    /// dropped (an unload, a re-registration, a reload) kept the words it
+    /// had cached for it, half a MB per thread per dropped tokenizer. The
+    /// piece cache is owned by the encoder and freed with it.
+    fn bpe_words_cached(&self) -> usize {
+        if self.native.is_some() {
+            0
+        } else {
+            HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD
+        }
+    }
+}
+
+impl HuggingFaceTokenizer {
+    /// The path this tokenizer's encodes take, chosen at load (see
+    /// [`EncodePath`]).
+    pub fn encode_path(&self) -> EncodePath {
+        #[cfg(feature = "tokenizers-v1")]
+        if self.v1.is_some() {
+            return EncodePath::V1;
+        }
+        if self.native.is_some() {
+            EncodePath::Native
+        } else {
+            EncodePath::Tokenizers
+        }
+    }
+
+    /// Whether this tokenizer uses the opt-in tokenizers v1 encode pipeline.
+    /// Unsupported configurations retain the existing encode path.
+    pub fn uses_v1_encoder(&self) -> bool {
+        self.encode_path() == EncodePath::V1
     }
 
     /// Create a tokenizer from a HuggingFace tokenizer JSON file
@@ -355,35 +468,36 @@ impl HuggingFaceTokenizer {
             .map(detect_renderer_from_config)
             .unwrap_or(Renderer::Jinja);
 
-        #[cfg(feature = "tokenizers-v1")]
-        let v1 =
-            crate::v1::V1Encoder::from_tokenizer(&tokenizer, Self::BPE_WORDS_CACHED_PER_THREAD);
-        #[cfg(feature = "tokenizers-v1")]
-        let native = if v1.is_none() {
-            NativeEncoder::from_tokenizer(&tokenizer)
-        } else {
-            None
-        };
-        #[cfg(not(feature = "tokenizers-v1"))]
-        let native = NativeEncoder::from_tokenizer(&tokenizer);
-        Self::bound_bpe_cache(&mut tokenizer, Self::bpe_words_cached(native.as_ref()));
+        let encoders = DirectEncoders::choose(&tokenizer);
+        Self::bound_bpe_cache(&mut tokenizer, encoders.bpe_words_cached());
         let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
         let byte_fallback_values = byte_fallback_values(&reverse_vocab, has_byte_fallback);
         Ok(HuggingFaceTokenizer {
             byte_level: ByteLevelTable::build(&tokenizer),
-            native,
+            pieces: PieceTable::build(&tokenizer),
+            native: encoders.native,
             #[cfg(feature = "tokenizers-v1")]
-            v1,
+            v1: encoders.v1,
             tokenizer,
             special_tokens,
             vocab,
             reverse_vocab,
             chat_template: ChatTemplateState::new(chat_template_str)?,
             eos_token_ids,
+            profile: renderer.profile(),
             renderer,
             has_byte_fallback,
             byte_fallback_values,
         })
+    }
+
+    /// The text of a window of the stream (a handful of ids): a walk of the
+    /// piece table when the vocabulary has one, else the `tokenizers` decode.
+    fn window_decode(&self, ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
+        match &self.pieces {
+            Some(table) => Ok(table.render(ids, skip_special_tokens)),
+            None => self.decode(ids, skip_special_tokens),
+        }
     }
 
     /// The byte a ByteFallback byte token (`<0xHH>`) stands for.
@@ -480,28 +594,8 @@ impl HuggingFaceTokenizer {
     /// frequent ones.
     const BPE_WORDS_CACHED_PER_THREAD: usize = 1024;
 
-    /// Words the model may cache per thread: none behind the direct encode
-    /// path (`native`), whose own piece cache, owned by the encoder and freed
-    /// with it, answers in front of the model for every piece of up to 256
-    /// bytes (the short ones by count, the long ones, a clause in a script
-    /// without word spaces say, within a byte budget; a longer piece is rare
-    /// and merged on every encode), else
-    /// [`Self::BPE_WORDS_CACHED_PER_THREAD`]. The
-    /// model's cache outlives the model: it is a thread-local the crate
-    /// never clears, so every thread that encoded with a tokenizer the
-    /// gateway dropped (an unload, a re-registration, a reload) kept the
-    /// words it had cached for it, half a MB per thread per dropped
-    /// tokenizer. The piece cache is owned by the encoder and freed with it.
-    fn bpe_words_cached(native: Option<&NativeEncoder>) -> usize {
-        if native.is_some() {
-            0
-        } else {
-            Self::BPE_WORDS_CACHED_PER_THREAD
-        }
-    }
-
     /// Sizes the per-thread word cache of a BPE model to `words`
-    /// ([`Self::bpe_words_cached`]); other model kinds have none.
+    /// ([`DirectEncoders::bpe_words_cached`]); other model kinds have none.
     fn bound_bpe_cache(tokenizer: &mut HfTokenizer, words: usize) {
         let bounded = match tokenizer.get_model() {
             ModelWrapper::BPE(bpe) => {
@@ -518,18 +612,8 @@ impl HuggingFaceTokenizer {
 
     /// Create from an existing HuggingFace tokenizer
     pub fn from_tokenizer(mut tokenizer: HfTokenizer) -> Self {
-        #[cfg(feature = "tokenizers-v1")]
-        let v1 =
-            crate::v1::V1Encoder::from_tokenizer(&tokenizer, Self::BPE_WORDS_CACHED_PER_THREAD);
-        #[cfg(feature = "tokenizers-v1")]
-        let native = if v1.is_none() {
-            NativeEncoder::from_tokenizer(&tokenizer)
-        } else {
-            None
-        };
-        #[cfg(not(feature = "tokenizers-v1"))]
-        let native = NativeEncoder::from_tokenizer(&tokenizer);
-        Self::bound_bpe_cache(&mut tokenizer, Self::bpe_words_cached(native.as_ref()));
+        let encoders = DirectEncoders::choose(&tokenizer);
+        Self::bound_bpe_cache(&mut tokenizer, encoders.bpe_words_cached());
         let special_tokens = Self::extract_special_tokens(&tokenizer, &ConfigTokens::default());
         let vocab = tokenizer.get_vocab(true); // true = include special tokens and added_tokens
         let reverse_vocab: HashMap<TokenIdType, String> = vocab
@@ -541,9 +625,10 @@ impl HuggingFaceTokenizer {
         let byte_fallback_values = byte_fallback_values(&reverse_vocab, has_byte_fallback);
         HuggingFaceTokenizer {
             byte_level: ByteLevelTable::build(&tokenizer),
-            native,
+            pieces: PieceTable::build(&tokenizer),
+            native: encoders.native,
             #[cfg(feature = "tokenizers-v1")]
-            v1,
+            v1: encoders.v1,
             tokenizer,
             special_tokens,
             vocab,
@@ -551,6 +636,7 @@ impl HuggingFaceTokenizer {
             chat_template: ChatTemplateState::empty(),
             eos_token_ids: Vec::new(), // No directory path in from_tokenizer
             renderer: Renderer::Jinja,
+            profile: None,
             has_byte_fallback,
             byte_fallback_values,
         }
@@ -685,13 +771,13 @@ impl Encoder for HuggingFaceTokenizer {
             return v1.encode(input, add_special_tokens);
         }
         // The direct path accepts no post-processor that adds tokens, so a
-        // request for special tokens gets the same ids and is served too.
-        if let Some(ids) = self
-            .native
-            .as_ref()
-            .and_then(|native| native.encode(self.tokenizer.get_model(), input))
-        {
-            return Ok(Encoding::Plain(ids));
+        // request for special tokens gets the same ids and is served too. An
+        // input it gives up is counted and encoded by `tokenizers`.
+        if let Some(native) = &self.native {
+            match native.encode(self.tokenizer.get_model(), input) {
+                Ok(ids) => return Ok(Encoding::Plain(ids)),
+                Err(fallback) => encode_path::note_fallback(fallback),
+            }
         }
         self.tokenizer
             .encode(input, add_special_tokens)
@@ -753,7 +839,7 @@ impl HuggingFaceTokenizer {
         count: bool,
     ) -> Result<DecodeStep> {
         if prefix.is_empty() && !ids.is_empty() {
-            let new_prefix = self.decode(ids, skip_special_tokens)?;
+            let new_prefix = self.window_decode(ids, skip_special_tokens)?;
             if !new_prefix.ends_with('\u{FFFD}') {
                 *prefix = new_prefix;
                 *prefix_index = ids.len();
@@ -761,7 +847,7 @@ impl HuggingFaceTokenizer {
         }
         let token_id = new_ids.last().copied();
         ids.extend(new_ids);
-        let string = self.decode(ids, skip_special_tokens)?;
+        let string = self.window_decode(ids, skip_special_tokens)?;
         if string.ends_with('\u{FFFD}') {
             return Ok(DecodeStep::default());
         }
@@ -787,7 +873,7 @@ impl HuggingFaceTokenizer {
         };
         let new_prefix_index = ids.len() - *prefix_index;
         ids.drain(..*prefix_index);
-        *prefix = self.decode(ids, skip_special_tokens)?;
+        *prefix = self.window_decode(ids, skip_special_tokens)?;
         *prefix_index = new_prefix_index;
         Ok(DecodeStep {
             text: Some(new_text),
@@ -864,7 +950,7 @@ impl HuggingFaceTokenizer {
         // step that spans the boundary (a `Replace` after the fuse) breaks
         // that, and the alignment then covers the whole emitted text, as it
         // did before the run's start was known.
-        let stable = self.decode(&emitted[..stable_end], skip_special_tokens)?;
+        let stable = self.window_decode(&emitted[..stable_end], skip_special_tokens)?;
         Ok(if prefix.starts_with(stable.as_str()) {
             stable.len()
         } else {
@@ -904,7 +990,7 @@ impl HuggingFaceTokenizer {
             && *prefix_index > 0
             && *prefix_index == ids.len()
         {
-            let prefill = self.decode(&ids[..*prefix_index], skip_special_tokens)?;
+            let prefill = self.window_decode(&ids[..*prefix_index], skip_special_tokens)?;
             let stable_seed_end = ids[..*prefix_index]
                 .iter()
                 .rposition(|&id| !self.byte_fallback_piece(id, skip_special_tokens))
@@ -913,13 +999,13 @@ impl HuggingFaceTokenizer {
                 // Keep an unfinished seed byte run as decode context, but
                 // suppress the stable prompt text before it.
                 *prefix_index = stable_seed_end;
-                *prefix = self.decode(&ids[..*prefix_index], skip_special_tokens)?;
+                *prefix = self.window_decode(&ids[..*prefix_index], skip_special_tokens)?;
             } else if stable_seed_end < *prefix_index {
                 // A completed seed run is prompt text. Start new bytes at
                 // its boundary so later invalid bytes cannot rewrite it.
                 ids.truncate(stable_seed_end);
                 *prefix_index = stable_seed_end;
-                *prefix = self.decode(ids, skip_special_tokens)?;
+                *prefix = self.window_decode(ids, skip_special_tokens)?;
             } else {
                 *prefix = prefill;
             }
@@ -946,6 +1032,26 @@ impl HuggingFaceTokenizer {
                 text: Some('\u{FFFD}'.to_string()),
                 prefix_mismatch: false,
             });
+        }
+        if let Some(table) = &self.pieces {
+            // Nothing pending and a plain piece: the window's text grows by
+            // exactly this piece's text (the leading-space strip touched the
+            // window's first piece, which this one is not), so it streams at
+            // once and becomes the window on its own, where the strip applies
+            // to it: the prefix the full step would record.
+            if *prefix_index == ids.len() && !prefix.is_empty() && !prefix.ends_with('\u{FFFD}') {
+                if let Some(text) = table.plain_text(token_id, skip_special_tokens) {
+                    let text = text.to_owned();
+                    ids.clear();
+                    ids.push(token_id);
+                    *prefix = table.render(ids, skip_special_tokens);
+                    *prefix_index = 1;
+                    return Ok(DecodeStep {
+                        text: Some(text),
+                        prefix_mismatch: false,
+                    });
+                }
+            }
         }
         let step = self.step_decode_lenient(
             vec![token_id],
@@ -1133,7 +1239,7 @@ impl Decoder for HuggingFaceTokenizer {
             *prefix_index = 0;
             return Ok(DecodeStep::default());
         }
-        let decoded = self.decode(ids, skip_special_tokens)?;
+        let decoded = self.window_decode(ids, skip_special_tokens)?;
         let (pending, prefix_mismatch) = match decoded.strip_prefix(prefix.as_str()) {
             Some(pending) => (pending.to_string(), false),
             None => {
@@ -1209,111 +1315,66 @@ impl TokenizerTrait for HuggingFaceTokenizer {
     }
 
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
-        match self.renderer {
-            // V4.1 wants message parts preserved (OpenAI wire format) so the
-            // gateway passes `image_url`/`image` parts through as a list
-            // instead of flattening to a string; the encoder turns each part
-            // into a placeholder at its position. Part *order* is still the
-            // gateway's media-part order (the V4.1 multimodal spec declares
-            // `Authored`; without a spec the gateway moves media first).
-            // V3.2/V4 have no native opinion here and fall back to whatever
-            // the (usually absent) Jinja template reports.
-            Renderer::DeepseekV41 => ChatTemplateContentFormat::OpenAI,
-            Renderer::Jinja | Renderer::DeepseekV32 | Renderer::DeepseekV4(_) => {
-                self.chat_template.content_format()
-            }
-        }
+        self.profile
+            .and_then(|profile| profile.content_format)
+            .unwrap_or_else(|| self.chat_template.content_format())
     }
 
     fn thinking_toggle(&self) -> ThinkingToggle {
-        match self.renderer {
-            // The DeepSeek V3.2 encoder gates thinking on the `thinking`
-            // kwarg, default off. The Jinja processor has no knowledge of
-            // the native encoder so we must report it directly.
-            Renderer::DeepseekV32 => ThinkingToggle::DefaultOff,
-            // V4 defaults thinking ON like the engine's own server (its
-            // `tokenizers/deepseek_v4.py`): `thinking: false`, its
-            // `enable_thinking` alias or `reasoning_effort: "none"` turns it
-            // off. V4.1 defaults thinking ON: `reasoning_effort: "none"` or an
-            // explicit `thinking: false` (or the engine's `enable_thinking` alias,
-            // see `renderer_capabilities`) turns it off.
-            Renderer::DeepseekV4(_) | Renderer::DeepseekV41 => ThinkingToggle::DefaultOn,
-            Renderer::Jinja => self.chat_template.thinking_toggle(),
-        }
+        self.profile.map_or_else(
+            || self.chat_template.thinking_toggle(),
+            |profile| profile.thinking_toggle,
+        )
     }
 
     fn thinking_key_name(&self) -> Option<ThinkingKeyName> {
-        match self.renderer {
-            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) | Renderer::DeepseekV41 => {
-                Some(ThinkingKeyName::Thinking)
-            }
-            Renderer::Jinja => self.chat_template.thinking_key_name(),
-        }
+        self.profile.map_or_else(
+            || self.chat_template.thinking_key_name(),
+            |profile| Some(profile.thinking_key_name),
+        )
     }
+
     fn native_reasoning_effort_values(&self) -> &'static [&'static str] {
-        match self.renderer {
-            Renderer::DeepseekV4(encoding) => encoding.valid_native_values(),
-            Renderer::DeepseekV41 => deepseek_v41::NATIVE_EFFORT_VALUES,
-            Renderer::DeepseekV32 => &[],
-            Renderer::Jinja => self.chat_template.native_reasoning_effort_values(),
-        }
+        self.profile.map_or_else(
+            || self.chat_template.native_reasoning_effort_values(),
+            |profile| profile.native_effort_values,
+        )
     }
 
     fn native_reasoning_effort_off_values(&self) -> &'static [&'static str] {
-        match self.renderer {
-            // V4 reads `reasoning_effort` as the engine's own server does:
-            // `"none"` is chat mode, every other value (`"minimal"` included,
-            // which the engine maps to the low effort) keeps thinking on. Declaring
-            // the off word keeps the gateway's parser arming on that rule.
-            Renderer::DeepseekV4(_) => &["none"],
-            // The native V3.2/V4.1 renderers switch off on the protocol's
-            // `none`/`minimal`, so they declare no words of their own.
-            Renderer::DeepseekV32 | Renderer::DeepseekV41 => &[],
-            Renderer::Jinja => self.chat_template.native_reasoning_effort_off_values(),
-        }
+        self.profile.map_or_else(
+            || self.chat_template.native_reasoning_effort_off_values(),
+            |profile| profile.native_effort_off_values,
+        )
     }
 
     fn think_in_prefill(&self) -> bool {
-        match self.renderer {
-            // All three native encoders emit `<｜Assistant｜><think>` at the end
-            // of the prompt when thinking mode is on; the completion therefore
-            // starts mid-reasoning and the parser must be told so.
-            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) | Renderer::DeepseekV41 => true,
-            Renderer::Jinja => self.chat_template.think_in_prefill(),
-        }
+        self.profile.map_or_else(
+            || self.chat_template.think_in_prefill(),
+            |profile| profile.think_in_prefill,
+        )
     }
 
     fn prefill_opens_think_block(&self) -> bool {
-        match self.renderer {
-            // The native renderers all report a thinking switch, so this flag
-            // (read only for a switchless template) mirrors `think_in_prefill`.
-            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) | Renderer::DeepseekV41 => {
-                self.think_in_prefill()
-            }
-            Renderer::Jinja => self.chat_template.prefill_opens_think_block(),
-        }
+        self.profile.map_or_else(
+            || self.chat_template.prefill_opens_think_block(),
+            |profile| profile.think_in_prefill,
+        )
     }
 
     fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
-        match self.renderer {
-            // The V4.1 shim honours the engine's `enable_thinking` alias, renders a
-            // trailing assistant message itself when `add_generation_prompt`
-            // is false, and parses tool-call `arguments` strings with the
-            // reference's tolerance.
-            Renderer::DeepseekV41 => crate::traits::RendererCapabilities {
-                enable_thinking_alias: true,
-                native_assistant_continuation: true,
-                raw_tool_call_arguments: true,
-            },
-            // The V4 shim reads the engine's `enable_thinking` alias too.
-            Renderer::DeepseekV4(_) => crate::traits::RendererCapabilities {
-                enable_thinking_alias: true,
-                ..crate::traits::RendererCapabilities::default()
-            },
-            Renderer::DeepseekV32 | Renderer::Jinja => {
-                crate::traits::RendererCapabilities::default()
-            }
-        }
+        self.profile
+            .map_or_else(Default::default, |profile| profile.capabilities)
+    }
+
+    fn native_thinking_mode(
+        &self,
+        template_kwargs: Option<&HashMap<String, serde_json::Value>>,
+        thinking: Option<bool>,
+    ) -> Option<bool> {
+        self.profile
+            .and_then(|profile| profile.thinking_mode)
+            .map(|resolve| resolve(template_kwargs, thinking))
     }
 
     fn set_chat_template(&mut self, template: String) -> Result<()> {
@@ -1751,6 +1812,103 @@ mod tests {
 
     use super::derive_thinking_mode;
     use crate::{chat_template::ChatTemplateParams, encoders::deepseek_v32::ThinkingMode};
+
+    /// With the piece table the step algorithm streams byte for byte what it
+    /// streams through the `tokenizers` window decode. Random streams of word
+    /// pieces, byte runs (valid, incomplete, lost), specials, a lone marker
+    /// and a piece ending in U+FFFD go through the raw client step, the eager
+    /// step and `finish_decode`, fresh and seeded, with and without the
+    /// trailing strip, under both special-token settings; the raw step keeps
+    /// the process-wide recovery counters still, which other tests of this
+    /// binary read. Streams without a lost run also go through `Sequence`,
+    /// the gateway's path.
+    #[test]
+    fn the_piece_table_streams_what_the_tokenizers_window_decode_streams() {
+        use std::sync::Arc;
+
+        use super::HuggingFaceTokenizer;
+        use crate::{
+            byte_fallback::tests::{random_ids, random_ids_without_lost_runs, synthetic},
+            sequence::Sequence,
+            traits::{Decoder, Tokenizer as TokenizerTrait},
+        };
+        type Window = (Vec<u32>, String, usize);
+        for strip in [false, true] {
+            for skip in [false, true] {
+                let with = HuggingFaceTokenizer::from_tokenizer(synthetic(strip));
+                assert!(with.pieces.is_some(), "the synthetic chain has a table");
+                let mut without = HuggingFaceTokenizer::from_tokenizer(synthetic(strip));
+                without.pieces = None;
+                let mut state =
+                    0x9E37_79B9_7F4A_7C15u64 ^ u64::from(strip) ^ (u64::from(skip) << 1);
+                for round in 0..1_200usize {
+                    let seed = random_ids(&mut state, round % 5);
+                    let ids = random_ids(&mut state, 1 + round % 24);
+                    let eager = round % 3 == 2;
+                    // The window a seeded sequence starts from: the seed as
+                    // context, nothing emitted.
+                    let mut a: Window = (seed.clone(), String::new(), seed.len());
+                    let mut b: Window = (seed.clone(), String::new(), seed.len());
+                    let step = |tok: &HuggingFaceTokenizer, w: &mut Window, id: u32| {
+                        if eager {
+                            tok.decode_step_eager(id, &mut w.0, &mut w.1, &mut w.2, skip)
+                        } else {
+                            tok.decode_step(id, &mut w.0, &mut w.1, &mut w.2, skip)
+                        }
+                    };
+                    for &id in &ids {
+                        assert_eq!(
+                            step(&with, &mut a, id).unwrap(),
+                            step(&without, &mut b, id).unwrap(),
+                            "seed {seed:?} ids {ids:?} at {id} strip {strip} skip {skip} eager {eager}"
+                        );
+                    }
+                    // The end of input, where nothing is pending that a lost
+                    // run would make the counters record: the last id closes
+                    // any run (a skipped special does not).
+                    if ids.last().is_some_and(|&id| {
+                        (3..=7).contains(&id) || (!skip && (1..=2).contains(&id))
+                    }) {
+                        let fa = with
+                            .finish_decode(&mut a.0, &mut a.1, &mut a.2, skip)
+                            .unwrap();
+                        let fb = without
+                            .finish_decode(&mut b.0, &mut b.1, &mut b.2, skip)
+                            .unwrap();
+                        assert_eq!(
+                            (fa.text, fa.prefix_mismatch),
+                            (fb.text, fb.prefix_mismatch),
+                            "finish of {seed:?} + {ids:?}"
+                        );
+                    }
+                }
+                let with: Arc<dyn TokenizerTrait> = Arc::new(with);
+                let without: Arc<dyn TokenizerTrait> = Arc::new(without);
+                for round in 0..300usize {
+                    let ids = random_ids_without_lost_runs(&mut state, 1 + round % 30);
+                    let mut a = Sequence::new_with_options(Arc::clone(&with), skip);
+                    let mut b = Sequence::new_with_options(Arc::clone(&without), skip);
+                    for &id in &ids {
+                        assert_eq!(
+                            a.append_token(id).unwrap(),
+                            b.append_token(id).unwrap(),
+                            "{ids:?} at {id} strip {strip} skip {skip}"
+                        );
+                    }
+                    assert_eq!(
+                        a.finish().unwrap(),
+                        b.finish().unwrap(),
+                        "finish of {ids:?}"
+                    );
+                    assert_eq!(
+                        a.prefix_mismatches(),
+                        0,
+                        "{ids:?}: no lost run, no recovery"
+                    );
+                }
+            }
+        }
+    }
 
     fn thinking_kwargs(value: bool) -> HashMap<String, serde_json::Value> {
         HashMap::from([("thinking".to_string(), serde_json::Value::Bool(value))])

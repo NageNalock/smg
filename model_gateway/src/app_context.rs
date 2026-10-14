@@ -480,7 +480,11 @@ impl AppContextBuilder {
             &router_config.tenant_api_keys,
         );
 
-        let rl = crate::rl_adapter::build_rl_state(&worker_registry, &router_config);
+        let rl = crate::rl_adapter::build_rl_state(
+            &worker_registry,
+            &worker_client_cache,
+            &router_config,
+        );
 
         let token_dump =
             TokenDump::from_config(&router_config).map_err(AppContextBuildError::InvalidConfig)?;

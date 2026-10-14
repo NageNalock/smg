@@ -53,6 +53,12 @@ pub struct ServerInfo {
     /// closes the HTTP-only path so capacity-aware consumers (e.g. WorkerCapacity)
     /// see the same label regardless of transport.
     pub max_running_requests: Option<usize>,
+    /// Whether the engine splits `max_running_requests` across its
+    /// attention-DP workers (`attn_dp_size` above carries that width as its
+    /// newer releases resolve it): under `--dp-aware` each rank worker then
+    /// gets its share of the window (`create_worker::labels_for_rank`), on
+    /// this path as on the gRPC one.
+    pub enable_dp_attention: Option<bool>,
     pub weight_version: Option<String>,
 }
 
@@ -722,6 +728,43 @@ mod tests {
             let dp_info = super::super::discover_dp::dp_info_from_labels(&labels).unwrap();
             assert_eq!(dp_info.dp_size, 4);
         }
+    }
+
+    /// The attention-DP split reaches the labels on this path too, so a
+    /// dp-aware registration over HTTP gives each rank worker its share of
+    /// the window as the gRPC path does.
+    #[test]
+    fn test_sglang_server_info_surfaces_the_attention_dp_split() {
+        let body = serde_json::json!({
+            "model_path": "Qwen/Qwen3-8B",
+            "tp_size": 16,
+            "dp_size": 8,
+            "enable_dp_attention": true,
+            "attn_dp_size": 8,
+            "max_running_requests": 16384,
+        });
+        let info: ServerInfo = serde_json::from_value(body).expect("deserialize ServerInfo");
+        let labels = flat_labels(&info);
+        assert_eq!(
+            labels.get("enable_dp_attention").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(labels.get("attn_dp_size").map(String::as_str), Some("8"));
+
+        // Absent fields make no label, so a rank worker of an engine that
+        // reports neither keeps its window as it is.
+        let plain: ServerInfo = serde_json::from_value(serde_json::json!({
+            "model_path": "Qwen/Qwen3-8B",
+            "tp_size": 1,
+            "dp_size": 1,
+            "max_running_requests": 256,
+        }))
+        .expect("deserialize ServerInfo");
+        let labels = flat_labels(&plain);
+        assert!(
+            !labels.contains_key("enable_dp_attention") && !labels.contains_key("attn_dp_size"),
+            "{labels:?}"
+        );
     }
 
     #[test]

@@ -95,6 +95,7 @@ class _WindowServerArgs(msgspec.Struct):
     max_running_requests: int | None = None
     dp_size: int = 1
     enable_dp_attention: bool = False
+    attn_dp_size: int | None = None
 
 
 def _servicer(servicer_mod, server_args, **request_manager):
@@ -187,6 +188,42 @@ def test_a_partial_read_is_reported_but_not_cached_until_every_rank_published(
     # Both ranks published: cached from here on.
     published.clear()
     assert _info(servicer).server_args["max_running_requests"] == 1024
+
+
+def test_the_window_follows_the_rewritten_arguments_of_a_newer_engine(servicer_mod, monkeypatch):
+    """A newer engine resolves --dp-size 8 --enable-dp-attention into
+    attn_dp_size=8, dp_size=1, enable_dp_attention=False and runs one scheduler
+    per attention-DP worker: the flag's units and the rank count follow, so a
+    default start reports the whole engine's window (not one worker's share)
+    and caches it once all eight published, not after the first."""
+    monkeypatch.delenv("SMG_PAIRING_PROTOCOL", raising=False)
+    published = _snapshots(*([2048] * 7))
+    reader = SimpleNamespace(read_all=lambda: list(published))
+    servicer = _servicer(
+        servicer_mod,
+        _WindowServerArgs(attn_dp_size=8, dp_size=1, enable_dp_attention=False),
+        load_snapshot_reader=reader,
+    )
+    # Seven of eight ranks published: reported in the flag's units, not cached.
+    assert _info(servicer).server_args["max_running_requests"] == 16384
+    published.append(SimpleNamespace(dp_rank=7, max_running_requests=1024))
+    assert _info(servicer).server_args["max_running_requests"] == 8192
+    published.clear()
+    assert _info(servicer).server_args["max_running_requests"] == 8192
+
+    # Two replicas of four attention-DP workers each: the flag is split four
+    # ways, eight schedulers publish.
+    published = _snapshots(*([1024] * 7))
+    mixed = _servicer(
+        servicer_mod,
+        _WindowServerArgs(attn_dp_size=4, dp_size=2, enable_dp_attention=False),
+        load_snapshot_reader=SimpleNamespace(read_all=lambda: list(published)),
+    )
+    assert _info(mixed).server_args["max_running_requests"] == 4096
+    published.append(SimpleNamespace(dp_rank=7, max_running_requests=512))
+    assert _info(mixed).server_args["max_running_requests"] == 2048
+    published.clear()
+    assert _info(mixed).server_args["max_running_requests"] == 2048
 
 
 def test_server_info_reports_the_window_once_a_snapshot_is_published(servicer_mod, monkeypatch):

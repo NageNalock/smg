@@ -106,18 +106,20 @@ class TestEffectiveRunningWindow:
         assert loads_mod.effective_running_window(ranks, attention_dp_size=1) == 2048
         assert loads_mod.effective_running_window([], attention_dp_size=8) == 0
 
-    def test_the_figure_is_clamped_to_what_the_gateway_label_can_carry(self, loads_mod):
-        # The gateway parses the label as a 16-bit count: 32 attention-DP
-        # workers publishing 2048 each (65536) would read as no window.
+    def test_the_figure_is_not_clamped_the_gateway_saturates_and_divides_it(self, loads_mod):
+        # The gateway saturates a figure wider than its count and, under
+        # dp-aware routing, divides an attention-DP engine's window per rank
+        # worker first: 32 workers publishing 2048 each report 65536, not a
+        # clamped 65535 that would hand each rank 2047.
         ranks = [_snapshot(None) for _ in range(32)]
         for rank, snapshot in enumerate(ranks):
             snapshot.dp_rank, snapshot.max_running_requests = rank, 2048
-        assert loads_mod.effective_running_window(ranks, attention_dp_size=32) == 65535
+        assert loads_mod.effective_running_window(ranks, attention_dp_size=32) == 65536
         assert loads_mod.effective_running_window(ranks, attention_dp_size=31) == 63488
         wide = _snapshot(None)
         wide.max_running_requests = 70000
-        assert loads_mod.effective_running_window([wide]) == 65535
-        assert loads_mod.MAX_REPORTED_RUNNING_WINDOW == 65535
+        assert loads_mod.effective_running_window([wide]) == 70000
+        assert not hasattr(loads_mod, "MAX_REPORTED_RUNNING_WINDOW")
 
     def test_the_ranks_that_published_a_window_are_counted(self, loads_mod):
         published, unset = _snapshot(None), _snapshot(None)

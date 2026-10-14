@@ -27,6 +27,15 @@
 //! request answered and nothing charged to the prefill worker. One more
 //! lets the call of a leg given up on fail late, and expects the worker
 //! charged once, at the verdict.
+//!
+//! The decode leg of the sequential shape has a bound of its own, counted
+//! from its dispatch once the prefill leg has answered: a handoff that
+//! waits on a prefill engine that stalled right after answering, or a
+//! decode engine that never schedules the leg, holds the request past the
+//! prefill leg's bound otherwise. Two cases hold the decode call's headers
+//! or return an empty stream after a prefill that answered at once, and
+//! expect 504 `decode_worker_silent` within the bound, one `timeout` on the
+//! decode worker and nothing on the prefill.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -822,17 +831,25 @@ fn tenant() -> TenantRequestMeta {
 }
 
 /// One streaming chat through `router`: its status, body and duration.
+async fn one_streaming_chat(router: &dyn RouterTrait) -> (http::StatusCode, String, Duration) {
+    one_chat(router, true).await
+}
+
+/// One chat through `router`, streaming or not: its status, body and duration.
 #[expect(
     clippy::unwrap_used,
     clippy::expect_used,
     reason = "test helper - panicking on failure is intentional"
 )]
-async fn one_streaming_chat(router: &dyn RouterTrait) -> (http::StatusCode, String, Duration) {
+async fn one_chat(
+    router: &dyn RouterTrait,
+    streaming: bool,
+) -> (http::StatusCode, String, Duration) {
     let request = serde_json::from_value(serde_json::json!({
         "model": MODEL,
         "messages": [{"role": "user", "content": "Hello world"}],
         "max_tokens": 8,
-        "stream": true,
+        "stream": streaming,
     }))
     .unwrap();
     let started = Instant::now();
@@ -933,6 +950,136 @@ fn assert_given_up_on(status: http::StatusCode, body: &str, elapsed: Duration) {
         elapsed >= BOUND && elapsed < BOUND + SLACK,
         "given up on at the bound ({BOUND:?}), not before and not much after: {elapsed:?}"
     );
+}
+
+/// What a request given up on at its decode leg looks like: a 504 under the
+/// decode leg's own code, answered within the bound plus slack.
+fn assert_decode_given_up_on(status: http::StatusCode, body: &str, elapsed: Duration) {
+    assert_eq!(status, http::StatusCode::GATEWAY_TIMEOUT, "{body}");
+    assert!(body.contains("decode_worker_silent"), "{body}");
+    assert!(
+        elapsed >= BOUND && elapsed < BOUND + SLACK,
+        "given up on at the bound ({BOUND:?}), not before and not much after: {elapsed:?}"
+    );
+}
+
+/// Sequential dispatch, the prefill answers at once and the decode call
+/// never returns its stream (a servicer that flushes headers with the first
+/// message, in front of a handoff that waits on a prefill engine that
+/// stalled right after answering): given up on at the decode leg's bound,
+/// counted as the decode worker's timeout, nothing charged to the prefill.
+#[test]
+fn a_sequential_decode_that_returns_no_stream_after_the_prefill_answered_is_given_up_on_within_the_bound(
+) {
+    let prefill = Engine::new(Behaviour::Answer(Duration::ZERO));
+    let decode = Engine::new(Behaviour::HoldHeaders);
+    let (prefill_calls, decode_calls) = (prefill.clone(), decode.clone());
+    let rendered = render_after(|| async move {
+        let prefill_port = start_mock_engine(prefill).await;
+        let decode_port = start_mock_engine(decode).await;
+        let router = build_pd_router(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (decode_port, WorkerType::Decode),
+            ],
+            RuntimeType::Vllm,
+        )
+        .await;
+        let (status, body, elapsed) = one_streaming_chat(router.as_ref()).await;
+        assert_decode_given_up_on(status, &body, elapsed);
+    });
+    assert_eq!(prefill_calls.calls(), 1, "the prefill answered once");
+    assert_eq!(decode_calls.calls(), 1, "not replayed on the silent decode");
+    assert_eq!(
+        worker_errors(&rendered, "decode", "timeout"),
+        1.0,
+        "one timeout on the decode worker:\n{rendered}"
+    );
+    assert_eq!(
+        worker_errors(&rendered, "decode", "backend_error"),
+        0.0,
+        "counted once, under one class:\n{rendered}"
+    );
+    assert_eq!(
+        worker_errors(&rendered, "prefill", "timeout"),
+        0.0,
+        "the prefill, which answered, is not charged:\n{rendered}"
+    );
+}
+
+/// Sequential dispatch, the prefill answers at once and the decode returns
+/// its stream at once and never writes to it: the same verdict, from the
+/// first-response phase.
+#[test]
+fn a_sequential_decode_whose_stream_stays_empty_after_the_prefill_answered_is_given_up_on_within_the_bound(
+) {
+    let prefill = Engine::new(Behaviour::Answer(Duration::ZERO));
+    let decode = Engine::new(Behaviour::EmptyStream);
+    let (prefill_calls, decode_calls) = (prefill.clone(), decode.clone());
+    let rendered = render_after(|| async move {
+        let prefill_port = start_mock_engine(prefill).await;
+        let decode_port = start_mock_engine(decode).await;
+        let router = build_pd_router(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (decode_port, WorkerType::Decode),
+            ],
+            RuntimeType::Vllm,
+        )
+        .await;
+        let (status, body, elapsed) = one_streaming_chat(router.as_ref()).await;
+        assert_decode_given_up_on(status, &body, elapsed);
+    });
+    assert_eq!(prefill_calls.calls(), 1, "the prefill answered once");
+    assert_eq!(decode_calls.calls(), 1, "not replayed on the silent decode");
+    assert_eq!(
+        worker_errors(&rendered, "decode", "timeout"),
+        1.0,
+        "one timeout on the decode worker:\n{rendered}"
+    );
+    assert_eq!(
+        worker_errors(&rendered, "prefill", "timeout"),
+        0.0,
+        "the prefill, which answered, is not charged:\n{rendered}"
+    );
+}
+
+/// Sequential dispatch, a non-streaming request: the decode leg's first item
+/// is its whole generation (the servicers send nothing of a non-streaming
+/// request before it finishes), no first-token signal, so the bound does not
+/// apply; a decode that answers past the bound still completes, and nothing
+/// is charged to either worker.
+#[test]
+fn a_non_streaming_request_is_not_bound_by_the_decode_legs_first_token() {
+    let prefill = Engine::new(Behaviour::Answer(Duration::ZERO));
+    let decode = Engine::new(Behaviour::Answer(BOUND + Duration::from_secs(1)));
+    let (prefill_calls, decode_calls) = (prefill.clone(), decode.clone());
+    let rendered = render_after(|| async move {
+        let prefill_port = start_mock_engine(prefill).await;
+        let decode_port = start_mock_engine(decode).await;
+        let router = build_pd_router(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (decode_port, WorkerType::Decode),
+            ],
+            RuntimeType::Vllm,
+        )
+        .await;
+        let (status, body, elapsed) = one_chat(router.as_ref(), false).await;
+        assert_eq!(status, http::StatusCode::OK, "{body}");
+        assert!(
+            elapsed >= BOUND + Duration::from_secs(1) && elapsed < CASE_CAP,
+            "answered when the decode answered, past the bound: {elapsed:?}"
+        );
+    });
+    assert_eq!(prefill_calls.calls(), 1);
+    assert_eq!(decode_calls.calls(), 1, "not replayed");
+    assert_eq!(
+        worker_errors(&rendered, "decode", "timeout"),
+        0.0,
+        "no verdict on a non-streaming leg:\n{rendered}"
+    );
+    assert_eq!(worker_errors(&rendered, "prefill", "timeout"), 0.0);
 }
 
 /// Sequential dispatch, the prefill call never returns its stream: given up
