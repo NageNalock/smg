@@ -98,6 +98,20 @@ pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
     req.messages = merge_roots(roots).into_iter().chain(rest).collect();
 }
 
+/// The contract defaults for fields the client omitted: a streamed request
+/// sent without `stream_options` gets `include_usage` on, since the vendor's
+/// API ends every stream with a usage chunk and its clients read the token
+/// counts (the reasoning tokens among them) from it. An explicit opt-out
+/// stays; a request that does not stream gains no `stream_options`.
+pub(super) fn apply_defaults(req: &mut ChatCompletionRequest) {
+    if req.stream {
+        req.stream_options
+            .get_or_insert_default()
+            .include_usage
+            .get_or_insert(true);
+    }
+}
+
 /// The root messages as one: the first one's name, the contents joined in
 /// order.
 fn merge_roots(roots: Vec<ChatMessage>) -> Option<ChatMessage> {

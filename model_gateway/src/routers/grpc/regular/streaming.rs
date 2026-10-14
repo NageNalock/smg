@@ -4280,6 +4280,8 @@ mod failure_tests;
 mod pd_usage_tests;
 #[cfg(test)]
 mod symphony_tests;
+#[cfg(test)]
+mod usage_chunk_tests;
 
 #[cfg(test)]
 mod delta_slicing_tests;

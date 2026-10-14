@@ -264,8 +264,9 @@ impl ProviderProfile {
         match self {
             ProviderProfile::DeepSeek => deepseek::normalize_chat(req),
             ProviderProfile::Kimi => kimi::normalize_chat(req),
+            ProviderProfile::Minimax => minimax::apply_defaults(req),
             ProviderProfile::Zai => zai::normalize_chat(req),
-            ProviderProfile::OpenAi | ProviderProfile::Generic | ProviderProfile::Minimax => {}
+            ProviderProfile::OpenAi | ProviderProfile::Generic => {}
         }
     }
 
