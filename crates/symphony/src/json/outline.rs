@@ -140,6 +140,13 @@ impl Scanner {
         &self.found
     }
 
+    /// Where the outline stopped reading short of the object's close, if it did: the byte it could
+    /// not place as a member, a colon, a value or the closing brace, and so the first byte that is
+    /// not the object's. `None` while the object is being read, and once it has closed.
+    pub fn stopped_at(&self) -> Option<usize> {
+        (matches!(self.stage, Stage::Done) && self.found.close.is_none()).then_some(self.at)
+    }
+
     /// Read the bytes of `text` that came after the last call; `text` holds every byte fed so
     /// far, in order.
     pub fn advance(&mut self, text: &str) {
@@ -500,6 +507,31 @@ mod tests {
             );
         }
         assert_eq!(outline(r#"{"name": }"#).name, None);
+    }
+
+    #[test]
+    fn the_outline_says_where_it_stopped_short_of_the_close() {
+        let stopped = |text: &str| {
+            let mut scanner = Scanner::default();
+            scanner.advance(text);
+            scanner.stopped_at()
+        };
+        let text = r#"{"name": "f", "arguments": {"a": 1}</f>"#;
+        assert_eq!(stopped(text), text.find("</f>"), "a brace left off");
+        assert_eq!(
+            stopped(r#"{"name": "f", "arguments": {"a": 1}, junk}"#),
+            Some(r#"{"name": "f", "arguments": {"a": 1}, "#.len()),
+            "text where a member should be"
+        );
+        assert_eq!(
+            stopped(r#"{"name": "f", "arguments": }"#),
+            Some(r#"{"name": "f", "arguments": "#.len()),
+            "a delimiter where a value should start"
+        );
+        assert_eq!(stopped("  x"), Some(2), "no object at all");
+        assert_eq!(stopped(r#"{"name": "f"}"#), None, "closed, not stopped");
+        assert_eq!(stopped(r#"{"name": "f", "arg"#), None, "still reading");
+        assert_eq!(stopped(""), None);
     }
 
     #[test]

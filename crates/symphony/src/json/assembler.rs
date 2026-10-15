@@ -37,11 +37,13 @@ pub struct Assembler {
     /// The argument byte from which the arguments stopped being a valid JSON prefix, if they did.
     invalid_from: Option<usize>,
     done: bool,
-    /// Whether the object ends where its arguments stop being a JSON prefix: the bytes from there
-    /// on are then the caller's ([`Self::refused_tail`]), for a shaped call's trailer to read.
+    /// Whether the object ends where its bytes stop being a call's object: where its arguments
+    /// stop being a JSON prefix, or where its outline stops short of the closing brace (the brace
+    /// left off, text where a member should be). The bytes from there on are then the caller's
+    /// ([`Self::refused_tail`]), for a shaped call's trailer to read, rather than the object's.
     ends_where_refused: bool,
     /// Where in `text` the object ended so, until the bytes from there were handed back.
-    refused_at: Option<usize>,
+    ended_at: Option<usize>,
 }
 
 impl Assembler {
@@ -59,7 +61,7 @@ impl Assembler {
             invalid_from: None,
             done: false,
             ends_where_refused: false,
-            refused_at: None,
+            ended_at: None,
         }
     }
 
@@ -68,17 +70,33 @@ impl Assembler {
         self.invalid_from.is_some()
     }
 
-    /// The object ends where its arguments stop being a JSON prefix (see [`Self::refused_tail`]).
+    /// The object ends where its bytes stop being a call's object: where its arguments stop being
+    /// a JSON prefix, or where its outline stops short of the closing brace (see
+    /// [`Self::refused_tail`]).
     pub fn ending_where_refused(mut self) -> Self {
         self.ends_where_refused = true;
         self
     }
 
-    /// For an object that ends where refused: the bytes from the refusal on, which the object took
-    /// before the refusal was known, handed back once with the character before them, for the
+    /// Whether the object ended where its arguments stopped being a JSON prefix: it ends there
+    /// ([`Self::ending_where_refused`]), and they did. An object that ended where its outline
+    /// stopped, or one that closed after its arguments broke, did not.
+    pub fn ended_where_refused(&self) -> bool {
+        self.ends_where_refused && self.invalid_from.is_some()
+    }
+
+    /// Where the outline stopped short of the object's close, for an object that ends there.
+    fn stopped_at(&self) -> Option<usize> {
+        self.scanner
+            .stopped_at()
+            .filter(|_| self.ends_where_refused)
+    }
+
+    /// For an object that ends where refused: the bytes from where it ended on, which the object
+    /// took before that was known, handed back once with the character before them, for the
     /// caller to read as what follows the arguments. `None` otherwise.
     pub fn refused_tail(&mut self) -> Option<(String, Option<char>)> {
-        let at = self.refused_at.take()?;
+        let at = self.ended_at.take()?;
         let tail = self.text.split_off(at);
         let before = self.text.chars().next_back();
         Some((tail, before))
@@ -120,12 +138,19 @@ impl Assembler {
         let arguments = self.scanner.found().arguments.clone();
         if !self.started {
             let Some(name) = self.scanner.found().name.clone() else {
-                if let Some(close) = close {
-                    // Closed without a name: not a call. Said now, so `done` is true at the close.
-                    out.push(Event::Malformed {
-                        text: Text::uncounted(&self.text[..close]),
-                        why: MalformedReason::Other("a tool call without a name".to_string()),
-                    });
+                // Closed, or stopped short of its close, without a name: not a call. Said now, so
+                // `done` is true at the close or the stop.
+                if let Some(end) = close.or_else(|| self.stopped_at()) {
+                    if end > 0 {
+                        out.push(Event::Malformed {
+                            text: Text::uncounted(&self.text[..end]),
+                            why: MalformedReason::Other("a tool call without a name".to_string()),
+                        });
+                    }
+                    if close.is_none() {
+                        // The bytes from the stop on are the caller's (`refused_tail`).
+                        self.ended_at = Some(end);
+                    }
                     self.done = true;
                 }
                 return taken;
@@ -133,7 +158,11 @@ impl Assembler {
             let head_end = match (&arguments, close) {
                 (Some(span), _) => span.start,
                 (None, Some(close)) => close,
-                (None, None) => return taken,
+                // Stopped short of its close before any arguments: a call without them.
+                (None, None) => match self.stopped_at() {
+                    Some(at) => at,
+                    None => return taken,
+                },
             };
             out.push(Event::ToolCallStart {
                 index: self.index,
@@ -144,12 +173,21 @@ impl Assembler {
             self.started = true;
         }
         self.emit_new_argument_bytes(arguments.as_ref(), out);
-        if self.refused_at.is_some() && !self.done {
-            // The arguments broke and the object ends there, unterminated: the call ends with what
-            // arrived, and the bytes from the break on are the caller's (`refused_tail`).
+        if self.ended_at.is_none() {
+            self.ended_at = self.stopped_at();
+        }
+        if let Some(at) = self.ended_at {
+            // The object ends short of its close, unterminated: at the arguments' break, with
+            // nothing after them, or where its outline stopped, with what the outline read after
+            // them. The call ends with what arrived, and the bytes from there on are the caller's
+            // (`refused_tail`).
+            let tail_start = arguments
+                .as_ref()
+                .and_then(|span| span.end)
+                .map_or(at, |end| end.min(at));
             out.push(Event::ToolCallEnd {
                 index: self.index,
-                source: Text::default(),
+                source: Text::uncounted(&self.text[tail_start..at]),
             });
             self.done = true;
             return taken;
@@ -240,7 +278,7 @@ impl Assembler {
         if self.ends_where_refused && self.invalid_from.is_some() {
             // The object ends at the break; what follows is handed back, not reported as its
             // malformed rest.
-            self.refused_at = Some(span.start + valid_end);
+            self.ended_at = Some(span.start + valid_end);
             return;
         }
         if self.emitted < bytes.len() {
@@ -598,6 +636,102 @@ mod tests {
             .collect();
         assert_eq!(malformed, " junk}");
         assert_eq!(sources(&events), text);
+    }
+
+    /// With `ending_where_refused`, an object whose outline stops short of its closing brace (the
+    /// brace left off, text where a member should be) ends there, as one whose arguments break
+    /// does: the call ends with what the outline read after the arguments, and the bytes from the
+    /// stop on are handed back. Stopped before its name, the object named no call, and its bytes
+    /// come back malformed.
+    #[test]
+    fn an_object_ending_where_refused_ends_where_its_outline_stops() {
+        let feed = |text: &str, by_char: bool| {
+            let mut assembler = Assembler::new(0, "call_0").ending_where_refused();
+            let mut out = Events::new();
+            if by_char {
+                for (i, c) in text.char_indices() {
+                    assembler.feed(&text[i..i + c.len_utf8()], &mut out);
+                }
+            } else {
+                assert_eq!(assembler.feed(text, &mut out), text.len(), "{text:?}");
+            }
+            let tail = assembler.refused_tail();
+            assert!(
+                assembler.done() && !assembler.refused() && !assembler.ended_where_refused(),
+                "{text:?}"
+            );
+            assert_eq!(assembler.feed("more", &mut out), 0, "{text:?}");
+            assembler.finish(&mut out);
+            (out.drain(), tail)
+        };
+        let start = |source: &str| Event::ToolCallStart {
+            index: 0,
+            id: "call_0".into(),
+            name: "f".into(),
+            source: Text::uncounted(source),
+        };
+        let end = |source: &str| Event::ToolCallEnd {
+            index: 0,
+            source: Text::uncounted(source),
+        };
+        let head = r#"{"name": "f", "arguments": "#;
+        let value = Event::ToolCallArguments {
+            index: 0,
+            json: r#"{"a": 1}"#.into(),
+            source: Text::uncounted(r#"{"a": 1}"#),
+        };
+
+        let text = r#"{"name": "f", "arguments": {"a": 1}</f>"#;
+        let (events, tail) = feed(text, false);
+        assert_eq!(
+            events,
+            vec![start(head), value.clone(), end("")],
+            "a brace left off"
+        );
+        assert_eq!(tail, Some(("</f>".to_string(), Some('}'))));
+        let (events, tail) = feed(text, true);
+        assert_eq!(events.first(), Some(&start(head)), "byte by byte");
+        assert_eq!(arguments(&events), r#"{"a": 1}"#, "byte by byte");
+        assert_eq!(events.last(), Some(&end("")), "byte by byte");
+        assert_eq!(
+            tail,
+            Some(("<".to_string(), Some('}'))),
+            "the tail is what came in the piece the stop came in"
+        );
+
+        let (events, tail) = feed(r#"{"name": "f", "arguments": {"a": 1}, junk</f>"#, false);
+        assert_eq!(
+            events,
+            vec![start(head), value, end(", ")],
+            "what the outline read after the arguments is the end's"
+        );
+        assert_eq!(tail, Some(("junk</f>".to_string(), Some(' '))));
+
+        let (events, tail) = feed(r#"{"name": "f"</f>"#, false);
+        assert_eq!(
+            events,
+            vec![start(r#"{"name": "f""#), end("")],
+            "a call without arguments"
+        );
+        assert_eq!(tail, Some(("</f>".to_string(), Some('"'))));
+
+        let (events, tail) = feed(r#"{"arguments": {"a": 1}, x</f>"#, false);
+        assert_eq!(
+            events,
+            vec![Event::Malformed {
+                text: Text::uncounted(r#"{"arguments": {"a": 1}, "#),
+                why: MalformedReason::Other("a tool call without a name".into()),
+            }],
+            "stopped before its name: no call"
+        );
+        assert_eq!(tail, Some(("x</f>".to_string(), Some(' '))));
+
+        // A plain object keeps every byte, as before: its region's close ends it.
+        let mut assembler = Assembler::new(0, "call_0");
+        let mut out = Events::new();
+        assert_eq!(assembler.feed(text, &mut out), text.len());
+        assert!(!assembler.done());
+        assert_eq!(assembler.refused_tail(), None);
     }
 
     #[test]
