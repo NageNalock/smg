@@ -883,8 +883,8 @@ const GPT_OSS_OUTPUTS: &[&str] = &[
 
 /// Calls on abstract tags: a call its trailer closes, terminals whose header does not match (in
 /// the content, in a thought, twice in a row), a close the trailer does not end at, a call cut
-/// short, a call the stop closes after its trailer, a header the end leaves unfinished, and
-/// nothing.
+/// short, a value the reader refuses before the trailer closes the call, a call the stop closes
+/// after its trailer, a header the end leaves unfinished, and nothing.
 const SHAPED_TAGS_OUTPUTS: &[&str] = &[
     "Sure.<c><n=f>{\"a\": 1}</f>\n</c>Done.",
     "Hi <c><x>bye",
@@ -892,6 +892,7 @@ const SHAPED_TAGS_OUTPUTS: &[&str] = &[
     "<c><c><n=f>{}</f></c>",
     "<c><n=f>{}</c>x</f></c>",
     "<c><n=f>{\"a\": [1, 2",
+    "<c><n=f>{\"a\": 1</f>\n</c>Done.",
     "<c><n=f>{}</f>",
     "<c><n=",
     "",

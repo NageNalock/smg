@@ -37,6 +37,11 @@ pub struct Assembler {
     /// The argument byte from which the arguments stopped being a valid JSON prefix, if they did.
     invalid_from: Option<usize>,
     done: bool,
+    /// Whether the object ends where its arguments stop being a JSON prefix: the bytes from there
+    /// on are then the caller's ([`Self::refused_tail`]), for a shaped call's trailer to read.
+    ends_where_refused: bool,
+    /// Where in `text` the object ended so, until the bytes from there were handed back.
+    refused_at: Option<usize>,
 }
 
 impl Assembler {
@@ -53,7 +58,30 @@ impl Assembler {
             prefix: Prefix::default(),
             invalid_from: None,
             done: false,
+            ends_where_refused: false,
+            refused_at: None,
         }
+    }
+
+    /// Whether the arguments stopped being a JSON prefix.
+    pub fn refused(&self) -> bool {
+        self.invalid_from.is_some()
+    }
+
+    /// The object ends where its arguments stop being a JSON prefix (see [`Self::refused_tail`]).
+    pub fn ending_where_refused(mut self) -> Self {
+        self.ends_where_refused = true;
+        self
+    }
+
+    /// For an object that ends where refused: the bytes from the refusal on, which the object took
+    /// before the refusal was known, handed back once with the character before them, for the
+    /// caller to read as what follows the arguments. `None` otherwise.
+    pub fn refused_tail(&mut self) -> Option<(String, Option<char>)> {
+        let at = self.refused_at.take()?;
+        let tail = self.text.split_off(at);
+        let before = self.text.chars().next_back();
+        Some((tail, before))
     }
 
     /// Whether the object has closed, as a call or as an object that named none; `feed` takes
@@ -116,6 +144,16 @@ impl Assembler {
             self.started = true;
         }
         self.emit_new_argument_bytes(arguments.as_ref(), out);
+        if self.refused_at.is_some() && !self.done {
+            // The arguments broke and the object ends there, unterminated: the call ends with what
+            // arrived, and the bytes from the break on are the caller's (`refused_tail`).
+            out.push(Event::ToolCallEnd {
+                index: self.index,
+                source: Text::default(),
+            });
+            self.done = true;
+            return taken;
+        }
         if let Some(close) = close {
             let tail_start = arguments
                 .as_ref()
@@ -198,6 +236,12 @@ impl Assembler {
                 source: Text::uncounted(fresh),
             });
             self.emitted = valid_end;
+        }
+        if self.ends_where_refused && self.invalid_from.is_some() {
+            // The object ends at the break; what follows is handed back, not reported as its
+            // malformed rest.
+            self.refused_at = Some(span.start + valid_end);
+            return;
         }
         if self.emitted < bytes.len() {
             out.push(Event::Malformed {
