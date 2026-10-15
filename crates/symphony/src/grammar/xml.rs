@@ -31,7 +31,7 @@ use serde_json::Value;
 
 use super::{
     schema::{keyword, shape, Definitions},
-    CallMarkers, Grammar, Tag,
+    CallMarkers, Count, Grammar, Tag,
 };
 
 /// The words the assembler reads as a boolean.
@@ -41,13 +41,13 @@ const ITEM: &str = "item";
 /// How deep the elements follow the schema; below that, a value is any text.
 const DEPTH: usize = 16;
 
-/// The block of calls for `tools`, written with `separator` before every tag, or `None` for a
-/// table whose calls sit in no block.
+/// The block of calls for `tools`, written with `separator` before every tag, as many as `count`
+/// lets the model write, or `None` for a table whose calls sit in no block.
 pub(super) fn calls(
     markers: &CallMarkers<'_>,
     separator: &str,
     tools: &[&Tool],
-    at_least_one: bool,
+    count: Count<'_>,
 ) -> Option<Grammar> {
     let block = markers.block.as_ref()?;
     let writer = Writer {
@@ -58,19 +58,21 @@ pub(super) fn calls(
         .iter()
         .map(|tool| writer.invoke(markers, &tool.function.name, &tool.function.parameters))
         .collect();
-    Some(Grammar::TriggeredTags {
-        triggers: vec![block.open.to_string()],
-        tags: vec![Tag::new(
+    // The block holds at least one invoke whether or not the request asks for a call: an empty
+    // block is no answer.
+    let invokes = Count {
+        at_least_one: true,
+        ..count
+    }
+    .separated(invokes);
+    Some(count.triggered(
+        vec![block.open.to_string()],
+        vec![Tag::new(
             format!("{}\n", block.open),
-            Grammar::TagsWithSeparator {
-                tags: invokes,
-                separator: String::new(),
-                at_least_one: true,
-            },
+            invokes,
             format!("{separator}{}", block.close),
         )],
-        at_least_one,
-    })
+    ))
 }
 
 /// The spelling the table gives: the separator before every tag, and the markers that end a call

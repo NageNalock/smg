@@ -602,7 +602,11 @@ impl WorkerMediaPipeline {
 
     /// The content part for one item, with the checks the Python servicer
     /// makes before fetching: a scheme this worker fetches, an inline payload
-    /// under the cap, a modality the pipeline takes.
+    /// under the cap, a modality the pipeline takes. The cap's message names
+    /// the worker as the flag's owner: the router relays the refusal in its
+    /// 400, and its own per-item input bound (`SMG_*_MAX_INPUT_BYTES`, 256 MiB
+    /// by default) is checked earlier with a message of its own, so a reader
+    /// of either knows which launcher to set.
     fn part(
         &self,
         index: usize,
@@ -622,7 +626,7 @@ impl WorkerMediaPipeline {
             if size > cap {
                 return Err(WorkerMediaError::Invalid(format!(
                     "media_refs[{index}]: inline payload is {size} bytes, above the {cap}-byte cap \
-                     (--mm-max-item-bytes)"
+                     (the worker's --mm-max-item-bytes)"
                 )));
             }
         }
@@ -876,7 +880,7 @@ mod tests {
     /// The inline payload cap sizes a `data:` URL by the shared rule: the
     /// scheme's case does not matter, so an uppercase scheme cannot slip a
     /// payload past `--mm-max-item-bytes` that the router and the servicer
-    /// refuse.
+    /// refuse; the refusal names the worker as the flag's owner.
     #[tokio::test]
     async fn pipeline_caps_an_inline_payload_whatever_the_scheme_case() {
         let dir = std::env::temp_dir().join(format!(
@@ -927,7 +931,7 @@ mod tests {
                     &error,
                     WorkerMediaError::Invalid(message)
                         if message.contains("inline payload is 6 bytes")
-                            && message.contains("--mm-max-item-bytes")
+                            && message.contains("(the worker's --mm-max-item-bytes)")
                 ),
                 "{url}: {error}"
             );

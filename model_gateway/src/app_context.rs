@@ -456,15 +456,16 @@ impl AppContextBuilder {
             return Err(AppContextBuildError::InvalidConfig(why));
         }
         if router_config.parser == ParserChoice::Symphony
-            && (names.tool.is_some() || names.reasoning.is_some())
+            && names.tool.is_some()
             && named_table(&names).is_none()
         {
             tracing::warn!(
                 tool_call_parser = ?names.tool,
                 reasoning_parser = ?names.reasoning,
-                "The configured parser names select no Symphony table, so every model is read by \
-                 the legacy parsers under --parser symphony; a table's name, or a legacy name \
-                 that reads a table's format (qwen, qwen_xml, ...), reads with that table"
+                "The configured tool-call parser name selects no Symphony table, so every model \
+                 is read by the legacy parsers under --parser symphony; a table's name, or a \
+                 legacy name that reads a table's format (qwen, qwen_xml, ...), reads with that \
+                 table"
             );
         }
 

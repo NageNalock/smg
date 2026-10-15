@@ -6,11 +6,13 @@
 //! `symphony` on, the parser names set for the model decide ([`reads`]): the `tool_parser` and
 //! `reasoning_parser` of the model's card (worker labels), else the `--tool-call-parser` and
 //! `--reasoning-parser` flags, resolved as the legacy path resolves them (`ParserResolver`).
-//! A name that is a table's own (`symphony::formats::Table::name`) or a legacy parser's that
-//! reads a table's format (`qwen` is `qwen3`, `qwen_xml` is `qwen3_tagged`; [`table_named`])
+//! A name a table answers to (`symphony::formats::Table::answering_to`: its own name, or a
+//! legacy parser's that reads its format, `qwen` for `qwen3`, `qwen_xml` for `qwen3_tagged`)
 //! reads every request for the model with that table, whatever the model is, the tool-call name
-//! deciding; any other legacy parser's name keeps the legacy parsers, which is the way back for
-//! one model when its table misbehaves; no name at all takes the registry's table for the model
+//! deciding; any other legacy tool-call parser's name keeps the legacy parsers, which is the way
+//! back for one model when its table misbehaves, `passthrough` among them; no name at all, or a
+//! reasoning name alone that no table answers to, other than `passthrough`, takes the registry's
+//! table for the model
 //! (`symphony::formats::for_model`), and the legacy parsers with their own detection when it has
 //! none. The names are checked at startup and at a worker's registration ([`check_names`]).
 //! Every request read with `legacy` keeps the older parsers. The response names the parser that
@@ -60,47 +62,53 @@ pub(crate) fn choice(
         .ok_or_else(|| format!("{HEADER} must be legacy or symphony, not {spelled:?}"))
 }
 
-/// Legacy parser names that read a format a table reads, by the table. A legacy name with no
-/// row here keeps the legacy parsers under `--parser symphony`.
-const ALIASES: [(&str, Table); 9] = [
-    ("qwen", Table::Qwen3),
-    ("qwen_xml", Table::Qwen3Tagged),
-    ("qwen_coder", Table::Qwen3Tagged),
-    ("nemotron", Table::Qwen3Tagged),
-    ("glm47_moe", Table::Glm),
-    ("glm45_moe", Table::Glm4),
-    ("hy_v4", Table::Hy4),
-    ("deepseek_v41", Table::DeepSeekV4_1),
-    ("minimax", Table::MinimaxM2),
-];
+/// The legacy parser that leaves its channel as written: an operator's choice no table reads
+/// for, so it keeps the legacy parsers, alone or beside another name.
+const PASSTHROUGH: &str = "passthrough";
 
-/// The table a parser name selects: the table whose own name it is ([`Table::named`]), else the
-/// one its legacy name is an alias of ([`ALIASES`]); `None` for a legacy name with neither.
-pub(crate) fn table_named(name: &str) -> Option<Table> {
-    Table::named(name).or_else(|| {
-        let name = name.trim().to_ascii_lowercase();
-        let (_, table) = ALIASES.iter().find(|(alias, _)| *alias == name)?;
-        Some(*table)
-    })
+fn is_passthrough(name: Option<&str>) -> bool {
+    name.is_some_and(|name| name.trim().eq_ignore_ascii_case(PASSTHROUGH))
 }
 
-/// The table the parser names set for a model select, when they do: the tool-call name's
-/// ([`table_named`]), else the reasoning name's when no tool-call name is set. A name that is
-/// neither a table's nor a legacy alias selects none, and so do no names at all.
+/// The table the parser names set for a model select, when they do: the tool-call name's, else
+/// the reasoning name's when no tool-call name is set. A name is a table's own or a legacy
+/// parser's that reads its format ([`Table::answering_to`]); any other name selects none,
+/// `passthrough` among them, and so do no names at all.
 pub(crate) fn named_table(names: &Names) -> Option<Table> {
-    match &names.tool {
-        Some(tool) => table_named(tool),
-        None => names.reasoning.as_deref().and_then(table_named),
-    }
+    names
+        .tool
+        .as_deref()
+        .or(names.reasoning.as_deref())
+        .and_then(Table::answering_to)
 }
 
-/// The table that reads `request`'s response, if one does: `parser` is Symphony, the request
-/// asks nothing the older path answers differently (the response separates reasoning, and
-/// `tool_choice` is not `none`), and a table is there to read it: the one the model's parser
-/// `names` select ([`named_table`]), whatever the model, or the registry's for the model when no
-/// name is set. A legacy parser's name with no alias leaves the response to the legacy parsers.
-/// Preparation and request building both decide with this one predicate.
+/// The table that reads `request`'s response, if one does: the one [`selected`] by the parser
+/// names and the registry, unless the request asks what the older path answers differently. A
+/// table that reads calls from the output's first byte (`json`, `xlam`) reads a bare JSON answer
+/// as a call, so it declines a request that declares no tools: the request asked for no calls,
+/// and the older parsers read none. Preparation and request building both decide with this one
+/// predicate.
 pub(crate) fn reads(
+    parser: ParserChoice,
+    names: &Names,
+    request: &ChatCompletionRequest,
+) -> Option<Format> {
+    let format = selected(parser, names, request)?;
+    let no_tools = request.effective_tools().next().is_none();
+    if format.starts_in_calls() && no_tools {
+        return None;
+    }
+    Some(format)
+}
+
+/// The table `parser` and the parser `names` select for `request`: `parser` is Symphony, the
+/// request asks nothing the older path answers differently (the response separates reasoning,
+/// and `tool_choice` is not `none`), and a table is there to read it: the one the model's parser
+/// `names` select ([`named_table`]), whatever the model, or the registry's for the model when no
+/// name is set, or when a reasoning name alone selects none, since every table reads the thought
+/// channel; `passthrough` alone is the choice to leave the thought as written, which no table
+/// does. A tool-call name no table answers to leaves the response to the legacy parsers.
+fn selected(
     parser: ParserChoice,
     names: &Names,
     request: &ChatCompletionRequest,
@@ -114,10 +122,13 @@ pub(crate) fn reads(
     {
         return None;
     }
-    if names.tool.is_none() && names.reasoning.is_none() {
-        return for_model(&request.model);
-    }
-    let table = named_table(names)?;
+    let table = match named_table(names) {
+        Some(table) => table,
+        None if names.tool.is_none() && !is_passthrough(names.reasoning.as_deref()) => {
+            return for_model(&request.model)
+        }
+        None => return None,
+    };
     // The registry's table comes with the model's own turn opener; a table named for a model
     // the registry reads with another, or does not know, replays from the table's own.
     match for_model(&request.model) {
@@ -485,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn the_tool_call_name_selects_a_table_by_its_own_name_or_a_legacy_alias() {
+    fn the_tool_call_name_selects_the_table_that_answers_to_it() {
         assert_eq!(named_table(&Names::default()), None);
         assert_eq!(
             named_table(&names(Some("kimi_k3"), Some("kimi_k3"))),
@@ -528,20 +539,79 @@ mod tests {
         );
         assert_eq!(named_table(&names(Some("llama"), None)), None);
         assert_eq!(named_table(&names(Some("llama"), Some("qwen3"))), None);
+        // `passthrough` leaves a channel as written, which no table reads for: the legacy
+        // parsers keep it, alone or beside another name.
+        assert_eq!(
+            named_table(&names(Some("passthrough"), Some(" Passthrough "))),
+            None
+        );
+        assert_eq!(named_table(&names(Some("passthrough"), None)), None);
+        assert_eq!(named_table(&names(None, Some("passthrough"))), None);
+        assert_eq!(
+            named_table(&names(Some("passthrough"), Some("qwen3"))),
+            None
+        );
     }
 
     #[test]
-    fn every_alias_is_a_legacy_parsers_name_and_no_tables() {
+    fn every_name_a_table_answers_to_besides_its_own_is_a_legacy_parsers() {
         let tools = tool_parser::ParserFactory::new();
         let reasoning = reasoning_parser::ParserFactory::new();
-        for (alias, table) in ALIASES {
-            assert_eq!(Table::named(alias), None, "{alias} is a table's own name");
+        for (alias, _) in Table::ALIASES {
             assert!(
                 tools.has_parser(alias) || reasoning.registry().has_parser(alias),
                 "{alias} is no legacy parser's name"
             );
-            assert_eq!(table_named(alias), Some(table));
         }
+    }
+
+    #[test]
+    fn a_table_that_reads_calls_from_the_first_byte_needs_tools() {
+        // `json` and `xlam` read a bare JSON answer as a call: without tools the request asked
+        // for none, so the legacy parsers keep it; a table with call markers reads either way.
+        let json = names(Some("json"), None);
+        let without = request(json!({}));
+        assert!(assign(ParserChoice::Symphony, &json, &without, None, PROMPT).is_none());
+        let tools = serde_json::to_value(tools()).expect("tools");
+        let with = request(json!({"tools": tools}));
+        let assigned = assign(ParserChoice::Symphony, &json, &with, None, PROMPT);
+        assert_eq!(assigned.expect("assigned").format.name(), "json");
+        let xlam = request(json!({"model": "Salesforce/Llama-xLAM-2-8b-fc-r"}));
+        let by_registry = assign(
+            ParserChoice::Symphony,
+            &Names::default(),
+            &xlam,
+            None,
+            PROMPT,
+        );
+        assert!(by_registry.is_none());
+        let qwen = assign(
+            ParserChoice::Symphony,
+            &Names::default(),
+            &without,
+            None,
+            PROMPT,
+        );
+        assert_eq!(qwen.expect("assigned").format.name(), "qwen3");
+        // Inkling starts in an arguments state too, but its call has a marker after the tool's
+        // name, so a bare answer is never a call: the table reads a request without tools.
+        let inkling = assign(
+            ParserChoice::Symphony,
+            &names(Some("inkling"), None),
+            &without,
+            None,
+            PROMPT,
+        );
+        assert_eq!(inkling.expect("assigned").format.name(), "inkling");
+        // Llama Nemotron writes xLAM's list between markers: a bare answer is never a call there.
+        let nemotron = assign(
+            ParserChoice::Symphony,
+            &names(Some("llama_nemotron"), None),
+            &without,
+            None,
+            PROMPT,
+        );
+        assert_eq!(nemotron.expect("assigned").format.name(), "llama_nemotron");
     }
 
     #[test]
@@ -572,6 +642,8 @@ mod tests {
             PROMPT
         )
         .is_none());
+        // A reasoning name alone that selects no table leaves the choice to the registry: a
+        // known model takes its table and the table's tag, an unknown one the legacy parsers.
         let required = request(json!({"tool_choice": "required"}));
         let reasoning_only = names(None, Some("deepseek_r1"));
         assert!(constraint(
@@ -580,6 +652,42 @@ mod tests {
             &required,
             &tools(),
             false
+        )
+        .is_some());
+        let assigned = assign(
+            ParserChoice::Symphony,
+            &reasoning_only,
+            &request(json!({})),
+            None,
+            PROMPT,
+        );
+        assert_eq!(assigned.expect("assigned").format.name(), "qwen3");
+        let unknown_required = request(json!({"model": "unknown", "tool_choice": "required"}));
+        assert!(constraint(
+            ParserChoice::Symphony,
+            &reasoning_only,
+            &unknown_required,
+            &tools(),
+            false
+        )
+        .is_none());
+        assert!(assign(
+            ParserChoice::Symphony,
+            &reasoning_only,
+            &unknown,
+            None,
+            PROMPT
+        )
+        .is_none());
+        // `passthrough` alone is the choice to leave the thought as written: the legacy
+        // parsers keep a known model too.
+        let passthrough_only = names(None, Some("passthrough"));
+        assert!(assign(
+            ParserChoice::Symphony,
+            &passthrough_only,
+            &request(json!({})),
+            None,
+            PROMPT
         )
         .is_none());
         let kimi = names(Some("kimi_k3"), None);
@@ -663,6 +771,18 @@ mod tests {
         assert_eq!(
             why.expect_err("unknown"),
             "unknown reasoning parser 'nonsense': neither a legacy parser nor a Symphony table"
+        );
+        // A legacy name a table answers to is checked as the legacy name it is: a tool parser's
+        // given as the reasoning parser is unknown there, under either parser.
+        let why = check_names(symphony, &names(None, Some("qwen_xml")), true, false);
+        assert_eq!(
+            why.expect_err("wrong kind"),
+            "unknown reasoning parser 'qwen_xml': neither a legacy parser nor a Symphony table"
+        );
+        let why = check_names(legacy, &names(None, Some("qwen_xml")), true, false);
+        assert_eq!(
+            why.expect_err("wrong kind"),
+            "unknown reasoning parser 'qwen_xml'"
         );
     }
 

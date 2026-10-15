@@ -187,10 +187,16 @@ The rules, in the order `json` applies them:
   decoded: `"exact phrase"` keeps its quotes, indentation and a trailing newline stay, and
   `&amp;` is five characters. A parameter is declared `string` when its schema admits that
   type at all: `"type": "string"`, a list of types or an `anyOf` that includes it, or, when the
-  schema has no `type`, an `enum` of strings, with or without `null` among them. A `type`
-  decides alone when it is there, as it does for the engine's parser: BFCL declares
-  `{"type": "array", "enum": [...]}` for a list whose members come from the enum, and that is
-  an array. When the schema admits `null` as well as `string`, the text `null`, and the `None`
+  schema has no `type`, an `enum` of strings, with or without `null` among them, or a `const`
+  string, which is an enum of one. An `allOf` admits what all of its members that name a type
+  admit, so `{"allOf": [{"type": "string"}, {"maxLength": 8}]}` is a string, and it narrows the
+  types named beside it to those, so `{"type": ["string", "null"], "allOf": [{"type": "string"},
+  {"maxLength": 8}]}` is a string that is never null. A `number` admits every integer, so an
+  `allOf` of an `integer` and a `number` is an integer. OpenAPI's `"nullable": true` admits `null`
+  beside whatever else the schema admits. An `enum` beside a `type` adds nothing, as for the
+  engine's parser: BFCL declares `{"type": "array", "enum": [...]}` for a list whose members come
+  from the enum, and that is an array. When the schema admits `null` as well as `string`, the text
+  `null`, and the `None`
   a template writes for a null argument, are null; any other text is the string. A string
   declared alone keeps `null` as its text, as the engine's readers do; bellwether #56 refuses a case
   whose reference holds a null there, since no output carries it.

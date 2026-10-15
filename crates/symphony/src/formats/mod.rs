@@ -12,6 +12,7 @@
 //! [`Engine`]: crate::Engine
 pub mod deepseek_v4_1;
 pub mod dots3;
+pub mod forced;
 pub mod function_gemma;
 pub mod gemma4;
 pub mod glm;
@@ -28,7 +29,7 @@ pub mod llama_nemotron;
 pub mod minicpm5;
 pub mod minimax_m2;
 pub mod minimax_m3;
-pub mod mistral;
+pub mod mistral_v13;
 pub mod olmo3;
 pub mod plain;
 pub mod qwen2_5;
@@ -39,6 +40,7 @@ pub mod xlam;
 
 pub use deepseek_v4_1::deepseek_v4_1;
 pub use dots3::dots3;
+pub use forced::forced;
 pub use function_gemma::function_gemma;
 pub use gemma4::gemma4;
 pub use glm::glm;
@@ -55,7 +57,7 @@ pub use llama_nemotron::llama_nemotron;
 pub use minicpm5::minicpm5;
 pub use minimax_m2::minimax_m2;
 pub use minimax_m3::minimax_m3;
-pub use mistral::mistral;
+pub use mistral_v13::mistral_v13;
 pub use olmo3::olmo3;
 pub use plain::plain;
 pub use qwen2_5::qwen2_5;

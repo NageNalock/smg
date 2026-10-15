@@ -49,6 +49,33 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 
+/// HTTP/2 receive window per stream (one in-flight RPC).
+///
+/// These windows only govern what the worker sends back; requests flow under
+/// the worker's own settings. The stream window caps how much of a response h2
+/// buffers while SMG is not reading it, e.g. while a slow SSE client keeps the
+/// bounded body channel full. Beyond that, flow control pauses the worker.
+///
+/// h2 charges every buffered DATA frame under 256 bytes against a single
+/// budget per *connection*, and a streamed token chunk is a few dozen bytes.
+/// Once the budget is gone the client sends
+/// `GOAWAY ENHANCE_YOUR_CALM too_many_data_frames`, failing every RPC on the
+/// connection. A 16 MiB stream window let one unread high-rate stream (an
+/// `n=128` request behind a slow client) do that in about 90 seconds.
+const STREAM_WINDOW: u32 = 256 * 1024;
+
+/// HTTP/2 receive window per connection.
+///
+/// Every stream is already capped at [`STREAM_WINDOW`], so this does not bound
+/// memory in practice. It sizes h2's small-DATA-frame budget, which is half of
+/// this window.
+const CONNECTION_WINDOW: u32 = 512 * 1024 * 1024;
+
+// A stream window packed with 1-byte DATA frames costs `STREAM_WINDOW * 255`
+// budget units. Require room for four of them, so a few stalled streams
+// cannot tear down the connection they share.
+const _: () = assert!((STREAM_WINDOW as usize) * 255 * 4 <= (CONNECTION_WINDOW as usize) / 2);
+
 /// Connect a `tonic::Channel` to the given endpoint with the SMG-standard
 /// keep-alive and HTTP/2 window profile applied, using
 /// [`DEFAULT_CONNECT_TIMEOUT`].
@@ -90,11 +117,8 @@ fn configured_endpoint(
         .tcp_keepalive(Some(TCP_KEEPALIVE))
         .tcp_nodelay(true)
         .http2_adaptive_window(false)
-        // 16MB stream window, 32MB connection window — sized for the
-        // typical inference response (multi-MB tokenized payloads +
-        // streaming chunks) without head-of-line blocking.
-        .initial_stream_window_size(Some(16 * 1024 * 1024))
-        .initial_connection_window_size(Some(32 * 1024 * 1024)))
+        .initial_stream_window_size(Some(STREAM_WINDOW))
+        .initial_connection_window_size(Some(CONNECTION_WINDOW)))
 }
 
 /// Whether `status` is what tonic makes of a failure in the HTTP/2 layer
@@ -134,7 +158,8 @@ mod tests {
     use tower::Service;
 
     use super::{
-        configured_endpoint, is_transport_failure, normalize_grpc_endpoint, DEFAULT_CONNECT_TIMEOUT,
+        configured_endpoint, is_transport_failure, normalize_grpc_endpoint,
+        DEFAULT_CONNECT_TIMEOUT, STREAM_WINDOW,
     };
 
     #[derive(Clone, Copy)]
@@ -277,8 +302,6 @@ mod tests {
     // sub-256-byte DATA frames from that window (`max(window / 2, 25_600)`),
     // which is what turns a backlog of streamed token frames into
     // `GOAWAY ENHANCE_YOUR_CALM too_many_data_frames`.
-
-    const STREAM_WINDOW: u32 = 16 * 1024 * 1024;
 
     /// Read `SETTINGS_INITIAL_WINDOW_SIZE` from the client's first frame.
     /// `None` means the client omitted it, which h2 does at the 65535 default.
@@ -435,11 +458,41 @@ mod tests {
         );
     }
 
+    /// The previous profile (16 MiB stream / 32 MiB connection window) let a
+    /// single unread stream buffer enough token frames to exhaust the 16 MiB
+    /// budget (~66k one-byte frames), and the client GOAWAYed every stream on
+    /// the connection.
+    #[tokio::test]
+    async fn oversized_stream_window_goaways_on_unread_token_frames() {
+        const MIB: u32 = 1024 * 1024;
+        let outcome = blast_unread_data_frames(
+            |uri| {
+                Endpoint::from_shared(uri)
+                    .expect("uri")
+                    .http2_adaptive_window(false)
+                    .initial_stream_window_size(Some(16 * MIB))
+                    .initial_connection_window_size(Some(32 * MIB))
+            },
+            70_000,
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                BlastOutcome::ClientGoAway(h2::Reason::ENHANCE_YOUR_CALM)
+            ),
+            "expected GOAWAY ENHANCE_YOUR_CALM, got {outcome:?}"
+        );
+    }
+
+    /// Flow control stops the peer once an unread stream holds `STREAM_WINDOW`
+    /// bytes, and a full window of 1-byte frames still fits in the budget. The
+    /// connection therefore survives no matter how much the peer tries to send.
     #[tokio::test]
     async fn configured_endpoint_survives_unread_token_frames() {
         let outcome = blast_unread_data_frames(
             |uri| configured_endpoint(&uri, DEFAULT_CONNECT_TIMEOUT).expect("endpoint"),
-            2_000,
+            STREAM_WINDOW as usize + 1_024,
         )
         .await;
         assert!(

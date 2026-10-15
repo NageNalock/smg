@@ -20,8 +20,8 @@
 
 use super::{
     deepseek_v4_1, dots3, function_gemma, gemma4, glm, glm4, hy4, inkling, iquest, json,
-    k2_horizon, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2, minimax_m3, mistral,
-    olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+    k2_horizon, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2, minimax_m3,
+    mistral_v13, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
 };
 use crate::{
     format::{CallSyntax, Format},
@@ -64,8 +64,8 @@ pub enum Table {
     MinimaxM2,
     /// [`minimax_m3()`].
     MinimaxM3,
-    /// [`mistral()`].
-    Mistral,
+    /// [`mistral_v13()`].
+    MistralV13,
     /// [`llama_nemotron()`].
     LlamaNemotron,
     /// [`kimi_k3()`].
@@ -108,7 +108,7 @@ impl Table {
         Self::Json,
         Self::MinimaxM2,
         Self::MinimaxM3,
-        Self::Mistral,
+        Self::MistralV13,
         Self::LlamaNemotron,
         Self::KimiK3,
         Self::Inkling,
@@ -141,7 +141,7 @@ impl Table {
             Self::Json => "json",
             Self::MinimaxM2 => "minimax_m2",
             Self::MinimaxM3 => "minimax_m3",
-            Self::Mistral => "mistral",
+            Self::MistralV13 => "mistral_v13",
             Self::LlamaNemotron => "llama_nemotron",
             Self::KimiK3 => "kimi_k3",
             Self::Inkling => "inkling",
@@ -156,12 +156,40 @@ impl Table {
         }
     }
 
-    /// The table `name` spells ([`Table::name`], in any case, spaces around it ignored); `None`
-    /// for any other text, a legacy parser's name among them.
+    /// The table named `name`, a table's own name ([`Self::name`]) in any case; `None` for any
+    /// other text, a legacy parser's name among them: [`Self::answering_to`] reads those.
     pub fn named(name: &str) -> Option<Self> {
         let name = name.trim().to_ascii_lowercase();
         Self::ALL.into_iter().find(|table| table.name() == name)
     }
+
+    /// The table that answers to `name`: the table named so ([`Self::named`]), else the one whose
+    /// format the legacy parser of that name reads ([`Self::ALIASES`]); `None` for any other text.
+    pub fn answering_to(name: &str) -> Option<Self> {
+        Self::named(name).or_else(|| {
+            let name = name.trim().to_ascii_lowercase();
+            let (_, table) = Self::ALIASES.iter().find(|(alias, _)| *alias == name)?;
+            Some(*table)
+        })
+    }
+
+    /// The other names a table answers to ([`Self::answering_to`]): the gateway's older tool and
+    /// reasoning parsers that read the table's format, so that a deployment that names one
+    /// (`--tool-call-parser qwen_xml`) reads with the table (`qwen3_tagged`) when the gateway
+    /// reads with Symphony. A parser that reads a format no table reads has no row and keeps its
+    /// own parser; so does `passthrough`, which leaves its channel as written, which no table
+    /// reads for.
+    pub const ALIASES: [(&str, Table); 9] = [
+        ("qwen", Table::Qwen3),
+        ("qwen_xml", Table::Qwen3Tagged),
+        ("qwen_coder", Table::Qwen3Tagged),
+        ("nemotron", Table::Qwen3Tagged),
+        ("glm47_moe", Table::Glm),
+        ("glm45_moe", Table::Glm4),
+        ("hy_v4", Table::Hy4),
+        ("deepseek_v41", Table::DeepSeekV4_1),
+        ("minimax", Table::MinimaxM2),
+    ];
 
     /// The table, built.
     pub fn format(self) -> Format {
@@ -181,7 +209,7 @@ impl Table {
             Self::Json => json(),
             Self::MinimaxM2 => minimax_m2(),
             Self::MinimaxM3 => minimax_m3(),
-            Self::Mistral => mistral(),
+            Self::MistralV13 => mistral_v13(),
             Self::LlamaNemotron => llama_nemotron(),
             Self::KimiK3 => kimi_k3(),
             Self::Inkling => inkling(),
@@ -436,7 +464,7 @@ const GROUPS: &[Group] = &[
     Group {
         model: "mistralai/Devstral-2-123B-Instruct-2512",
         also: &[],
-        table: Table::Mistral,
+        table: Table::MistralV13,
         opener: None,
     },
     Group {
@@ -739,7 +767,7 @@ const GROUPS: &[Group] = &[
     Group {
         model: "mistralai/Ministral-3-14B-Instruct-2512-BF16",
         also: &[],
-        table: Table::Mistral,
+        table: Table::MistralV13,
         opener: None,
     },
     Group {
@@ -748,37 +776,37 @@ const GROUPS: &[Group] = &[
             "Ministral-3-3B-Reasoning-2512",
             "Ministral-3-8B-Reasoning-2512",
         ],
-        table: Table::Mistral,
+        table: Table::MistralV13,
         opener: None,
     },
     Group {
         model: "mistralai/Ministral-3-3B-Instruct-2512",
         also: &[],
-        table: Table::Mistral,
+        table: Table::MistralV13,
         opener: None,
     },
     Group {
         model: "mistralai/Ministral-3-3B-Instruct-2512-BF16",
         also: &[],
-        table: Table::Mistral,
+        table: Table::MistralV13,
         opener: None,
     },
     Group {
         model: "mistralai/Ministral-3-8B-Instruct-2512-BF16",
         also: &[],
-        table: Table::Mistral,
+        table: Table::MistralV13,
         opener: None,
     },
     Group {
         model: "mistralai/Mistral-Medium-3.5-128B",
         also: &[],
-        table: Table::Mistral,
+        table: Table::MistralV13,
         opener: None,
     },
     Group {
         model: "mistralai/Mistral-Small-4-119B-2603",
         also: &[],
-        table: Table::Mistral,
+        table: Table::MistralV13,
         opener: None,
     },
     Group {
@@ -1177,6 +1205,7 @@ pub fn groups() -> impl Iterator<Item = (&'static str, &'static [&'static str], 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::Emits;
 
     #[test]
     fn a_primary_resolves_by_its_id_in_any_case_with_or_without_the_organisation() {
@@ -1240,6 +1269,27 @@ mod tests {
     }
 
     #[test]
+    fn every_alias_spells_its_table_and_is_no_tables_own_name() {
+        let mut seen = std::collections::HashSet::new();
+        for (alias, table) in Table::ALIASES {
+            assert!(seen.insert(alias), "{alias} is listed twice");
+            assert!(
+                Table::ALL.iter().all(|own| own.name() != alias),
+                "{alias} is a table's own name"
+            );
+            assert_eq!(Table::named(alias), None, "{alias} is a table's own name");
+            assert_eq!(Table::answering_to(alias), Some(table), "{alias}");
+            assert_eq!(
+                Table::answering_to(&alias.to_ascii_uppercase()),
+                Some(table),
+                "{alias}"
+            );
+        }
+        assert_eq!(Table::answering_to("llama"), None);
+        assert_eq!(Table::answering_to("passthrough"), None);
+    }
+
+    #[test]
     fn every_table_has_a_name_of_its_own_that_spells_it_back() {
         let mut seen: Vec<&str> = Vec::new();
         for table in Table::ALL {
@@ -1298,6 +1348,37 @@ mod tests {
                 assert!(!seen.contains(&lower), "{repository} is listed twice");
                 seen.push(lower);
             }
+        }
+    }
+
+    #[test]
+    fn every_tables_variants_without_reasoning_or_calls_still_validate() {
+        for table in Table::ALL {
+            let format = table.format();
+            let silent = format.clone().without_reasoning();
+            silent
+                .validate()
+                .unwrap_or_else(|e| panic!("{}: without_reasoning: {e}", table.name()));
+            assert!(
+                (0..silent.states()).all(|state| silent.emits(state) != Emits::Reasoning),
+                "{}: a thought state remains",
+                table.name()
+            );
+            let unread = format.without_calls();
+            unread
+                .validate()
+                .unwrap_or_else(|e| panic!("{}: without_calls: {e}", table.name()));
+            assert_eq!(unread.call_syntax(), None, "{}", table.name());
+            assert!(
+                (0..unread.states()).all(|state| unread.emits(state) != Emits::Arguments),
+                "{}: an arguments state remains",
+                table.name()
+            );
+            assert!(
+                (1..unread.states()).all(|state| unread.emits(state) != Emits::Wrapper),
+                "{}: a calls wrapper remains",
+                table.name()
+            );
         }
     }
 }

@@ -27,7 +27,7 @@ use serde_json::Value;
 
 use super::{
     schema::{joined, joined_nodes, keyword, shape, Definitions},
-    CallMarkers, Grammar, Tag,
+    CallMarkers, Count, Grammar, Tag,
 };
 use crate::gemma::Spelling;
 
@@ -73,12 +73,13 @@ impl Walk {
 }
 
 /// The calls for `tools`: one tag per tool, triggered by the call's opener, `call:NAME{` after it,
-/// the arguments in `spelling`, then `}` and the call's close.
+/// the arguments in `spelling`, then `}` and the call's close; as many as `count` lets the model
+/// write.
 pub(super) fn calls(
     markers: &CallMarkers<'_>,
     spelling: Spelling,
     tools: &[&Tool],
-    at_least_one: bool,
+    count: Count<'_>,
 ) -> Grammar {
     let ends = Ends {
         call_exits: &markers.call_exits,
@@ -95,11 +96,7 @@ pub(super) fn calls(
             )
         })
         .collect();
-    Grammar::TriggeredTags {
-        triggers: vec![markers.call_open.to_string()],
-        tags,
-        at_least_one,
-    }
+    count.triggered(vec![markers.call_open.to_string()], tags)
 }
 
 /// What ends a string's text besides its own token: the terminals the table has a row for out of

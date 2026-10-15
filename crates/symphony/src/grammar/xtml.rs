@@ -28,7 +28,7 @@ use serde_json::Value;
 use super::{
     block_of,
     schema::{self, shape, Definitions},
-    CallMarkers, Grammar, WayIn,
+    CallMarkers, Count, Grammar, WayIn,
 };
 
 const OPEN: &str = "<|open|>";
@@ -37,13 +37,13 @@ const SEP: &str = "<|sep|>";
 /// The call's count of the turn's calls, from one.
 const INDEX: &str = "[1-9][0-9]*";
 
-/// The block of calls for `tools`, entered by `ways_in`, or `None` for a table whose calls sit
-/// in no block.
+/// The block of calls for `tools`, entered by `ways_in`, as many as `count` lets the model write,
+/// or `None` for a table whose calls sit in no block.
 pub(super) fn calls(
     markers: &CallMarkers<'_>,
     ways_in: &[WayIn<'_>],
     tools: &[&Tool],
-    at_least_one: bool,
+    count: Count<'_>,
 ) -> Option<Grammar> {
     let block = markers.block.as_ref()?;
     let one_call = Grammar::Or(
@@ -52,8 +52,8 @@ pub(super) fn calls(
             .map(|tool| call(markers, &tool.function.name, &tool.function.parameters))
             .collect(),
     );
-    let content = Grammar::Plus(Box::new(one_call));
-    Some(block_of(ways_in, content, block.close, at_least_one))
+    let content = count.calls(one_call);
+    Some(block_of(ways_in, content, block.close, count))
 }
 
 /// One call: the call's opener and the tool's name, its index, the arguments and the call's close.

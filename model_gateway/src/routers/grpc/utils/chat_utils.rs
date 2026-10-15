@@ -17,7 +17,7 @@ use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
     stop::StopSequenceDecoderBuilder,
-    traits::{Encoding, PromptEncoding, Tokenizer},
+    traits::{Encoding, PromptEncoding, RendererCapabilities, Tokenizer},
     StopSequenceDecoder,
 };
 use openai_protocol::{
@@ -395,6 +395,18 @@ const REASONING_EFFORT_KEY: &str = "reasoning_effort";
 const TOOL_CHOICE_KEY: &str = "tool_choice";
 const RESPONSE_FORMAT_KEY: &str = "response_format";
 
+/// The template kwarg both prompt paths tell the tool choice through: the
+/// chat value as sent, so a renderer reads one shape under
+/// `/v1/chat/completions`, `/v1/messages` and `count_tokens`.
+pub(crate) fn insert_tool_choice_kwarg(
+    kwargs: &mut HashMap<String, Value>,
+    tool_choice: &ToolChoice,
+) {
+    if let Ok(value) = serde_json::to_value(tool_choice) {
+        kwargs.insert(TOOL_CHOICE_KEY.to_string(), value);
+    }
+}
+
 /// Merge request-level reasoning, tool, and output-format controls with any
 /// request `chat_template_kwargs`, forwarding each verbatim. The chat template
 /// owns interpretation (level→value mapping, `tool_choice`/`response_format`
@@ -406,9 +418,7 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
     let kwargs_capacity = 3 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
     let mut combined = HashMap::with_capacity(kwargs_capacity);
     if let Some(tool_choice) = &request.tool_choice {
-        if let Ok(value) = serde_json::to_value(tool_choice) {
-            combined.insert(TOOL_CHOICE_KEY.to_string(), value);
-        }
+        insert_tool_choice_kwarg(&mut combined, tool_choice);
     }
     if let Some(response_format) = &request.response_format {
         if let Ok(value) = serde_json::to_value(response_format) {
@@ -427,11 +437,11 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
     combined
 }
 
-/// Typed `thinking.type` first, else the OpenAI mapping of the effective effort.
+/// The thinking preference the prompt is rendered with: the typed toggle,
+/// else the effective effort, both as the request's provider profile reads
+/// them (`ChatCompletionRequest::template_thinking`).
 fn resolve_template_thinking(request: &ChatCompletionRequest) -> Option<bool> {
-    request.thinking_toggle().or_else(|| {
-        openai_protocol::chat::thinking_from_reasoning_effort(request.effective_reasoning_effort())
-    })
+    request.template_thinking()
 }
 
 /// gRPC backends require content parts the gateway knows how to render.
@@ -679,13 +689,19 @@ pub(crate) fn filter_chat_request_by_tool_choice(
 /// is forced by the tool constraint, built from `callable_tools`); an
 /// `allowed_tools` choice renders its subset; `none` renders no tool, as the
 /// Responses path renders it, so the model is not offered a call it may not
-/// make and answers in text; any other request renders as it is.
-pub(crate) fn request_as_rendered(
+/// make and answers in text, unless the renderer declares the tools under
+/// `none` itself and forbids the call in the prompt
+/// ([`RendererCapabilities::declares_tools_under_tool_choice_none`]); any
+/// other request renders as it is.
+pub fn request_as_rendered(
     request: &ChatCompletionRequest,
+    capabilities: RendererCapabilities,
 ) -> std::borrow::Cow<'_, ChatCompletionRequest> {
     match request.tool_choice {
         Some(ToolChoice::Function { .. }) => std::borrow::Cow::Borrowed(request),
-        Some(ToolChoice::Value(ToolChoiceValue::None)) if request.tools.is_some() => {
+        Some(ToolChoice::Value(ToolChoiceValue::None))
+            if request.tools.is_some() && !capabilities.declares_tools_under_tool_choice_none =>
+        {
             let mut rendered = request.clone();
             rendered.tools = None;
             std::borrow::Cow::Owned(rendered)
@@ -700,25 +716,15 @@ pub(crate) fn request_as_rendered(
 /// Returns the flat prompt only. A renderer that must encode the prompt itself
 /// (Kimi-K3) cannot be honored through this entry point; the gRPC pipeline
 /// uses [`process_chat_messages_with_placeholders`] and encodes what it
-/// returns.
+/// returns, and a caller outside it takes
+/// [`process_chat_messages_with_encoding`].
 pub fn process_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
     image_placeholder: Option<&str>,
 ) -> Result<ProcessedMessages, String> {
-    // Bindings call this entry point without the gRPC preparation stage.
-    validate_chat_content_parts(&request.messages)?;
-    let placeholder_tokens = image_placeholder.map(|token| {
-        let mut placeholders = PlaceholderTokens::default();
-        placeholders.insert(Modality::Image, token.to_string());
-        placeholders
-    });
-    let (processed, encoding) = process_chat_messages_with_placeholders(
-        request,
-        tokenizer,
-        placeholder_tokens.as_ref(),
-        MediaPartOrder::MediaFirst,
-    )?;
+    let (processed, encoding) =
+        process_chat_messages_with_encoding(request, tokenizer, image_placeholder)?;
     if matches!(encoding, PromptEncoding::Deferred(_)) {
         static WARNED: OnceLock<()> = OnceLock::new();
         WARNED.get_or_init(|| {
@@ -730,6 +736,30 @@ pub fn process_chat_messages(
         });
     }
     Ok(processed)
+}
+
+/// [`process_chat_messages`] with how the tokenize step must encode the
+/// prompt: [`PromptEncoding::FromText`] for every flat renderer, or the
+/// deferred encode a segment-aware renderer prepared, whose ids are the
+/// prompt the gateway sends.
+pub fn process_chat_messages_with_encoding(
+    request: &ChatCompletionRequest,
+    tokenizer: &dyn Tokenizer,
+    image_placeholder: Option<&str>,
+) -> Result<(ProcessedMessages, PromptEncoding), String> {
+    // Bindings call this entry point without the gRPC preparation stage.
+    validate_chat_content_parts(&request.messages)?;
+    let placeholder_tokens = image_placeholder.map(|token| {
+        let mut placeholders = PlaceholderTokens::default();
+        placeholders.insert(Modality::Image, token.to_string());
+        placeholders
+    });
+    process_chat_messages_with_placeholders(
+        request,
+        tokenizer,
+        placeholder_tokens.as_ref(),
+        MediaPartOrder::MediaFirst,
+    )
 }
 
 /// Render the chat prompt. The second element says how the tokenize step must
@@ -1761,8 +1791,9 @@ mod tests {
         };
 
         let named = request(json!({"type": "function", "function": {"name": "get_weather"}}));
+        let plain = RendererCapabilities::default();
         assert_eq!(
-            names(&request_as_rendered(&named)),
+            names(&request_as_rendered(&named, plain)),
             ["get_weather", "get_time"]
         );
         assert_eq!(
@@ -1778,20 +1809,17 @@ mod tests {
             "type": "allowed_tools", "mode": "auto",
             "tools": [{"type": "function", "name": "get_time"}]
         }));
-        assert_eq!(names(&request_as_rendered(&allowed)), ["get_time"]);
+        assert_eq!(names(&request_as_rendered(&allowed, plain)), ["get_time"]);
 
         let auto = request(json!("auto"));
         assert_eq!(
-            names(&request_as_rendered(&auto)),
+            names(&request_as_rendered(&auto, plain)),
             ["get_weather", "get_time"]
         );
     }
 
-    /// `tool_choice: none` renders no tool: the model is not offered a call
-    /// it may not make, and the request's other fields render as sent.
-    #[test]
-    fn tool_choice_none_renders_no_tool() {
-        let request: ChatCompletionRequest = serde_json::from_value(json!({
+    fn tool_choice_none_request() -> ChatCompletionRequest {
+        serde_json::from_value(json!({
             "model": "m",
             "messages": [{"role": "user", "content": "q"}],
             "tools": [
@@ -1799,12 +1827,40 @@ mod tests {
             ],
             "tool_choice": "none",
         }))
-        .expect("chat request");
-        let rendered = request_as_rendered(&request);
+        .expect("chat request")
+    }
+
+    /// `tool_choice: none` renders no tool: the model is not offered a call
+    /// it may not make, and the request's other fields render as sent.
+    #[test]
+    fn tool_choice_none_renders_no_tool() {
+        let request = tool_choice_none_request();
+        let rendered = request_as_rendered(&request, RendererCapabilities::default());
         assert!(rendered.tools.is_none());
         assert_eq!(rendered.messages.len(), request.messages.len());
         // The request itself keeps its tools for the rest of the pipeline.
         assert!(request.tools.is_some());
+    }
+
+    /// A renderer that declares the tools under `tool_choice: none` itself
+    /// (and forbids the call in the prompt, as its reference does) gets them:
+    /// the request renders as sent.
+    #[test]
+    fn a_renderer_that_declares_tools_under_tool_choice_none_keeps_them() {
+        let request = tool_choice_none_request();
+        let rendered = request_as_rendered(
+            &request,
+            RendererCapabilities {
+                declares_tools_under_tool_choice_none: true,
+                ..RendererCapabilities::default()
+            },
+        );
+        assert!(matches!(rendered, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(
+            rendered.tools.as_ref().map(Vec::len),
+            Some(1),
+            "the tool declaration stays for the renderer to write"
+        );
     }
 
     fn effort_request(reasoning_effort: Option<&str>) -> ChatCompletionRequest {
@@ -1899,6 +1955,42 @@ mod tests {
         assert_eq!(
             resolve_template_thinking(&effort_request(Some("none"))),
             Some(false)
+        );
+    }
+
+    /// Under the MiniMax profile no effort value switches thinking off and an
+    /// explicit effort outranks `thinking.disabled`; the request renders the
+    /// template's default (thinking on, the model's own depth).
+    #[test]
+    fn minimax_effort_keeps_thinking_on() {
+        let minimax = |thinking: Option<Value>, reasoning_effort: Option<&str>| {
+            let mut request = effort_request(reasoning_effort);
+            request.model = "MiniMax-M3".to_string();
+            request.thinking = thinking.map(|value| serde_json::from_value(value).unwrap());
+            request
+        };
+        for effort in ["none", "minimal", "high"] {
+            assert_eq!(
+                resolve_template_thinking(&minimax(None, Some(effort))),
+                None,
+                "{effort}"
+            );
+            assert_eq!(
+                resolve_template_thinking(&minimax(
+                    Some(json!({"type": "disabled"})),
+                    Some(effort)
+                )),
+                None,
+                "{effort} outranks thinking.disabled"
+            );
+        }
+        assert_eq!(
+            resolve_template_thinking(&minimax(Some(json!({"type": "disabled"})), None)),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_template_thinking(&minimax(Some(json!({"type": "enabled"})), Some("none"))),
+            Some(true)
         );
     }
 
@@ -2119,10 +2211,7 @@ mod tests {
     /// observable without a checkpoint: which messages reach the template,
     /// whether a generation prompt was requested, and whether tool-call
     /// `arguments` arrive as written.
-    fn render_with(
-        capabilities: llm_tokenizer::traits::RendererCapabilities,
-        request: &ChatCompletionRequest,
-    ) -> Value {
+    fn render_with(capabilities: RendererCapabilities, request: &ChatCompletionRequest) -> Value {
         let tokenizer = llm_tokenizer::MockTokenizer::new()
             .with_renderer_capabilities(capabilities)
             .with_json_chat_template();
@@ -2143,18 +2232,18 @@ mod tests {
         value
     }
 
-    const NATIVE_CONTINUATION: llm_tokenizer::traits::RendererCapabilities =
-        llm_tokenizer::traits::RendererCapabilities {
-            enable_thinking_alias: false,
-            native_assistant_continuation: true,
-            raw_tool_call_arguments: false,
-        };
-    const RAW_ARGUMENTS: llm_tokenizer::traits::RendererCapabilities =
-        llm_tokenizer::traits::RendererCapabilities {
-            enable_thinking_alias: false,
-            native_assistant_continuation: false,
-            raw_tool_call_arguments: true,
-        };
+    const NATIVE_CONTINUATION: RendererCapabilities = RendererCapabilities {
+        enable_thinking_alias: false,
+        native_assistant_continuation: true,
+        raw_tool_call_arguments: false,
+        declares_tools_under_tool_choice_none: false,
+    };
+    const RAW_ARGUMENTS: RendererCapabilities = RendererCapabilities {
+        enable_thinking_alias: false,
+        native_assistant_continuation: false,
+        raw_tool_call_arguments: true,
+        declares_tools_under_tool_choice_none: false,
+    };
 
     /// Without the capability the trailing assistant message is popped and its
     /// content is appended after a generation prompt; with it the message

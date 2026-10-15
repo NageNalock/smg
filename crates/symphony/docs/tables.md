@@ -140,7 +140,7 @@ table has no terminal for it, so such a message sits in the named-JSON header un
 `<|end_message|>` and comes back whole as `Malformed` (a name without a call), no byte lost; a
 recording of one decides what it is.
 
-## Mistral (`mistral`)
+## Mistral v13 (`mistral_v13`)
 
 What the table says beyond the others:
 
@@ -159,7 +159,9 @@ What the table says beyond the others:
 - **A forced call's tag has no end.** `Format::grammar` writes a tag per tool from `[TOOL_CALLS]`,
   the name and `[ARGS]` to the schema, and nothing after it, as the template writes nothing: the
   object the schema accepts ends the tag. The gateway's older `mistral` parser and its tag read
-  Mistral 7B v0.3's `[TOOL_CALLS][{…}]` list, another syntax, so nothing is pinned to it.
+  Mistral 7B v0.3's `[TOOL_CALLS][{…}]` list, another syntax, so nothing is pinned to it; the
+  table's name keeps that parser's apart, so `--tool-call-parser mistral` stays with it under
+  `--parser symphony`, and the registry picks this table for the v13 groups.
 
 What the table leaves open: whether every engine takes a tag whose `end` is empty (xgrammar's
 structural tag allows it; the Symphony e2e lane says so for the engines it runs); and the older
@@ -184,6 +186,23 @@ write (Nemotron Ultra 253B CPT, the UltraLong 1M, 2M and 4M, Safety Guard 8B v3,
 Principle): one call alone, `parameters` naming the arguments, and never a list, content beside a
 call or a thought, since the template refuses them; the list and the wrapping after an object rest
 on the unit tests until a group writes them.
+
+## The forced call (`forced`)
+
+Not a table an operator names: the gateway picks this format for a request whose `tool_choice`
+names a function and whose constraint is the JSON schema the older path builds for it (the
+function's `parameters`), so the whole output is that function's arguments, with no marker and no
+name in it. The name comes from the request (`Declared::forcing`), and `ToolCallStart` carries it
+with no source byte of its own. The value streams through `json::Arguments` (`json::forced` drives
+it): the whitespace before it is dropped, a fragment for every byte that keeps it a JSON prefix,
+malformed from the first that does not, and the call's end where the value is whole or where the
+stream ends; the engine reports text after a whole value as text after the object. A required call
+under the same path is a list of `{"name": …, "parameters": …}` objects, which the `json` table
+reads.
+
+What the format leaves open: it derives no grammar, since its constraint is the request's own
+schema; bellwether #19 records the constrained outputs, which replay here when they land, so the
+format stands on its unit tests and on the gateway's reading of the same outputs until then.
 
 ## Llama Nemotron (`llama_nemotron`)
 

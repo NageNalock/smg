@@ -30,10 +30,11 @@ pub enum ParserChoice {
     #[default]
     Legacy,
     /// Symphony's tables: the one a model's parser names select (its worker labels, else the
-    /// `--tool-call-parser` and `--reasoning-parser` flags) when they name a table or a legacy
-    /// parser that reads a table's format (`qwen` is `qwen3`, `qwen_xml` is `qwen3_tagged`), the
-    /// registry's for the models it knows when they name nothing; any other legacy parser's name,
-    /// and every other model, keep the legacy parsers.
+    /// `--tool-call-parser` and `--reasoning-parser` flags) when a table answers to the name, its
+    /// own or a legacy parser's that reads its format (`qwen` for `qwen3`, `qwen_xml` for
+    /// `qwen3_tagged`); the registry's for the models it knows when they name nothing, or only a
+    /// reasoning parser no table answers to, `passthrough` excepted; any other legacy tool-call
+    /// parser's name, `passthrough`, and every other model, keep the legacy parsers.
     Symphony,
 }
 

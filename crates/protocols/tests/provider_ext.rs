@@ -1322,11 +1322,53 @@ fn kimi_profile_stream_usage_default_is_kimi_wide() {
 }
 
 #[test]
-fn non_kimi_models_get_no_stream_usage_default() {
-    for model in ["gpt-4o-mini", "MiniMax-M3"] {
+fn models_without_a_stream_usage_default_get_none() {
+    for model in ["gpt-4o-mini", "self-hosted-model"] {
         let mut req = sampling_request(model, json!({"stream": true}));
         req.normalize();
         assert!(req.stream_options.is_none(), "{model}");
+    }
+}
+
+#[test]
+fn minimax_profile_defaults_stream_usage_on() {
+    for model in ["MiniMax-M3", "MiniMax-M2"] {
+        let mut req = sampling_request(model, json!({"stream": true}));
+        req.normalize();
+        assert_eq!(include_usage(&req), Some(true), "{model}");
+        assert!(req.validate().is_ok(), "{model}");
+    }
+}
+
+#[test]
+fn minimax_profile_keeps_explicit_stream_usage_opt_out() {
+    let mut req = sampling_request(
+        "MiniMax-M3",
+        json!({"stream": true, "stream_options": {"include_usage": false}}),
+    );
+    req.normalize();
+    assert_eq!(include_usage(&req), Some(false));
+}
+
+#[test]
+fn minimax_profile_stream_usage_default_preserves_other_stream_options() {
+    let mut req = sampling_request(
+        "MiniMax-M3",
+        json!({"stream": true, "stream_options": {"continuous_usage_stats": true}}),
+    );
+    req.normalize();
+    let opts = req.stream_options.as_ref().unwrap();
+    assert_eq!(opts.include_usage, Some(true));
+    assert_eq!(opts.continuous_usage_stats, Some(true));
+}
+
+#[test]
+fn minimax_profile_adds_no_stream_options_when_not_streaming() {
+    for fields in [json!({}), json!({"stream": false})] {
+        let mut req = sampling_request("MiniMax-M3", fields);
+        req.normalize();
+        assert!(req.stream_options.is_none());
+        assert!(!has_code(&req, "stream_options_requires_stream"));
     }
 }
 
