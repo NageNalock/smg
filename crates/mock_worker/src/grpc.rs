@@ -320,8 +320,11 @@ impl TokenSpeedScheduler for MockScheduler {
 
     async fn abort(
         &self,
-        _request: Request<ts::AbortRequest>,
+        request: Request<ts::AbortRequest>,
     ) -> Result<Response<ts::AbortResponse>, Status> {
+        if let Some(engine) = &self.engine {
+            engine.abort(request.into_inner().request_id);
+        }
         Ok(Response::new(ts::AbortResponse {
             success: true,
             message: String::new(),

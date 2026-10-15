@@ -666,6 +666,7 @@ pub(crate) struct Published {
 /// Messages into the engine actor.
 enum EngineMsg {
     Request(NewRequest),
+    Abort(String),
     /// Drop every cached block and announce `AllBlocksCleared` (an engine
     /// restart, as far as the gateway's index is concerned).
     Reset,
@@ -811,6 +812,11 @@ impl Engine {
     /// Submit a request. Dropped silently if the engine has shut down.
     pub fn submit(&self, req: NewRequest) {
         let _ = self.tx.send(EngineMsg::Request(req));
+    }
+
+    /// Abort a queued or running request. Unknown or completed IDs are harmless.
+    pub(crate) fn abort(&self, request_id: String) {
+        let _ = self.tx.send(EngineMsg::Abort(request_id));
     }
 
     /// Clear the prefix cache and announce it (`AllBlocksCleared`).
@@ -1250,8 +1256,8 @@ async fn deliver(
 }
 
 /// Apply one actor message: enqueue a request (scoring the fleet oracle at
-/// arrival, before this engine's own cache changes), reset the cache, or
-/// restart the publisher.
+/// arrival, before this engine's own cache changes), abort a request, reset
+/// the cache, or restart the publisher.
 fn handle_msg(
     state: &mut SchedulerState,
     shared: &Arc<EngineShared>,
@@ -1286,6 +1292,19 @@ fn handle_msg(
             }
             state.enqueue_with_oracle(req, params, oracle_tokens);
             shared.in_flight.store(state.in_flight(), Ordering::Relaxed);
+        }
+        EngineMsg::Abort(request_id) => {
+            if let Some((tx, event)) = state.abort(&request_id, params) {
+                shared.in_flight.store(state.in_flight(), Ordering::Relaxed);
+                *shared.snapshot.write().unwrap_or_else(|p| p.into_inner()) =
+                    state.snapshot(params);
+                if params.request_overhead_ms > 0.0 {
+                    // Keep the terminal event behind tokens awaiting delivery.
+                    let _ = shared.deliver_tx.send((Instant::now(), tx, event));
+                } else {
+                    let _ = tx.send(event);
+                }
+            }
         }
         EngineMsg::Reset => state.reset(),
         EngineMsg::RestartPublisher(ack) => {
@@ -1594,6 +1613,37 @@ impl SchedulerState {
     /// Requests the engine holds: running or queued.
     fn in_flight(&self) -> usize {
         self.running.len() + self.waiting.len()
+    }
+
+    fn abort(
+        &mut self,
+        request_id: &str,
+        p: &EngineParams,
+    ) -> Option<(mpsc::UnboundedSender<GenEvent>, GenEvent)> {
+        let (events, prompt_tokens, completion_tokens, cached_tokens) = if let Some(index) =
+            self.running.iter().position(|r| r.request_id == request_id)
+        {
+            let r = self.running.remove(index);
+            self.release(&r, p);
+            (r.events, r.prompt_tokens, r.generated, r.cached_tokens)
+        } else {
+            let index = self
+                .waiting
+                .iter()
+                .position(|w| w.req.request_id == request_id)?;
+            let w = self.waiting.remove(index)?;
+            let (generated, cached) = w.resume.map_or((0, 0), |r| (r.generated, r.cached_tokens));
+            (w.req.events, w.prompt_tokens, generated, cached)
+        };
+        Some((
+            events,
+            GenEvent::Done {
+                finish_reason: "abort",
+                prompt_tokens,
+                completion_tokens,
+                cached_tokens,
+            },
+        ))
     }
 
     /// Queue a request with no oracle information (tests).
@@ -2339,6 +2389,64 @@ mod tests {
             },
             rx,
         )
+    }
+
+    #[test]
+    fn abort_releases_prefill_and_decode_kv_without_clearing_the_cache() {
+        for prefix_cache in [false, true] {
+            for prompt_len in [4, 12] {
+                let p = EngineParams {
+                    block_size: 4,
+                    max_batched_tokens: 5,
+                    kv_capacity_tokens: 32,
+                    prefix_cache,
+                    ..EngineParams::default()
+                };
+                let mut st = SchedulerState::new();
+                let (r, _rx) = req("cancelled", vec![7; prompt_len], 100);
+                st.enqueue(r, &p);
+                st.step(&p);
+                assert_eq!(st.pool.allocated, 2, "a full block and a partial tail");
+                let cached = st.pool.cached();
+
+                let (_, event) = st.abort("cancelled", &p).expect("the request exists");
+                assert!(matches!(
+                    event,
+                    GenEvent::Done {
+                        finish_reason: "abort",
+                        ..
+                    }
+                ));
+                assert!(st.is_idle());
+                assert_eq!(st.snapshot(&p).num_used_tokens, 0);
+                assert_eq!(st.pool.cached(), cached, "cached prefixes remain reusable");
+                assert_eq!(st.pool.allocated, st.pool.free_lru.len() as u64);
+                assert!(st.pool.fits(p.capacity_blocks(), p.capacity_blocks()));
+                assert!(st.abort("cancelled", &p).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn abort_preserves_usage_for_a_preempted_request() {
+        let p = EngineParams::default();
+        let mut st = SchedulerState::new();
+        let (r, _rx) = req("preempted", vec![7; 64], 100);
+        st.enqueue(r, &p);
+        st.step(&p);
+        st.preempt_last(&p);
+        let (_, event) = st.abort("preempted", &p).expect("the request is queued");
+        assert!(matches!(
+            event,
+            GenEvent::Done {
+                finish_reason: "abort",
+                prompt_tokens: 64,
+                completion_tokens: 1,
+                ..
+            }
+        ));
+        assert!(st.is_idle());
+        assert_eq!(st.pool.allocated, st.pool.free_lru.len() as u64);
     }
 
     /// Run passes until the given request emits its first Token, returning the
